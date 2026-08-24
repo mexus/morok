@@ -388,7 +388,7 @@ fn test_compile_with_program_pipeline_components_rejects_malformed_program_state
 }
 
 #[test]
-fn test_collect_non_overridable_fixedvars_locks_only_loop_var_names() {
+fn test_collect_non_overridable_fixedvars_locks_loop_and_device_bindings() {
     // After the schedule-level Range/End refactor, schedule-loop bindings are
     // tracked structurally via `ScheduleItem.loop_var_names` (populated from
     // `KernelInvocation.fixedvars` at instantiation time). User-supplied
@@ -407,6 +407,7 @@ fn test_collect_non_overridable_fixedvars_locks_only_loop_var_names() {
             ("outer_i".to_string(), 2_i64),
             ("loop_j".to_string(), 1_i64),
             ("user_n".to_string(), 7_i64),
+            ("_device_num".to_string(), 3_i64),
         ]),
         dependencies: vec![],
         instance_dependencies: vec![],
@@ -416,8 +417,71 @@ fn test_collect_non_overridable_fixedvars_locks_only_loop_var_names() {
 
     let locked = collect_non_overridable_fixedvars(&item);
     assert_eq!(locked.get("outer_i"), Some(&2));
+    assert_eq!(locked.get("_device_num"), Some(&3));
     assert!(!locked.contains_key("loop_j"));
     assert!(!locked.contains_key("user_n"));
+}
+
+#[test]
+fn test_cpu_plan_executes_device_bound_mstack_lanes() {
+    crate::test::helpers::test_setup();
+
+    let output0 = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 1, DType::Float32);
+    let output1 = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 1, DType::Float32);
+    let output_param = UOp::param(0, 1, DType::Float32, None);
+    let output_index =
+        UOp::index().buffer(output_param).indices(vec![UOp::index_const(0)]).call().expect("output index");
+    let device_num = UOp::range_axis(UOp::index_const(2), svod_ir::AxisId::Renumbered(0), svod_ir::AxisType::Device);
+    let value = device_num
+        .cast(DType::Float32)
+        .try_mul(&UOp::native_const(11.0f32))
+        .and_then(|value| value.try_add(&UOp::native_const(10.0f32)))
+        .expect("lane value expression");
+    let body = UOp::sink_with_info(
+        vec![output_index.store(value)],
+        svod_ir::KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() },
+    );
+    let stack = UOp::mstack(SmallVec::from_vec(vec![output0.clone(), output1.clone()]));
+    let call = body.call(SmallVec::from_vec(vec![stack.clone()]), svod_ir::CallInfo::default());
+    let pre_schedule = crate::schedule::PreSchedule {
+        items: vec![crate::schedule::PreScheduleItem {
+            kernel: call.clone(),
+            ast: body,
+            sources: vec![stack],
+            dependencies: vec![],
+            bound_ranges: vec![],
+        }],
+        invocations: vec![crate::schedule::KernelInvocation { kernel_id: call.id, fixedvars: HashMap::new() }],
+        output_buffer_uops: vec![output0.clone(), output1.clone()],
+    };
+    let inputs = HashMap::from([(output0.id, (*cpu_buffer(1)).clone()), (output1.id, (*cpu_buffer(1)).clone())]);
+    let schedule = crate::schedule::instantiate_schedule(&pre_schedule, &inputs, &HashMap::new(), false)
+        .expect("expand MSTACK lanes");
+    assert_eq!(schedule.items.len(), 2);
+
+    let mut plan = prepare_execution_plan(&schedule, &PrepareConfig::for_cpu_backend(crate::CpuBackend::Clang))
+        .expect("prepare CPU lane plan");
+    let fixed_device_nums: Vec<i64> = plan
+        .prepared_ops()
+        .iter()
+        .filter_map(|op| match op {
+            PreparedOp::CompiledProgram(kernel) => kernel.fixedvars.get("_device_num").copied(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fixed_device_nums, vec![0, 1]);
+
+    plan.execute_with_vars(&[("_device_num", 99)]).expect("fixed lane binding must ignore runtime override");
+    let mut values = Vec::new();
+    for lane in 0..2 {
+        let output = plan.output_buffer_at(lane).expect("lane output");
+        let mut value = [0.0f32];
+        output
+            .copyout(unsafe { std::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<f32>()) })
+            .expect("copy lane output");
+        values.push(value[0]);
+    }
+    assert_eq!(values, vec![10.0, 21.0]);
 }
 
 #[test]

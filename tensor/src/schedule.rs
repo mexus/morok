@@ -17,7 +17,7 @@ use std::sync::Arc;
 use svod_device::Buffer;
 use svod_device::device::Device;
 use svod_device::registry;
-use svod_ir::{Op, UOp};
+use svod_ir::{CustomFunctionKind, Op, UOp};
 use tracing::{debug, trace};
 
 use crate::error::*;
@@ -65,6 +65,164 @@ fn source_primary_buffer_id(src: &Arc<UOp>) -> Option<u64> {
         Op::MStack { .. } => None,
         _ => None,
     }
+}
+
+fn validate_mselect_bounds(call_id: u64, root: &Arc<UOp>) -> Result<()> {
+    for node in root.toposort() {
+        let Op::MSelect { buffer, device_index } = node.op() else { continue };
+        let Op::MStack { buffers } = buffer.op() else {
+            return Err(Error::MultiUnsupportedForm {
+                call_id,
+                details: format!("MSELECT {} must select from an explicit MSTACK", node.id),
+            });
+        };
+        if *device_index >= buffers.len() {
+            return Err(Error::MultiSelectOutOfBounds {
+                source_id: node.id,
+                device_index: *device_index,
+                lane_count: buffers.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn device_lane_binding(call_id: u64, ast: &Arc<UOp>, lane_count: Option<usize>) -> Result<bool> {
+    let mut device_ranges = Vec::new();
+    let mut device_params = Vec::new();
+    for node in ast.toposort() {
+        match node.op() {
+            Op::Range { axis_type: svod_ir::AxisType::Device, .. } => device_ranges.push(node),
+            Op::Param { arg, .. } if arg.addrspace.is_none() && arg.name.as_deref() == Some("_device_num") => {
+                device_params.push(node)
+            }
+            _ => {}
+        }
+    }
+
+    let marker_count = device_ranges.len() + device_params.len();
+    if marker_count == 0 {
+        return Ok(false);
+    }
+    let Some(lane_count) = lane_count else {
+        return Err(Error::MultiUnsupportedForm {
+            call_id,
+            details: "DEVICE launch binding requires aligned MSTACK arguments".into(),
+        });
+    };
+    if marker_count != 1 {
+        return Err(Error::MultiUnsupportedForm {
+            call_id,
+            details: format!("expected exactly one DEVICE launch marker, found {marker_count}"),
+        });
+    }
+
+    let extent = if let Some(range) = device_ranges.first() {
+        let Op::Range { end, .. } = range.op() else { unreachable!() };
+        let (Some(vmin), Some(vmax)) = (end.vmin().try_int(), end.vmax().try_int()) else {
+            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+        };
+        if vmin != vmax {
+            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+        }
+        vmin
+    } else {
+        let Op::Param { arg, .. } = device_params[0].op() else { unreachable!() };
+        let Some((vmin, vmax)) = &arg.vmin_vmax else {
+            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+        };
+        let (Some(vmin), Some(vmax)) = (vmin.0.try_int(), vmax.0.try_int()) else {
+            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+        };
+        if vmin != 0 {
+            return Err(Error::MultiUnsupportedForm {
+                call_id,
+                details: format!("_device_num bounds must start at zero, got {vmin}..={vmax}"),
+            });
+        }
+        vmax.checked_add(1).ok_or(Error::MultiDeviceExtentNotStatic { call_id })?
+    };
+
+    if extent != lane_count as i64 {
+        return Err(Error::MultiDeviceExtentMismatch { call_id, expected: lane_count, actual: extent });
+    }
+    Ok(true)
+}
+
+struct MultiSourceExpansion {
+    lanes: Vec<Vec<Arc<UOp>>>,
+    bind_device_num: bool,
+}
+
+fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> Result<MultiSourceExpansion> {
+    for source in sources {
+        validate_mselect_bounds(call_id, source)?;
+    }
+
+    let mut lane_count = None;
+    for (source_index, source) in sources.iter().enumerate() {
+        let Op::MStack { buffers } = source.op() else { continue };
+        if buffers.is_empty() {
+            return Err(Error::MultiEmptyLanes { call_id, source_index });
+        }
+        if let Some(expected) = lane_count {
+            if buffers.len() != expected {
+                return Err(Error::MultiLaneCountMismatch { call_id, source_index, expected, actual: buffers.len() });
+            }
+        } else {
+            lane_count = Some(buffers.len());
+        }
+    }
+
+    let bind_device_num = device_lane_binding(call_id, ast, lane_count)?;
+    let Some(lane_count) = lane_count else {
+        return Ok(MultiSourceExpansion { lanes: vec![sources.to_vec()], bind_device_num: false });
+    };
+    let effect = match ast.op() {
+        Op::End { computation, .. } => computation,
+        _ => ast,
+    };
+    if matches!(effect.op(), Op::Slice { .. }) {
+        return Err(Error::MultiUnsupportedForm {
+            call_id,
+            details: "SLICE calls cannot be expanded across lanes".into(),
+        });
+    }
+
+    let mut lanes = vec![Vec::with_capacity(sources.len()); lane_count];
+    for (source_index, source) in sources.iter().enumerate() {
+        match source.op() {
+            Op::MStack { buffers } => {
+                for (lane, buffer) in buffers.iter().enumerate() {
+                    if buffer.toposort().iter().any(|node| matches!(node.op(), Op::Slice { .. })) {
+                        return Err(Error::MultiLaneSliceAlias { call_id, source_index, lane });
+                    }
+                    if matches!(buffer.op(), Op::MStack { .. }) {
+                        return Err(Error::MultiUnsupportedForm {
+                            call_id,
+                            details: format!("MSTACK source {source_index} lane {lane} is a nested MSTACK"),
+                        });
+                    }
+                    lanes[lane].push(buffer.clone());
+                }
+            }
+            Op::Bind { .. } => {
+                for lane_sources in &mut lanes {
+                    lane_sources.push(source.clone());
+                }
+            }
+            other => {
+                return Err(Error::MultiUnsupportedForm {
+                    call_id,
+                    details: format!(
+                        "source {source_index} is {other:?}; every non-scalar CALL argument must be an MSTACK when any argument is multi"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(MultiSourceExpansion { lanes, bind_device_num })
 }
 
 fn collect_callable_dep_ids(dep: &Arc<UOp>, out: &mut HashSet<u64>) -> Result<()> {
@@ -624,6 +782,7 @@ pub struct ScheduleResult {
 }
 
 /// Buffers collected for a single callable.
+#[derive(Clone)]
 struct CallableBuffers {
     /// Device buffers in codegen order.
     buffers: Vec<Buffer>,
@@ -794,14 +953,42 @@ pub fn instantiate_schedule(
     for item in &pre_schedule.items {
         let nodes = item.ast.toposort();
 
-        // Map sources to actual Buffers.
-        let mut kb = collect_callable_buffers(&item.sources, input_buffers, &mut allocated_buffers, &output_ids)?;
+        let expansion = expand_multi_sources(item.kernel.id, &item.ast, &item.sources)?;
+        let mut lane_buffers = Vec::with_capacity(expansion.lanes.len());
+        for sources in &expansion.lanes {
+            lane_buffers.push(collect_callable_buffers(sources, input_buffers, &mut allocated_buffers, &output_ids)?);
+        }
 
         let effect = match item.ast.op() {
             Op::End { computation, .. } => computation,
             _ => &item.ast,
         };
+        let cross_device_effect = matches!(effect.op(), Op::Copy { .. })
+            || matches!(effect.op(), Op::CustomFunction { kind: CustomFunctionKind::AllReduce { .. }, .. });
+        if lane_buffers.len() > 1 && !cross_device_effect {
+            for (lane, kb) in lane_buffers.iter().enumerate() {
+                let mut expected: Option<svod_dtype::DeviceSpec> = None;
+                for buffer in &kb.buffers {
+                    let actual = buffer.allocator().device_spec();
+                    if actual.is_disk() {
+                        continue;
+                    }
+                    if let Some(expected) = &expected
+                        && expected != &actual
+                    {
+                        return Err(Error::MultiLaneDeviceMismatch {
+                            call_id: item.kernel.id,
+                            lane,
+                            expected: format!("{expected:?}"),
+                            actual: format!("{actual:?}"),
+                        });
+                    }
+                    expected = Some(actual);
+                }
+            }
+        }
         if let Op::Slice { offset, size, .. } = effect.op() {
+            let kb = lane_buffers.first_mut().expect("single-lane expansion always has one buffer set");
             let offset = match offset.op() {
                 Op::Const(value) => value.0.try_int().and_then(|value| usize::try_from(value).ok()),
                 _ => None,
@@ -848,11 +1035,10 @@ pub fn instantiate_schedule(
             ScheduleItemTemplate {
                 kernel: item.kernel.clone(),
                 ast: item.ast.clone(),
-                buffers: kb.buffers,
-                buffer_uop_ids: kb.uop_ids,
+                lane_buffers,
                 dependencies: item.dependencies.clone(),
-                alias_registered_ids: kb.alias_ids,
                 base_fixedvars: fixedvars,
+                bind_device_num: expansion.bind_device_num,
             },
         );
     }
@@ -868,6 +1054,7 @@ pub fn instantiate_schedule(
     }
 
     let mut schedule = Vec::with_capacity(pre_schedule.invocations.len());
+    let mut expanded_instances_by_kernel: HashMap<u64, Vec<usize>> = HashMap::new();
     for invocation in &pre_schedule.invocations {
         if alias_dependencies.contains_key(&invocation.kernel_id) {
             continue;
@@ -879,27 +1066,48 @@ pub fn instantiate_schedule(
             .fail();
         };
 
-        // Merge the kernel's user-Variable bindings (`base_fixedvars`) with
-        // the loop-counter bindings produced at this iteration.
-        let mut fixedvars = template.base_fixedvars.clone();
-        fixedvars.extend(invocation.fixedvars.iter().map(|(k, v)| (k.clone(), *v)));
-        let loop_var_names: HashSet<String> = invocation.fixedvars.keys().cloned().collect();
-
         let mut dependencies = HashSet::new();
         executable_dependencies(&template.dependencies, &alias_dependencies, &mut dependencies);
         let mut dependencies: Vec<u64> = dependencies.into_iter().collect();
         dependencies.sort_unstable();
-        schedule.push(ScheduleItem {
-            kernel: template.kernel.clone(),
-            ast: template.ast.clone(),
-            buffers: template.buffers.clone(),
-            buffer_uop_ids: template.buffer_uop_ids.clone(),
-            fixedvars,
-            loop_var_names,
-            dependencies,
-            instance_dependencies: Vec::new(),
-            alias_registered_ids: template.alias_registered_ids.clone(),
-        });
+
+        let mut instance_dependencies = HashSet::new();
+        for dependency in &dependencies {
+            if let Some(instances) = expanded_instances_by_kernel.get(dependency) {
+                instance_dependencies.extend(instances.iter().copied());
+            }
+        }
+        let mut instance_dependencies: Vec<usize> = instance_dependencies.into_iter().collect();
+        instance_dependencies.sort_unstable();
+
+        let expanded = template.lane_buffers.len() > 1;
+        let first_schedule_index = schedule.len();
+        for (lane, kb) in template.lane_buffers.iter().enumerate() {
+            let mut fixedvars = template.base_fixedvars.clone();
+            fixedvars.extend(invocation.fixedvars.iter().map(|(name, value)| (name.clone(), *value)));
+            if template.bind_device_num {
+                insert_fixedvar_checked(&mut fixedvars, template.kernel.id, "_device_num", lane as i64)?;
+            }
+            let loop_var_names: HashSet<String> = invocation.fixedvars.keys().cloned().collect();
+
+            schedule.push(ScheduleItem {
+                kernel: template.kernel.clone(),
+                ast: template.ast.clone(),
+                buffers: kb.buffers.clone(),
+                buffer_uop_ids: kb.uop_ids.clone(),
+                fixedvars,
+                loop_var_names,
+                dependencies: dependencies.clone(),
+                instance_dependencies: instance_dependencies.clone(),
+                alias_registered_ids: kb.alias_ids.clone(),
+            });
+        }
+        if expanded {
+            expanded_instances_by_kernel
+                .entry(invocation.kernel_id)
+                .or_default()
+                .extend(first_schedule_index..schedule.len());
+        }
     }
 
     let output_uop_ids: Vec<u64> = pre_schedule.output_buffer_uops.iter().map(|u| u.buf_uop().id).collect();
@@ -1141,11 +1349,23 @@ fn collect_callable_buffers(
 struct ScheduleItemTemplate {
     kernel: Arc<UOp>,
     ast: Arc<UOp>,
-    buffers: Vec<Buffer>,
-    buffer_uop_ids: Vec<u64>,
+    lane_buffers: Vec<CallableBuffers>,
     dependencies: Vec<u64>,
-    alias_registered_ids: Vec<u64>,
     base_fixedvars: HashMap<String, i64>,
+    bind_device_num: bool,
+}
+
+fn insert_fixedvar_checked(
+    fixedvars: &mut HashMap<String, i64>,
+    call_id: u64,
+    name: &str,
+    incoming: i64,
+) -> Result<()> {
+    if let Some(&existing) = fixedvars.get(name) {
+        return Err(Error::MultiBindingConflict { call_id, name: name.to_string(), existing, incoming });
+    }
+    fixedvars.insert(name.to_string(), incoming);
+    Ok(())
 }
 
 fn schedule_range_bounds(range: &Arc<UOp>) -> Result<(i64, i64)> {

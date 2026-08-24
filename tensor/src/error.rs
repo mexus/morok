@@ -128,6 +128,35 @@ pub enum Error {
     #[snafu(display("Expected CALL operation"))]
     ExpectedCallableOp,
 
+    #[snafu(display("CALL {call_id} MSTACK source {source_index} has no lanes"))]
+    MultiEmptyLanes { call_id: u64, source_index: usize },
+
+    #[snafu(display("CALL {call_id} MSTACK source {source_index} has {actual} lanes, expected {expected}"))]
+    MultiLaneCountMismatch { call_id: u64, source_index: usize, expected: usize, actual: usize },
+
+    #[snafu(display("MSELECT {source_id} lane {device_index} is out of bounds for {lane_count} lanes"))]
+    MultiSelectOutOfBounds { source_id: u64, device_index: usize, lane_count: usize },
+
+    #[snafu(display("CALL {call_id} has unsupported MULTI form: {details}"))]
+    MultiUnsupportedForm { call_id: u64, details: String },
+
+    #[snafu(display("CALL {call_id} MSTACK source {source_index} lane {lane} cannot contain a SLICE alias"))]
+    MultiLaneSliceAlias { call_id: u64, source_index: usize, lane: usize },
+
+    #[snafu(display("CALL {call_id} lane {lane} mixes device endpoints {expected} and {actual}"))]
+    MultiLaneDeviceMismatch { call_id: u64, lane: usize, expected: String, actual: String },
+
+    #[snafu(display("CALL {call_id} DEVICE extent must be a static integer"))]
+    MultiDeviceExtentNotStatic { call_id: u64 },
+
+    #[snafu(display("CALL {call_id} DEVICE extent {actual} does not match MSTACK lane count {expected}"))]
+    MultiDeviceExtentMismatch { call_id: u64, expected: usize, actual: i64 },
+
+    #[snafu(display(
+        "CALL {call_id} fixed binding conflict for '{name}': existing value {existing}, incoming value {incoming}"
+    ))]
+    MultiBindingConflict { call_id: u64, name: String, existing: i64, incoming: i64 },
+
     // =========================================================================
     // Runtime Errors
     // =========================================================================

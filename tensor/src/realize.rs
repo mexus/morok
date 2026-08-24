@@ -1540,12 +1540,16 @@ fn collect_non_overridable_fixedvars(item: &ScheduleItem) -> HashMap<String, i64
     // overridden by user `var_vals` — they're loop counters, not symbolic
     // input variables. `loop_var_names` is populated at instantiation time
     // from the keys of `KernelInvocation.fixedvars`, structurally separating
-    // loop counters from runtime variable binds.
-    let mut locked = HashMap::with_capacity(item.loop_var_names.len());
+    // loop counters from runtime variable binds. `_device_num` is similarly
+    // selected by host-side MSTACK lane expansion and is never user-overridable.
+    let mut locked = HashMap::with_capacity(item.loop_var_names.len() + 1);
     for name in &item.loop_var_names {
         if let Some(v) = item.fixedvars.get(name) {
             locked.insert(name.clone(), *v);
         }
+    }
+    if let Some(v) = item.fixedvars.get("_device_num") {
+        locked.insert("_device_num".to_string(), *v);
     }
     locked
 }
