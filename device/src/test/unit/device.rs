@@ -433,6 +433,60 @@ fn program_spec_rejects_empty_binary_compiler_key() {
 }
 
 #[test]
+fn beam_worker_artifact_validates_source_binary_abi_and_compiler_identity() {
+    let sink = UOp::sink(vec![UOp::native_const(1i32)]);
+    let linear = UOp::linear(sink.toposort().into());
+    let info = svod_ir::ProgramInfo { name: "beam_worker".into(), target: DeviceSpec::Cpu, ..Default::default() };
+    let source = "void beam_worker(void) {}".to_string();
+    let abi = Vec::new();
+    let source_identity = crate::device::source_stage_identity(&info, &abi, &linear, &source).unwrap();
+    let bytes = vec![1, 2, 3, 4];
+    let identity = crate::device::binary_stage_identity(source_identity, "compiler", &bytes);
+    let launch = || [UOp::index_const(1), UOp::index_const(1), UOp::index_const(1)];
+
+    crate::device::CompiledSpec::from_beam_worker(
+        "beam_worker".into(),
+        source.clone(),
+        bytes.clone(),
+        sink.clone(),
+        abi.clone(),
+        launch(),
+        identity.clone(),
+        &DeviceSpec::Cpu,
+        "compiler",
+    )
+    .unwrap();
+    assert!(
+        crate::device::CompiledSpec::from_beam_worker(
+            "beam_worker".into(),
+            format!("{source} // tampered"),
+            bytes.clone(),
+            sink.clone(),
+            abi.clone(),
+            launch(),
+            identity.clone(),
+            &DeviceSpec::Cpu,
+            "compiler",
+        )
+        .is_err()
+    );
+    assert!(
+        crate::device::CompiledSpec::from_beam_worker(
+            "beam_worker".into(),
+            source,
+            vec![9],
+            sink,
+            abi,
+            launch(),
+            identity,
+            &DeviceSpec::Cpu,
+            "other-compiler",
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn test_program_spec_from_uop_without_metadata_defaults_name_to_kernel() {
     let sink = UOp::sink(vec![UOp::native_const(4.5f32)]);
     let linear = UOp::linear(sink.toposort().into());

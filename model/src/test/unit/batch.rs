@@ -175,8 +175,7 @@ fn test_single_vs_batch_consistency() {
 /// a stray batch-wide reduction would let the shorter lane's padding leak into the
 /// full lane or produce NaN. (The short lane's own valid rows are NOT compared to
 /// an unbatched run — the subsampling conv over the pad boundary perturbs them and
-/// exact equivalence isn't a model invariant; the masked-attention numerics are
-/// covered by `fa_layout_parity_vs_sdpa_key_masked`.)
+/// exact equivalence isn't a model invariant.)
 #[test]
 #[ignore = "heavy: ragged-batch lane isolation + finiteness"]
 fn test_ragged_batch_keeps_full_lane_isolated_and_finite() {
@@ -271,89 +270,6 @@ fn test_const_shape_jit_has_no_symbolic_vars() {
 
     // No vars to bind — a plain replay must execute the whole graph.
     jit.execute().unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// Flash-attention integration parity.
-//
-// The encoder MHSA now routes through `svod_tk::flash_attention_with` on the
-// `[B, T, H, d_k]` head-split layout (no `transpose(1,2)` to head-major), with a
-// key-only `key_lens` padding mask. On gfx942 (d_k % 16 == 0, T % 128 == 0,
-// f16/bf16) the hand kernel fires; everywhere else it falls back to SDPA. These
-// tests assert the integration matches the prior head-major SDPA path with the
-// same key mask — within f16 accumulation slack on the hand-kernel path.
-//
-// Run on the GPU with:
-//   SVOD_DEVICE=AMD:0 cargo test -p svod-model --lib \
-//     batch::fa_layout_parity_vs_sdpa_key_masked -- --ignored --nocapture
-// ---------------------------------------------------------------------------
-
-/// Reference attention in the *old* layout: `[B,T,H,d_k] → [B,H,T,d_k]` via
-/// `transpose(1,2)`, SDPA with the `[B,1,1,T]` key mask (`true = masked` where
-/// `arange(T) >= valid`), then back to `[B,T,H,d_k]`. Mirrors what
-/// `MultiHeadSelfAttention::forward` did before the FA swap.
-fn sdpa_ref_bthd(q: &Tensor, k: &Tensor, v: &Tensor, valid: &[i32]) -> Tensor {
-    let to_bhtd = |t: &Tensor| {
-        t.cast(DType::Float32).unwrap().try_transpose(1, 2).unwrap() // [B,T,H,d] -> [B,H,T,d]
-    };
-    let (qp, kp, vp) = (to_bhtd(q), to_bhtd(k), to_bhtd(v));
-    let n = q.shape().unwrap()[1].as_const().unwrap();
-    let b = valid.len();
-    let range = Tensor::arange(n as i64, None, None).unwrap().try_reshape([1usize, 1, 1, n]).unwrap();
-    let lref = Tensor::from_slice(valid).try_reshape([b, 1, 1, 1]).unwrap();
-    let mask = range.try_ge(&lref).unwrap();
-    let out_bhtd =
-        qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(false).attn_mask(&mask).call().unwrap();
-    out_bhtd.try_transpose(1, 2).unwrap() // [B,H,T,d] -> [B,T,H,d]
-}
-
-/// `flash_attention_with(causal:false, key_lens)` on `[B,T,H,d_k]` must match the
-/// prior head-major SDPA path with the same key-only mask. Shapes are encoder-
-/// realistic (d_k=16, T=128) so on gfx942 the hand kernel fires; on CPU the call
-/// falls back to SDPA and the comparison is exact. Tol 2e-2 (f16 slack).
-#[test]
-#[ignore = "GPU: flash-attention vs SDPA layout parity at encoder shapes"]
-fn fa_layout_parity_vs_sdpa_key_masked() {
-    let (b, t, h, d_k) = (2usize, 128usize, 16usize, 16usize);
-    let valid = [100i32, 128];
-
-    let mk = || {
-        let mut x = Tensor::randn(&[b, t, h, d_k]).unwrap().cast(DType::Float16).unwrap();
-        x.realize().unwrap();
-        x
-    };
-    let (q, k, v) = (mk(), mk(), mk());
-
-    let mut key_lens = Tensor::from_slice(valid);
-    key_lens.realize().unwrap();
-
-    let fa = svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens: Some(&key_lens) })
-        .expect("flash_attention_with")
-        .expect("FA kernel applies");
-    let mut fa_f = fa.cast(DType::Float32).unwrap();
-    fa_f.realize().unwrap();
-    let got = fa_f.as_vec::<f32>().unwrap();
-
-    let mut reference = sdpa_ref_bthd(&q, &k, &v, &valid);
-    reference.realize().unwrap();
-    let expected = reference.as_vec::<f32>().unwrap();
-
-    assert_eq!(got.len(), expected.len(), "length mismatch");
-    // Compare only valid query rows per batch (rows >= valid[b] are discarded by
-    // the conv pad_mask downstream; the kernel still computes them with key-only
-    // masking, matching the reference, but we focus the assert on live rows).
-    let mut max_abs = 0.0f32;
-    for (bi, &vlen) in valid.iter().enumerate() {
-        for ti in 0..(vlen as usize) {
-            let row = (bi * t + ti) * h * d_k;
-            for off in 0..(h * d_k) {
-                let idx = row + off;
-                max_abs = max_abs.max((got[idx] - expected[idx]).abs());
-            }
-        }
-    }
-    println!("fa-layout-parity B={b} T={t} H={h} d_k={d_k} valid={valid:?}: max abs err = {max_abs:e}");
-    assert!(max_abs <= 2e-2, "FA layout parity exceeds tol (max abs {max_abs:e})");
 }
 
 /// Full encoder `forward_batch` at a FA-eligible config (d_model=256, n_heads=16

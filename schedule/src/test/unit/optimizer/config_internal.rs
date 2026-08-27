@@ -27,8 +27,17 @@ fn test_beam_config_default() {
     assert_eq!(config.max_local, 1024);
     assert_eq!(config.min_progress_ns, 10);
     assert!(!config.enable_nolocals);
-    assert!(config.compile_workers > 0);
+    assert_eq!(config.compile_workers, 0);
+    assert_eq!(config.max_tasks_per_child, 16);
     assert_eq!(config.compile_timeout_secs, 10);
+}
+
+#[test]
+fn test_beam_min_progress_matches_tinygrad_microseconds_env() {
+    assert_eq!(parse_beam_min_progress(None), 10);
+    assert_eq!(parse_beam_min_progress(Some("0.01")), 10);
+    assert_eq!(parse_beam_min_progress(Some("1")), 1_000);
+    assert_eq!(parse_beam_min_progress(Some("invalid")), 10);
 }
 
 #[test]
@@ -39,6 +48,7 @@ fn test_beam_config_builder() {
         .min_progress_ns(25)
         .enable_nolocals(true)
         .compile_workers(3)
+        .max_tasks_per_child(5)
         .compile_timeout_secs(7)
         .build();
 
@@ -48,6 +58,7 @@ fn test_beam_config_builder() {
     assert_eq!(config.min_progress_ns, 25);
     assert!(config.enable_nolocals);
     assert_eq!(config.compile_workers, 3);
+    assert_eq!(config.max_tasks_per_child, 5);
     assert_eq!(config.compile_timeout_secs, 7);
 }
 

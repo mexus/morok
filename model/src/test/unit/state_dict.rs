@@ -13,6 +13,8 @@
 
 use crate::gigaam::{GigaAm, GigaAmConfig, Head, TransducerConfig};
 use crate::state::{HasStateDict, StateDict};
+use svod_dtype::DType;
+use svod_tensor::Tensor;
 
 use super::batch::test_config;
 
@@ -126,4 +128,40 @@ fn gigaam_state_dict_round_trip_rnnt() {
 
     let mut empty = GigaAm::with_random_weights(cfg);
     reload(&mut empty, &sd);
+}
+
+#[test]
+fn gigaam_encoder_dtype_conversion_leaves_head_fp32() {
+    let cfg = test_config();
+    let source = GigaAm::with_random_weights(cfg.clone());
+    let sd = compose_state_dict(&source);
+
+    let default_model = GigaAm::from_state_dict(&sd, cfg.clone(), None).expect("load default encoder");
+    assert_eq!(default_model.encoder.input_dtype(), DType::Float16);
+
+    let model = GigaAm::from_state_dict_with_encoder_dtype(&sd, cfg, None, DType::BFloat16).expect("load BF16 encoder");
+
+    assert_eq!(model.encoder.input_dtype(), DType::BFloat16);
+    assert_eq!(model.encoder.layers[0].mhsa.q_proj.uop().dtype(), DType::BFloat16);
+    assert_eq!(model.encoder.layers[0].mhsa.q_bias.uop().dtype(), DType::BFloat16);
+    assert_eq!(model.encoder.layers[0].final_norm.weight.uop().dtype(), DType::BFloat16);
+    let head = model.head.as_ctc().expect("CTC head");
+    assert_eq!(head.weight.uop().dtype(), DType::Float32);
+    assert_eq!(head.bias.uop().dtype(), DType::Float32);
+}
+
+#[test]
+fn gigaam_rejects_ctc_head_shape_mismatched_with_config() {
+    let cfg = test_config();
+    let source = GigaAm::with_random_weights(cfg.clone());
+    let mut sd = compose_state_dict(&source);
+    sd.insert("head.weight".into(), Tensor::full(&[257, cfg.d_model, 1], 0.0f32, DType::Float32).unwrap());
+    sd.insert("head.bias".into(), Tensor::full(&[257], 0.0f32, DType::Float32).unwrap());
+
+    let err = match GigaAm::from_state_dict(&sd, cfg, None) {
+        Ok(_) => panic!("mismatched CTC head must fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("CTC head shapes"), "unexpected error: {err}");
+    assert!(err.to_string().contains("num_classes=34"), "unexpected error: {err}");
 }

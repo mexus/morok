@@ -23,7 +23,7 @@ const SDMA_OP_POLL_REGMEM: u32 = 8;
 /// Generated SDMA v4/v5/v6 definitions: linear memory write and global clock.
 const SDMA_OP_WRITE: u32 = 2;
 const SDMA_OP_TIMESTAMP: u32 = 13;
-const SDMA_SUBOP_TIMESTAMP_GET_GLOBAL: u32 = 0;
+const SDMA_SUBOP_TIMESTAMP_GET_GLOBAL: u32 = 2;
 /// Linear-copy sub-opcode (sits in header bits 8..16; for linear it is 0).
 const SDMA_SUBOP_COPY_LINEAR: u32 = 0;
 /// POLL_REGMEM comparison: value `>=` reference.

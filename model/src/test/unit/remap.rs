@@ -57,17 +57,25 @@ fn test_remap_mhsa() {
     let mut sd = StateDict::new();
     sd.insert("encoder.layers.0.norm_self_att.weight".into(), fake_tensor());
     sd.insert("encoder.layers.0.self_attn.linear_q.weight".into(), fake_tensor());
+    sd.insert("encoder.layers.0.self_attn.linear_q.weight_scale".into(), fake_tensor());
     sd.insert("encoder.layers.0.self_attn.linear_k.weight".into(), fake_tensor());
+    sd.insert("encoder.layers.0.self_attn.linear_k.weight_scale".into(), fake_tensor());
     sd.insert("encoder.layers.0.self_attn.linear_v.weight".into(), fake_tensor());
+    sd.insert("encoder.layers.0.self_attn.linear_v.weight_scale".into(), fake_tensor());
     sd.insert("encoder.layers.0.self_attn.linear_out.weight".into(), fake_tensor());
+    sd.insert("encoder.layers.0.self_attn.linear_out.weight_scale".into(), fake_tensor());
     sd.insert("encoder.layers.0.self_attn.linear_pos.weight".into(), fake_tensor());
 
     let out = remap_pytorch(sd, &config).unwrap();
     assert!(out.contains_key("layers.0.mhsa.norm.weight"));
     assert!(out.contains_key("layers.0.mhsa.q_proj"));
+    assert!(out.contains_key("layers.0.mhsa.q_weight_scale"));
     assert!(out.contains_key("layers.0.mhsa.k_proj"));
+    assert!(out.contains_key("layers.0.mhsa.k_weight_scale"));
     assert!(out.contains_key("layers.0.mhsa.v_proj"));
+    assert!(out.contains_key("layers.0.mhsa.v_weight_scale"));
     assert!(out.contains_key("layers.0.mhsa.out_proj"));
+    assert!(out.contains_key("layers.0.mhsa.out_weight_scale"));
     assert!(!out.contains_key("layers.0.mhsa.linear_pos.weight"));
 }
 
@@ -113,13 +121,17 @@ fn test_remap_ffn() {
     let mut sd = StateDict::new();
     sd.insert("encoder.layers.0.norm_feed_forward1.weight".into(), fake_tensor());
     sd.insert("encoder.layers.0.feed_forward1.linear1.weight".into(), fake_tensor());
+    sd.insert("encoder.layers.0.feed_forward1.linear1.weight_scale".into(), fake_tensor());
     sd.insert("encoder.layers.0.feed_forward1.linear2.weight".into(), fake_tensor());
+    sd.insert("encoder.layers.0.feed_forward1.linear2.weight_scale".into(), fake_tensor());
     sd.insert("encoder.layers.0.norm_out.weight".into(), fake_tensor());
 
     let out = remap_pytorch(sd, &config).unwrap();
     assert!(out.contains_key("layers.0.ffn1.norm.weight"));
     assert!(out.contains_key("layers.0.ffn1.linear1.weight"));
+    assert!(out.contains_key("layers.0.ffn1.linear1.weight_scale"));
     assert!(out.contains_key("layers.0.ffn1.linear2.weight"));
+    assert!(out.contains_key("layers.0.ffn1.linear2.weight_scale"));
     assert!(out.contains_key("layers.0.final_norm.weight"));
 }
 

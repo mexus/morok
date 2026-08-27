@@ -1904,6 +1904,15 @@ pub(crate) fn linked_sdma_published_bytes(write_idx: u64, ring_size: usize, byte
     Ok(published)
 }
 
+pub(crate) fn absolute_pm4_read_idx(write_idx: u64, reported_read: u64, capacity: usize) -> u64 {
+    let capacity = capacity as u64;
+    let mut read = write_idx / capacity * capacity + reported_read % capacity;
+    if read > write_idx {
+        read = read.saturating_sub(capacity);
+    }
+    read
+}
+
 fn wait_pm4_headroom(g: &QueueInner, dwords: usize) -> Result<()> {
     let capacity = g.ring_size / 4;
     if dwords == 0 || dwords >= capacity {
@@ -1911,9 +1920,10 @@ fn wait_pm4_headroom(g: &QueueInner, dwords: usize) -> Result<()> {
     }
     let start = std::time::Instant::now();
     loop {
-        // KFD compute queue read/write pointers are monotonically increasing
-        // dword indices; only ring addressing wraps.
-        let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+        // PM4 reports only the queue-relative RPTR bits. Reconstruct its epoch
+        // from the monotonic producer index, as KFD does when restoring a HQD.
+        let reported_read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+        let read = absolute_pm4_read_idx(g.write_idx, reported_read, capacity);
         if g.write_idx + dwords as u64 - read <= capacity as u64 {
             return Ok(());
         }

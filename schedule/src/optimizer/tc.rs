@@ -581,6 +581,7 @@ fn tc_reject_reason(err: &OptError) -> &'static str {
         OptError::UnsupportedFeature { .. } => "unsupported backend feature",
         OptError::MissingRendererCapabilities => "missing renderer capabilities",
         OptError::DeviceLimitExceeded { .. } => "device limit exceeded",
+        OptError::BeamWorker { .. } => "BEAM worker failure",
     }
 }
 

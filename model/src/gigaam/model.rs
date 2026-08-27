@@ -15,15 +15,76 @@
 use std::path::Path;
 
 use snafu::ResultExt;
+use svod_dtype::DType;
 
 use crate::state::{self, HasStateDict, StateDict};
 
 use crate::gigaam::ctc::CTCHead;
 use crate::gigaam::encoder::Encoder;
-use crate::gigaam::error::{Error, HubSnafu, StateSnafu};
+use crate::gigaam::error::{Error, HubSnafu, StateSnafu, TensorSnafu};
 use crate::gigaam::rnnt::RnntHead;
 use crate::gigaam::{GigaAmConfig, Result, remap};
 use crate::sentencepiece;
+
+fn prepare_scaled_weights(sd: &mut StateDict, dtype: &DType) -> Result<()> {
+    let scales: Vec<_> = sd
+        .keys()
+        .filter_map(|key| {
+            if let Some(prefix) = key.strip_suffix(".weight_scale") {
+                Some((key.clone(), format!("{prefix}.weight"), format!("{prefix}.act_scale")))
+            } else {
+                key.strip_suffix("_weight_scale")
+                    .map(|prefix| (key.clone(), format!("{prefix}_proj"), format!("{prefix}_act_scale")))
+            }
+        })
+        .collect();
+    let mut promoted = Vec::new();
+    for (scale_key, weight_key, act_scale_key) in scales {
+        let scale = sd.get(&scale_key).expect("scale key came from the state dict").clone();
+        let weight = sd
+            .get(&weight_key)
+            .ok_or_else(|| Error::CheckpointConfig {
+                message: format!("quantization scale {scale_key} has no matching weight {weight_key}"),
+            })?
+            .clone();
+        let weight_dtype = weight.uop().dtype();
+        let encoder_weight = weight_key.starts_with("encoder.")
+            || weight_key.starts_with("model.encoder.")
+            || weight_key.starts_with("layers.")
+            || weight_key.starts_with("subsampling.");
+        sd.remove(&act_scale_key);
+        let quantized = if weight_dtype == DType::FP8E4M3 || (weight_dtype.is_signed() && !encoder_weight) {
+            weight.clone()
+        } else if weight_dtype == DType::UInt8 {
+            // Compatibility with the repository's original raw-bit FP8 export.
+            weight.bitcast(DType::FP8E4M3).context(TensorSnafu)?
+        } else if weight_dtype.is_signed() {
+            continue;
+        } else {
+            return Err(Error::CheckpointConfig {
+                message: format!("quantized weight {weight_key} has unsupported dtype {weight_dtype:?}"),
+            });
+        };
+        let target_dtype = if encoder_weight { dtype.clone() } else { DType::Float32 };
+        let shape = weight.shape().context(TensorSnafu)?;
+        let mut scale_shape = vec![1isize; shape.len()];
+        scale_shape[0] = shape[0].as_const().ok_or_else(|| Error::CheckpointConfig {
+            message: format!("quantized weight {weight_key} has symbolic output dimension"),
+        })? as isize;
+        let dequantized = quantized
+            .cast(target_dtype.clone())
+            .context(TensorSnafu)?
+            .try_mul(&scale.cast(target_dtype).context(TensorSnafu)?.try_reshape(scale_shape).context(TensorSnafu)?)
+            .context(TensorSnafu)?;
+        sd.remove(&scale_key);
+        promoted.push((weight_key, dequantized.contiguous()));
+    }
+    svod_tensor::Tensor::realize_batch(promoted.iter_mut().map(|(_, tensor)| tensor)).context(TensorSnafu)?;
+    for (weight_key, tensor) in promoted {
+        sd.insert(weight_key, tensor);
+    }
+    Ok(())
+}
 
 /// WER+RTF-tuned soft chunk target (seconds) for the GigaAM RN-T pipeline.
 /// Short chunks cut the RN-T decoder's autoregressive skip-deletions (the
@@ -109,39 +170,69 @@ impl GigaAm {
     /// Auto-detects head type from `config.transducer.is_some()`; fetches
     /// `tokenizer.model` only when the config asks for RN-T.
     pub fn from_hub_with_revision(model_id: &str, revision: &str) -> Result<Self> {
+        Self::from_hub_with_revision_and_weights_and_encoder_dtype(
+            model_id,
+            revision,
+            "model.safetensors",
+            DType::Float16,
+        )
+    }
+
+    /// Load a named Hub checkpoint with an explicit encoder compute dtype.
+    pub fn from_hub_with_revision_and_weights_and_encoder_dtype(
+        model_id: &str,
+        revision: &str,
+        weights: &str,
+        encoder_dtype: DType,
+    ) -> Result<Self> {
         let api = hf_hub::api::sync::Api::new().context(HubSnafu)?;
         let repo =
             api.repo(hf_hub::Repo::with_revision(model_id.to_string(), hf_hub::RepoType::Model, revision.to_string()));
         let config_path = repo.get("config.json").context(HubSnafu)?;
-        let weights_path = repo.get("model.safetensors").context(HubSnafu)?;
+        let weights_path = repo.get(weights).context(HubSnafu)?;
         let config = GigaAmConfig::from_json(&config_path)?;
         // SentencePiece-RN-T variants (e.g. `v3_e2e_rnnt`) ship the tokenizer
         // as `tokenizer.model`. CTC variants don't have one; skip the fetch.
         let tokenizer_path = if config.transducer.is_some() { repo.get("tokenizer.model").ok() } else { None };
-        Self::from_safetensors(&weights_path, tokenizer_path.as_deref(), config)
+        Self::from_safetensors_with_encoder_dtype(&weights_path, tokenizer_path.as_deref(), config, encoder_dtype)
     }
 
     /// Load from a directory containing `config.json` + `model.safetensors`
     /// (and optionally `tokenizer.model` for RN-T configs).
     pub fn from_dir(dir: &Path) -> Result<Self> {
+        Self::from_dir_with_weights_and_encoder_dtype(dir, "model.safetensors", DType::Float16)
+    }
+
+    /// Load a named local checkpoint with an explicit encoder compute dtype.
+    pub fn from_dir_with_weights_and_encoder_dtype(dir: &Path, weights: &str, encoder_dtype: DType) -> Result<Self> {
         let config_path = dir.join("config.json");
-        let weights_path = dir.join("model.safetensors");
+        let weights_path = dir.join(weights);
         let config = GigaAmConfig::from_json(&config_path)?;
         let tokenizer_path = dir.join("tokenizer.model");
         let tokenizer_path =
             if config.transducer.is_some() && tokenizer_path.exists() { Some(tokenizer_path) } else { None };
-        Self::from_safetensors(&weights_path, tokenizer_path.as_deref(), config)
+        Self::from_safetensors_with_encoder_dtype(&weights_path, tokenizer_path.as_deref(), config, encoder_dtype)
     }
 
     /// Load weights + (optional) SentencePiece tokenizer and assemble the
     /// model. `tokenizer` is ignored for CTC configs.
     pub fn from_safetensors(weights: &Path, tokenizer: Option<&Path>, config: GigaAmConfig) -> Result<Self> {
+        Self::from_safetensors_with_encoder_dtype(weights, tokenizer, config, DType::Float16)
+    }
+
+    /// Load a safetensors checkpoint with an explicit encoder compute dtype.
+    pub fn from_safetensors_with_encoder_dtype(
+        weights: &Path,
+        tokenizer: Option<&Path>,
+        config: GigaAmConfig,
+        encoder_dtype: DType,
+    ) -> Result<Self> {
         let sd = state::load_safetensors(weights).context(StateSnafu)?;
         let vocab_override = tokenizer
             .map(sentencepiece::load_vocab)
             .transpose()
             .map_err(|e| Error::DecoderConfig { message: e.to_string() })?;
-        Self::from_state_dict(&sd, config, vocab_override)
+        Self::from_state_dict_with_encoder_dtype(&sd, config, vocab_override, encoder_dtype)
     }
 
     /// Build from a pre-loaded state dict. `vocab_override` (RN-T only) wins
@@ -151,13 +242,42 @@ impl GigaAm {
     /// `head.decoder.` / `head.joint.` prefixes) and remaps to svod layout
     /// before loading.
     pub fn from_state_dict(sd: &StateDict, config: GigaAmConfig, vocab_override: Option<Vec<String>>) -> Result<Self> {
+        Self::from_state_dict_with_encoder_dtype(sd, config, vocab_override, DType::Float16)
+    }
+
+    /// Build from a state dict while converting all floating encoder parameters
+    /// to one compute dtype. A coherent conversion prevents FP32 affine biases
+    /// from promoting reduced-precision activations before attention.
+    pub fn from_state_dict_with_encoder_dtype(
+        sd: &StateDict,
+        config: GigaAmConfig,
+        vocab_override: Option<Vec<String>>,
+        encoder_dtype: DType,
+    ) -> Result<Self> {
+        if encoder_dtype != DType::Float16 && encoder_dtype != DType::BFloat16 && encoder_dtype != DType::Float32 {
+            return Err(Error::EncoderDtype { dtype: encoder_dtype });
+        }
         let is_pytorch = sd.keys().any(|k| {
             k.starts_with("encoder.")
                 || k.starts_with("model.encoder.")
                 || k.starts_with("head.decoder.")
                 || k.starts_with("head.joint.")
         });
-        let sd_owned = if is_pytorch { remap::remap_pytorch(sd.clone(), &config)? } else { sd.clone() };
+        let mut sd_owned = sd.clone();
+        prepare_scaled_weights(&mut sd_owned, &encoder_dtype)?;
+        if is_pytorch {
+            sd_owned = remap::remap_pytorch(sd_owned, &config)?;
+        }
+        for (key, tensor) in &mut sd_owned {
+            if (key.starts_with("subsampling.") || key.starts_with("layers."))
+                && tensor.uop().dtype().is_float()
+                && tensor.uop().dtype() != encoder_dtype
+                && !key.ends_with(".weight_scale")
+            {
+                *tensor =
+                    tensor.cast(encoder_dtype.clone()).map_err(|source| Error::Tensor { source: Box::new(source) })?;
+            }
+        }
         let sd = &sd_owned;
 
         let encoder = Encoder::from_state_dict(sd, &config)?;
@@ -166,6 +286,22 @@ impl GigaAm {
             None => {
                 let mut h = CTCHead::empty(&config);
                 h.load_state_dict(sd, "head").context(StateSnafu)?;
+                let weight_shape = h.weight.shape().context(TensorSnafu)?;
+                let bias_shape = h.bias.shape().context(TensorSnafu)?;
+                let expected_weight = [config.vocab_size, config.d_model, 1];
+                let expected_bias = [config.vocab_size];
+                let concrete =
+                    |shape: &[svod_ir::SInt]| shape.iter().map(svod_ir::SInt::as_const).collect::<Option<Vec<_>>>();
+                if concrete(&weight_shape).as_deref() != Some(expected_weight.as_slice())
+                    || concrete(&bias_shape).as_deref() != Some(expected_bias.as_slice())
+                {
+                    return Err(Error::CheckpointConfig {
+                        message: format!(
+                            "CTC head shapes weight={weight_shape:?}, bias={bias_shape:?} do not match config num_classes={} and d_model={} (expected weight={expected_weight:?}, bias={expected_bias:?})",
+                            config.vocab_size, config.d_model
+                        ),
+                    });
+                }
                 Head::Ctc(h)
             }
             Some(tr) => {

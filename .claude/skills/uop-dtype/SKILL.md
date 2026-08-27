@@ -58,8 +58,6 @@ description: Reference for UOp and DType constructors, methods, and usage patter
 UOp::index()
     .buffer(buffer_uop)
     .indices(vec![index1, index2])
-    .gate(gate_uop)        // Optional: WHERE validity condition
-    .ptr(true)             // Optional: keep Ptr dtype for STORE targets
     .call()?              // Returns Result<Arc<Self>>
 
 // Index validity
@@ -252,18 +250,10 @@ let index = UOp::index()
     .indices(vec![idx_i, idx_j])
     .call()?;
 
-// With gate (WHERE condition moved to INDEX)
+// With validity
 let gated_index = UOp::index()
     .buffer(buffer_uop)
-    .indices(vec![idx])
-    .gate(gate_uop)
-    .call()?;
-
-// Ptr dtype for STORE targets (keeps pointer type)
-let ptr_index = UOp::index()
-    .buffer(buffer_uop)
-    .indices(vec![idx])
-    .ptr(true)  // Keep Ptr dtype
+    .indices(vec![idx.valid(gate_uop)])
     .call()?;
 ```
 

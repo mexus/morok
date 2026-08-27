@@ -208,6 +208,9 @@ pub enum Error {
     #[snafu(display("{op} requires floating-point dtype for {arg}, got {dtype:?}"))]
     FloatDTypeRequired { op: &'static str, arg: &'static str, dtype: svod_dtype::DType },
 
+    #[snafu(display("{op} requires signed integer dtype for {arg}, got {dtype:?}"))]
+    SignedIntegerDTypeRequired { op: &'static str, arg: &'static str, dtype: svod_dtype::DType },
+
     #[snafu(display("Failed to create ndarray: {source}"))]
     NdarrayShape { source: ndarray::ShapeError },
 

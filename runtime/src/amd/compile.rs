@@ -111,6 +111,19 @@ pub(crate) fn compile_ir_to_amd_object_with(
     Ok(output.stdout)
 }
 
+pub(crate) fn spawn_ir_to_amd_object(
+    toolchain: &ClangToolchain,
+    ir: &str,
+    arch: AmdArch,
+) -> svod_device::Result<svod_device::device::CompilerProcess> {
+    if !has_amdgpu_target_with(toolchain) {
+        return Err(svod_device::Error::Runtime {
+            message: "AMD GPU support requires clang built with the AMDGPU target".into(),
+        });
+    }
+    crate::clang::spawn_compile_process(toolchain, ir, &amd_object_flags(arch))
+}
+
 /// Validate both the generic ELF contract and the architecture encoded in
 /// AMDGPU `e_flags` before cached bytes reach `AmdProgram`.
 pub(crate) fn validate_amd_object(bytes: &[u8], arch: AmdArch, kernel_name: &str) -> crate::Result<()> {

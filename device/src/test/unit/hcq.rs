@@ -392,14 +392,15 @@ fn copy_op(
 }
 
 #[test]
-fn two_device_direct_peer_copy_stays_on_target_lane() {
+fn direct_copy_uses_declared_executor_access() {
     use crate::hcq::{CopyLeg, QueueMergeLimits, SemanticLinkedPlan, schedule_device_lanes};
-    let op = copy_op(0, resource(1, gpu(0)), resource(2, gpu(1)));
+    let mut op = copy_op(0, resource(1, gpu(0)), resource(2, gpu(1)));
+    op.lane.device = gpu(2);
     let scheduled = schedule_device_lanes(&[op], QueueMergeLimits::UNLIMITED, |executor, owner| {
-        matches!((executor, owner), (DeviceSpec::Amd { .. }, DeviceSpec::Amd { .. }))
+        executor == &gpu(2) && matches!(owner, DeviceSpec::Amd { .. })
     });
     assert_eq!(scheduled.len(), 1);
-    assert_eq!(scheduled[0].lane.device, gpu(1));
+    assert_eq!(scheduled[0].lane.device, gpu(2));
     assert_eq!(scheduled[0].commands[0].copy_leg, Some(CopyLeg::Direct));
 
     let plan = SemanticLinkedPlan::from_lane_submissions(scheduled, lane_signals).unwrap();

@@ -88,6 +88,15 @@ fn linked_transaction_limits_include_aggregate_and_sdma_wrap_padding() {
 }
 
 #[test]
+fn pm4_read_pointer_reconstructs_the_producer_epoch() {
+    const CAPACITY: usize = 4_194_304;
+
+    assert_eq!(absolute_pm4_read_idx(20_000, 7_485, CAPACITY), 7_485);
+    assert_eq!(absolute_pm4_read_idx(CAPACITY as u64 + 24_588, 7_485, CAPACITY), CAPACITY as u64 + 7_485);
+    assert_eq!(absolute_pm4_read_idx(CAPACITY as u64 + 7_485, CAPACITY as u64 - 10, CAPACITY), CAPACITY as u64 - 10);
+}
+
+#[test]
 fn mock_compute_queue_construction_unwinds_every_allocation_stage() {
     for (xccs, allocation_stages) in [(1, 4), (2, 5)] {
         for fail_at in 0..allocation_stages {
@@ -736,7 +745,7 @@ fn hcq_sdma_command_and_mixed_goldens() {
             3,
             0x2000,
             2,
-            13,
+            0x20d,
             0x4000,
             4,
             0x0003_0005,

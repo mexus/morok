@@ -204,9 +204,9 @@ impl<C> SimplifiedPatternMatcher<C> {
     ///
     /// # Tracing
     ///
-    /// Enable debug-level tracing to see pattern matching activity:
+    /// Enable trace-level logging to see pattern matching activity:
     /// ```bash
-    /// RUST_LOG=svod_ir::pattern=debug cargo run
+    /// RUST_LOG=svod_ir::pattern=trace cargo run
     /// ```
     pub fn rewrite(&self, uop: &Arc<UOp>, ctx: &mut C) -> RewriteResult {
         let key = OpKey::from_op(uop.op());
@@ -228,7 +228,7 @@ impl<C> SimplifiedPatternMatcher<C> {
             };
             let result = closure(uop, ctx);
             if !matches!(result, RewriteResult::NoMatch) {
-                tracing::debug!(op_key = ?key, pattern_sequence = sequence, "pattern matched");
+                tracing::trace!(op_key = ?key, pattern_sequence = sequence, "pattern matched");
                 return result;
             }
         }

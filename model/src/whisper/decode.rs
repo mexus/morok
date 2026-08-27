@@ -46,7 +46,7 @@ pub(crate) fn detect_language_profile(
     }
     if let Some(graph_profile) = graph_profile {
         let graph_started = std::time::Instant::now();
-        let kernels = decoder_jit.execute_profiled().context(JitSnafu)?;
+        let kernels = decoder_jit.execute_profiled_static().context(JitSnafu)?;
         decoder_jit.output().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
         graph_profile.record(graph_started.elapsed(), kernels);
     } else {
@@ -919,7 +919,7 @@ pub(crate) fn run_fixed_slot_decode(
                 .sum::<usize>();
             if profile {
                 let graph_started = std::time::Instant::now();
-                let kernels = step_jit.execute_profiled().context(JitSnafu)?;
+                let kernels = step_jit.execute_profiled_static().context(JitSnafu)?;
                 step_jit.logits().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
                 graph_profile.record(graph_started.elapsed(), kernels);
             } else {
@@ -1373,7 +1373,7 @@ fn execute_prefill(
     // Execute prefill JIT (plan manages all buffers, no realize)
     if let Some(graph_profile) = graph_profile {
         let graph_started = std::time::Instant::now();
-        let kernels = prefill_jit.execute_profiled().context(JitSnafu)?;
+        let kernels = prefill_jit.execute_profiled_static().context(JitSnafu)?;
         prefill_jit.logits().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
         graph_profile.record(graph_started.elapsed(), kernels);
     } else {

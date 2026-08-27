@@ -80,7 +80,7 @@ impl Renderer for LlvmTextRenderer {
         let nodes = crate::llvm::sched::apply_pipeline_scheduling(nodes, self.target);
 
         for (i, node) in nodes.iter().enumerate() {
-            tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "linearized node");
+            tracing::trace!(position = i, op = node.op().as_ref(), id = node.id, "linearized node");
         }
 
         let mut ctx = RenderContext::new();
@@ -251,7 +251,7 @@ attributes #0 = {{ {attrs} }}
             inner_body = kernel.join("\n"),
         );
 
-        tracing::debug!(generated_code = ir, "llvm codegen: final generated code");
+        tracing::trace!(generated_code = ir, "llvm codegen: final generated code");
 
         let mut result = RenderedKernel::new(ir, kernel_name.to_string());
         result.buffer_args = buffer_args;

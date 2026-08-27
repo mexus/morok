@@ -60,6 +60,7 @@ use error::*;
 
 pub mod activation;
 pub mod arithmetic;
+pub mod beam_worker;
 pub mod bitwise;
 pub mod broadcast;
 pub mod conditional;

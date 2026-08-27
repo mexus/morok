@@ -181,9 +181,12 @@ impl Allocator for AmdAllocator {
                 // fence the whole device first — same contract as `_copyin`/
                 // `_copyout`.
                 self.dev.synchronize()?;
-                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr.as_ptr().add(dest_off), sz) };
-                let src_slice = unsafe { std::slice::from_raw_parts(src_ptr.as_ptr().add(src_off), sz) };
-                dst.copy_from_slice(src_slice);
+                // Memory-planned views may overlap. Tinygrad's no-SDMA path uses
+                // memmove, so retain those semantics instead of creating aliased
+                // slices and lowering to memcpy.
+                unsafe {
+                    std::ptr::copy(src_ptr.as_ptr().add(src_off), dst_ptr.as_ptr().add(dest_off), sz);
+                }
                 // Coherence handled by the consumer dispatch's full L2 acquire
                 // prologue (cf. `_copyin`).
                 Ok(())

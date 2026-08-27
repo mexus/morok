@@ -43,6 +43,18 @@ fn test_beam_actions_contains_expected_types() {
 }
 
 #[test]
+fn test_beam_action_grid_uses_tinygrad_amount_major_order() {
+    let upcasts = BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::UPCAST).take(9).collect::<Vec<_>>();
+    assert_eq!(
+        upcasts.iter().take(8).map(|action| action.axis).collect::<Vec<_>>(),
+        (0..8).map(Some).collect::<Vec<_>>()
+    );
+    assert!(upcasts.iter().take(8).all(|action| action.arg.int() == Ok(0)));
+    assert_eq!(upcasts[8].axis, Some(0));
+    assert_eq!(upcasts[8].arg.int(), Ok(2));
+}
+
+#[test]
 fn test_beam_tensor_core_actions_keep_strict_default_and_padded_axes() {
     let tensor_core_actions = BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::TC).collect::<Vec<_>>();
     assert_eq!(tensor_core_actions.len(), 10);
@@ -80,11 +92,50 @@ fn test_beam_cache_key_includes_behavior_controls() {
         BeamConfig { enable_nolocals: !base.enable_nolocals, ..base.clone() },
         BeamConfig { compile_timeout_secs: base.compile_timeout_secs + 1, ..base.clone() },
         BeamConfig { num_runs: base.num_runs + 1, ..base.clone() },
-        BeamConfig { compile_workers: base.compile_workers + 1, ..base.clone() },
     ];
     for variant in variants {
         assert_ne!(base_key, CacheKey::from_scheduler(&scheduler, &variant, "compiler", 0).to_bytes());
     }
+    let parallel = BeamConfig { compile_workers: base.compile_workers + 1, ..base.clone() };
+    assert_eq!(base_key, CacheKey::from_scheduler(&scheduler, &parallel, "compiler", 0).to_bytes());
+    let recycling = BeamConfig { max_tasks_per_child: base.max_tasks_per_child + 1, ..base.clone() };
+    assert_eq!(base_key, CacheKey::from_scheduler(&scheduler, &recycling, "compiler", 0).to_bytes());
+}
+
+#[test]
+fn test_remote_beam_parent_tracks_only_opt_sequences() {
+    let scheduler = weak_axis_scheduler(0x4b31);
+    let config =
+        BeamConfig { beam_width: 2, min_progress_ns: 1_000_000_000, disable_cache: true, ..Default::default() };
+    let base_opt_count = scheduler.applied_opts.len();
+    let worker_scheduler = scheduler.clone();
+    let result = beam_search_remote_staged(
+        scheduler,
+        &config,
+        |candidates, emit| {
+            assert!(candidates.iter().all(|opts| opts.len() == base_opt_count + 1));
+            for (index, opts) in candidates.iter().enumerate() {
+                if apply_remote_candidate(worker_scheduler.clone(), base_opt_count, opts, &config).is_some() {
+                    emit(
+                        index,
+                        CompiledCandidate {
+                            artifact: index,
+                            binary_key: index.to_le_bytes().to_vec(),
+                            compute_ops: 1,
+                            preparation: Duration::ZERO,
+                            compilation: Duration::ZERO,
+                        },
+                    );
+                }
+            }
+            Ok(())
+        },
+        |index, _| Some(Duration::from_nanos(10_000 - *index as u64)),
+    )
+    .unwrap();
+    assert_eq!(result.iterations, 1);
+    assert_eq!(result.scheduler.applied_opts.len(), base_opt_count + 1);
+    assert!(result.compiled > 0);
 }
 
 #[test]
@@ -109,7 +160,7 @@ fn weak_axis_scheduler(constant: i32) -> Scheduler {
 }
 
 #[test]
-fn test_staged_beam_filters_parallel_compiles_dedups_and_serializes_timing() {
+fn test_staged_beam_streams_unordered_compiles_dedups_and_serializes_timing() {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -117,11 +168,6 @@ fn test_staged_beam_filters_parallel_compiles_dedups_and_serializes_timing() {
     #[derive(Clone)]
     struct FakeArtifact {
         index: usize,
-    }
-
-    fn enter(active: &AtomicUsize, maximum: &AtomicUsize) {
-        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-        maximum.fetch_max(now, Ordering::SeqCst);
     }
 
     let scheduler = weak_axis_scheduler(0x51a9);
@@ -132,11 +178,8 @@ fn test_staged_beam_filters_parallel_compiles_dedups_and_serializes_timing() {
         disable_cache: true,
         ..BeamConfig::default()
     };
-    let prepared = Arc::new(AtomicUsize::new(0));
     let opts_by_index = Arc::new(Mutex::new(HashMap::new()));
     let compile_calls = Arc::new(AtomicUsize::new(0));
-    let compile_active = Arc::new(AtomicUsize::new(0));
-    let compile_max = Arc::new(AtomicUsize::new(0));
     let benchmark_calls = Arc::new(AtomicUsize::new(0));
     let benchmark_active = Arc::new(AtomicUsize::new(0));
     let benchmark_max = Arc::new(AtomicUsize::new(0));
@@ -145,30 +188,24 @@ fn test_staged_beam_filters_parallel_compiles_dedups_and_serializes_timing() {
         scheduler,
         &config,
         {
-            let prepared = Arc::clone(&prepared);
             let opts_by_index = Arc::clone(&opts_by_index);
-            move |candidate| {
-                let index = prepared.fetch_add(1, Ordering::SeqCst);
-                opts_by_index.lock().unwrap().insert(index, candidate.applied_opts.clone());
-                Some(PreparedCandidate {
-                    artifact: FakeArtifact { index },
-                    ir_hash: if index <= 1 { 0 } else { index as u64 },
-                    compute_ops: if index == 2 { 1001 } else { 1 },
-                })
-            }
-        },
-        {
             let calls = Arc::clone(&compile_calls);
-            let active = Arc::clone(&compile_active);
-            let maximum = Arc::clone(&compile_max);
-            move |artifact: FakeArtifact| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                enter(&active, &maximum);
-                std::thread::sleep(Duration::from_millis(5));
-                active.fetch_sub(1, Ordering::SeqCst);
-                let binary_key =
-                    if matches!(artifact.index, 3 | 4) { vec![0xdd] } else { artifact.index.to_le_bytes().to_vec() };
-                Some(CompiledCandidate { artifact, binary_key })
+            move |candidates: &[Scheduler], emit: &mut dyn FnMut(usize, CompiledCandidate<FakeArtifact>)| {
+                for index in (0..candidates.len()).rev() {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    opts_by_index.lock().unwrap().insert(index, candidates[index].applied_opts.clone());
+                    let binary_key = if matches!(index, 3 | 4) { vec![0xdd] } else { index.to_le_bytes().to_vec() };
+                    emit(
+                        index,
+                        CompiledCandidate {
+                            artifact: FakeArtifact { index },
+                            binary_key,
+                            compute_ops: if index == 2 { 1001 } else { 1 },
+                            preparation: Duration::ZERO,
+                            compilation: Duration::ZERO,
+                        },
+                    );
+                }
             }
         },
         {
@@ -177,7 +214,8 @@ fn test_staged_beam_filters_parallel_compiles_dedups_and_serializes_timing() {
             let maximum = Arc::clone(&benchmark_max);
             move |artifact: &FakeArtifact, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
-                enter(&active, &maximum);
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(1));
                 active.fetch_sub(1, Ordering::SeqCst);
                 Some(Duration::from_nanos(10_000 - artifact.index as u64))
@@ -186,17 +224,18 @@ fn test_staged_beam_filters_parallel_compiles_dedups_and_serializes_timing() {
     )
     .unwrap();
 
-    let generated = prepared.load(Ordering::SeqCst);
+    let generated = compile_calls.load(Ordering::SeqCst);
     assert!(generated > 6, "test scheduler must expose enough candidates");
     assert_eq!(result.generated, generated);
-    assert_eq!(result.unique_ir, generated - 1, "one structural duplicate must be removed");
-    assert_eq!(compile_calls.load(Ordering::SeqCst), result.unique_ir - 1, "excessive candidate must not compile");
+    assert_eq!(result.unique_ir, 0);
     assert_eq!(result.compiled, compile_calls.load(Ordering::SeqCst));
-    assert_eq!(result.unique_binary, result.compiled - 1, "one duplicate binary must be removed");
+    assert_eq!(
+        result.unique_binary,
+        result.compiled - 2,
+        "one excessive-compute and one duplicate binary must be removed"
+    );
     assert_eq!(benchmark_calls.load(Ordering::SeqCst), result.unique_binary);
     assert_eq!(result.benchmarked, result.unique_binary);
-    assert!(compile_max.load(Ordering::SeqCst) > 1, "compilation should overlap");
-    assert!(compile_max.load(Ordering::SeqCst) <= config.compile_workers, "compile concurrency must be bounded");
     assert_eq!(benchmark_max.load(Ordering::SeqCst), 1, "backend timing must be serialized");
 
     let winning_index = opts_by_index
@@ -224,6 +263,9 @@ fn test_staged_beam_cache_cold_and_warm_choose_same_winner() {
     let compiler_identity = "fake-compiler:beam-cold-warm-v1";
     let key = CacheKey::from_scheduler(&scheduler, &config, compiler_identity, 0x1234);
     cache_invalidate(&key);
+    if CACHE_DB.is_none() {
+        return; // Another Svod process may hold sled's exclusive database lock.
+    }
 
     let run = |scheduler: Scheduler| {
         beam_search_cached_staged(
@@ -231,13 +273,23 @@ fn test_staged_beam_cache_cold_and_warm_choose_same_winner() {
             &config,
             compiler_identity,
             0x1234,
-            |candidate| {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                candidate.applied_opts.hash(&mut hasher);
-                let identity = hasher.finish();
-                Some(PreparedCandidate { artifact: identity, ir_hash: identity, compute_ops: 1 })
+            |candidates, emit| {
+                for (index, candidate) in candidates.iter().enumerate() {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    candidate.applied_opts.hash(&mut hasher);
+                    let identity = hasher.finish();
+                    emit(
+                        index,
+                        CompiledCandidate {
+                            artifact: identity,
+                            binary_key: identity.to_le_bytes().to_vec(),
+                            compute_ops: 1,
+                            preparation: Duration::ZERO,
+                            compilation: Duration::ZERO,
+                        },
+                    );
+                }
             },
-            |identity| Some(CompiledCandidate { artifact: identity, binary_key: identity.to_le_bytes().to_vec() }),
             |identity, _| Some(Duration::from_nanos(1 + identity % 10_000)),
         )
         .unwrap()
@@ -251,6 +303,146 @@ fn test_staged_beam_cache_cold_and_warm_choose_same_winner() {
     assert_eq!(warm.iterations, 0, "second search should replay the persistent BEAM entry");
     assert_eq!(cold.scheduler.applied_opts, warm.scheduler.applied_opts);
     assert_eq!(cold.timing, warm.timing);
+}
+
+#[test]
+fn test_remote_beam_cache_reuses_winner_across_parallel_and_recycling_changes() {
+    use std::hash::{Hash, Hasher};
+
+    let scheduler = weak_axis_scheduler(0x7193);
+    let cold_config = BeamConfig {
+        min_progress_ns: 1_000_000_000,
+        compile_workers: 1,
+        max_tasks_per_child: 1,
+        disable_cache: false,
+        ..Default::default()
+    };
+    let warm_config = BeamConfig { compile_workers: 8, max_tasks_per_child: 99, ..cold_config.clone() };
+    let identity = "fake-compiler:remote-cache-v1";
+    let key = CacheKey::from_scheduler(&scheduler, &cold_config, identity, 0x22);
+    cache_invalidate(&key);
+    if CACHE_DB.is_none() {
+        return;
+    }
+
+    let run = |config: &BeamConfig| {
+        let worker_scheduler = scheduler.clone();
+        let base_opt_count = scheduler.applied_opts.len();
+        beam_search_cached_remote(
+            scheduler.clone(),
+            config,
+            identity,
+            0x22,
+            |candidates, emit| {
+                for (index, opts) in candidates.iter().enumerate() {
+                    if apply_remote_candidate(worker_scheduler.clone(), base_opt_count, opts, config).is_none() {
+                        continue;
+                    }
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    opts.hash(&mut hasher);
+                    let artifact = hasher.finish();
+                    emit(
+                        index,
+                        CompiledCandidate {
+                            artifact,
+                            binary_key: artifact.to_le_bytes().to_vec(),
+                            compute_ops: 1,
+                            preparation: Duration::ZERO,
+                            compilation: Duration::ZERO,
+                        },
+                    );
+                }
+                Ok(())
+            },
+            |artifact, _| Some(Duration::from_nanos(1 + artifact % 10_000)),
+        )
+        .unwrap()
+    };
+    let cold = run(&cold_config);
+    let warm = run(&warm_config);
+    cache_invalidate(&key);
+    assert!(cold.iterations > 0);
+    assert_eq!(warm.iterations, 0);
+    assert_eq!(cold.scheduler.applied_opts, warm.scheduler.applied_opts);
+    assert_eq!(cold.timing, warm.timing);
+}
+
+#[test]
+fn test_remote_beam_does_not_cache_unbenchmarked_search() {
+    let scheduler = weak_axis_scheduler(0x7a21);
+    let config = BeamConfig { min_progress_ns: 1_000_000_000, disable_cache: false, ..Default::default() };
+    let identity = "fake-compiler:remote-no-empty-cache-v1";
+    let key = CacheKey::from_scheduler(&scheduler, &config, identity, 0x31);
+    cache_invalidate(&key);
+    if CACHE_DB.is_none() {
+        return;
+    }
+
+    let failed = beam_search_cached_remote(
+        scheduler.clone(),
+        &config,
+        identity,
+        0x31,
+        |_candidates, _emit: &mut dyn FnMut(usize, CompiledCandidate<usize>)| Ok(()),
+        |_artifact, _| Some(Duration::from_nanos(1)),
+    )
+    .unwrap();
+    assert_eq!(failed.benchmarked, 0);
+    assert_eq!(failed.timing, Duration::MAX);
+    assert!(cache_get(&key).is_none());
+
+    let cold = beam_search_cached_remote(
+        scheduler,
+        &config,
+        identity,
+        0x31,
+        |candidates, emit| {
+            for index in 0..candidates.len() {
+                emit(
+                    index,
+                    CompiledCandidate {
+                        artifact: index,
+                        binary_key: index.to_le_bytes().to_vec(),
+                        compute_ops: 1,
+                        preparation: Duration::ZERO,
+                        compilation: Duration::ZERO,
+                    },
+                );
+            }
+            Ok(())
+        },
+        |artifact, _| Some(Duration::from_nanos(10_000 - *artifact as u64)),
+    )
+    .unwrap();
+    assert!(cold.iterations > 0, "the failed search must not create a cache hit");
+    assert!(cache_get(&key).is_some());
+    cache_invalidate(&key);
+}
+
+#[test]
+fn test_remote_beam_worker_error_invalidates_cache() {
+    let scheduler = weak_axis_scheduler(0x7a22);
+    let config = BeamConfig { min_progress_ns: 1_000_000_000, disable_cache: false, ..Default::default() };
+    let identity = "fake-compiler:remote-worker-error-v1";
+    let key = CacheKey::from_scheduler(&scheduler, &config, identity, 0x32);
+    cache_invalidate(&key);
+    if CACHE_DB.is_none() {
+        return;
+    }
+
+    cache_put(&key, &[Opt::upcast(0, 2)]);
+    let result = beam_search_cached_remote(
+        scheduler,
+        &config,
+        identity,
+        0x32,
+        |_candidates, _emit: &mut dyn FnMut(usize, CompiledCandidate<usize>)| {
+            Err(OptError::BeamWorker { message: "disconnected".into() })
+        },
+        |_artifact, _| Some(Duration::from_nanos(1)),
+    );
+    assert!(matches!(result, Err(OptError::BeamWorker { .. })));
+    assert!(cache_get(&key).is_none());
 }
 
 #[test]

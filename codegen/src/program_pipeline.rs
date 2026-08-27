@@ -442,6 +442,28 @@ pub fn do_compile(program: &Arc<UOp>, compiler: &dyn Compiler) -> Result<(Arc<UO
     Ok((compiled_program, compiled))
 }
 
+/// Rebuild a compiled specification from bytes produced by an isolated compile
+/// worker for this exact SOURCE-stage PROGRAM.
+pub fn adopt_compiled_bytes(program: &Arc<UOp>, compiler_key: &str, bytes: Vec<u8>) -> Result<CompiledSpec> {
+    validate_program_shape(program)?;
+    let (sink, info, linear, source, binary) = unpack_program(program)?;
+    if binary.is_some() {
+        return Err(invalid_program_state("cannot adopt bytes into an already compiled PROGRAM"));
+    }
+    let linear = linear.ok_or_else(|| invalid_program_state("PROGRAM has no LINEAR stage"))?;
+    let source = source.ok_or_else(|| invalid_program_state("PROGRAM has no SOURCE stage"))?;
+    let spec = ProgramSpec::from_uop(program)?;
+    let expected_source = source_stage_identity(&info, &spec.abi, &linear, &spec.src)?;
+    validate_source_stage(&source, &expected_source)?;
+    let identity = binary_stage_identity(expected_source, compiler_key, &bytes);
+    let mut compiled = CompiledSpec::from_bytes(spec.name, bytes, sink, spec.abi)?;
+    compiled.src = Some(spec.src);
+    compiled.global_size = spec.global_size;
+    compiled.local_size = spec.local_size;
+    compiled.bind_program_stage(linear, &info.target, compiler_key, identity)?;
+    Ok(compiled)
+}
+
 /// Progressively advance SINK/PROGRAM input to a requested PROGRAM stage.
 pub fn get_program(
     input: &Arc<UOp>,

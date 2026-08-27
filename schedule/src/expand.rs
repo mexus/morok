@@ -140,7 +140,7 @@ fn expand_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         Ok(Some(shape)) => shape,
         Ok(None) => return None,
         Err(error) => {
-            tracing::debug!(?error, source = src.tree(), "cannot infer shaped reduction source");
+            tracing::trace!(?error, source = src.tree(), "cannot infer shaped reduction source");
             return None;
         }
     };

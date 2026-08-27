@@ -31,21 +31,7 @@ use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA, ObjectCache, Ob
 pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdArch) -> Result<Device> {
     let spec = DeviceSpec::Amd { device_id };
     let allocator = registry.get(&spec)?;
-    let renderer = Arc::new(AmdRendererWrapper { device: spec.clone(), arch });
-    let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
-    let toolchain = ClangToolchain::discover(cache.as_deref()).map_err(runtime_as_device)?;
-    let flags = crate::amd::compile::amd_object_flags(arch);
-    let identity = CompilerIdentity {
-        schema: OBJECT_CACHE_SCHEMA,
-        backend: "amd-clang".into(),
-        target_architecture: format!("amdgcn-amd-amdhsa/{}", arch.mcpu()),
-        toolchain: toolchain.identity().into(),
-        flags,
-        abi: format!("amdhsa-kernel-abi-v1;wave-size={}", arch.wave_size()),
-        object_format: "elf64-amdgpu-code-object-relocatable-v1".into(),
-    };
-    let cache_key = identity.cache_key();
-    let compiler = Arc::new(AmdCompiler { arch, cache, toolchain, identity, cache_key });
+    let (renderer, compiler) = create_amd_codegen(device_id, arch)?;
     // Build the per-device process-shared state: the signal pool (singleton
     // per physical AMD:N, lives on AmdDeviceCore). Each `ExecutionPlan` /
     // `AmdGraph` / per-call `Program::execute` leases or builds its OWN
@@ -65,19 +51,24 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     // Seed the pool onto the device core so `PoolQueue::new_with_resources`
     // can acquire its PM4 counter signal.
     device_handle.core().install_signal_pool(signal_pool);
-    // Bring up the SDMA copy queue so host↔device staging works — this is what
-    // lets buffers be device-local (non-host-visible). A creation failure
-    // cleanly leaves has_sdma_queue=false, so buffers stay host-visible and use
-    // the memmove copy path (today's behaviour). Must run before any _alloc,
-    // which reads has_sdma_queue to decide cpu_access.
-    match AmdCopyQueue::create(&amd_alloc) {
-        Ok(copy_queue) => {
+    // Bring up SDMA on CDNA so buffers can be device-local. Svod's direct KFD
+    // SDMA queue is not safe alongside its PM4 queue on RDNA yet, so RDNA uses
+    // the existing host-visible memmove path. Must decide before any _alloc,
+    // which reads has_sdma_queue to select buffer visibility.
+    let copy_queue = if !arch.is_cdna() || std::env::var_os("AMD_DISABLE_SDMA").is_some() {
+        None
+    } else {
+        Some(AmdCopyQueue::create(&amd_alloc))
+    };
+    match copy_queue {
+        Some(Ok(copy_queue)) => {
             device_handle.core().install_copy_queue(copy_queue);
             device_handle.core().set_has_sdma_queue(true);
         }
-        Err(e) => {
+        Some(Err(e)) => {
             tracing::warn!(error = %e, "SDMA copy queue unavailable; AMD buffers stay host-visible");
         }
+        None => {}
     }
     // PM4 graph capture is opt-in via `SVOD_PM4_GRAPH=1` (default OFF — it
     // regresses on gfx1151). Parse the env ONCE here into the per-device flag so
@@ -119,6 +110,28 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     });
 
     Ok(Device::new(spec, allocator, renderer, compiler, runtime).with_graph(graph))
+}
+
+/// Construct AMD renderer/compiler components without opening KFD or creating
+/// queues. Clean BEAM workers use this path with device usage disabled.
+pub fn create_amd_codegen(device_id: usize, arch: AmdArch) -> Result<(Arc<dyn Renderer>, Arc<dyn Compiler>)> {
+    let spec = DeviceSpec::Amd { device_id };
+    let renderer = Arc::new(AmdRendererWrapper { device: spec, arch });
+    let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
+    let toolchain = ClangToolchain::discover(cache.as_deref()).map_err(runtime_as_device)?;
+    let flags = crate::amd::compile::amd_object_flags(arch);
+    let identity = CompilerIdentity {
+        schema: OBJECT_CACHE_SCHEMA,
+        backend: "amd-clang".into(),
+        target_architecture: format!("amdgcn-amd-amdhsa/{}", arch.mcpu()),
+        toolchain: toolchain.identity().into(),
+        flags,
+        abi: format!("amdhsa-kernel-abi-v1;wave-size={}", arch.wave_size()),
+        object_format: "elf64-amdgpu-code-object-relocatable-v1".into(),
+    };
+    let cache_key = identity.cache_key();
+    let compiler = Arc::new(AmdCompiler { arch, cache, toolchain, identity, cache_key });
+    Ok((renderer, compiler))
 }
 
 struct AmdRendererWrapper {
@@ -207,6 +220,33 @@ impl Compiler for AmdCompiler {
 
     fn cache_key(&self) -> &str {
         &self.cache_key
+    }
+
+    fn start_compile_process(&self, spec: &ProgramSpec) -> Result<Option<svod_device::device::CompilerProcessTask>> {
+        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
+        if let Some(cache) = &self.cache
+            && let Some(bytes) = cache
+                .get_validated(&key, |bytes| crate::amd::compile::validate_amd_object(bytes, self.arch, &spec.name))
+                .map_err(runtime_as_device)?
+        {
+            return Ok(Some(svod_device::device::CompilerProcessTask::Ready(bytes)));
+        }
+        let process = crate::amd::compile::spawn_ir_to_amd_object(&self.toolchain, &spec.src, self.arch)?;
+        Ok(Some(svod_device::device::CompilerProcessTask::Spawned(process)))
+    }
+
+    fn finish_compile_process(&self, spec: &ProgramSpec, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
+        if let Some(cache) = &self.cache {
+            cache
+                .publish_compiled(&key, bytes, |bytes| {
+                    crate::amd::compile::validate_amd_object(bytes, self.arch, &spec.name)
+                })
+                .map_err(runtime_as_device)
+        } else {
+            crate::amd::compile::validate_amd_object(&bytes, self.arch, &spec.name).map_err(runtime_as_device)?;
+            Ok(bytes)
+        }
     }
 }
 

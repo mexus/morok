@@ -3441,6 +3441,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "proptest",
  "proptest-derive",
+ "serde",
  "sha2",
  "smallvec",
  "snafu 0.8.9",
@@ -3467,6 +3468,7 @@ dependencies = [
 name = "svod-ir"
 version = "0.1.0-alpha.3"
 dependencies = [
+ "bincode",
  "bon",
  "derive_more",
  "half",
@@ -3598,7 +3600,6 @@ dependencies = [
  "once_cell",
  "proptest",
  "proptest-derive",
- "rayon",
  "serde",
  "sled",
  "smallvec",
@@ -3617,13 +3618,16 @@ dependencies = [
 name = "svod-tensor"
 version = "0.1.0-alpha.3"
 dependencies = [
+ "bincode",
  "bon",
  "criterion",
+ "libc",
  "ndarray",
  "once_cell",
  "papaya",
  "parking_lot 0.12.5",
  "proptest",
+ "serde",
  "serde_json",
  "smallvec",
  "snafu 0.8.9",

@@ -55,7 +55,7 @@ impl crate::Renderer for CRenderer {
         crate::common::reject_unsupported_fnuz(&nodes, "C")?;
 
         for (i, node) in nodes.iter().enumerate() {
-            tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "c linearized node");
+            tracing::trace!(position = i, op = node.op().as_ref(), id = node.id, "c linearized node");
             match node.op() {
                 Op::Custom { deps, code } | Op::CustomI { deps, code } => {
                     validate_custom_template_strict(code, deps.len())?;
@@ -230,7 +230,7 @@ impl crate::Renderer for CRenderer {
 
         let code = code_lines.join("\n");
 
-        tracing::debug!(generated_c = code, "c codegen: final generated code");
+        tracing::trace!(generated_c = code, "c codegen: final generated code");
 
         let mut result = RenderedKernel::new(code, kernel_name.to_string());
         result.buffer_args = buffer_args;

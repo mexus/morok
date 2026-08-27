@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use snafu::ResultExt;
+
 use crate::state::{self, HasStateDict, StateDict};
 
 use super::config::{ModelDimensions, WhisperSize};
@@ -15,13 +17,30 @@ use super::model::Whisper;
 impl Whisper {
     /// Load from a safetensors state dict.
     ///
-    /// HuggingFace Transformers checkpoints store weights in Float32. Linear
-    /// and convolution weights are cast to `dims.dtype`, while embeddings and
-    /// LayerNorm affine parameters retain checkpoint precision to match
-    /// OpenAI's mixed-precision forward pass.
+    /// HuggingFace Transformers checkpoints commonly store weights in Float32.
+    /// Linear, convolution, and token embedding weights use `dims.dtype`, while
+    /// positional embeddings and LayerNorm affine parameters retain checkpoint
+    /// precision. Pre-converted checkpoints should already use these storage
+    /// dtypes so loading does not create lazy cast graphs.
     pub fn from_state_dict(sd: &StateDict, dims: ModelDimensions) -> Result<Self> {
         let dtype = dims.dtype.clone();
-        let remapped = remap_hf_keys(sd);
+        let mut remapped = remap_hf_keys(sd);
+        let scales: Vec<_> = remapped
+            .keys()
+            .filter_map(|key| key.strip_suffix(".weight_scale").map(|weight_key| (key.clone(), weight_key.to_string())))
+            .collect();
+        for (scale_key, weight_key) in scales {
+            let scale = remapped.remove(&scale_key).expect("scale key came from the state dict");
+            let weight = remapped
+                .get(&weight_key)
+                .ok_or_else(|| Error::State { source: state::Error::MissingKey { key: weight_key.clone() } })?;
+            let dequantized = weight
+                .cast(dtype.clone())
+                .context(super::error::TensorSnafu)?
+                .try_mul(&scale.cast(dtype.clone()).context(super::error::TensorSnafu)?)
+                .context(super::error::TensorSnafu)?;
+            remapped.insert(weight_key, dequantized);
+        }
         let mut sd = state::cast_all(&remapped, dtype);
         for (key, tensor) in &remapped {
             if keeps_checkpoint_dtype(key) {
@@ -35,16 +54,31 @@ impl Whisper {
 
     /// Load from a local safetensors file or directory.
     pub fn from_dir(dir: &Path, dims: ModelDimensions) -> Result<Self> {
-        let sd = state::load_safetensors_dir(dir).map_err(|e| Error::State { source: e })?;
+        Self::from_dir_with_weights(dir, "model.safetensors", dims)
+    }
+
+    /// Load a named safetensors checkpoint from a local directory.
+    pub fn from_dir_with_weights(dir: &Path, weights: &str, dims: ModelDimensions) -> Result<Self> {
+        let sd = if weights == "model.safetensors" {
+            state::load_safetensors_dir(dir)
+        } else {
+            state::load_safetensors(&dir.join(weights))
+        }
+        .map_err(|e| Error::State { source: e })?;
         Self::from_state_dict(&sd, dims)
     }
 
     /// Load from HuggingFace Hub (`openai/whisper-{name}` or custom repo).
     pub fn from_hub(model_id: &str, revision: &str, dims: ModelDimensions) -> Result<Self> {
+        Self::from_hub_with_weights(model_id, revision, "model.safetensors", dims)
+    }
+
+    /// Load a named safetensors checkpoint from Hugging Face Hub.
+    pub fn from_hub_with_weights(model_id: &str, revision: &str, weights: &str, dims: ModelDimensions) -> Result<Self> {
         let api = hf_hub::api::sync::Api::new().map_err(|e| Error::Checkpoint { msg: e.to_string() })?;
         let repo =
             api.repo(hf_hub::Repo::with_revision(model_id.to_string(), hf_hub::RepoType::Model, revision.to_string()));
-        let path = repo.get("model.safetensors").map_err(|e| Error::Checkpoint { msg: e.to_string() })?;
+        let path = repo.get(weights).map_err(|e| Error::Checkpoint { msg: e.to_string() })?;
         let sd = state::load_safetensors(&path).map_err(|e| Error::State { source: e })?;
         Self::from_state_dict(&sd, dims)
     }
@@ -60,7 +94,6 @@ impl Whisper {
 fn keeps_checkpoint_dtype(key: &str) -> bool {
     key == "encoder.positional_embedding"
         || key == "decoder.positional_embedding"
-        || key == "decoder.token_embedding.weight"
         || key.starts_with("encoder.ln_post.")
         || key.starts_with("decoder.ln.")
         || [".attn_ln.", ".cross_attn_ln.", ".mlp_ln."].iter().any(|part| key.contains(part))

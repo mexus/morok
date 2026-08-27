@@ -1,10 +1,27 @@
 //! Miscellaneous devectorizer integration tests.
 
-use svod_dtype::DType;
+use svod_dtype::{AddrSpace, DType};
 use svod_ir::types::ConstValue;
+use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::properties::InScopeRangesProperty;
 use svod_ir::{Op, UOp};
 
 use super::helpers::*;
+
+#[test]
+fn test_shaped_register_store_preserves_outer_range() {
+    use svod_ir::types::{AxisId, AxisType};
+
+    let outer = UOp::range_axis(UOp::index_const(4), AxisId::Unrenumbered(0), AxisType::Loop);
+    let register = UOp::buffer(0, 2, DType::Float32, AddrSpace::Reg, None);
+    let zeros = UOp::stack(vec![create_float_const(0.0), create_float_const(0.0)].into());
+    let store = register.after(vec![outer.clone()].into()).store(zeros);
+
+    let result = apply_devectorize(&store);
+    let stores = result.toposort().into_iter().filter(|node| matches!(node.op(), Op::Store { .. })).collect::<Vec<_>>();
+    assert_eq!(stores.len(), 2);
+    assert!(stores.iter().all(|store| InScopeRangesProperty::get(store).iter().any(|range| range.0.id == outer.id)));
+}
 
 /// Test: Full devectorize pass on a simple load
 #[test]

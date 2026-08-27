@@ -31,6 +31,86 @@ impl Tensor {
         self.clamp().min(&min).max(&max).call()?.cast(dtype)
     }
 
+    /// Dynamically quantized per-token linear operation.
+    ///
+    /// Activations are symmetrically quantized along the contraction axis,
+    /// multiplied by a per-output-channel integer weight, accumulated in the
+    /// dtype's normal sum type,
+    /// and rescaled in FP32 before the optional bias and output cast.
+    #[builder]
+    pub fn dynamic_quantized_linear(
+        &self,
+        weight: &Tensor,
+        weight_scale: &Tensor,
+        bias: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        const OP: &str = "dynamic_quantized_linear";
+        let output_dtype = self.uop().dtype();
+        let quantized_dtype = weight.uop().dtype();
+        if !output_dtype.is_float() {
+            return Err(crate::Error::FloatDTypeRequired { op: OP, arg: "input", dtype: output_dtype });
+        }
+        if !quantized_dtype.is_signed() {
+            return Err(crate::Error::SignedIntegerDTypeRequired { op: OP, arg: "weight", dtype: quantized_dtype });
+        }
+        if !weight_scale.uop().dtype().is_float() {
+            return Err(crate::Error::FloatDTypeRequired {
+                op: OP,
+                arg: "weight_scale",
+                dtype: weight_scale.uop().dtype(),
+            });
+        }
+        if let Some(bias) = bias
+            && !bias.uop().dtype().is_float()
+        {
+            return Err(crate::Error::FloatDTypeRequired { op: OP, arg: "bias", dtype: bias.uop().dtype() });
+        }
+
+        let input_shape = self.shape()?;
+        let weight_shape = weight.shape()?;
+        let scale_shape = weight_scale.shape()?;
+        let bias_shape = bias.map(Tensor::shape).transpose()?;
+        let output_shape = weight_shape.first().cloned().map(|dim| vec![dim]);
+        let valid_shapes = weight_shape.len() == 2
+            && input_shape.last() == weight_shape.get(1)
+            && output_shape.as_deref() == Some(scale_shape.as_slice())
+            && bias_shape.as_ref().is_none_or(|shape| output_shape.as_deref() == Some(shape.as_slice()));
+        if !valid_shapes {
+            return Err(crate::Error::ShapeMismatch {
+                context: OP.to_string(),
+                expected: "input [..., in], weight [out, in], weight_scale [out], bias [out]".to_string(),
+                actual: format!(
+                    "input {input_shape:?}, weight {weight_shape:?}, weight_scale {scale_shape:?}, bias {bias_shape:?}"
+                ),
+            });
+        }
+
+        let accumulation_dtype = Self::sum_acc_dtype(&quantized_dtype);
+        let limit = Tensor::from_const(quantized_dtype.max_value()).cast(output_dtype.clone())?;
+        let neg_limit = limit.try_neg()?;
+        let epsilon = Tensor::from_const(1e-6f32).cast(output_dtype.clone())?;
+        let activation_scale =
+            self.try_abs()?.max_with().axes(-1isize).keepdim(true).call()?.try_div(&limit)?.maximum(&epsilon)?;
+        let quantized = self
+            .try_div(&activation_scale)?
+            .round()?
+            .clamp()
+            .min(&neg_limit)
+            .max(&limit)
+            .call()?
+            .cast(quantized_dtype)?;
+        let accumulated = quantized.contiguous().linear().weight(weight).dtype(accumulation_dtype).call()?;
+
+        let mut output = accumulated
+            .cast(DType::Float32)?
+            .try_mul(&activation_scale.cast(DType::Float32)?)?
+            .try_mul(&weight_scale.cast(DType::Float32)?)?;
+        if let Some(bias) = bias {
+            output = output.try_add(&bias.cast(DType::Float32)?)?;
+        }
+        output.cast(output_dtype)
+    }
+
     /// Quantized convolution: zero-point–adjust inputs, convolve in int32,
     /// rescale and requantize to the output dtype.
     ///

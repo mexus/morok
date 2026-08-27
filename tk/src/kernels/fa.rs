@@ -55,17 +55,13 @@ pub const FLASH_ATTENTION_SEQUENCE_MULTIPLE: usize = Q_BLK * NUM_WARPS;
 const KV_BLK: usize = 32;
 
 fn iconst(v: i64) -> Arc<UOp> {
-    UOp::const_(DType::Index, ConstValue::Int(v))
+    UOp::index_const(v)
 }
 
 /// The GPU arch(es) the **production graph** flash-attention ([`flash_attention_with`]
-/// → [`build_fa_mw_rdb`]) is built for: gfx942 (CDNA MFMA, wave64) and gfx1151
-/// (RDNA3.5 WMMA, wave32). The rolled double-buffer builder arch-selects the WMMA
-/// fragment shapes (`_W32_*`), the accumulator→input relayout (an LDS round-trip on
-/// RDNA, a register copy on CDNA), and the even/odd-aware mask geometry; the launch
-/// block tracks the real wave width. The launcher gates against this list, the
-/// generic launch infra stays arch-agnostic.
-/// Validated on gfx942 (CDNA3) and gfx1151 (RDNA3.5).
+/// → [`build_fa_mw_rdb`]) is enabled for gfx942 (CDNA MFMA, wave64) and gfx1151
+/// (RDNA3.5 WMMA, wave32). The launcher gates against this list; generic launch
+/// infrastructure stays architecture-agnostic.
 pub const FA_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
 
 /// Whether `device` can run the production graph flash-attention kernel.
@@ -76,8 +72,7 @@ pub fn flash_attention_supported(device: &svod_dtype::DeviceSpec) -> bool {
 
 /// The **direct-launch** FA wrappers ([`flash_attention_forward`], `_mw`, `_mw_db`,
 /// `_mw_rdb`) hardcode the wave64 block size and the CDNA fragment tiles, so they
-/// stay gfx942-only — gfx1151 reaches the wave32 kernel only through the
-/// wave-width-aware [`flash_attention_with`] graph entry.
+/// stay gfx942-only.
 const FA_DIRECT_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942];
 
 /// Validate a direct-launch wrapper's device against [`FA_DIRECT_SUPPORTED_ARCHS`].
@@ -335,7 +330,7 @@ pub(crate) fn build_fa_mw_rdb(
     // `(block_q_base+1)*NUM_WARPS*Q_BLK/KV_BLK` super-blocks (exact for these tiles).
     Kernel::assert_divisible(NUM_WARPS * q_blk_rows, kv_blk_rows, "FA rolled-db KV_BLK");
     let group_size = (h / h_kv) as i64;
-    let g = ker.group(NUM_WARPS); // 512 threads — collaborative K/V GLOBAL→LDS fill
+    let g = ker.group(NUM_WARPS);
     let warp = ker.warp();
 
     // ABI: outputs (o) then inputs (q, k, v), fixed by construction.
@@ -350,16 +345,15 @@ pub(crate) fn build_fa_mw_rdb(
     let (o, q, k, v) = (outs[0].clone(), ins[0].clone(), ins[1].clone(), ins[2].clone());
     // Per-batch valid key-length buffer (padding mask), bound AFTER o,q,k,v (trailing —
     // never interleaved) so the ABI slot order stays stable; only bound when `masked`.
-    // The scalar `lens[batch]`
-    // is read and cast to `Index` so the score-mask compare (`kv_pos >= vl`) matches
-    // the causal path's Index-typed position arithmetic exactly.
+    // The scalar `lens[batch]` is already int32, matching the concrete SPECIAL
+    // position arithmetic.
     let valid_len = masked.then(|| {
         let lens = ker.gl(&[b], DType::Int32);
-        load_at(lens.uop(), lens.shape(), &[Idx::from(&ker.block_idx[2])]).cast(DType::Index)
+        load_at(lens.uop(), lens.shape(), &[Idx::from(&ker.block_idx[2])])
     });
 
     let head = ker.grid_x();
-    let head_kv = head.idiv(&iconst(group_size));
+    let head_kv = head.floor_div(&iconst(group_size));
     let batch = ker.grid_z();
     let block_q_base = ker.grid_y();
     let warpid = g.warpid_in_group();
@@ -384,14 +378,13 @@ pub(crate) fn build_fa_mw_rdb(
     // Q tile + transpose (shared, read-only across the loop). `o_reg_t` is the
     // transpose of the `[d,q]` PV accumulator for the `O[q,d]` store (N-major ⇒
     // `rt_acc_t` on RDNA).
-    let q_reg_fl = ker.operand((q_blk_rows, d), f32.clone(), row);
+    let q_reg_fl = ker.operand((q_blk_rows, d), f32, row);
     let q_reg = ker.operand((q_blk_rows, d), in_dt.clone(), row);
     let q_reg_t = ker.operand((d, q_blk_rows), in_dt.clone(), col);
     let o_reg_t = ker.acc_t((q_blk_rows, d), row);
 
-    // One scratch set (vs the unroll's two): the rolled body has a back-edge, so
-    // the carried FaAcc + a single scratch suffice. `att_smem` (RDNA only) holds
-    // `NUM_WARPS` per-warp `kv_blk × q_blk` bands for the accumulator→input relayout.
+    // One scratch set: the rolled body has a back-edge, so the carried FaAcc + a
+    // single set suffice. `att_smem` holds one per-warp relayout band on RDNA.
     let sc = FaScratch {
         k_reg: ker.operand((kv_blk_rows, d), in_dt.clone(), row),
         k_reg_t: ker.operand((d, kv_blk_rows), in_dt.clone(), col),
@@ -434,12 +427,12 @@ pub(crate) fn build_fa_mw_rdb(
     let v_smem = g.commit_reg_to_local(v_smem, &s0_v, true);
 
     // Rolled KV loop. `kv_bound` (the dynamic per-q-block causal trip count) is the
-    // Range end. The prefetch-block index is `(kv+1) % total_kv_blocks` (a Mod): the
+    // Range end. The prefetch-block index is `(kv+1) % total_kv_blocks` (a FloorMod): the
     // final trip's prefetch (`kv+1 == total`) wraps to block 0, which is never
     // gathered, keeping the GLOBAL read in bounds. A `min`/`where` clamp is avoided
     // — a `WHERE` in the prefetch-address path is mis-ordered past its address-MUL
     // consumer in this kernel's linearization, leaving the renderer without its SSA
-    // value; Mod (like the parity) lowers and orders cleanly.
+    // value; FloorMod (like the parity) lowers and orders cleanly.
     let lp = ker.loop_dynamic(kv_bound);
     let kv_idx = lp.index().clone();
     let kvp1 = kv_idx.add(&iconst(1));
@@ -586,7 +579,7 @@ impl Default for FaOpts<'_> {
 ///   [`crate::graph_launch`], honoring `opts.causal` and the optional
 ///   `opts.key_lens` **key-only** mask (a 5th `[B]` `i32` global after `o,q,k,v`).
 /// - `Ok(None)` — *doesn't apply here:* the device isn't a supported arch
-///   ([`FA_SUPPORTED_ARCHS`] — gfx942 / gfx1151 with the AMD toolchain), **or** the
+///   ([`FA_SUPPORTED_ARCHS`] — gfx942/gfx1151 with the AMD toolchain), **or** the
 ///   runtime sequence length doesn't tile (`N % (q_blk·NUM_WARPS) != 0`). The caller
 ///   substitutes its own attention (e.g. [`Tensor::scaled_dot_product_attention`]).
 /// - `Err` — *malformed request* on a supported device: a FIXED property is wrong —
@@ -656,7 +649,6 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
             let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
             let out = Tensor::empty(&[b, n, h, d], dtype.clone());
             let masked = opts.key_lens.is_some();
-            let causal = opts.causal;
             let build_dtype = dtype.clone();
             // ABI/global order is o, q, k, v, (lens) — `out` is global[0], inputs map to
             // global[1..] in order, so `key_lens` (the 5th global) goes last.
@@ -686,7 +678,7 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
                     h,
                     h_kv,
                     d,
-                    FaConfig { q_blk, kv_blk, causal, ..Default::default() },
+                    FaConfig { q_blk, kv_blk, causal: opts.causal, ..Default::default() },
                     build_dtype.clone(),
                     masked,
                 );

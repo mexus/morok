@@ -118,7 +118,7 @@ pub fn schedule_device_lanes(
     for op in operations {
         match &op.kind {
             TopologyOperationKind::Copy { src, dst, bytes }
-                if !(can_access(&op.lane.device, &src.owner) && can_access(&src.owner, &dst.owner)) =>
+                if !(can_access(&op.lane.device, &src.owner) && can_access(&op.lane.device, &dst.owner)) =>
             {
                 // A unique host resource prevents unrelated staged copies from
                 // aliasing while still creating the required dependency edge.

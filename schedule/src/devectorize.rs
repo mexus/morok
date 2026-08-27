@@ -1241,19 +1241,25 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
                     } else if matches!(alu.op(), Op::Store { .. }) && source_index == 0 {
                         let indices: SmallVec<[Arc<UOp>; 4]> =
                             coordinate.iter().map(|&index| UOp::index_const(index as i64)).collect();
-                        let selected = match source.op() {
-                            Op::Stack { sources } => const_index_into_stack(sources, &indices),
-                            Op::After { passthrough, .. } if matches!(passthrough.op(), Op::Stack { .. }) => {
+                        let (selected, deps) = match source.op() {
+                            Op::Stack { sources } => (const_index_into_stack(sources, &indices), None),
+                            Op::After { passthrough, deps } if matches!(passthrough.op(), Op::Stack { .. }) => {
                                 let Op::Stack { sources } = passthrough.op() else { unreachable!() };
-                                const_index_into_stack(sources, &indices)
+                                (const_index_into_stack(sources, &indices), Some(deps))
                             }
-                            _ => UOp::index().buffer(source.clone()).indices(indices).call().ok(),
-                        }
-                        .ok_or(svod_ir::Error::IndexOutOfBounds)?;
-                        Ok(match selected.op() {
+                            _ => (UOp::index().buffer(source.clone()).indices(indices).call().ok(), None),
+                        };
+                        let selected = selected.ok_or(svod_ir::Error::IndexOutOfBounds)?;
+                        let selected = match selected.op() {
                             Op::Load { index, .. } => index.clone(),
                             _ => selected,
-                        })
+                        };
+                        if let (Some(deps), Op::Index { buffer, indices }) = (deps, selected.op()) {
+                            let ordered = buffer.after(deps.clone());
+                            Ok(selected.with_sources(std::iter::once(ordered).chain(indices.iter().cloned()).collect()))
+                        } else {
+                            Ok(selected)
+                        }
                     } else {
                         coordinate.iter().try_fold(source.clone(), |value, &index| {
                             UOp::index().buffer(value).indices(vec![UOp::index_const(index as i64)]).call()

@@ -55,3 +55,14 @@ fn cpu_object_validation_checks_header_and_entry_symbol() {
     wrong_machine[18..20].copy_from_slice(&0xffffu16.to_le_bytes());
     assert!(validate_c_object(&wrong_machine, "cached_kernel").is_err());
 }
+
+#[test]
+fn clean_compiler_process_produces_valid_object() {
+    let toolchain = ClangToolchain::discover(None).unwrap();
+    let mut process = spawn_compile_process(&toolchain, "void isolated_kernel(void) {}\n", &c_object_flags()).unwrap();
+    while process.try_wait().unwrap().is_none() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let object = process.finish().unwrap();
+    validate_c_object(&object, "isolated_kernel").unwrap();
+}

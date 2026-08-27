@@ -3,5 +3,5 @@
 pub mod amd;
 pub mod cpu;
 
-pub use amd::create_amd_device;
-pub use cpu::{CpuBackend, create_cpu_device, create_cpu_device_with_backend};
+pub use amd::{create_amd_codegen, create_amd_device};
+pub use cpu::{CpuBackend, create_cpu_codegen, create_cpu_device, create_cpu_device_with_backend};

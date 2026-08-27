@@ -55,8 +55,8 @@ pub mod types;
 
 // Re-exports
 pub use beam::{
-    BeamResult, CandidateMetrics, beam_search, beam_search_cached, beam_search_cached_with_behavior, clear_cache,
-    compute_ops_estimate, hash_post_codegen_ir, replay_opts,
+    BeamResult, CandidateMetrics, apply_remote_candidate, beam_search, beam_search_cached, beam_search_cached_remote,
+    beam_search_cached_with_behavior, clear_cache, compute_ops_estimate, hash_post_codegen_ir, replay_opts,
 };
 pub use config::{BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcOpt as TcOptLevel, TcSelect, TcUsage};
 pub use error::OptError;
@@ -549,7 +549,7 @@ fn apply_post_optimization_configured_with_capture(
     // Save metadata before graph_rewrite destroys it (e.g., KernelInfo with kernel name)
     let saved_metadata = ast.metadata_raw();
 
-    tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
+    tracing::trace!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
     // Env-gated per-stage diagnostic. Set SVOD_PER_STAGE_UOPS=1 to print
     // node_count to stderr after each post-opt stage. Used to pinpoint
@@ -1160,7 +1160,7 @@ fn pm_mod_to_idiv() -> &'static crate::TypedPatternMatcher {
 /// Called by both heuristic and beam search paths.
 #[tracing::instrument(skip_all)]
 pub fn apply_pre_optimization(ast: Arc<svod_ir::UOp>) -> Result<Arc<svod_ir::UOp>, OptError> {
-    tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
+    tracing::trace!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
     // Tinygrad full_rewrite_to_sink verifies the original kernel DAG at this
     // boundary before per-kernel preprocessing.

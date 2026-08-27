@@ -5,6 +5,17 @@
 
 use bon::bon;
 
+fn beam_min_progress_from_env() -> u64 {
+    parse_beam_min_progress(std::env::var("BEAM_MIN_PROGRESS").ok().as_deref())
+}
+
+fn parse_beam_min_progress(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|microseconds| (microseconds * 1_000.0).max(0.0).min(u64::MAX as f64) as u64)
+        .unwrap_or(10)
+}
+
 // ============================================================================
 // OPTIMIZATION STRATEGY
 // ============================================================================
@@ -142,9 +153,9 @@ impl TcSelect {
 ///
 /// No total search timeout — the loop terminates only on the `min_progress`
 /// floor or an empty candidate set. `BEAM_TIMEOUT_SEC` is a per-candidate
-/// compile alarm enforced in `compile_and_time`'s thread+timeout machinery,
+/// compile alarm enforced inside the BEAM compile worker,
 /// not a global search budget.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BeamConfig {
     /// Beam width - number of candidates to keep at each step.
     pub beam_width: usize,
@@ -164,6 +175,8 @@ pub struct BeamConfig {
     pub compile_workers: usize,
     /// Per-candidate backend compilation timeout in seconds.
     pub compile_timeout_secs: u64,
+    /// Tasks handled before replacing a clean spawned worker.
+    pub max_tasks_per_child: usize,
     /// Disable disk cache.
     pub disable_cache: bool,
 }
@@ -178,15 +191,12 @@ impl Default for BeamConfig {
             num_runs: 3,
             min_progress_ns: 10,
             enable_nolocals: false,
-            compile_workers: default_beam_compile_workers(),
+            compile_workers: 0,
             compile_timeout_secs: 10,
+            max_tasks_per_child: 16,
             disable_cache: false,
         }
     }
-}
-
-fn default_beam_compile_workers() -> usize {
-    std::thread::available_parallelism().map(|parallelism| parallelism.get()).unwrap_or(1)
 }
 
 #[bon]
@@ -206,13 +216,15 @@ impl BeamConfig {
         #[builder(default = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000))]
         max_uops: usize,
         #[builder(default = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3))] num_runs: usize,
-        #[builder(default = std::env::var("BEAM_MIN_PROGRESS").ok().and_then(|s| s.parse().ok()).unwrap_or(10))]
-        min_progress_ns: u64,
-        #[builder(default = std::env::var("SVOD_NOLOCALS").is_ok())] enable_nolocals: bool,
-        #[builder(default = std::env::var("PARALLEL").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_beam_compile_workers))]
+        #[builder(default = beam_min_progress_from_env())] min_progress_ns: u64,
+        #[builder(default = std::env::var("NOLOCALS").is_ok() || std::env::var("SVOD_NOLOCALS").is_ok())]
+        enable_nolocals: bool,
+        #[builder(default = std::env::var("PARALLEL").ok().and_then(|s| s.parse().ok()).unwrap_or(0))]
         compile_workers: usize,
         #[builder(default = std::env::var("BEAM_TIMEOUT_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(10))]
         compile_timeout_secs: u64,
+        #[builder(default = std::env::var("BEAM_MAX_TASKS_PER_CHILD").ok().and_then(|s| s.parse().ok()).unwrap_or(16))]
+        max_tasks_per_child: usize,
         #[builder(default = std::env::var("IGNORE_BEAM_CACHE").is_ok())] disable_cache: bool,
     ) -> Self {
         Self {
@@ -225,6 +237,7 @@ impl BeamConfig {
             enable_nolocals,
             compile_workers,
             compile_timeout_secs,
+            max_tasks_per_child,
             disable_cache,
         }
     }
@@ -238,9 +251,9 @@ impl BeamConfig {
     /// * `BEAM_LOCAL_MAX` - Max local memory elements (default: 1024)
     /// * `BEAM_UOPS_MAX` - Max UOps before rejecting (default: 3000)
     /// * `BEAM_RUNS` - Benchmark runs per kernel (default: 3)
-    /// * `BEAM_MIN_PROGRESS` - Minimum progress in nanoseconds (default: 10)
-    /// * `SVOD_NOLOCALS` - Include the NOLOCALS action if set
-    /// * `PARALLEL` - Maximum concurrent candidate compilations (default: host parallelism)
+    /// * `BEAM_MIN_PROGRESS` - Minimum progress in microseconds (default: 0.01)
+    /// * `NOLOCALS` / `SVOD_NOLOCALS` - Include the NOLOCALS action if set
+    /// * `PARALLEL` - Maximum concurrent candidate compilations (default: 0 for CPU; GPU resolves to host parallelism)
     /// * `BEAM_TIMEOUT_SEC` - Per-candidate compile timeout in seconds (default: 10)
     /// * `IGNORE_BEAM_CACHE` - Bypass disk cache if set
     pub fn from_env() -> Self {
@@ -249,11 +262,12 @@ impl BeamConfig {
         let max_local = std::env::var("BEAM_LOCAL_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
         let max_uops = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
         let num_runs = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
-        let min_progress_ns = std::env::var("BEAM_MIN_PROGRESS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
-        let enable_nolocals = std::env::var("SVOD_NOLOCALS").is_ok();
-        let compile_workers =
-            std::env::var("PARALLEL").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_beam_compile_workers);
+        let min_progress_ns = beam_min_progress_from_env();
+        let enable_nolocals = std::env::var("NOLOCALS").is_ok() || std::env::var("SVOD_NOLOCALS").is_ok();
+        let compile_workers = std::env::var("PARALLEL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let compile_timeout_secs = std::env::var("BEAM_TIMEOUT_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+        let max_tasks_per_child =
+            std::env::var("BEAM_MAX_TASKS_PER_CHILD").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
         let disable_cache = std::env::var("IGNORE_BEAM_CACHE").is_ok();
 
         Self {
@@ -266,6 +280,7 @@ impl BeamConfig {
             enable_nolocals,
             compile_workers,
             compile_timeout_secs,
+            max_tasks_per_child,
             disable_cache,
         }
     }

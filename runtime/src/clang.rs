@@ -9,6 +9,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use object::read::{Object, ObjectSymbol};
 use object::{Architecture, BinaryFormat, Endianness, ObjectKind};
@@ -17,6 +18,8 @@ use sha2::{Digest, Sha256};
 use crate::error::JitResultExt;
 use crate::object_cache::ObjectCache;
 use crate::{Error, Result};
+
+static COMPILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Resolved Clang executable plus an exact persisted identity. The executable
 /// digest makes replacement unambiguous; `--version` remains in the identity
@@ -155,6 +158,52 @@ pub(crate) fn compile_c_object(toolchain: &ClangToolchain, src: &str, flags: &[S
         }
         std::fs::read(output_path).jit("read clang shared object")
     }
+}
+
+pub(crate) fn spawn_compile_process(
+    toolchain: &ClangToolchain,
+    src: &str,
+    flags: &[String],
+) -> svod_device::Result<svod_device::device::CompilerProcess> {
+    let sequence = COMPILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!("svod-beam-{}-{sequence}", std::process::id()));
+    std::fs::create_dir(&directory)
+        .map_err(|error| svod_device::Error::Runtime { message: format!("create compiler task directory: {error}") })?;
+    let source_path = directory.join("source");
+    let output_path = directory.join("output");
+    let stderr_path = directory.join("stderr");
+    if let Err(error) = std::fs::write(&source_path, src) {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(svod_device::Error::Runtime { message: format!("write compiler source: {error}") });
+    }
+
+    let mut args = flags.to_vec();
+    for index in 0..args.len() {
+        if args[index] == "-" {
+            args[index] = if index > 0 && args[index - 1] == "-o" {
+                output_path.display().to_string()
+            } else {
+                source_path.display().to_string()
+            };
+        } else if args[index] == "<temporary-shared-object>" {
+            args[index] = output_path.display().to_string();
+        }
+    }
+    let stderr = match std::fs::File::create(&stderr_path) {
+        Ok(stderr) => stderr,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&directory);
+            return Err(svod_device::Error::Runtime { message: format!("create compiler stderr: {error}") });
+        }
+    };
+    let child = match toolchain.command().args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&directory);
+            return Err(svod_device::Error::Runtime { message: format!("spawn clang: {error}") });
+        }
+    };
+    Ok(svod_device::device::CompilerProcess::new(child, output_path, stderr_path, directory))
 }
 
 pub(crate) fn validate_c_object(bytes: &[u8], symbol: &str) -> Result<()> {

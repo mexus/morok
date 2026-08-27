@@ -1,6 +1,7 @@
 //! Tests for neural network operations: pool, conv, normalization, resize.
 
 use ndarray::{Array4, array};
+use svod_dtype::DType;
 
 use crate::Tensor;
 use crate::nn::{Conv1d, LSTMCell, Layer, Reduction, ResizeMode};
@@ -8,6 +9,24 @@ use crate::test::helpers::RealizeTestExt;
 
 fn get_shape(tensor: &Tensor) -> Vec<usize> {
     tensor.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()
+}
+
+#[test]
+fn dynamic_quantized_linear_matches_integer_reference() {
+    let x = Tensor::from_slice([127.0f32, -64.0, 32.0, 0.0, 63.5, -32.0, 16.0, 0.0]).try_reshape([2, 4]).unwrap();
+    let weight = Tensor::from_slice([1i8, 1, 1, 1, 2, -1, 0, 1, -1, 0, 2, -2]).try_reshape([3, 4]).unwrap();
+    let weight_scale = Tensor::from_slice([0.5f32, 1.0, 2.0]);
+    let bias = Tensor::from_slice([1.0f32, -2.0, 0.5]);
+
+    let mut output =
+        x.dynamic_quantized_linear().weight(&weight).weight_scale(&weight_scale).bias(&bias).call().unwrap();
+    output.realize().unwrap();
+
+    assert_eq!(output.uop().dtype(), DType::Float32);
+    let expected = [48.5f32, 316.0, -125.5, 24.75, 157.0, -62.5];
+    for (actual, expected) in output.as_vec::<f32>().unwrap().iter().zip(expected) {
+        assert!((actual - expected).abs() < 1e-4, "actual={actual}, expected={expected}");
+    }
 }
 
 // =========================================================================

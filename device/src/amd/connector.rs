@@ -235,6 +235,7 @@ impl Drop for QueueLease {
 pub(crate) struct SubmissionFinalizer {
     signal: Arc<AmdSignal>,
     value: u64,
+    progress: Vec<Arc<AmdSignal>>,
     _timestamps: Option<Arc<AmdSignal>>,
     publication: Mutex<PublicationState>,
     publication_changed: Condvar,
@@ -253,6 +254,7 @@ impl SubmissionFinalizer {
         Arc::new(Self {
             signal,
             value,
+            progress: Vec::new(),
             _timestamps: timestamps,
             publication: Mutex::new(PublicationState::Published),
             publication_changed: Condvar::new(),
@@ -260,10 +262,11 @@ impl SubmissionFinalizer {
         })
     }
 
-    pub(crate) fn prepared_timeline(signal: Arc<AmdSignal>, value: u64) -> Arc<Self> {
+    pub(crate) fn prepared_timeline(signal: Arc<AmdSignal>, value: u64, progress: Vec<Arc<AmdSignal>>) -> Arc<Self> {
         Arc::new(Self {
             signal,
             value,
+            progress,
             _timestamps: None,
             publication: Mutex::new(PublicationState::Prepared),
             publication_changed: Condvar::new(),
@@ -293,7 +296,7 @@ impl SubmissionFinalizer {
         match *publication {
             PublicationState::Published => {
                 drop(publication);
-                self.signal.wait_signal_value(self.value, timeout_ms)
+                self.signal.wait_signal_value_with_progress(self.value, timeout_ms, &self.progress)
             }
             PublicationState::Failed => Err(Error::Runtime {
                 message: "AMD submission failed before its terminal timeline point was published".into(),
@@ -695,7 +698,9 @@ impl crate::device::PlanContext for OwnerCtx {
         semantic: &crate::hcq::SemanticLinkedPlan,
         calls: &[crate::device::PlanCall<'_>],
     ) -> Result<crate::device::NativeReplayOutcome> {
-        if let Some(reason) = crate::amd::linked_plan::native_topology_decline(semantic) {
+        if let Some(reason) =
+            crate::amd::linked_plan::native_topology_decline(semantic, self.core.copy_queue().is_some())
+        {
             return Ok(crate::device::NativeReplayOutcome::Declined(reason));
         }
         let mut plan = self.linked_plan.lock();

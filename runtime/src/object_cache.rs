@@ -148,6 +148,21 @@ impl ObjectCache {
         Ok(bytes)
     }
 
+    pub(crate) fn get_validated<V>(&self, key: &ObjectCacheKey, validate: V) -> Result<Option<Vec<u8>>>
+    where
+        V: Fn(&[u8]) -> Result<()>,
+    {
+        let digest = key.digest();
+        self.read_validated(&self.entry_path(&digest), &digest, &validate)
+    }
+
+    pub(crate) fn publish_compiled<V>(&self, key: &ObjectCacheKey, bytes: Vec<u8>, validate: V) -> Result<Vec<u8>>
+    where
+        V: Fn(&[u8]) -> Result<()>,
+    {
+        self.get_or_compile(key, validate, || Ok(bytes))
+    }
+
     /// Persist deterministic compiler probes separately from evictable object
     /// entries. This lets a warm process reconstruct a versioned object key
     /// without invoking the compiler just to run `--version` or `-###`.

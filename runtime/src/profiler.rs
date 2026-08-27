@@ -340,7 +340,8 @@ impl PmcSelection {
 /// Options for [`ExecutionPlan::profile`](crate::ExecutionPlan::profile).
 #[derive(Debug, Clone)]
 pub struct ProfileOptions {
-    /// Replays to run; the per-kernel minimum device time is kept (robust to outliers).
+    /// Replays to run (clamped to at least one by `profile`); the per-kernel
+    /// minimum device time is kept (robust to outliers).
     pub iters: u32,
     /// Collect Tier-2/3 static analysis (flops/bytes/resources). Cheap; on by default.
     pub static_analysis: bool,

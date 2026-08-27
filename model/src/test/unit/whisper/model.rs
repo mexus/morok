@@ -146,7 +146,7 @@ fn low_precision_cross_projection_keeps_fp32_cache_storage() {
 }
 
 #[test]
-fn low_precision_load_preserves_openai_fp32_parameters() {
+fn low_precision_load_uses_compute_dtype_for_tied_embedding() {
     let source_dims = small_decoder_dims();
     let source = Whisper::empty(source_dims.clone()).state_dict("");
     let mut low_dims = source_dims;
@@ -157,7 +157,7 @@ fn low_precision_load_preserves_openai_fp32_parameters() {
     assert_eq!(model.encoder.blocks[0].attn.query.weight.uop().dtype(), DType::Float16);
     assert_eq!(model.encoder.positional_embedding.uop().dtype(), DType::Float32);
     assert_eq!(model.encoder.blocks[0].attn_ln.weight.uop().dtype(), DType::Float32);
-    assert_eq!(model.decoder.token_embedding.uop().dtype(), DType::Float32);
+    assert_eq!(model.decoder.token_embedding.uop().dtype(), DType::Float16);
     assert_eq!(model.decoder.positional_embedding.uop().dtype(), DType::Float32);
     assert_eq!(model.decoder.blocks[0].cross_attn_ln.bias.uop().dtype(), DType::Float32);
     assert_eq!(model.decoder.ln.weight.uop().dtype(), DType::Float32);

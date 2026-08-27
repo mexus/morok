@@ -25,4 +25,6 @@ pub enum OptError {
     MissingRendererCapabilities,
     #[snafu(display("optimization would exceed device limit: {limit_type} {value} > max {max}"))]
     DeviceLimitExceeded { limit_type: &'static str, value: usize, max: usize },
+    #[snafu(display("BEAM worker failed: {message}"))]
+    BeamWorker { message: String },
 }

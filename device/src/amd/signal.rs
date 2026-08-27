@@ -129,30 +129,35 @@ impl AmdSignal {
     /// Early-exit on fault is load-bearing for BEAM search: a bad kernel config
     /// may fault the GPU, and paying the full timeout per rejected candidate is
     /// unaffordable.
-    fn poll_until(&self, ready: impl Fn(u64) -> bool, timeout_ms: u64, what: &'static str) -> Result<()> {
+    fn poll_until(&self, target: u64, timeout_ms: u64, what: &'static str, progress: &[Arc<AmdSignal>]) -> Result<()> {
         let mut start = std::time::Instant::now();
         let mut prev = u64::MAX;
+        let mut progress_values = vec![u64::MAX; progress.len()];
         loop {
             if let Some(error) = self.device.upgrade().and_then(|device| device.poison_error()) {
                 return Err(error);
             }
             let v = self.load();
-            if ready(v) {
+            if v >= target {
                 return Ok(());
             }
-            if v != prev {
-                prev = v; // progress: timeout is for *no* progress, so reset.
+            let mut advanced = v != prev;
+            prev = v;
+            for (signal, previous) in progress.iter().zip(&mut progress_values) {
+                let value = signal.load();
+                advanced |= value != *previous;
+                *previous = value;
+            }
+            if advanced {
                 start = std::time::Instant::now();
             }
             if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
                 // A hung kernel almost always raised a fault; surface it
                 // alongside the deadline.
                 let fault = self.device.upgrade().and_then(|d| d.poll_faults_nonblocking());
-                // The wait predicate is opaque here, so `target` is reported as
-                // 0 and `what` names the operation.
                 return Err(fault.unwrap_or(Error::TimelineTimeout {
                     what,
-                    target: 0,
+                    target,
                     current: v,
                     waited_ms: timeout_ms,
                 }));
@@ -166,7 +171,16 @@ impl AmdSignal {
     /// Spin-wait until the value is ≥ `target` (increment convention — SDMA
     /// fence / monotonic timeline writes a literal increasing value).
     pub(crate) fn wait_signal_value(&self, target: u64, timeout_ms: u64) -> Result<()> {
-        self.poll_until(|v| v >= target, timeout_ms, "wait_signal_value")
+        self.poll_until(target, timeout_ms, "wait_signal_value", &[])
+    }
+
+    pub(crate) fn wait_signal_value_with_progress(
+        &self,
+        target: u64,
+        timeout_ms: u64,
+        progress: &[Arc<AmdSignal>],
+    ) -> Result<()> {
+        self.poll_until(target, timeout_ms, "wait_signal_value", progress)
     }
 
     /// CP-written dispatch timestamps in nanoseconds, valid only after the
@@ -347,7 +361,7 @@ impl TimelineSignal for AmdSignal {
     fn wait(&self, target: u64, timeout_ms: u64) -> Result<()> {
         // Tiered strategy (spin → yield → KFD WAIT_EVENTS sleep) + fault
         // surfacing live in the shared `poll_until` helper.
-        self.poll_until(|v| v >= target, timeout_ms, "wait")
+        self.poll_until(target, timeout_ms, "wait", &[])
     }
 }
 

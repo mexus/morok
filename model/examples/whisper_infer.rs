@@ -16,7 +16,8 @@
 //!   --task       transcribe or translate (default: transcribe)
 //!   --profile    Run and print a separate per-stage GPU profile
 //!   --timestamps Print word timestamps
-//!   --repo       HF Hub repo (default: openai/whisper-{size})
+//!   --repo       HF Hub repo (default: vpermilp/whisper)
+//!   --revision   HF Hub revision (default: main)
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -46,9 +47,21 @@ struct Args {
     #[arg(long, default_value = "tiny")]
     size: String,
 
-    /// HF Hub repo override (default: openai/whisper-{size}).
+    /// HF Hub repo override (default: vpermilp/whisper).
     #[arg(long)]
     repo: Option<String>,
+
+    /// HF Hub branch, tag, or commit (default: model size, or main with --repo).
+    #[arg(long)]
+    revision: Option<String>,
+
+    /// Local checkpoint directory, overriding --repo and --revision.
+    #[arg(long)]
+    model_dir: Option<PathBuf>,
+
+    /// Safetensors filename within the repository or local directory.
+    #[arg(long, default_value = "model.safetensors")]
+    weights: String,
 
     /// Spoken language code, or "auto" to detect.
     #[arg(long, default_value = "auto")]
@@ -117,9 +130,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("WAV is {sample_rate} Hz; Whisper expects {} Hz", SAMPLE_RATE).into());
     }
 
-    let repo = args.repo.clone().unwrap_or_else(|| format!("openai/whisper-{}", size.name()));
-    println!("\nLoading Whisper from {repo} ...");
-    let model = Whisper::from_hub(&repo, "main", svod_model::whisper::ModelDimensions::for_size(size))?;
+    let dims = svod_model::whisper::ModelDimensions::for_size(size);
+    let model = if let Some(model_dir) = &args.model_dir {
+        println!("\nLoading Whisper from {} ...", model_dir.display());
+        Whisper::from_dir_with_weights(model_dir, &args.weights, dims)?
+    } else {
+        let repo = args.repo.clone().unwrap_or_else(|| "vpermilp/whisper".to_string());
+        let revision =
+            args.revision.as_deref().unwrap_or_else(|| if args.repo.is_some() { "main" } else { size.name() });
+        println!("\nLoading Whisper from {repo}@{revision} ...");
+        Whisper::from_hub_with_weights(&repo, revision, &args.weights, dims)?
+    };
 
     let multilingual = model.is_multilingual();
     let num_languages = model.dims.num_languages();
@@ -182,7 +203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nRunning separate profiling pass (excluded from RTF)...");
         let profiled = asr.transcribe(&waveform, RunOptions { profile: true, ..Default::default() })?;
         if let Some(profile) = &profiled.profile {
-            println!("\n--- Profile ---\n{profile}");
+            println!("\n--- Profile ---\n{}", profile.render_table());
             for stage in &profile.stages {
                 if !stage.meta.is_empty() {
                     println!("{} metadata:", stage.name);

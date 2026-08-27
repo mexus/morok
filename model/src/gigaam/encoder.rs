@@ -1,6 +1,6 @@
 use ndarray::Array4;
 use snafu::ResultExt;
-use svod_dtype::DType;
+use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
@@ -37,6 +37,35 @@ fn build_rope_cache(config: &GigaAmConfig) -> (Tensor, Tensor) {
 }
 
 type Result<T> = super::Result<T>;
+
+#[derive(Clone)]
+pub struct DynamicQuantization {
+    pub weight_scale: Tensor,
+}
+
+fn load_dynamic_quantization(
+    sd: &StateDict,
+    weight: &Tensor,
+    weight_scale_key: &str,
+) -> std::result::Result<Option<DynamicQuantization>, state::Error> {
+    if !weight.uop().dtype().is_signed() {
+        return Ok(None);
+    }
+    Ok(Some(DynamicQuantization { weight_scale: get_tensor(sd, weight_scale_key)? }))
+}
+
+fn linear(x: &Tensor, weight: &Tensor, bias: &Tensor, quantization: Option<&DynamicQuantization>) -> Result<Tensor> {
+    match quantization {
+        Some(quantization) => x
+            .dynamic_quantized_linear()
+            .weight(weight)
+            .weight_scale(&quantization.weight_scale)
+            .bias(bias)
+            .call()
+            .context(TensorSnafu),
+        None => x.linear().weight(weight).bias(bias).call().context(TensorSnafu),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LayerNormWeights
@@ -88,6 +117,8 @@ pub struct FeedForward {
     pub linear1_bias: Tensor,
     pub linear2_weight: Tensor,
     pub linear2_bias: Tensor,
+    pub linear1_quantization: Option<DynamicQuantization>,
+    pub linear2_quantization: Option<DynamicQuantization>,
 }
 
 impl FeedForward {
@@ -99,6 +130,8 @@ impl FeedForward {
             linear1_bias: fan_in_uniform(&[d_ff], d, DType::Float32),
             linear2_weight: fan_in_uniform(&[d, d_ff], d_ff, DType::Float32),
             linear2_bias: fan_in_uniform(&[d], d_ff, DType::Float32),
+            linear1_quantization: None,
+            linear2_quantization: None,
         }
     }
 
@@ -107,9 +140,9 @@ impl FeedForward {
         // to realize between them), which the generic optimizer fuses + (with BEAM)
         // tunes as well as a hand kernel — so the FFN stays plain graph ops.
         let y = self.norm.apply(x)?;
-        let y = y.linear().weight(&self.linear1_weight).bias(&self.linear1_bias).call().context(TensorSnafu)?;
+        let y = linear(&y, &self.linear1_weight, &self.linear1_bias, self.linear1_quantization.as_ref())?;
         let y = y.silu().context(TensorSnafu)?;
-        y.linear().weight(&self.linear2_weight).bias(&self.linear2_bias).call().context(TensorSnafu)
+        linear(&y, &self.linear2_weight, &self.linear2_bias, self.linear2_quantization.as_ref())
     }
 }
 
@@ -120,6 +153,12 @@ impl HasStateDict for FeedForward {
         sd.insert(prefixed(prefix, "linear1.bias"), self.linear1_bias.clone());
         sd.insert(prefixed(prefix, "linear2.weight"), self.linear2_weight.clone());
         sd.insert(prefixed(prefix, "linear2.bias"), self.linear2_bias.clone());
+        if let Some(quantization) = &self.linear1_quantization {
+            sd.insert(prefixed(prefix, "linear1.weight_scale"), quantization.weight_scale.clone());
+        }
+        if let Some(quantization) = &self.linear2_quantization {
+            sd.insert(prefixed(prefix, "linear2.weight_scale"), quantization.weight_scale.clone());
+        }
         sd
     }
 
@@ -129,6 +168,10 @@ impl HasStateDict for FeedForward {
         self.linear1_bias = get_tensor(sd, &prefixed(prefix, "linear1.bias"))?;
         self.linear2_weight = get_tensor(sd, &prefixed(prefix, "linear2.weight"))?;
         self.linear2_bias = get_tensor(sd, &prefixed(prefix, "linear2.bias"))?;
+        self.linear1_quantization =
+            load_dynamic_quantization(sd, &self.linear1_weight, &prefixed(prefix, "linear1.weight_scale"))?;
+        self.linear2_quantization =
+            load_dynamic_quantization(sd, &self.linear2_weight, &prefixed(prefix, "linear2.weight_scale"))?;
         Ok(())
     }
 }
@@ -149,6 +192,10 @@ pub struct MultiHeadSelfAttention {
     pub v_bias: Tensor,
     pub out_proj: Tensor,
     pub out_bias: Tensor,
+    pub q_quantization: Option<DynamicQuantization>,
+    pub k_quantization: Option<DynamicQuantization>,
+    pub v_quantization: Option<DynamicQuantization>,
+    pub out_quantization: Option<DynamicQuantization>,
     pub n_heads: usize,
     pub d_model: usize,
 }
@@ -166,6 +213,10 @@ impl MultiHeadSelfAttention {
             v_bias: fan_in_uniform(&[d], d, DType::Float32),
             out_proj: fan_in_uniform(&[d, d], d, DType::Float32),
             out_bias: fan_in_uniform(&[d], d, DType::Float32),
+            q_quantization: None,
+            k_quantization: None,
+            v_quantization: None,
+            out_quantization: None,
             n_heads: config.n_heads,
             d_model: d,
         }
@@ -206,9 +257,9 @@ impl MultiHeadSelfAttention {
             .context(TensorSnafu)?
             .contiguous();
 
-        let q = qk_input.linear().weight(&self.q_proj).bias(&self.q_bias).call().context(TensorSnafu)?;
-        let k = qk_input.linear().weight(&self.k_proj).bias(&self.k_bias).call().context(TensorSnafu)?;
-        let v = y.linear().weight(&self.v_proj).bias(&self.v_bias).call().context(TensorSnafu)?;
+        let q = linear(&qk_input, &self.q_proj, &self.q_bias, self.q_quantization.as_ref())?;
+        let k = linear(&qk_input, &self.k_proj, &self.k_bias, self.k_quantization.as_ref())?;
+        let v = linear(&y, &self.v_proj, &self.v_bias, self.v_quantization.as_ref())?;
 
         // Head-split into `[B, T, H, d_k]` — the layout `flash_attention_with`
         // consumes directly (seq second, head third, head_dim last). No
@@ -220,14 +271,18 @@ impl MultiHeadSelfAttention {
 
         // The hand FA kernel when it applies (AMD + tiling shape), else this model's
         // own SDPA — tk no longer falls back silently; the policy lives here.
-        let attn = match svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens })
-            .context(TkSnafu)?
-        {
-            Some(out) => out,
-            None => sdpa_attention(&q, &k, &v, key_lens)?,
+        let attn = if matches!(q.uop().dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16) {
+            match svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens })
+                .context(TkSnafu)?
+            {
+                Some(out) => out,
+                None => sdpa_attention(&q, &k, &v, key_lens)?,
+            }
+        } else {
+            sdpa_attention(&q, &k, &v, key_lens)?
         };
         let out = merge_heads(&attn, b, t, d_model)?;
-        out.linear().weight(&self.out_proj).bias(&self.out_bias).call().context(TensorSnafu)
+        linear(&out, &self.out_proj, &self.out_bias, self.out_quantization.as_ref())
     }
 }
 
@@ -281,12 +336,26 @@ impl HasStateDict for MultiHeadSelfAttention {
     fn state_dict(&self, prefix: &str) -> StateDict {
         let mut sd = self.norm.state_dict(&prefixed(prefix, "norm"));
         state_field!(sd, prefix, self, [q_proj, q_bias, k_proj, k_bias, v_proj, v_bias, out_proj, out_bias]);
+        for (name, quantization) in [
+            ("q", &self.q_quantization),
+            ("k", &self.k_quantization),
+            ("v", &self.v_quantization),
+            ("out", &self.out_quantization),
+        ] {
+            if let Some(quantization) = quantization {
+                sd.insert(prefixed(prefix, &format!("{name}_weight_scale")), quantization.weight_scale.clone());
+            }
+        }
         sd
     }
 
     fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), crate::state::Error> {
         self.norm.load_state_dict(sd, &prefixed(prefix, "norm"))?;
         load_state_field!(self, sd, prefix, [q_proj, q_bias, k_proj, k_bias, v_proj, v_bias, out_proj, out_bias]);
+        self.q_quantization = load_dynamic_quantization(sd, &self.q_proj, &prefixed(prefix, "q_weight_scale"))?;
+        self.k_quantization = load_dynamic_quantization(sd, &self.k_proj, &prefixed(prefix, "k_weight_scale"))?;
+        self.v_quantization = load_dynamic_quantization(sd, &self.v_proj, &prefixed(prefix, "v_weight_scale"))?;
+        self.out_quantization = load_dynamic_quantization(sd, &self.out_proj, &prefixed(prefix, "out_weight_scale"))?;
         Ok(())
     }
 }
@@ -805,10 +874,10 @@ impl Encoder {
         let mel_shape = mel.shape().context(TensorSnafu)?;
         let b = mel_shape[0].clone();
 
-        let lengths = lengths.cast(DType::Index).context(TensorSnafu)?;
+        let lengths = lengths.cast(DType::Int32).context(TensorSnafu)?;
 
-        let two_t = Tensor::const_(2i64, DType::Index);
-        let one_t = Tensor::const_(1i64, DType::Index);
+        let two_t = Tensor::const_(2i32, DType::Int32);
+        let one_t = Tensor::const_(1i32, DType::Int32);
 
         let mut lengths_sub = lengths;
         for _ in 0..2 {
@@ -823,13 +892,13 @@ impl Encoder {
         let t_sub = shape[1].clone();
 
         // `key_lens` = subsampled valid-frame counts as a realized `[B]` `i32`
-        // tensor — attention's key-only padding mask. Keep the `Index`-typed
-        // `lengths_sub` for the `pad_valid` comparison (the conv `pad_mask`).
+        // tensor — attention's key-only padding mask. Keep `lengths_sub` in the
+        // same concrete dtype for the `pad_valid` comparison (the conv `pad_mask`).
         let key_lens =
             lengths_sub.cast(DType::Int32).context(TensorSnafu)?.try_reshape([b.clone()]).context(TensorSnafu)?;
 
         let range = Tensor::arange(self.max_encoder_frames as i64, None, None).context(TensorSnafu)?;
-        let range = range.cast(DType::Index).context(TensorSnafu)?;
+        let range = range.cast(DType::Int32).context(TensorSnafu)?;
         let range = range.try_shrink([(SInt::Const(0), t_sub.clone())]).context(TensorSnafu)?;
         let range = range.try_reshape([SInt::Const(1), t_sub.clone()]).context(TensorSnafu)?;
         let lens = lengths_sub;

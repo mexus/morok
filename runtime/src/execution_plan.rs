@@ -1384,9 +1384,9 @@ impl ExecutionPlan {
         self.poison_hcq(result)
     }
 
-    /// Profile the plan: run the per-dispatch path `opts.iters` times, keeping
-    /// each kernel's minimum device time (robust to outliers). Returns a
-    /// single-stage [`RunProfile`]; render it with [`RunProfile::render_table`].
+    /// Profile the plan: run the per-dispatch path `opts.iters.max(1)` times,
+    /// keeping each kernel's minimum device time (robust to outliers). Returns
+    /// a single-stage [`RunProfile`]; render it with [`RunProfile::render_table`].
     ///
     /// Tier-2/3 static analysis (`opts.static_analysis`) and Tier-4 hardware
     /// counters (`opts.counters`) attach to each [`KernelProfile`] when enabled.
@@ -1421,16 +1421,21 @@ impl ExecutionPlan {
             }
         };
         // Each pass is one "profile" stage; merge passes by per-kernel min time.
-        let run = |kernels| RunProfile { stages: vec![StageProfile::gpu("profile", start.elapsed(), kernels)] };
-        let mut report = run(self.execute_profiled()?);
-        for _ in 1..opts.iters {
-            report.merge_min(run(self.execute_profiled()?));
-        }
+        // Match from_env(): zero iterations still means one profiling pass.
+        let result: Result<RunProfile> = (|| {
+            let run = |kernels| RunProfile { stages: vec![StageProfile::gpu("profile", start.elapsed(), kernels)] };
+            let mut report = run(self.execute_profiled()?);
+            for _ in 1..opts.iters.max(1) {
+                report.merge_min(run(self.execute_profiled()?));
+            }
+            Ok(report)
+        })();
         // Disarm so later non-profiled executions on this context don't pay for
         // (or perturb from) counter programming.
         if let Some(ctx) = armed_ctx {
             ctx.set_pmc(&[]);
         }
+        let mut report = result?;
         if opts.static_analysis {
             // Profiles are in dispatch order; the compiled kernels in op_levels
             // order line up one-to-one, so zip attaches each kernel's analysis.

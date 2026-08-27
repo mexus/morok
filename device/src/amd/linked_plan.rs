@@ -17,9 +17,15 @@ use crate::hcq::{
     SubmissionTimelines, SystemField, SystemPatchValues,
 };
 
-pub(crate) fn native_topology_decline(plan: &SemanticLinkedPlan) -> Option<crate::device::NativeReplayDecline> {
+pub(crate) fn native_topology_decline(
+    plan: &SemanticLinkedPlan,
+    has_copy_queue: bool,
+) -> Option<crate::device::NativeReplayDecline> {
     if let Some(operation) = plan.staged_copy() {
         return Some(crate::device::NativeReplayDecline::StagedCopy { operation });
+    }
+    if !has_copy_queue && plan.lanes().iter().any(|submission| matches!(submission.lane.queue, QueueKind::Copy(_))) {
+        return Some(crate::device::NativeReplayDecline::BackendUnsupported);
     }
     let mut devices = plan.lanes().iter().map(|submission| &submission.lane.device);
     let expected = devices.next()?.clone();
@@ -518,7 +524,9 @@ impl AmdLinkedPlan {
                     .find(|signal| signal.value_addr() == final_point.signal_address)
                     .unwrap()
                     .clone();
-                let finalizer = SubmissionFinalizer::prepared_timeline(signal, final_point.value);
+                let progress =
+                    self._signals.iter().filter(|candidate| !Arc::ptr_eq(candidate, &signal)).cloned().collect();
+                let finalizer = SubmissionFinalizer::prepared_timeline(signal, final_point.value, progress);
                 lane.register_inflight(Arc::clone(&finalizer));
                 Some(finalizer)
             } else {
@@ -582,7 +590,18 @@ mod tests {
             commands: vec![TopologyCommand { operation: 4, copy_leg: Some(CopyLeg::ToHost) }],
             signal_value: 1,
         }]);
-        assert_eq!(native_topology_decline(&semantic), Some(NativeReplayDecline::StagedCopy { operation: 4 }));
+        assert_eq!(native_topology_decline(&semantic, true), Some(NativeReplayDecline::StagedCopy { operation: 4 }));
+    }
+
+    #[test]
+    fn native_topology_rejects_copy_without_hardware_queue() {
+        let semantic = plan(vec![LaneSubmission {
+            lane: DeviceQueue { device: DeviceSpec::Amd { device_id: 0 }, queue: QueueKind::Copy(0) },
+            waits: vec![],
+            commands: vec![TopologyCommand { operation: 4, copy_leg: None }],
+            signal_value: 1,
+        }]);
+        assert_eq!(native_topology_decline(&semantic, false), Some(NativeReplayDecline::BackendUnsupported));
     }
 
     #[test]
@@ -602,7 +621,7 @@ mod tests {
             },
         ]);
         assert!(matches!(
-            native_topology_decline(&semantic),
+            native_topology_decline(&semantic, true),
             Some(NativeReplayDecline::MixedComputeDevices {
                 expected: DeviceSpec::Amd { device_id: 0 },
                 actual: DeviceSpec::Amd { device_id: 1 },

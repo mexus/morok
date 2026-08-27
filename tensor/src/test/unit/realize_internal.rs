@@ -2,6 +2,19 @@ use super::*;
 use smallvec::SmallVec;
 use svod_dtype::DType;
 
+#[test]
+fn beam_behavior_fingerprint_ignores_parallelism() {
+    let base = svod_schedule::OptimizerConfig::default();
+    let mut parallel = base.clone();
+    parallel.beam.compile_workers += 7;
+    parallel.beam.max_tasks_per_child += 9;
+    assert_eq!(post_optimizer_behavior_fingerprint(&base), post_optimizer_behavior_fingerprint(&parallel));
+
+    let mut semantic_change = base.clone();
+    semantic_change.transcendental += 1;
+    assert_ne!(post_optimizer_behavior_fingerprint(&base), post_optimizer_behavior_fingerprint(&semantic_change));
+}
+
 fn cpu_buffer(numel: usize) -> Arc<svod_device::Buffer> {
     let allocator = svod_device::registry::cpu().expect("cpu allocator");
     Arc::new(svod_device::Buffer::new(allocator, DType::Float32, vec![numel], Default::default()))

@@ -234,6 +234,28 @@ impl Compiler for ClangCompiler {
     fn cache_key(&self) -> &str {
         &self.cache_key
     }
+
+    fn start_compile_process(&self, spec: &ProgramSpec) -> Result<Option<svod_device::device::CompilerProcessTask>> {
+        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
+        if let Some(cache) = &self.cache
+            && let Some(bytes) =
+                cache.get_validated(&key, |bytes| validate_c_object(bytes, &spec.name)).map_err(runtime_as_device)?
+        {
+            return Ok(Some(svod_device::device::CompilerProcessTask::Ready(bytes)));
+        }
+        let process = crate::clang::spawn_compile_process(&self.toolchain, &spec.src, &self.flags)?;
+        Ok(Some(svod_device::device::CompilerProcessTask::Spawned(process)))
+    }
+
+    fn finish_compile_process(&self, spec: &ProgramSpec, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
+        if let Some(cache) = &self.cache {
+            cache.publish_compiled(&key, bytes, |bytes| validate_c_object(bytes, &spec.name)).map_err(runtime_as_device)
+        } else {
+            validate_c_object(&bytes, &spec.name).map_err(runtime_as_device)?;
+            Ok(bytes)
+        }
+    }
 }
 
 /// Runtime factory for creating Clang programs.
@@ -313,6 +335,34 @@ impl Compiler for LlvmCompiler {
     fn cache_key(&self) -> &str {
         &self.cache_key
     }
+
+    fn start_compile_process(
+        &self,
+        spec: &svod_device::device::ProgramSpec,
+    ) -> Result<Option<svod_device::device::CompilerProcessTask>> {
+        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
+        if let Some(cache) = &self.cache
+            && let Some(bytes) = cache
+                .get_validated(&key, |bytes| crate::clang::validate_relocatable_object(bytes, &spec.name))
+                .map_err(runtime_as_device)?
+        {
+            return Ok(Some(svod_device::device::CompilerProcessTask::Ready(bytes)));
+        }
+        let process = crate::clang::spawn_compile_process(&self.toolchain, &spec.src, &self.flags)?;
+        Ok(Some(svod_device::device::CompilerProcessTask::Spawned(process)))
+    }
+
+    fn finish_compile_process(&self, spec: &svod_device::device::ProgramSpec, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
+        if let Some(cache) = &self.cache {
+            cache
+                .publish_compiled(&key, bytes, |bytes| crate::clang::validate_relocatable_object(bytes, &spec.name))
+                .map_err(runtime_as_device)
+        } else {
+            crate::clang::validate_relocatable_object(&bytes, &spec.name).map_err(runtime_as_device)?;
+            Ok(bytes)
+        }
+    }
 }
 
 /// LLVM renderer wrapper implementing the Renderer trait.
@@ -379,7 +429,18 @@ pub fn create_cpu_device(registry: &DeviceRegistry) -> Result<Device> {
 pub fn create_cpu_device_with_backend(registry: &DeviceRegistry, backend: CpuBackend) -> Result<Device> {
     let device_spec = DeviceSpec::Cpu;
     let allocator = registry.get(&device_spec)?;
+    let (renderer, compiler) = create_cpu_codegen(backend)?;
+    let runtime: RuntimeFactory = match backend {
+        CpuBackend::Clang => Arc::new(create_clang_program),
+        CpuBackend::Llvm => Arc::new(create_llvm_program),
+    };
+    Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
+}
 
+/// Construct CPU renderer/compiler components without creating an allocator or
+/// executable runtime. Clean BEAM workers use this device-disabled path.
+pub fn create_cpu_codegen(backend: CpuBackend) -> Result<(Arc<dyn Renderer>, Arc<dyn Compiler>)> {
+    let device_spec = DeviceSpec::Cpu;
     match backend {
         CpuBackend::Clang => {
             let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
@@ -404,10 +465,10 @@ pub fn create_cpu_device_with_backend(registry: &DeviceRegistry, backend: CpuBac
                 },
             };
             let cache_key = identity.cache_key();
-            let renderer = Arc::new(ClangRendererWrapper { device: device_spec.clone() });
-            let compiler = Arc::new(ClangCompiler { cache, toolchain, flags, identity, cache_key });
-            let runtime: RuntimeFactory = Arc::new(create_clang_program);
-            Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
+            Ok((
+                Arc::new(ClangRendererWrapper { device: device_spec }),
+                Arc::new(ClangCompiler { cache, toolchain, flags, identity, cache_key }),
+            ))
         }
         CpuBackend::Llvm => {
             let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
@@ -428,10 +489,10 @@ pub fn create_cpu_device_with_backend(registry: &DeviceRegistry, backend: CpuBac
                 object_format: "elf-relocatable-svod-jit-loader-v1".into(),
             };
             let cache_key = identity.cache_key();
-            let renderer = Arc::new(LlvmRendererWrapper { device: device_spec.clone() });
-            let compiler = Arc::new(LlvmCompiler { cache, toolchain, flags, identity, cache_key });
-            let runtime: RuntimeFactory = Arc::new(create_llvm_program);
-            Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
+            Ok((
+                Arc::new(LlvmRendererWrapper { device: device_spec }),
+                Arc::new(LlvmCompiler { cache, toolchain, flags, identity, cache_key }),
+            ))
         }
     }
 }
