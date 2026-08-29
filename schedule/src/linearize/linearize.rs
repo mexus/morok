@@ -518,10 +518,33 @@ fn partial_tuplize_cmp(
     partial_tuplize_ref_cmp(PartialTuplizeRef::Node(left.clone()), PartialTuplizeRef::Node(right.clone()), cache)
 }
 
+/// Upper bound on the memo below. A rewrite run over one model reaches a few
+/// thousand distinct pairs; the cap only bounds a long-lived worker thread.
+const TUPLIZE_CMP_MEMO_CAP: usize = 1 << 16;
+
+thread_local! {
+    /// Cross-call memo for [`tinygrad_tuplize_cmp`]. Tinygrad gets this for
+    /// free: `tuplize` is a `cached_property` on the UOp (`uop/ops.py:187-189`),
+    /// so a comparison walks each node's key once per process. Ours rebuilt the
+    /// whole comparison from scratch on every call, and the caller is a rewrite
+    /// pattern (`symbolic/patterns.rs:692`) that runs per candidate node.
+    ///
+    /// Keyed by UOp id pairs, which is sound because ids are monotonic and
+    /// never reused (`ir/src/uop/hash_consing.rs:46-52`), so a verdict for a
+    /// pair stays true for the life of the process.
+    static TUPLIZE_CMP_MEMO: std::cell::RefCell<HashMap<(u64, u64), Option<Ordering>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
 /// Compare pinned Tinygrad `(op, arg, dtype, *src.tuplize)` keys without
 /// inventing an order for Python-incomparable or Svod-only values.
 pub(crate) fn tinygrad_tuplize_cmp(left: &Arc<UOp>, right: &Arc<UOp>) -> Option<Ordering> {
-    partial_tuplize_cmp(left, right, &mut HashMap::new())
+    TUPLIZE_CMP_MEMO.with_borrow_mut(|memo| {
+        if memo.len() >= TUPLIZE_CMP_MEMO_CAP {
+            memo.clear();
+        }
+        partial_tuplize_cmp(left, right, memo)
+    })
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
