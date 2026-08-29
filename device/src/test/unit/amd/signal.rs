@@ -137,3 +137,31 @@ fn mock_signal_pool_construction_failure_and_drop_balance_backing() {
     assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (1, 1, 0));
     assert!(iface.free_issues().is_empty());
 }
+
+#[test]
+fn mock_signal_pool_grows_a_chunk_and_releases_unwound_slots() {
+    let iface = Arc::new(MockAmdIface::default());
+    let device = iface.device();
+    let allocator = AmdAllocator { dev: device, device_id: 0 };
+    let pool = SignalPool::new(&allocator, 64).unwrap();
+    let capacity = pool.capacity();
+    let held = (0..capacity).map(|_| pool.acquire().expect("slot")).collect::<Vec<_>>();
+    assert_eq!((pool.free(), iface.allocation_count()), (0, 1));
+
+    // Exhaustion carves another chunk instead of erroring (tinygrad
+    // `HCQCompiled.new_signal`, support/hcq.py:452-458).
+    let extra = pool.acquire().expect("exhausted pool must grow");
+    assert_eq!((pool.capacity(), iface.allocation_count(), pool.free()), (capacity * 2, 2, capacity - 1));
+
+    // A panic unwind still returns its slot; only a poisoned device retains one.
+    let free_before = pool.free();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _signal = pool.acquire().expect("slot");
+        panic!("scripted signal abandonment");
+    }));
+    assert!(result.is_err());
+    assert_eq!(pool.free(), free_before);
+
+    drop((extra, held));
+    assert_eq!(pool.free(), pool.capacity());
+}

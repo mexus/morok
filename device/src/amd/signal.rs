@@ -245,8 +245,14 @@ impl std::fmt::Debug for AmdSignal {
 }
 
 impl Drop for AmdSignal {
+    /// Tinygrad's `HCQSignal.__del__` (`support/hcq.py:250-251`) returns the
+    /// slot unconditionally, and so does this — leaking a slot on every caught
+    /// panic drains the pool for no benefit, and the slot is host memory.
+    ///
+    /// Documented divergence: a poisoned device may still have a wedged command
+    /// processor writing this slot, so a poisoned device never recycles slots.
     fn drop(&mut self) {
-        if std::thread::panicking() || self.device.upgrade().is_some_and(|device| device.is_poisoned()) {
+        if self.device.upgrade().is_some_and(|device| device.is_poisoned()) {
             return;
         }
         if let Some(pool) = self.pool.upgrade() {
@@ -365,25 +371,41 @@ impl TimelineSignal for AmdSignal {
     }
 }
 
-/// Pool over a shared host-visible GTT region (one or more pages); hands out
-/// [`AmdSignal`]s. Sized at construction: a flat per-owner model needs only a
-/// handful, but DAG dispatch reserves one slot per kernel of the largest
-/// captured graph (low hundreds for GigaAM), so the pool spans several pages.
-pub struct SignalPool {
-    /// Owning buffer — held to keep the GTT mapping alive while signals exist.
-    _buffer: RawBuffer,
+/// One GTT-backed run of `chunk_slots` consecutive signal slots.
+struct SignalChunk {
+    buffer: RawBuffer,
     base_gpu: u64,
     base_host: NonNull<u8>,
-    /// Total slots carved from the region (rounded up to whole pages).
-    slots: usize,
-    free_slots: Mutex<Vec<u32>>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    chunks: Vec<SignalChunk>,
+    free_slots: Vec<u32>,
+}
+
+/// Pool over host-visible GTT chunks; hands out [`AmdSignal`]s. A flat
+/// per-owner model needs only a handful of slots, but DAG dispatch reserves one
+/// per kernel of the largest captured graph (low hundreds for GigaAM), so the
+/// initial chunk spans several pages and exhaustion grows another chunk rather
+/// than failing (tinygrad `HCQCompiled.new_signal`, `support/hcq.py:452-458`).
+///
+/// Slot ids are a flat numbering across chunks: chunk `i` owns
+/// `i * chunk_slots .. (i + 1) * chunk_slots`, so a released slot needs no
+/// chunk bookkeeping.
+pub struct SignalPool {
+    /// Used to carve additional chunks on exhaustion. Its `Arc<AmdDevice>` is
+    /// the same one every chunk's `RawBuffer` already holds.
+    allocator: AmdAllocator,
+    chunk_slots: usize,
+    state: Mutex<PoolState>,
     /// Captured at pool creation; signals downgrade-clone this into a `Weak`
     /// so `wait` can call `AmdDeviceCore::wait_events` for KFD escalation.
     device: Arc<AmdDeviceCore>,
 }
 
-// SAFETY: AtomicU64 covers concurrent reads/writes through `base_host`;
-// `free_slots` is mutex-protected; `_buffer` is owned and not aliased.
+// SAFETY: AtomicU64 covers concurrent reads/writes through a chunk's
+// `base_host`; chunks and free slots are mutex-protected and not aliased.
 unsafe impl Send for SignalPool {}
 unsafe impl Sync for SignalPool {}
 
@@ -393,50 +415,66 @@ impl Drop for SignalPool {
             return;
         }
         if let Err(error) = self.device.synchronize_all() {
-            tracing::warn!(?error, "SignalPool drop: backing allocation quarantined");
+            tracing::warn!(?error, "SignalPool drop: backing allocations quarantined");
             return;
         }
-        self._buffer.free_amd_device_in_place();
+        for chunk in &self.state.get_mut().chunks {
+            chunk.buffer.free_amd_device_in_place();
+        }
     }
 }
 
 impl SignalPool {
-    /// Allocate the backing GTT page from `allocator` and partition it.
+    /// Allocate the first GTT chunk from `allocator` and partition it.
     ///
     /// Critical: the signal page must be **GTT-coherent + uncached** so that
     /// the GPU's decrement of the completion_signal field is immediately
     /// visible to the host (otherwise it sits in GPU L2 and we spin
     /// forever).
     pub fn new(allocator: &AmdAllocator, slots: usize) -> Result<Arc<Self>> {
-        // Round up to a whole page so the GTT allocation is page-aligned and
+        // Round up to a whole page so every GTT allocation is page-aligned and
         // every byte is usable as a slot.
-        let slots = slots.max(1).next_multiple_of(SLOTS_PER_PAGE);
+        let pool = Arc::new(Self {
+            allocator: AmdAllocator { dev: Arc::clone(&allocator.dev), device_id: allocator.device_id },
+            chunk_slots: slots.max(1).next_multiple_of(SLOTS_PER_PAGE),
+            state: Mutex::new(PoolState::default()),
+            device: Arc::clone(allocator.dev.core()),
+        });
+        pool.grow(&mut pool.state.lock())?;
+        Ok(pool)
+    }
+
+    /// Append one more chunk's worth of slots. The caller holds `state`.
+    fn grow(&self, state: &mut PoolState) -> Result<()> {
         let buffer = AmdBufferGuard::new(
-            allocator.alloc_uncached_tagged(SLOT_BYTES * slots, crate::amd::va_registry::AllocTag::SignalPool)?,
+            self.allocator
+                .alloc_uncached_tagged(SLOT_BYTES * self.chunk_slots, crate::amd::va_registry::AllocTag::SignalPool)?,
         );
         let (base_gpu, base_host) = match buffer.buffer() {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-            _ => {
-                return Err(Error::NotHostVisible { what: "SignalPool" });
-            }
+            _ => return Err(Error::NotHostVisible { what: "SignalPool" }),
         };
-        let free_slots = Mutex::new((0..slots as u32).rev().collect()); // pop low slots first
-        let device = Arc::clone(allocator.dev.core());
-        Ok(Arc::new(Self { _buffer: buffer.into_inner(), base_gpu, base_host, slots, free_slots, device }))
+        let first = (state.chunks.len() * self.chunk_slots) as u32;
+        state.chunks.push(SignalChunk { buffer: buffer.into_inner(), base_gpu, base_host });
+        // Pop low slots first.
+        state.free_slots.extend((first..first + self.chunk_slots as u32).rev());
+        Ok(())
     }
 
-    /// Carve off a new signal from the pool. Returns `Err` when exhausted.
+    /// Carve off a new signal, growing the pool when every slot is in use.
     pub fn acquire(self: &Arc<Self>) -> Result<AmdSignal> {
-        let slot = self.free_slots.lock().pop().ok_or_else(|| Error::AmdAllocFailed {
-            reason: format!("SignalPool exhausted ({} slots in use)", self.slots),
-        })?;
-        let offset = slot as usize * SLOT_BYTES;
-        let base_gpu = self.base_gpu + offset as u64;
-        let base_host = self.base_host.as_ptr();
+        let mut state = self.state.lock();
+        if state.free_slots.is_empty() {
+            self.grow(&mut state)?;
+        }
+        let slot = state.free_slots.pop().expect("a grown pool has free slots");
+        let chunk = &state.chunks[slot as usize / self.chunk_slots];
+        let offset = (slot as usize % self.chunk_slots) * SLOT_BYTES;
+        let base_gpu = chunk.base_gpu + offset as u64;
         // Lay out the amd_signal_t: zero the 64-byte slot, then set kind=USER so
         // the AQL packet processor treats it as a value signal, value stays 0.
-        // SAFETY: offset + SLOT_BYTES <= page size by construction.
-        let slot_host = unsafe { base_host.add(offset) };
+        // SAFETY: offset + SLOT_BYTES <= the chunk size by construction.
+        let slot_host = unsafe { chunk.base_host.as_ptr().add(offset) };
         unsafe {
             std::ptr::write_bytes(slot_host, 0, SLOT_BYTES);
             std::ptr::write_volatile(
@@ -459,7 +497,7 @@ impl SignalPool {
     }
 
     fn release_slot(&self, slot: u32) {
-        self.free_slots.lock().push(slot);
+        self.state.lock().free_slots.push(slot);
     }
 
     /// Currently-free slot count. Used by graph capture to decide whether a DAG
@@ -467,17 +505,22 @@ impl SignalPool {
     /// enough headroom for per-op AQL back-pressure + PM4 counters; if not,
     /// capture falls back to blanket-BARRIER instead of starving dispatch.
     pub fn free(&self) -> usize {
-        self.free_slots.lock().len()
+        self.state.lock().free_slots.len()
+    }
+
+    /// Slots carved so far, across every chunk.
+    pub fn capacity(&self) -> usize {
+        self.state.lock().chunks.len() * self.chunk_slots
     }
 }
 
 impl std::fmt::Debug for SignalPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let free = self.free_slots.lock().len();
+        let state = self.state.lock();
         f.debug_struct("SignalPool")
-            .field("base_gpu", &format_args!("{:#x}", self.base_gpu))
-            .field("slots_total", &self.slots)
-            .field("slots_free", &free)
+            .field("chunks", &state.chunks.len())
+            .field("slots_total", &(state.chunks.len() * self.chunk_slots))
+            .field("slots_free", &state.free_slots.len())
             .finish()
     }
 }

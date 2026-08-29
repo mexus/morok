@@ -162,13 +162,17 @@ fn mock_copy_queue_construction_unwinds_ring_signal_and_staging_stages() {
         assert!(iface.free_issues().is_empty());
     }
 
+    // An exhausted signal pool grows another chunk instead of failing the queue.
     let (iface, allocator) = mock_allocator(1);
     let pool = crate::amd::signal::SignalPool::new(&allocator, 64).expect("signal pool");
-    let held = (0..64).map(|_| pool.acquire().unwrap()).collect::<Vec<_>>();
+    let held = (0..pool.capacity()).map(|_| pool.acquire().unwrap()).collect::<Vec<_>>();
     allocator.dev.core().install_signal_pool(Arc::clone(&pool));
-    assert!(AmdCopyQueue::create(&allocator).is_err());
-    assert_eq!((iface.allocation_count(), iface.free_count()), (3, 2));
-    assert_eq!((iface.queue_setup_count(), iface.queue_teardown_count()), (1, 1));
+    let queue = AmdCopyQueue::create(&allocator).expect("copy queue over a grown signal pool");
+    assert_eq!(pool.capacity(), 128);
+    assert_eq!((iface.allocation_count(), iface.free_count()), (5, 0));
+    assert_eq!((iface.queue_setup_count(), iface.queue_teardown_count()), (1, 0));
+    drop(queue);
+    assert_eq!((iface.free_count(), iface.queue_teardown_count()), (3, 1));
     drop(held);
 
     let (iface, allocator) = mock_allocator(1);
