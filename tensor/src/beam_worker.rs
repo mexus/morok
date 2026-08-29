@@ -487,22 +487,8 @@ impl WorkerPool {
             let mut progress = false;
             let mut slot = 0usize;
             while slot < self.workers.len() {
-                let timed_out = self.workers[slot]
-                    .busy
-                    .as_ref()
-                    .is_some_and(|task| !self.timeout.is_zero() && task.started.elapsed() >= self.timeout);
-                if timed_out {
-                    let task = self.workers[slot].busy.take().unwrap();
-                    finished += 1;
-                    progress = true;
-                    if std::env::var_os("BEAM_DEBUG").is_some() {
-                        eprintln!("[BEAM drop] worker_timeout candidate={}", task.index);
-                    }
-                    self.replace(slot)?;
-                    continue;
-                }
-                match self.workers[slot].responses.try_recv() {
-                    Ok(Ok(response)) => {
+                match poll_slot(&self.workers[slot].responses, self.workers[slot].busy.as_ref(), self.timeout) {
+                    SlotOutcome::Response(response) => {
                         let task = self.workers[slot].busy.take().ok_or_else(|| {
                             format!("BEAM helper returned idle response for candidate {}", response.index)
                         })?;
@@ -520,28 +506,31 @@ impl WorkerPool {
                             continue;
                         }
                     }
-                    Ok(Err(error)) => {
+                    SlotOutcome::Failed(error) => {
                         let failed = self.workers[slot].busy.take();
                         if failed.is_some() {
                             finished += 1;
                         }
                         progress = true;
                         self.replace(slot)?;
-                        if std::env::var_os("BEAM_DEBUG").is_some() {
+                        if let Some(error) = error
+                            && std::env::var_os("BEAM_DEBUG").is_some()
+                        {
                             eprintln!("[BEAM drop] worker_io: {error}");
                         }
                         continue;
                     }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        let failed = self.workers[slot].busy.take();
-                        if failed.is_some() {
-                            finished += 1;
-                        }
+                    SlotOutcome::TimedOut => {
+                        let task = self.workers[slot].busy.take().expect("timeout implies a busy task");
+                        finished += 1;
                         progress = true;
+                        if std::env::var_os("BEAM_DEBUG").is_some() {
+                            eprintln!("[BEAM drop] worker_timeout candidate={}", task.index);
+                        }
                         self.replace(slot)?;
                         continue;
                     }
-                    Err(mpsc::TryRecvError::Empty) => {}
+                    SlotOutcome::Idle => {}
                 }
                 slot += 1;
             }
@@ -552,3 +541,39 @@ impl WorkerPool {
         Ok(())
     }
 }
+
+/// What one poll of a worker slot found.
+enum SlotOutcome {
+    Response(WorkerResponse),
+    /// The helper's stdout errored or closed; `None` for a disconnected channel.
+    Failed(Option<std::io::Error>),
+    TimedOut,
+    Idle,
+}
+
+/// Drain the worker's channel first and only call it late when the channel is
+/// empty.
+///
+/// Checking the deadline first raced the reader thread: a response written
+/// exactly on the deadline was already queued, but the slot was declared timed
+/// out, the candidate was dropped, and a healthy helper was SIGKILLed and
+/// respawned.
+fn poll_slot(
+    responses: &Receiver<std::io::Result<WorkerResponse>>,
+    busy: Option<&BusyTask>,
+    timeout: Duration,
+) -> SlotOutcome {
+    match responses.try_recv() {
+        Ok(Ok(response)) => SlotOutcome::Response(response),
+        Ok(Err(error)) => SlotOutcome::Failed(Some(error)),
+        Err(mpsc::TryRecvError::Disconnected) => SlotOutcome::Failed(None),
+        Err(mpsc::TryRecvError::Empty) => match busy {
+            Some(task) if !timeout.is_zero() && task.started.elapsed() >= timeout => SlotOutcome::TimedOut,
+            _ => SlotOutcome::Idle,
+        },
+    }
+}
+
+#[cfg(test)]
+#[path = "test/unit/beam_worker.rs"]
+mod tests;
