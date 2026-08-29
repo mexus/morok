@@ -174,6 +174,20 @@ fn clang_preserves_shape_width_across_materialized_values_and_store_aliases() {
 }
 
 #[test]
+fn clang_store_width_follows_the_stored_value() {
+    let index = UOp::index()
+        .buffer(UOp::param(0, 8, DType::Float32, None))
+        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+        .call()
+        .unwrap();
+    let value = UOp::vconst(vec![ConstValue::Float(1.0); 4], DType::Float32);
+    let rendered = render_linearized(&UOp::sink(vec![index.store(value)]), Some("store_vector_through_scalar_index"))
+        .expect("render vector STORE through a scalar-width index");
+    assert!(rendered.code.contains("*((float4*)(data0 + 0"), "{}", rendered.code);
+    assert_c_compiles(&rendered.code);
+}
+
+#[test]
 fn clang_stack_dereferences_address_carrying_index_lanes() {
     let shrink = UOp::new(
         Op::Shrink {

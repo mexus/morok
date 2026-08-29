@@ -11,7 +11,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
 use super::types::{c_cast, c_dtype, c_math_fn};
-use crate::common::{access_width, format_custom_template_strict, shaped_dtype};
+use crate::common::{access_dtype, format_custom_template_strict, shaped_dtype};
 
 /// Context for C code generation, tracking variable names and SSA inlining.
 pub struct CContext {
@@ -278,7 +278,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             let idx = ctx.get(index).to_string();
             let val = ctx.get(value).to_string();
             let indent = ctx.indent();
-            let val_dtype = value.dtype().scalar_dtype().vec(access_width(index)).unwrap_or_else(|| value.dtype());
+            let val_dtype = access_dtype(index, value);
             kernel.push(format!("{indent}{} = {val};", render_access(index, &val_dtype, &idx)));
             Some(())
         }

@@ -61,6 +61,18 @@ pub fn value_width(value: &Arc<UOp>) -> usize {
     }
 }
 
+/// The dtype a memory access renders as. Its lane count is the wider of the
+/// stored value's and the address's, so a scalar-dtype address still renders a
+/// full vector access instead of truncating the value to one lane.
+pub fn access_dtype(index: &Arc<UOp>, value: &Arc<UOp>) -> DType {
+    let width = value_width(value).max(access_width(index));
+    if width > 1 {
+        value.dtype().scalar_dtype().vec(width).expect("grouped access dtype must be vectorizable")
+    } else {
+        value.dtype()
+    }
+}
+
 /// The dtype a value renders as: its scalar dtype widened to [`value_width`].
 pub fn shaped_dtype(value: &Arc<UOp>) -> DType {
     let count = value_width(value);
