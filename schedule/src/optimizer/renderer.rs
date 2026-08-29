@@ -774,14 +774,6 @@ pub struct TensorCore {
     /// per K iteration to compute a grid of output tiles simultaneously.
     /// Default is (1, 1) for single-tile operation.
     pub tile_grid: (usize, usize),
-
-    /// Whether the hand-coded heuristics may auto-pick this core.
-    ///
-    /// `false` keeps it BEAM-only: candidates whose matrix-op rate does not
-    /// beat the packed-vector rate (CDNA3 fp32 MFMA = 256 FLOP/CU/cycle ==
-    /// `v_pk_fma_f32`) only win when measured against a vector kernel, so the
-    /// unconditional heuristic pick must skip them.
-    pub heuristic_pick: bool,
 }
 
 // ============================================================================
@@ -825,13 +817,7 @@ impl TcConfig {
                 ),
             ),
             tile_grid: self.tile_grid,
-            heuristic_pick: true,
         }
-    }
-
-    /// Build a BEAM-only TensorCore: never auto-picked by the heuristics.
-    pub fn build_beam_only(&self, dtype_in: DType, dtype_out: DType) -> TensorCore {
-        TensorCore { heuristic_pick: false, ..self.build(dtype_in, dtype_out) }
     }
 }
 
@@ -908,20 +894,6 @@ pub const AMD_CDNA_161616: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
     swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(2), R(3)], &[R(0), R(1)], &[SL(0), SL(1), SL(2), SL(3)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(2), R(3)], &[R(0), R(1)], &[SL(4), SL(5), SU(0), SU(1)]),
-    tile_grid: (1, 1),
-};
-
-// fp32 MFMA (`v_mfma_f32_16x16x4_f32`): K=4 leaves only 2 reduce bits and one
-// f32 of A and B per lane (ept A=B=1 — scalar operands, no contract), with the
-// usual 4 f32 of D. Same N/M opt structure as `AMD_CDNA_161616`; the K-upcast
-// bits disappear, so the freed swizzle slots fold into the broadcast tuples.
-pub const AMD_CDNA_16164: TcConfig = TcConfig {
-    dims: (16, 16, 4),
-    threads: 64,
-    ept: (1, 1, 4),
-    opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
-    swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(0), R(1)], &[], &[SL(0), SL(1), SL(2), SL(3)]),
-    swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(0), R(1)], &[], &[SL(4), SL(5), SU(0), SU(1)]),
     tile_grid: (1, 1),
 };
 

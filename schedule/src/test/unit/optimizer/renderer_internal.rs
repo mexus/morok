@@ -99,9 +99,12 @@ fn test_amd_fp8_dtype_capabilities_are_arch_specific() {
 fn test_amd_tensor_core_tables_match_architecture() {
     use svod_dtype::AmdArch;
 
+    // tinygrad `tc.py:132`: amd_cdna3 = amd_cdna_161632[:2] + amd_cdna_161616 -- four
+    // cores, no fp32 input (the rate-neutral `v_mfma_f32_16x16x4_f32` is not offered).
     let gfx942 = Renderer::for_amd_arch(AmdArch::Gfx942);
     assert_eq!(gfx942.tensor_cores.len(), 4);
     assert!(gfx942.tensor_cores.iter().any(|tc| tc.dims == (16, 16, 32) && tc.dtype_in == DType::FP8E4M3));
+    assert!(!gfx942.tensor_cores.iter().any(|tc| tc.dtype_in == DType::Float32));
 
     let gfx950 = Renderer::for_amd_arch(AmdArch::Gfx950);
     assert_eq!(gfx950.tensor_cores.len(), 8);
