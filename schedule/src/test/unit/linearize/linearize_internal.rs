@@ -285,3 +285,32 @@ fn test_linearize_cleanup_expands_gated_store() {
     let Op::EndIf { if_op } = result[2].op() else { panic!("expected ENDIF") };
     assert!(Arc::ptr_eq(&if_op, &result[0]));
 }
+
+#[test]
+fn test_tuplize_comparison_survives_a_forty_thousand_deep_chain() {
+    // 2 MiB is a typical non-main thread stack. The recursive comparison
+    // overflowed even the 8 MiB main stack somewhere past 20k levels.
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let mut low = UOp::const_(DType::Int32, ConstValue::Int(1));
+            let mut high = UOp::const_(DType::Int32, ConstValue::Int(2));
+            for _ in 0..40_000 {
+                low = UOp::new(Op::Precast { src: low }, DType::Int32);
+                high = UOp::new(Op::Precast { src: high }, DType::Int32);
+            }
+            let topo = UOp::sink(vec![high.clone(), low.clone()]).toposort();
+            let keys = compute_tuplize(&topo);
+            let order = compare_tuplize(&keys[&low.id], &keys[&high.id], &mut HashMap::new());
+            assert_eq!(order, Ordering::Less);
+
+            // Releasing a 40k-deep Arc chain recurses in drop glue, which is a
+            // separate problem from the comparison under test. Hold the whole
+            // graph alive so the thread exits without unwinding it.
+            std::mem::forget(keys);
+            std::mem::forget(topo);
+        })
+        .expect("spawn comparison thread")
+        .join()
+        .expect("deep tuplize comparison must not overflow the stack");
+}

@@ -717,31 +717,77 @@ impl PartialOrd for TuplizeKey {
     }
 }
 
+/// One suspended `compare_tuplize` call: `next` is how many of this pair's
+/// source pairs have already come back Equal.
+struct TuplizeFrame {
+    left: Arc<TuplizeKey>,
+    right: Arc<TuplizeKey>,
+    next: usize,
+}
+
+impl TuplizeFrame {
+    fn pair(&self) -> (usize, usize) {
+        (Arc::as_ptr(&self.left) as usize, Arc::as_ptr(&self.right) as usize)
+    }
+}
+
+/// Lexicographic comparison of two tuplize keys.
+///
+/// Iterative rather than recursive: the key mirrors the UOp graph, so a deep
+/// chain (long CAST/PRECAST ladders, unrolled reductions) recursed once per
+/// level and overflowed the 8 MiB main stack around 20-30k deep. The memo is
+/// unchanged; the 128-element key truncation this replaced is *not* reinstated,
+/// because truncating makes the order non-total.
 fn compare_tuplize(
     left: &Arc<TuplizeKey>,
     right: &Arc<TuplizeKey>,
     cache: &mut HashMap<(usize, usize), Ordering>,
 ) -> Ordering {
-    let pair = (Arc::as_ptr(left) as usize, Arc::as_ptr(right) as usize);
-    if let Some(order) = cache.get(&pair) {
-        return *order;
-    }
-    let mut order =
-        left.op.cmp(&right.op).then_with(|| left.arg.cmp(&right.arg)).then_with(|| left.dtype.cmp(&right.dtype));
-    if order == Ordering::Equal {
-        for (a, b) in left.src.iter().zip(&right.src) {
-            order = compare_tuplize(a, b, cache);
-            if order != Ordering::Equal {
-                break;
+    let mut stack = vec![TuplizeFrame { left: left.clone(), right: right.clone(), next: 0 }];
+    // Verdict of the frame just popped, still to be consumed by its parent.
+    let mut settled: Option<Ordering> = None;
+
+    loop {
+        let frame = stack.last_mut().expect("the root frame is popped only by returning");
+        let mut decided = match settled.take() {
+            // A source pair came back: Equal moves on to the next one, anything
+            // else settles this frame.
+            Some(Ordering::Equal) => {
+                frame.next += 1;
+                None
             }
+            Some(order) => Some(order),
+            None => cache.get(&frame.pair()).copied().or_else(|| {
+                let shallow = frame
+                    .left
+                    .op
+                    .cmp(&frame.right.op)
+                    .then_with(|| frame.left.arg.cmp(&frame.right.arg))
+                    .then_with(|| frame.left.dtype.cmp(&frame.right.dtype));
+                (shallow != Ordering::Equal).then_some(shallow)
+            }),
+        };
+
+        if decided.is_none() {
+            decided = match (frame.left.src.get(frame.next), frame.right.src.get(frame.next)) {
+                (Some(a), Some(b)) => {
+                    let (a, b) = (a.clone(), b.clone());
+                    stack.push(TuplizeFrame { left: a, right: b, next: 0 });
+                    None
+                }
+                _ => Some(frame.left.src.len().cmp(&frame.right.src.len())),
+            };
         }
-        if order == Ordering::Equal {
-            order = left.src.len().cmp(&right.src.len());
+
+        let Some(order) = decided else { continue };
+        let pair = stack.pop().expect("the frame was borrowed from the stack").pair();
+        cache.insert(pair, order);
+        cache.insert((pair.1, pair.0), order.reverse());
+        if stack.is_empty() {
+            return order;
         }
+        settled = Some(order);
     }
-    cache.insert(pair, order);
-    cache.insert((pair.1, pair.0), order.reverse());
-    order
 }
 
 fn compute_tuplize(nodes: &[Arc<UOp>]) -> HashMap<u64, Arc<TuplizeKey>> {
