@@ -454,60 +454,65 @@ impl ExecutionPlan {
             return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::NoCompiledProgram));
         };
 
+        // One walk over the plan's endpoints. Native linked replay submits every
+        // kernel argument AND every copy endpoint through this context's
+        // queues; until peer mappings are explicit, all of them must belong to
+        // that exact physical device. Rechecked on every replay so a
+        // replacement buffer cannot patch a foreign VA into a cached plan —
+        // hence the single up-front `NativeDevice::resolve`, which keeps the
+        // process-global AMD device-cache lock out of the per-buffer path.
+        let native = svod_device::buffer::NativeDevice::resolve(owner);
         for op in &self.ops {
-            let PreparedOp::CompiledProgram(kernel) = op else { continue };
-            for (argument, &buffer_index) in kernel.buffer_indices.iter().enumerate() {
-                let actual = self.buffers[buffer_index].device_spec();
-                if &actual != owner {
-                    return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::ForeignProgramEndpoint {
-                        operation: kernel.id,
-                        argument,
-                        expected: owner.clone(),
-                        actual,
-                    }));
+            let (id, endpoints): (u64, Vec<(usize, Option<CopyEndpoint>)>) = match op {
+                PreparedOp::CompiledProgram(kernel) => {
+                    (kernel.id, kernel.buffer_indices.iter().map(|&index| (index, None)).collect())
                 }
-                if !self.buffers[buffer_index].matches_native_device(owner).context(ExecSnafu {
-                    context: format!("validate native kernel {} argument {argument}", kernel.id),
-                })? {
-                    return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::IncompatibleProgramAllocation {
-                        operation: kernel.id,
-                        argument,
-                        expected: owner.clone(),
-                    }));
-                }
-            }
-        }
-
-        // Native linked replay submits every copy through this context's copy
-        // queue. Until peer mappings are explicit, both current endpoints must
-        // belong to that exact physical device. Recheck on every replay so a
-        // replacement buffer cannot patch a foreign VA into a cached plan.
-        for op in &self.ops {
-            let PreparedOp::BufferCopy(copy) = op else { continue };
-            for (position, endpoint) in [(0, CopyEndpoint::Destination), (1, CopyEndpoint::Source)] {
-                let Some(&buffer_index) = copy.buffer_indices.get(position) else {
-                    continue;
-                };
-                let Some(buffer) = self.buffers.get(buffer_index) else {
-                    continue;
-                };
+                PreparedOp::BufferCopy(copy) => (
+                    copy.id,
+                    [CopyEndpoint::Destination, CopyEndpoint::Source]
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(position, endpoint)| {
+                            copy.buffer_indices.get(position).map(|&index| (index, Some(endpoint)))
+                        })
+                        .collect(),
+                ),
+                PreparedOp::CustomFunction(_) => continue,
+            };
+            for (argument, (buffer_index, endpoint)) in endpoints.into_iter().enumerate() {
+                let Some(buffer) = self.buffers.get(buffer_index) else { continue };
                 let actual = buffer.device_spec();
                 if &actual != owner {
-                    return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::ForeignCopyEndpoint {
-                        operation: copy.id,
-                        endpoint,
-                        expected: owner.clone(),
-                        actual,
+                    return Ok(NativeReplayOutcome::Declined(match endpoint {
+                        Some(endpoint) => NativeReplayDecline::ForeignCopyEndpoint {
+                            operation: id,
+                            endpoint,
+                            expected: owner.clone(),
+                            actual,
+                        },
+                        None => NativeReplayDecline::ForeignProgramEndpoint {
+                            operation: id,
+                            argument,
+                            expected: owner.clone(),
+                            actual,
+                        },
                     }));
                 }
                 if !buffer
-                    .matches_native_device(owner)
-                    .context(ExecSnafu { context: format!("validate native copy {} {endpoint:?}", copy.id) })?
+                    .matches_native(&native)
+                    .context(ExecSnafu { context: format!("validate native operation {id} endpoint {argument}") })?
                 {
-                    return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::IncompatibleCopyAllocation {
-                        operation: copy.id,
-                        endpoint,
-                        expected: owner.clone(),
+                    return Ok(NativeReplayOutcome::Declined(match endpoint {
+                        Some(endpoint) => NativeReplayDecline::IncompatibleCopyAllocation {
+                            operation: id,
+                            endpoint,
+                            expected: owner.clone(),
+                        },
+                        None => NativeReplayDecline::IncompatibleProgramAllocation {
+                            operation: id,
+                            argument,
+                            expected: owner.clone(),
+                        },
                     }));
                 }
             }
@@ -594,12 +599,19 @@ impl ExecutionPlan {
     }
 
     fn graph_endpoints_match_device(&self) -> Result<bool> {
+        // Resolve once per distinct kernel device instead of once per buffer:
+        // a captured chain is single-device, so this is one resolve per plan.
+        let mut resolved: Option<(DeviceSpec, svod_device::buffer::NativeDevice)> = None;
         for op in &self.ops {
             let PreparedOp::CompiledProgram(kernel) = op else { continue };
+            if resolved.as_ref().is_none_or(|(spec, _)| spec != &kernel.device) {
+                resolved = Some((kernel.device.clone(), svod_device::buffer::NativeDevice::resolve(&kernel.device)));
+            }
+            let native = &resolved.as_ref().expect("resolved above").1;
             for &index in &kernel.buffer_indices {
                 if self.buffers[index].device_spec() != kernel.device
                     || !self.buffers[index]
-                        .matches_native_device(&kernel.device)
+                        .matches_native(native)
                         .context(ExecSnafu { context: format!("validate graph kernel {} endpoint", kernel.id) })?
                 {
                     return Ok(false);
