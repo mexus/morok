@@ -343,54 +343,80 @@ impl Drop for SpawnedWorker {
     }
 }
 
+/// Locate the BEAM helper binary.
+///
+/// Only successes are cached: a transient miss — the helper not built yet, a
+/// `SVOD_BEAM_WORKER` pointing at a path that does not exist yet — used to be
+/// latched in a `OnceLock` and fail every later BEAM run in the process.
 fn helper_path() -> Result<PathBuf, String> {
-    static HELPER: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
-    HELPER
-        .get_or_init(|| {
-            if let Some(path) = std::env::var_os("SVOD_BEAM_WORKER") {
-                let path = PathBuf::from(path);
-                if path.is_file() {
-                    return Ok(path);
-                }
-                return Err(format!("SVOD_BEAM_WORKER={} is not a file", path.display()));
-            }
-            if let Some(path) = option_env!("CARGO_BIN_EXE_svod-beam-worker") {
-                let path = PathBuf::from(path);
-                if path.is_file() {
-                    return Ok(path);
-                }
-            }
+    static HELPER: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    let mut cached = HELPER.lock().expect("BEAM helper path lock poisoned");
+    if let Some(path) = cached.as_ref() {
+        return Ok(path.clone());
+    }
+    let path = resolve_helper_path()?;
+    *cached = Some(path.clone());
+    Ok(path)
+}
 
-            // Workspace development path. This makes `cargo run -p svod-model
-            // --example ...` self-hosting without requiring a manual helper build.
-            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let workspace = manifest_dir.parent().ok_or_else(|| {
-                "cannot locate workspace; set SVOD_BEAM_WORKER to an installed svod-beam-worker executable".to_string()
-            })?;
-            if !workspace.join("Cargo.toml").is_file() {
-                return Err("svod workspace is unavailable; set SVOD_BEAM_WORKER to an installed helper".into());
-            }
-            let mut cargo = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-            cargo.args(["build", "--quiet", "-p", "svod-tensor", "--bin", "svod-beam-worker"]);
-            let profile = if cfg!(debug_assertions) {
-                "debug"
-            } else {
-                cargo.arg("--release");
-                "release"
-            };
-            let status =
-                cargo.current_dir(workspace).status().map_err(|error| format!("build svod-beam-worker: {error}"))?;
-            if !status.success() {
-                return Err(format!("cargo failed to build svod-beam-worker: {status}"));
-            }
-            let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).map_or_else(
-                || workspace.join("target"),
-                |path| if path.is_absolute() { path } else { workspace.join(path) },
-            );
-            let path = target.join(profile).join(format!("svod-beam-worker{}", std::env::consts::EXE_SUFFIX));
-            if path.is_file() { Ok(path) } else { Err(format!("built BEAM helper is missing at {}", path.display())) }
-        })
-        .clone()
+fn resolve_helper_path() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("SVOD_BEAM_WORKER") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!("SVOD_BEAM_WORKER={} is not a file", path.display()));
+    }
+    // Only set when the *test* harness builds this crate's binaries; a library
+    // consumer never sees it, which is why the workspace build below exists.
+    if let Some(path) = option_env!("CARGO_BIN_EXE_svod-beam-worker") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
+    // Workspace development path. This makes `cargo run -p svod-model
+    // --example ...` self-hosting without requiring a manual helper build.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest_dir.parent().ok_or_else(|| {
+        "cannot locate workspace; set SVOD_BEAM_WORKER to an installed svod-beam-worker executable".to_string()
+    })?;
+    if !workspace.join("Cargo.toml").is_file() {
+        return Err("svod workspace is unavailable; set SVOD_BEAM_WORKER to an installed helper".into());
+    }
+    let mut cargo = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    cargo.args(["build", "-p", "svod-tensor", "--bin", "svod-beam-worker", "--message-format=json-render-diagnostics"]);
+    if !cfg!(debug_assertions) {
+        cargo.arg("--release");
+    }
+    let output = cargo
+        .current_dir(workspace)
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("build svod-beam-worker: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("cargo failed to build svod-beam-worker: {}", output.status));
+    }
+    // Take the path cargo reports rather than guessing `target/<profile>/`,
+    // which is wrong under `CARGO_TARGET_DIR`, a `--target` triple, or a custom
+    // profile directory.
+    last_executable(&output.stdout).ok_or_else(|| {
+        "cargo built svod-beam-worker but reported no executable artifact; \
+         set SVOD_BEAM_WORKER to an installed helper"
+            .to_string()
+    })
+}
+
+/// The last non-null `executable` in a cargo JSON message stream: the binary
+/// the requested `--bin` target just produced.
+fn last_executable(messages: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(messages)
+        .ok()?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|message| Some(PathBuf::from(message.get("executable")?.as_str()?)))
+        .next_back()
 }
 
 fn spawn_worker(path: &PathBuf, init: &WorkerInit) -> Result<SpawnedWorker, String> {

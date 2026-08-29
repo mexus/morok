@@ -41,3 +41,39 @@ fn a_closed_helper_fails_the_slot_regardless_of_the_deadline() {
     drop(send);
     assert!(matches!(poll_slot(&responses, Some(&overdue(timeout)), timeout), SlotOutcome::Failed(None)));
 }
+
+/// TA5: a bad `SVOD_BEAM_WORKER` must not be latched — the next resolution with
+/// a valid helper has to succeed.
+#[test]
+fn helper_resolution_failures_are_not_cached() {
+    let helper = tempfile::NamedTempFile::new().expect("helper stand-in");
+    let missing = helper.path().with_extension("absent");
+
+    unsafe { std::env::set_var("SVOD_BEAM_WORKER", &missing) };
+    let failure = helper_path().expect_err("a missing helper must not resolve");
+    assert!(failure.contains("is not a file"), "{failure}");
+
+    unsafe { std::env::set_var("SVOD_BEAM_WORKER", helper.path()) };
+    let resolved = helper_path().expect("a valid helper must resolve after a failure");
+    unsafe { std::env::remove_var("SVOD_BEAM_WORKER") };
+    assert_eq!(resolved, helper.path());
+}
+
+/// The helper path comes from cargo's own artifact report, not a guessed
+/// `target/<profile>/` layout.
+#[test]
+fn last_executable_takes_cargos_final_artifact() {
+    let messages = concat!(
+        r#"{"reason":"compiler-artifact","target":{"name":"svod-tensor"},"executable":null}"#,
+        "\n",
+        r#"{"reason":"compiler-artifact","executable":"/custom/target/dir/debug/svod-beam-worker"}"#,
+        "\n",
+        r#"{"reason":"build-finished","success":true}"#,
+        "\n",
+    );
+    assert_eq!(
+        last_executable(messages.as_bytes()),
+        Some(std::path::PathBuf::from("/custom/target/dir/debug/svod-beam-worker"))
+    );
+    assert_eq!(last_executable(b"not json\n"), None);
+}

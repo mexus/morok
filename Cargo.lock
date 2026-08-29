@@ -3639,6 +3639,7 @@ dependencies = [
  "svod-ir",
  "svod-runtime",
  "svod-schedule",
+ "tempfile",
  "test-case",
  "tracing",
 ]
