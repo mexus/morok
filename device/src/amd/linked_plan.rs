@@ -508,10 +508,20 @@ impl AmdLinkedPlan {
                 .filter(|submission| matches!(submission.queue, QueueKind::Copy(_)))
                 .map(|submission| submission.replay.bytes().len())
                 .collect::<Vec<_>>();
+            // Wait each ring's headroom with no guard held, then take both
+            // guards back-to-back: holding the compute guard while polling the
+            // process-shared SDMA ring stalled every host staging copy for up
+            // to the full timeout, and doubled this plan's worst case.
+            let copy_queue = owner.core().copy_queue();
+            if !compute_lengths.is_empty() {
+                lane.queue().wait_publication_headroom(&compute_lengths)?;
+            }
+            if !copy_lengths.is_empty() {
+                copy_queue.unwrap().wait_publication_headroom(&copy_lengths)?;
+            }
             let mut compute_publication = (!compute_lengths.is_empty())
                 .then(|| lane.queue().prepare_linked_publication(&compute_lengths))
                 .transpose()?;
-            let copy_queue = owner.core().copy_queue();
             let mut copy_publication = (!copy_lengths.is_empty())
                 .then(|| copy_queue.unwrap().prepare_linked_publication(&copy_lengths))
                 .transpose()?;

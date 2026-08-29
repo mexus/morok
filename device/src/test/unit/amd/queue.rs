@@ -424,6 +424,27 @@ fn mock_pool_failed_drain_and_panic_abandonment_quarantine_every_backing() {
 }
 
 #[test]
+fn mock_linked_publication_headroom_waits_before_taking_either_guard() {
+    let (_iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    let copy = AmdCopyQueue::create(&allocator).expect("copy queue");
+
+    // An idle ring clears both waits without holding a guard, so the guards can
+    // then be taken back-to-back.
+    pool.queue().wait_publication_headroom(&[64]).expect("compute headroom");
+    copy.wait_publication_headroom(&[64]).expect("copy headroom");
+    drop((
+        pool.queue().prepare_linked_publication(&[64]).expect("compute guard"),
+        copy.prepare_linked_publication(&[64]).expect("copy guard"),
+    ));
+
+    // Malformed lengths still fail before any guard is taken.
+    assert!(pool.queue().wait_publication_headroom(&[7]).is_err());
+    assert!(copy.wait_publication_headroom(&[7]).is_err());
+}
+
+#[test]
 fn mock_lane_acquisition_times_out_instead_of_parking_forever() {
     let (_iface, allocator) = mock_allocator(1);
     install_signal_pool(&allocator);

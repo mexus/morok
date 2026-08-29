@@ -1832,6 +1832,30 @@ impl AmdComputeQueue {
         Ok(())
     }
 
+    /// Wait for linked-publication headroom WITHOUT pinning the queue lock
+    /// across the poll. A linked plan spanning both engines waits each ring
+    /// here first and only then takes the two guards back-to-back; holding the
+    /// compute guard while polling the shared SDMA ring stalled every host
+    /// staging copy for up to the full timeout. Tinygrad completes the compute
+    /// `_submit` before the copy one and never nests engine locks.
+    pub(crate) fn wait_publication_headroom(&self, byte_lengths: &[usize]) -> Result<()> {
+        if let Some(error) = self.core.poison_error() {
+            return Err(error);
+        }
+        // `ring_size` and `is_pm4` are fixed at queue creation.
+        let units = validate_linked_compute_lengths(self.is_pm4, self.inner.lock().ring_size, byte_lengths)?;
+        let what = if self.is_pm4 { "PM4 linked publication headroom" } else { "AQL linked publication headroom" };
+        spin_until_headroom(what, HEADROOM_TIMEOUT_MS, || {
+            let inner = self.inner.lock();
+            if self.is_pm4 { pm4_shortfall(&inner, units) } else { aql_shortfall(&inner, units) }
+        })
+        .inspect_err(|error| self.core.poison(&error.to_string()))
+    }
+
+    /// Take the publication guard, re-verifying headroom. Cheap after
+    /// [`wait_publication_headroom`](Self::wait_publication_headroom); it keeps
+    /// its own bounded wait so a ring consumed between the two calls still
+    /// blocks rather than lapping.
     pub(crate) fn prepare_linked_publication(&self, byte_lengths: &[usize]) -> Result<LinkedComputePublication<'_>> {
         if let Some(error) = self.core.poison_error() {
             return Err(error);
@@ -2001,27 +2025,23 @@ pub(crate) fn absolute_pm4_read_idx(write_idx: u64, reported_read: u64, capacity
     read
 }
 
-fn wait_pm4_headroom(g: &QueueInner, dwords: usize) -> Result<()> {
-    let capacity = g.ring_size / 4;
-    if dwords == 0 || dwords >= capacity {
-        return Err(Error::CommandStreamTooLarge { kind: "PM4 ring submission", actual: dwords, limit: capacity - 1 });
-    }
+/// Bound on any single ring-headroom wait.
+const HEADROOM_TIMEOUT_MS: u64 = 30_000;
+
+/// Spin (then yield) until `probe` reports headroom. `probe` returns `None`
+/// once the ring has room, or the `(target, observed read index)` pair to
+/// report if the deadline expires. Taking a closure lets a caller that must not
+/// pin a ring re-take the queue lock on every attempt.
+fn spin_until_headroom(
+    what: &'static str,
+    timeout_ms: u64,
+    mut probe: impl FnMut() -> Option<(u64, u64)>,
+) -> Result<()> {
     let start = std::time::Instant::now();
     loop {
-        // PM4 reports only the queue-relative RPTR bits. Reconstruct its epoch
-        // from the monotonic producer index, as KFD does when restoring a HQD.
-        let reported_read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
-        let read = absolute_pm4_read_idx(g.write_idx, reported_read, capacity);
-        if g.write_idx + dwords as u64 - read <= capacity as u64 {
-            return Ok(());
-        }
-        if start.elapsed().as_millis() >= 30_000 {
-            return Err(Error::TimelineTimeout {
-                what: "PM4 ring headroom",
-                target: g.write_idx + dwords as u64 - capacity as u64,
-                current: read,
-                waited_ms: 30_000,
-            });
+        let Some((target, current)) = probe() else { return Ok(()) };
+        if start.elapsed().as_millis() as u64 >= timeout_ms {
+            return Err(Error::TimelineTimeout { what, target, current, waited_ms: timeout_ms });
         }
         std::hint::spin_loop();
         if start.elapsed().as_micros() >= 100 {
@@ -2030,27 +2050,41 @@ fn wait_pm4_headroom(g: &QueueInner, dwords: usize) -> Result<()> {
     }
 }
 
-fn wait_aql_headroom(g: &QueueInner, packets: usize) -> Result<()> {
-    let slots = g.ring_size / AQL_PACKET_BYTES;
-    let start = std::time::Instant::now();
-    loop {
-        let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
-        if g.write_idx + packets as u64 - read <= slots as u64 {
-            return Ok(());
-        }
-        if start.elapsed().as_millis() >= 30_000 {
-            return Err(Error::TimelineTimeout {
-                what: "AQL ring headroom",
-                target: g.write_idx + packets as u64 - slots as u64,
-                current: read,
-                waited_ms: 30_000,
-            });
-        }
-        std::hint::spin_loop();
-        if start.elapsed().as_micros() >= 100 {
-            std::thread::yield_now();
-        }
+/// `None` when `dwords` fit, else the producer index that must be retired to
+/// plus the consumer index observed now.
+fn pm4_shortfall(g: &QueueInner, dwords: usize) -> Option<(u64, u64)> {
+    let capacity = g.ring_size / 4;
+    // PM4 reports only the queue-relative RPTR bits. Reconstruct its epoch from
+    // the monotonic producer index, as KFD does when restoring a HQD.
+    let reported_read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+    let read = absolute_pm4_read_idx(g.write_idx, reported_read, capacity);
+    let needed = g.write_idx + dwords as u64;
+    (needed - read > capacity as u64).then(|| (needed - capacity as u64, read))
+}
+
+fn aql_shortfall(g: &QueueInner, packets: usize) -> Option<(u64, u64)> {
+    let slots = (g.ring_size / AQL_PACKET_BYTES) as u64;
+    let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+    let needed = g.write_idx + packets as u64;
+    (needed - read > slots).then(|| (needed - slots, read))
+}
+
+fn sdma_shortfall(g: &QueueInner, published: u64) -> Option<(u64, u64)> {
+    let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+    let needed = g.write_idx + published;
+    (needed - read > g.ring_size as u64).then(|| (needed - g.ring_size as u64, read))
+}
+
+fn wait_pm4_headroom(g: &QueueInner, dwords: usize) -> Result<()> {
+    let capacity = g.ring_size / 4;
+    if dwords == 0 || dwords >= capacity {
+        return Err(Error::CommandStreamTooLarge { kind: "PM4 ring submission", actual: dwords, limit: capacity - 1 });
     }
+    spin_until_headroom("PM4 ring headroom", HEADROOM_TIMEOUT_MS, || pm4_shortfall(g, dwords))
+}
+
+fn wait_aql_headroom(g: &QueueInner, packets: usize) -> Result<()> {
+    spin_until_headroom("AQL ring headroom", HEADROOM_TIMEOUT_MS, || aql_shortfall(g, packets))
 }
 
 /// View a `[u32; 16]` AQL packet as its 64 little-endian bytes.
@@ -2195,6 +2229,22 @@ impl AmdCopyQueue {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         unsafe { std::ptr::write_volatile(g.doorbell.as_ptr(), g.write_idx) };
         Ok(())
+    }
+
+    /// SDMA counterpart of
+    /// [`AmdComputeQueue::wait_publication_headroom`](AmdComputeQueue::wait_publication_headroom).
+    pub(crate) fn wait_publication_headroom(&self, byte_lengths: &[usize]) -> Result<()> {
+        if let Some(error) = self.core.poison_error() {
+            return Err(error);
+        }
+        let published = {
+            let inner = self.inner.lock();
+            linked_sdma_published_bytes(inner.write_idx, inner.ring_size, byte_lengths)?
+        };
+        spin_until_headroom("SDMA linked publication headroom", COPY_TIMEOUT_MS, || {
+            sdma_shortfall(&self.inner.lock(), published)
+        })
+        .inspect_err(|error| self.core.poison(&error.to_string()))
     }
 
     pub(crate) fn prepare_linked_publication(&self, byte_lengths: &[usize]) -> Result<LinkedCopyPublication<'_>> {
@@ -2380,48 +2430,12 @@ fn wait_sdma_headroom(g: &QueueInner, bytes: usize) -> Result<()> {
         });
     }
     let pos = (g.write_idx as usize) % g.ring_size;
-    let published = bytes + if pos + bytes > g.ring_size { g.ring_size - pos } else { 0 };
-    let start = std::time::Instant::now();
-    loop {
-        let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
-        if g.write_idx + published as u64 - read <= g.ring_size as u64 {
-            return Ok(());
-        }
-        if start.elapsed().as_millis() >= COPY_TIMEOUT_MS as u128 {
-            return Err(Error::TimelineTimeout {
-                what: "SDMA ring headroom",
-                target: g.write_idx + published as u64 - g.ring_size as u64,
-                current: read,
-                waited_ms: COPY_TIMEOUT_MS,
-            });
-        }
-        std::hint::spin_loop();
-        if start.elapsed().as_micros() >= 100 {
-            std::thread::yield_now();
-        }
-    }
+    let published = (bytes + if pos + bytes > g.ring_size { g.ring_size - pos } else { 0 }) as u64;
+    spin_until_headroom("SDMA ring headroom", COPY_TIMEOUT_MS, || sdma_shortfall(g, published))
 }
 
 fn wait_sdma_sequence_headroom(g: &QueueInner, published: u64) -> Result<()> {
-    let start = std::time::Instant::now();
-    loop {
-        let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
-        if g.write_idx + published - read <= g.ring_size as u64 {
-            return Ok(());
-        }
-        if start.elapsed().as_millis() >= COPY_TIMEOUT_MS as u128 {
-            return Err(Error::TimelineTimeout {
-                what: "SDMA linked transaction headroom",
-                target: g.write_idx + published - g.ring_size as u64,
-                current: read,
-                waited_ms: COPY_TIMEOUT_MS,
-            });
-        }
-        std::hint::spin_loop();
-        if start.elapsed().as_micros() >= 100 {
-            std::thread::yield_now();
-        }
-    }
+    spin_until_headroom("SDMA linked transaction headroom", COPY_TIMEOUT_MS, || sdma_shortfall(g, published))
 }
 
 impl std::fmt::Debug for AmdComputeQueue {
