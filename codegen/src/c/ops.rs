@@ -136,6 +136,35 @@ impl CContext {
         }
     }
 
+    /// Register an address (INDEX/SHRINK/pointer CAST) expression.
+    ///
+    /// Addresses are inlined like tinygrad's `cstyle.py` INDEX rendering, which
+    /// is safe there because its linearizer never places a node inside a range
+    /// that is consumed outside it. Morok's can, so an escaping address is
+    /// hoisted to function scope and assigned at its declaration depth —
+    /// otherwise the inlined text references a loop variable that is out of
+    /// scope at the use site.
+    pub fn emit_address(&mut self, uop: &Arc<UOp>, expr: String, kernel: &mut Vec<String>) -> String {
+        if !self.scope_escaping.contains(&uop.id) {
+            self.register(uop.id, expr.clone());
+            return expr;
+        }
+        let declared = if is_address_value(uop) {
+            match uop.dtype() {
+                dtype @ DType::Ptr { .. } => c_dtype(&dtype),
+                dtype => format!("{}*", c_dtype(&dtype)),
+            }
+        } else {
+            c_dtype(&shaped_dtype(uop))
+        };
+        let name = self.next_name("bidx");
+        let indent = self.indent();
+        self.hoisted_declarations.push(format!("  {declared} {name};"));
+        kernel.push(format!("{indent}{name} = {expr};"));
+        self.register(uop.id, name.clone());
+        name
+    }
+
     fn emit_expr_dtype(
         &mut self,
         uop: &Arc<UOp>,
@@ -199,7 +228,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
 
             if indices.is_empty() {
                 // No index - just alias the buffer pointer
-                ctx.register(uop.id, buf);
+                ctx.emit_address(uop, buf, kernel);
             } else {
                 let idx = if indices.len() == 1 {
                     ctx.get(&indices[0]).to_string()
@@ -215,13 +244,14 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 // carrying an address space remain addresses for LOAD/STORE.
                 let expr =
                     if buffer.addrspace().is_none() { format!("({buf})[{idx}]") } else { format!("{buf} + {idx}") };
-                ctx.register(uop.id, expr);
+                ctx.emit_address(uop, expr, kernel);
             }
             Some(())
         }
 
         Op::Shrink { src, offsets, sizes: _ } => {
-            ctx.register(uop.id, format!("{} + {}", ctx.get(src), ctx.get(offsets)));
+            let expr = format!("{} + {}", ctx.get(src), ctx.get(offsets));
+            ctx.emit_address(uop, expr, kernel);
             Some(())
         }
 
@@ -329,7 +359,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 let target = c_dtype(dtype);
                 let pointer_type = if matches!(dtype, DType::Ptr { .. }) { target } else { format!("{target}*") };
                 let expr = format!("(({pointer_type})({s}))");
-                ctx.register(uop.id, expr);
+                ctx.emit_address(uop, expr, kernel);
                 return Some(());
             }
             let rendered_dtype = shaped_dtype(uop);

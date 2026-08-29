@@ -174,6 +174,27 @@ fn clang_preserves_shape_width_across_materialized_values_and_store_aliases() {
 }
 
 #[test]
+fn clang_hoists_addresses_that_escape_their_loop() {
+    // The linearizer can place a shared node inside a range whose consumer sits
+    // outside it. Addresses are inlined, so without a hoist the STORE after the
+    // loop would reference `ridx0` — an out-of-scope identifier.
+    let param = UOp::param(0, 8, DType::Float32, None);
+    let bound = UOp::const_(DType::Int32, ConstValue::Int(4));
+    let range = UOp::range_axis_dtype(bound.clone(), AxisId::Renumbered(0), AxisType::Loop, DType::Int32);
+    let index = UOp::index().buffer(param.clone()).indices(vec![range.clone()]).call().unwrap();
+    let load = UOp::load().index(index.clone()).call();
+    let end = load.end(smallvec::smallvec![range.clone()]);
+    let store = index.clone().store(load.clone());
+    let linear = UOp::linear(smallvec::smallvec![bound, param, range, index, load, end, store]);
+
+    let rendered = render(&linear, Some("escaping_address")).expect("render escaping address");
+    assert!(rendered.code.contains("  float* bidx0;"), "{}", rendered.code);
+    let (_, after_loop) = rendered.code.split_once("\n  }\n").expect("loop must close");
+    assert!(!after_loop.contains("ridx0"), "{}", rendered.code);
+    assert_c_compiles(&rendered.code);
+}
+
+#[test]
 fn clang_store_width_follows_the_stored_value() {
     let index = UOp::index()
         .buffer(UOp::param(0, 8, DType::Float32, None))
