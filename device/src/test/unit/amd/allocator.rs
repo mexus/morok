@@ -16,7 +16,12 @@ fn mock_allocator(iface: &Arc<MockAmdIface>) -> AmdAllocator {
 fn allocator_construction_is_clean() {
     match AmdAllocator::new(0) {
         Ok(_alloc) => {}
-        Err(Error::NoAmdGpu { .. }) | Err(Error::AmdAllocFailed { .. }) | Err(Error::AmdIoctl { .. }) => {}
+        Err(
+            Error::NoAmdGpu { .. }
+            | Error::DeviceUnavailable { .. }
+            | Error::AmdAllocFailed { .. }
+            | Error::AmdIoctl { .. },
+        ) => {}
         Err(e) => panic!("unexpected error: {e:?}"),
     }
 }

@@ -16,7 +16,12 @@ fn open_without_gpu_or_unsupported_arch_is_clean_err() {
             // Host has a supported AMD GPU — exercise the happy path too.
             // (We can't assert much without hardware-specific data.)
         }
-        Err(Error::NoAmdGpu { .. }) | Err(Error::AmdAllocFailed { .. }) | Err(Error::AmdIoctl { .. }) => {
+        Err(
+            Error::NoAmdGpu { .. }
+            | Error::DeviceUnavailable { .. }
+            | Error::AmdAllocFailed { .. }
+            | Error::AmdIoctl { .. },
+        ) => {
             // All acceptable.
         }
         Err(e) => panic!("unexpected error variant: {e:?}"),
