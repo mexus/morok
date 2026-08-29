@@ -309,14 +309,17 @@ pub fn memory_coalescing(sink: Arc<UOp>, ctx: &Renderer) -> Arc<UOp> {
     #[allow(clippy::mutable_key_type)]
     let mut memory: HashMap<MemoryKey, (Arc<UOp>, BTreeMap<i64, Vec<Arc<UOp>>>)> = HashMap::new();
     for uop in sink.toposort() {
+        // Tinygrad asserts the same shape (`coalesce.py:111`), but a Python
+        // assert only guards development; ours would abort a release build over
+        // a *missed optimisation*. Coalescing an access is optional, so a gated
+        // load/store that still carries its gate as a separate source is simply
+        // left alone.
         let (op, index) = match uop.op() {
-            Op::Load { index, alt, gate } => {
-                assert!(alt.is_none() && gate.is_none(), "memory coalescing does not support gated loads/stores");
-                (MemoryOp::Load, index)
-            }
-            Op::Store { index, value: _, gate } => {
-                assert!(gate.is_none(), "memory coalescing does not support gated loads/stores");
-                (MemoryOp::Store, index)
+            Op::Load { index, alt, gate } if alt.is_none() && gate.is_none() => (MemoryOp::Load, index),
+            Op::Store { index, gate, .. } if gate.is_none() => (MemoryOp::Store, index),
+            Op::Load { .. } | Op::Store { .. } => {
+                tracing::warn!("memory coalescing skips a gated load/store");
+                continue;
             }
             _ => continue,
         };
@@ -408,18 +411,32 @@ pub fn memory_coalescing(sink: Arc<UOp>, ctx: &Renderer) -> Arc<UOp> {
 
                 match key.op {
                     MemoryOp::Store => {
-                        let mut data = Vec::with_capacity(group.len());
-                        for lane in group {
-                            let stores = &offsets[lane];
-                            assert_eq!(stores.len(), 1, "attempting multiple stores: {}", stores.len());
-                            let Op::Store { value, .. } = stores[0].op() else { unreachable!() };
-                            data.push(value.clone());
-                        }
-                        let value =
-                            if data.len() == 1 { data.pop().unwrap() } else { UOp::stack(data.into_iter().collect()) };
-                        let store = index.store(value);
-                        for lane in group {
-                            replacements.insert(UOpKey(offsets[lane][0].clone()), store.clone());
+                        let data: Option<Vec<Arc<UOp>>> = group
+                            .iter()
+                            .map(|lane| match offsets[lane].as_slice() {
+                                [store] => match store.op() {
+                                    Op::Store { value, .. } => Some(value.clone()),
+                                    _ => None,
+                                },
+                                _ => None,
+                            })
+                            .collect();
+                        // Tinygrad asserts one store per offset
+                        // (`coalesce.py:156`); leave the group un-coalesced
+                        // instead of aborting a release build over it.
+                        match data {
+                            None => tracing::warn!("memory coalescing skips an offset with multiple stores"),
+                            Some(mut data) => {
+                                let value = if data.len() == 1 {
+                                    data.pop().unwrap()
+                                } else {
+                                    UOp::stack(data.into_iter().collect())
+                                };
+                                let store = index.store(value);
+                                for lane in group {
+                                    replacements.insert(UOpKey(offsets[lane][0].clone()), store.clone());
+                                }
+                            }
                         }
                     }
                     MemoryOp::Load => {

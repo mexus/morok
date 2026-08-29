@@ -389,13 +389,14 @@ fn m5_wmma_stores_remain_distinct_before_and_after_coalescing() {
 }
 
 #[test]
-#[should_panic(expected = "attempting multiple stores: 2")]
-fn multiple_stores_to_one_group_offset_are_rejected() {
+fn multiple_stores_to_one_group_offset_are_left_un_coalesced() {
     let buffer = UOp::param(0, 16, DType::Float32, None);
     let index = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
     let first = index.store(UOp::const_(DType::Float32, ConstValue::Float(1.0)));
     let second = index.store(UOp::const_(DType::Float32, ConstValue::Float(2.0)));
-    let _ = memory_coalescing(UOp::sink(vec![first, second]), &Renderer::cpu());
+    let result = memory_coalescing(UOp::sink(vec![first, second]), &Renderer::cpu());
+
+    assert_eq!(stores(&result).len(), 2, "both stores survive; coalescing declines the group");
 }
 
 #[test]
@@ -418,4 +419,22 @@ fn image_float_half_float_roundtrip_is_removed() {
     let result = graph_rewrite(&pm_simplify_add_image(), roundtrip, &mut ctx);
 
     assert!(Arc::ptr_eq(&result, &value));
+}
+
+#[test]
+fn gated_load_is_skipped_rather_than_aborting_the_pass() {
+    let buffer = UOp::param(0, 16, DType::Float32, None);
+    let index = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
+    let old = UOp::new(
+        Op::Load {
+            index,
+            alt: Some(UOp::const_(DType::Float32, ConstValue::Float(0.0))),
+            gate: Some(UOp::const_(DType::Bool, ConstValue::Bool(true))),
+        },
+        DType::Float32,
+    );
+
+    let folded = loads(&memory_coalescing(UOp::sink(vec![old.clone()]), &Renderer::cpu()));
+    assert_eq!(folded.len(), 1, "the gated load must survive un-coalesced");
+    assert!(Arc::ptr_eq(&folded[0], &old));
 }
