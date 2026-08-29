@@ -579,8 +579,14 @@ fn symbolic_simple_base() -> TypedPatternMatcher {
 }
 
 /// Collapse `CAST(dtype, CONST(value))` into a constant shaped and typed like
-/// the cast. Upstream keeps this separate from `sym` so matcher composition can
-/// control its priority.
+/// the cast.
+///
+/// Tinygrad `uop/symbolic.py:101` keeps this standalone rather than inside
+/// `symbolic_simple`, and composes it explicitly at every site that wants it
+/// (`codegen/__init__.py:304,349,360`, `codegen/simplify.py:35`, `uop/ops.py:533`,
+/// `schedule/rangeify.py:587`). Morok mirrors that composition one for one, so
+/// devectorize and the image/load rewrites deliberately do not fold cast
+/// constants.
 pub fn pm_fold_cast_const() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         root @ Cast { src: _c @const(c_val), dtype: _ } ~> root.const_like(c_val.clone()),
