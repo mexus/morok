@@ -31,7 +31,7 @@ pub mod iface;
 #[cfg(unix)]
 pub mod kernarg;
 #[cfg(unix)]
-mod linked_plan;
+pub(crate) mod linked_plan;
 #[cfg(test)]
 pub(crate) use linked_plan::AmdLinkedPlan;
 pub mod occupancy;

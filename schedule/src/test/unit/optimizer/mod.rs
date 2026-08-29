@@ -1,4 +1,6 @@
 pub mod heuristics;
+pub mod implicit_barriers;
+pub mod mod_internal;
 pub mod opts_to_apply;
 pub mod opts_validation;
 pub mod scheduler;

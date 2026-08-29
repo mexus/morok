@@ -71,17 +71,17 @@ pub(crate) struct PoolQueue {
 /// Atomic lane claims, split from queue construction so exclusivity can be
 /// tested without AMD hardware.
 #[derive(Debug)]
-struct LaneClaims {
+pub(crate) struct LaneClaims {
     claimed: AtomicU64,
     capacity: usize,
 }
 
 impl LaneClaims {
-    fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self { claimed: AtomicU64::new(0), capacity: capacity.clamp(1, u64::BITS as usize) }
     }
 
-    fn try_claim(&self, initialized: usize) -> Option<usize> {
+    pub(crate) fn try_claim(&self, initialized: usize) -> Option<usize> {
         let count = initialized.min(self.capacity);
         let valid = if count == u64::BITS as usize { u64::MAX } else { (1u64 << count).wrapping_sub(1) };
         let mut observed = self.claimed.load(Ordering::Acquire);
@@ -103,12 +103,12 @@ impl LaneClaims {
         }
     }
 
-    fn claim_new(&self, slot: usize) {
+    pub(crate) fn claim_new(&self, slot: usize) {
         let previous = self.claimed.fetch_or(1u64 << slot, Ordering::AcqRel);
         debug_assert_eq!(previous & (1u64 << slot), 0);
     }
 
-    fn release(&self, slot: usize) {
+    pub(crate) fn release(&self, slot: usize) {
         let previous = self.claimed.fetch_and(!(1u64 << slot), Ordering::Release);
         debug_assert_ne!(previous & (1u64 << slot), 0);
     }
@@ -825,30 +825,5 @@ impl crate::device::PlanContext for OwnerCtx {
     fn finish_replay(&self) -> Result<()> {
         self.finish_session();
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::LaneClaims;
-
-    #[test]
-    fn lane_claims_are_exclusive_and_reusable() {
-        let claims = LaneClaims::new(3);
-        assert_eq!(claims.try_claim(0), None);
-        assert_eq!(claims.try_claim(3), Some(0));
-        assert_eq!(claims.try_claim(3), Some(1));
-        assert_eq!(claims.try_claim(3), Some(2));
-        assert_eq!(claims.try_claim(3), None);
-        claims.release(1);
-        assert_eq!(claims.try_claim(3), Some(1));
-    }
-
-    #[test]
-    fn lane_claims_never_expose_uninitialized_slots() {
-        let claims = LaneClaims::new(4);
-        claims.claim_new(0);
-        assert_eq!(claims.try_claim(1), None);
-        assert_eq!(claims.try_claim(2), Some(1));
     }
 }
