@@ -1,4 +1,5 @@
 use super::*;
+use test_case::test_case;
 
 /// Build a Vec<Arc<UOp>> of concrete `index_const` dims for tests that only
 /// exercise the numeric grouping/splitting logic.
@@ -45,14 +46,18 @@ fn test_existing_special_skips_all_gpudims_lowering() {
     assert!(add_gpudims(&Renderer::amd_cdna3(), &sink).is_none());
 }
 
-#[test]
-fn test_global_product_cap_accounts_for_local_extent() {
-    let global = UOp::range_axis(UOp::index_const(1 << 30), svod_ir::AxisId::Renumbered(0), AxisType::Global);
-    let local = UOp::range_axis(UOp::index_const(8), svod_ir::AxisId::Renumbered(1), AxisType::Local);
-    let sink = UOp::sink(vec![global, local]);
-
-    let lowered = add_gpudims(&Renderer::amd_cdna3(), &sink).expect("GPU ranges should lower");
-    let global_special_ends: Vec<usize> = lowered
+/// Extents of the `gidx*` SPECIALs `add_gpudims` emits for the given axes,
+/// sorted so the assertion does not depend on toposort order.
+fn global_special_extents(renderer: &Renderer, global_extents: &[i64], local_extents: &[i64]) -> Vec<usize> {
+    let mut ranges = Vec::new();
+    for (extents, axis_type) in [(global_extents, AxisType::Global), (local_extents, AxisType::Local)] {
+        for &extent in extents {
+            let axis = svod_ir::AxisId::Renumbered(ranges.len());
+            ranges.push(UOp::range_axis(UOp::index_const(extent), axis, axis_type));
+        }
+    }
+    let lowered = add_gpudims(renderer, &UOp::sink(ranges)).expect("GPU ranges should lower");
+    let mut ends: Vec<usize> = lowered
         .toposort()
         .into_iter()
         .filter_map(|uop| match uop.op() {
@@ -60,9 +65,15 @@ fn test_global_product_cap_accounts_for_local_extent() {
             _ => None,
         })
         .collect();
+    ends.sort_unstable();
+    ends
+}
 
-    assert_eq!(global_special_ends, vec![4, 1 << 28]);
-    assert!(global_special_ends.iter().all(|&end| end <= u32::MAX as usize / 8));
+#[test_case(&[8], &[4, 1 << 28]; "one local axis divides the work item cap")]
+#[test_case(&[0], &[1 << 30]; "zero extent local axis does not divide by zero")]
+#[test_case(&[64, 64, 64, 4], &[32, 1 << 25]; "contracted locals still cap the grid")]
+fn test_global_product_cap_accounts_for_local_extent(local_extents: &[i64], expected: &[usize]) {
+    assert_eq!(global_special_extents(&Renderer::amd_cdna3(), &[1 << 30], local_extents), expected);
 }
 
 #[test]

@@ -184,13 +184,7 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
 
         // Create local indices (lidx0, lidx1, ...)
         let local_idxs = get_grouped_dims("lidx", &local_shape, local_max_slice, false);
-        let hw_local: Vec<usize> = local_idxs
-            .iter()
-            .filter_map(|uop| match uop.op() {
-                Op::Special { end, .. } => Some(dim_max(end)),
-                _ => None,
-            })
-            .collect();
+        let hw_local = hardware_local_extents(&local_idxs);
         let global_max = ctx.global_prod_max.as_ref().map_or_else(
             || ctx.global_max.clone(),
             |prod_max| {
@@ -198,7 +192,9 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
                 base.iter()
                     .zip(prod_max)
                     .zip(hw_local.iter().copied().chain(std::iter::repeat(1)).take(3))
-                    .map(|((&global, &product), local)| global.min(product / local))
+                    // A zero-extent local axis would divide by zero; it occupies
+                    // one work-item slot either way, so clamp to 1.
+                    .map(|((&global, &product), local)| global.min(product / local.max(1)))
                     .collect::<Vec<_>>()
                     .into()
             },
@@ -241,6 +237,29 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     Some(sink.substitute(&subs))
+}
+
+/// Hardware extent of each `lidx*` axis behind the local indices.
+///
+/// Tinygrad (`gpudims.py:67`) reads `u.src[0]` off entries that *are* SPECIAL:
+/// `[_dim_max(u.src[0]) for u in local_idxs if u.op is Ops.SPECIAL]`. That only
+/// sees the axes `get_grouped_dims` handed back unchanged — as soon as a local
+/// dim is grouped or split, the returned entry is div/mod arithmetic over the
+/// SPECIALs and the list comes back short (empty in the fully-contracted case),
+/// silently dropping the AMD work-item product cap it feeds. Collect the
+/// SPECIAL leaves instead, deduplicated by `lidx` name so a leaf reachable from
+/// two decomposed indices is counted once, in axis order.
+fn hardware_local_extents(local_idxs: &[Arc<UOp>]) -> Vec<usize> {
+    local_idxs
+        .iter()
+        .flat_map(|idx| idx.toposort())
+        .filter_map(|u| match u.op() {
+            Op::Special { end, name } if name.starts_with("lidx") => Some((name.clone(), dim_max(end))),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_values()
+        .collect()
 }
 
 /// `core_id` upper bound for the threaded path (tinygrad `gpudims.py:60`).
