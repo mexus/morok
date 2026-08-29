@@ -66,7 +66,9 @@ fn test_beam_config_builder() {
 fn test_heuristics_config_default() {
     let config = HeuristicsConfig::default();
     assert_eq!(config.tc_enabled, TcUsage::Enabled);
+    // tinygrad `helpers.py:238`: TC_OPT defaults to 0 on the heuristic path.
     assert_eq!(config.tc_opt, TcOpt::Strict);
+    assert_eq!(config.tc_opt.as_usize(), 0);
     assert!(config.matvec_enabled);
     assert_eq!(config.threads_per_row, 8);
     assert_eq!(config.rows_per_thread, 4);
@@ -95,7 +97,24 @@ fn test_optimizer_config_default() {
     let config = OptimizerConfig::default();
     assert_eq!(config.strategy, OptStrategy::Heuristic);
     assert_eq!(config.beam.beam_width, 4);
+    // tinygrad `helpers.py:245`: DISABLE_FAST_IDIV defaults to 1.
     assert!(config.disable_fast_idiv);
+}
+
+/// `disable_fast_idiv` gates the magic-multiply rewrite in the late pattern set.
+#[test_case::test_case(true, true; "disabled keeps cdiv")]
+#[test_case::test_case(false, false; "enabled rewrites cdiv")]
+fn test_disable_fast_idiv_gates_late_rewrites(disable_fast_idiv: bool, expect_cdiv: bool) {
+    use svod_ir::{BinaryOp, DType, Op, UOp};
+
+    let x = UOp::var("x", DType::Int32, 0, 255);
+    let cdiv = UOp::new(Op::Binary(BinaryOp::CDiv, x, UOp::native_const(3i32)), DType::Int32);
+    let renderer = crate::optimizer::Renderer::cpu().with_rewrite_capabilities(svod_ir::RendererOps::all(), None, None);
+    let patterns = crate::optimizer::get_late_rewrite_patterns(&renderer, disable_fast_idiv);
+    let rewritten = crate::rewrite::graph_rewrite(&patterns, cdiv, &mut ());
+
+    let has_cdiv = rewritten.toposort().iter().any(|u| matches!(u.op(), Op::Binary(BinaryOp::CDiv, ..)));
+    assert_eq!(has_cdiv, expect_cdiv, "{}", rewritten.tree());
 }
 
 #[test]

@@ -561,3 +561,15 @@ fn test_full_upcast_const_end_unchanged() {
     assert_axis_count(&sched, AxisType::Upcast, 1);
     assert_axis_count(&sched, AxisType::Global, 0);
 }
+
+/// PADTO carries no reduce-op guard: tinygrad #16562 pads with Invalid instead of
+/// restricting the reduce to ADD (`postrange.py` PADTO, `test_padto_max`).
+#[test_case::test_case(ReduceOp::Add; "add")]
+#[test_case::test_case(ReduceOp::Max; "max")]
+#[test_case::test_case(ReduceOp::Mul; "mul")]
+fn test_padto_is_reduce_op_agnostic(reduce_op: ReduceOp) {
+    let pattern = create_reduce_with_globals(&[4, 4, 17], 17, reduce_op);
+    let mut sched = Scheduler::new(pattern, Renderer::cuda());
+    let result = apply_opt(&mut sched, &Opt::padto(2, 32), true);
+    assert!(result.is_ok(), "PADTO must not depend on the reduce op: {:?}", result.err());
+}

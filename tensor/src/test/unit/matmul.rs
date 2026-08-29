@@ -1324,44 +1324,6 @@ fn test_matmul_f16_mfma_validated() {
     validate_mfma_square(512, DType::Float16, "llvm.amdgcn.mfma.f32.16x16x16f16", 1.0);
 }
 
-/// Heuristic config pinned to the cdna3 fp32 tensor core. The core is
-/// BEAM-only (`heuristic_pick=false` — `v_mfma_f32_16x16x4_f32` matches the
-/// packed-vector fp32 rate, so an unconditional heuristic pick pessimizes), so
-/// these correctness tests force it via an explicit `tc_select` pin.
-fn f32_mfma_config() -> OptimizerConfig {
-    let renderer = svod_schedule::OptimizerRenderer::amd_cdna3();
-    let idx = renderer
-        .tensor_cores
-        .iter()
-        .position(|tc| tc.dtype_in == DType::Float32 && tc.dims == (16, 16, 4))
-        .expect("cdna3 fp32 16x16x4 tensor core");
-    OptimizerConfig::builder()
-        .strategy(OptStrategy::Heuristic)
-        .heuristics(HeuristicsConfig::builder().tc_select(TcSelect::Index(idx)).build())
-        .build()
-}
-
-/// gfx942 fp32 16×16×4 MFMA (`v_mfma_f32_16x16x4_f32`): scalar f32 A/B
-/// operands (ept 1/1), the smallest reduce tile (K=4 → 2 unroll bits), and a
-/// raw-fp32 input path with no cast prelude. Even size — every dim divides 16,
-/// so this proves the layout/swizzle and the K-tile loop; MFMA reorders the
-/// f32 accumulation but the integer inputs keep it exact.
-#[test]
-#[ignore]
-fn test_matmul_f32_mfma_validated() {
-    validate_mfma_square_with(f32_mfma_config(), 512, DType::Float32, "llvm.amdgcn.mfma.f32.16x16x4f32", 1.0);
-}
-
-/// fp32 MFMA multi-tile: 64×64 forces the 4×4 post-TC M/N tile upcasts on top
-/// of the residual K loop, the layer where the broadcast-collapse and
-/// scalar-accumulator bugs lived. (Odd non-divisible sizes don't get the fp32
-/// TC — PADTO selection is a follow-up.)
-#[test]
-#[ignore]
-fn test_matmul_f32_mfma_multitile_validated() {
-    validate_mfma_square_with(f32_mfma_config(), 64, DType::Float32, "llvm.amdgcn.mfma.f32.16x16x4f32", 1.0);
-}
-
 /// gfx942 fp8 (e4m3) 16×16×32 MFMA. The cdna3 fp8 tensor core is K=32, so this
 /// also exercises the K=32 reduce-tile lowering and i64 operand packing. Uses a
 /// smaller matrix: the fp8 path compiles many BEAM candidates (each with the

@@ -340,6 +340,15 @@ fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
 /// - Cannot pad UPCAST/UNROLL/THREAD axes (already vectorized/expanded)
 /// - Padding must add strictly less than 4x work
 ///
+/// There is deliberately **no** reduce-op guard. Tinygrad used to require
+/// `reduce_op == ADD` with no `GroupOp.UnsafePad` op in the reduce's backward
+/// slice; tinygrad 5f1e2d390 ("PADTO pads Invalids", #16562) deleted both that
+/// check and `GroupOp.UnsafePad`, because the padded lanes now index through
+/// `WHERE(valid, INDEX, Invalid)` instead of reading real memory. `postrange.py`
+/// at the pinned reference checks only the three constraints above, and its
+/// `test_padto_max` / `test_padto_sum` assert MAX reduces and `exp`/`lt` above a
+/// reduce pad correctly. This port matches that shape.
+///
 /// # Algorithm
 ///
 /// 1. Round up range size to alignment

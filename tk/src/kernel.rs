@@ -214,8 +214,9 @@ impl Kernel {
     }
 
     /// Close every tracked range and group the last `stores` terminal stores
-    /// into the final kernel SINK (carrying `opts_to_apply = Some(vec![])` so
-    /// the optimizer leaves this hand-lowered body untouched).
+    /// into the final kernel SINK (carrying `opts_to_apply = Some(vec![])`, the
+    /// tinygrad `()` analog, so the optimizer applies zero schedule opts to this
+    /// hand-lowered body; it still runs the shared pre/post-optimization pipeline).
     ///
     /// # Panics
     /// Panics on store-stack underflow — fewer terminal stores were recorded

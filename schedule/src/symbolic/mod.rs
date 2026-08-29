@@ -12,5 +12,5 @@ pub mod valid_simplification;
 
 pub use fast_div::fast_division_patterns;
 pub use index_lowering::{pm_cast_weak, pm_commit_weak, pm_lower_index_dtype, pm_lower_weak};
-pub use patterns::{pm_fold_cast_const, sym, symbolic, symbolic_no_dead_loop, symbolic_simple};
+pub use patterns::{pm_fold_cast_const, sym, symbolic, symbolic_simple};
 pub use valid_simplification::pm_simplify_valid;

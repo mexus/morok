@@ -434,3 +434,14 @@ fn test_regression_index_positions_preserved() {
 // =============================================================================
 // ScatterND regression
 // =============================================================================
+
+/// A zero-sized trailing dimension has no elements to chunk: reject instead of panicking.
+#[test_case::test_case(0, &[4, 0], false; "trailing zero dim")]
+#[test_case::test_case(4, &[2, 2], true; "square")]
+#[test_case::test_case(4, &[4, 0], false; "zero dim with elements")]
+#[test_case::test_case(3, &[2, 2], false; "not divisible")]
+fn stack_with_shape_rejects_unchunkable_shapes(count: usize, dims: &[usize], expected: bool) {
+    let elements: Vec<_> = (0..count).map(|i| UOp::native_const(i as i32)).collect();
+    let shape: Vec<_> = dims.iter().map(|&d| svod_ir::SInt::Const(d)).collect();
+    assert_eq!(crate::devectorize::stack_with_shape(elements, &shape).is_some(), expected);
+}

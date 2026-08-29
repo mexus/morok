@@ -246,8 +246,10 @@ use svod_ir::shape::{Shape, broadcast_shapes, shapes_equal};
 
 /// Run devectorize pass. Call AFTER `pre_expand`, BEFORE codegen.
 ///
-/// Combined matcher matching Tinygrad's fixed-point `devectorizer2` rewrite.
-///
+/// One `graph_rewrite` over the combined matcher, matching tinygrad
+/// `codegen/__init__.py:333` (`symbolic_simple+devectorizer2+indexing_simplify`).
+/// `graph_rewrite` already re-runs the matcher on every replacement, so an outer
+/// fixed-point loop would only paper over a missing pattern.
 pub fn devectorize(ast: &Arc<UOp>, renderer: &Renderer) -> Arc<UOp> {
     static COMBINED: LazyLock<TypedPatternMatcher<Renderer>> = LazyLock::new(|| {
         symbolic_simple().clone().with_context::<Renderer>()
@@ -255,16 +257,7 @@ pub fn devectorize(ast: &Arc<UOp>, renderer: &Renderer) -> Arc<UOp> {
             + bool_storage_patterns().clone().with_context::<Renderer>()
             + crate::late::indexing_simplify().clone().with_context::<Renderer>()
     });
-    let mut current = ast.clone();
-    let mut seen = HashSet::new();
-    loop {
-        assert!(seen.insert(current.id), "devectorize entered a rewrite cycle");
-        let next = graph_rewrite(&*COMBINED, current.clone(), &mut renderer.clone());
-        if Arc::ptr_eq(&next, &current) {
-            return next;
-        }
-        current = next;
-    }
+    graph_rewrite(&*COMBINED, ast.clone(), &mut renderer.clone())
 }
 
 /// Bool LOAD/STORE via uint8. LLVM i1 can have garbage in upper bits.
@@ -1084,57 +1077,59 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
                 }
             }
             Shl | Shr => {
-                let n = long_bin(And, b0.clone(), b0.const_like(31), word_dt.clone());
-                let ge32 = long_bin(Lt, b0.const_like(31), b0.clone(), DType::Bool);
+                // Constants must carry the *word* dtype: a `const_like` off a tagged long
+                // reference would stay 64-bit and never be split.
+                let wconst = |v: i64| {
+                    UOp::const_(
+                        word_dt.clone(),
+                        if from == ScalarDType::Int64 { ConstValue::Int(v) } else { ConstValue::UInt(v as u64) },
+                    )
+                };
+                let uconst = |v: u64| UOp::const_(DType::UInt32, ConstValue::UInt(v));
+                // `n` is the shift inside one word; `ge32` picks the "shift crosses the word" case.
+                let n = long_bin(And, b0.clone(), wconst(31), word_dt.clone());
+                let nu = n.clone().bitcast(DType::UInt32);
+                let ge32 = long_bin(Lt, wconst(31), b0.clone(), DType::Bool);
                 if *op == Shl {
-                    let low = long_bin(Shl, a0.clone(), n.clone(), word_dt.clone());
+                    // carry = a0 >>u (32 - n), spelled as two shifts so n == 0 stays in range.
                     let carry = long_bin(
                         Shr,
-                        long_bin(
-                            Shr,
-                            a0.clone().bitcast(DType::UInt32),
-                            a0.const_like(1).bitcast(DType::UInt32),
-                            DType::UInt32,
-                        ),
-                        long_bin(
-                            Sub,
-                            a0.const_like(31).bitcast(DType::UInt32),
-                            n.bitcast(DType::UInt32),
-                            DType::UInt32,
-                        ),
+                        long_bin(Shr, a0.clone().bitcast(DType::UInt32), uconst(1), DType::UInt32),
+                        long_bin(Sub, uconst(31), nu, DType::UInt32),
                         DType::UInt32,
                     )
                     .bitcast(word_dt.clone());
-                    let high = long_bin(Or, long_bin(Shl, a1, b0.clone(), word_dt.clone()), carry, word_dt.clone());
+                    let low = long_bin(Shl, a0, n.clone(), word_dt.clone());
+                    let high = long_bin(Or, long_bin(Shl, a1, n, word_dt.clone()), carry, word_dt.clone());
                     if word == 0 {
-                        UOp::try_where(ge32, low.const_like(0), low).expect("long shift where")
+                        UOp::try_where(ge32, wconst(0), low).expect("long shift where")
                     } else {
-                        UOp::try_where(ge32, a0, high).expect("long shift where")
+                        // shift >= 32: the high word is the low word shifted by n = shift - 32.
+                        UOp::try_where(ge32, low, high).expect("long shift where")
                     }
                 } else {
+                    // carry = a1 <<u (32 - n), spelled as two shifts so n == 0 stays in range.
                     let carry = long_bin(
                         Shl,
-                        long_bin(
-                            Shl,
-                            a1.clone().bitcast(DType::UInt32),
-                            a1.const_like(1).bitcast(DType::UInt32),
-                            DType::UInt32,
-                        ),
-                        long_bin(
-                            Sub,
-                            a1.const_like(31).bitcast(DType::UInt32),
-                            n.clone().bitcast(DType::UInt32),
-                            DType::UInt32,
-                        ),
+                        long_bin(Shl, a1.clone().bitcast(DType::UInt32), uconst(1), DType::UInt32),
+                        long_bin(Sub, uconst(31), nu.clone(), DType::UInt32),
                         DType::UInt32,
                     )
                     .bitcast(word_dt.clone());
-                    let low = long_bin(Or, long_bin(Shr, a0, n, word_dt.clone()), carry, word_dt.clone());
-                    let high = long_bin(Shr, a1.clone(), b0, word_dt.clone());
+                    // The low word always shifts logically: an Int32 `Shr` is arithmetic and
+                    // would smear the sign of `a0` into the bits `carry` supplies.
+                    let low = long_bin(
+                        Or,
+                        long_bin(Shr, a0.bitcast(DType::UInt32), nu, DType::UInt32).bitcast(word_dt.clone()),
+                        carry,
+                        word_dt.clone(),
+                    );
+                    // shift >= 32: the low word is the high word shifted by n = shift - 32.
+                    let high = long_bin(Shr, a1.clone(), n, word_dt.clone());
                     let fill = if from == ScalarDType::Int64 {
-                        long_bin(Shr, a1.clone(), a1.const_like(31), word_dt.clone())
+                        long_bin(Shr, a1.clone(), wconst(31), word_dt.clone())
                     } else {
-                        a1.const_like(0)
+                        wconst(0)
                     };
                     if word == 0 {
                         UOp::try_where(ge32, high.clone(), low).expect("long shift where")
@@ -1358,14 +1353,15 @@ fn broadcast_and_devec_wmma(wmma: &Arc<UOp>) -> Option<Arc<UOp>> {
     UOp::stack(lanes.into()).try_reshape(&output_shape).ok()
 }
 
-fn stack_with_shape(mut elements: Vec<Arc<UOp>>, shape: &[svod_ir::SInt]) -> Option<Arc<UOp>> {
+pub(crate) fn stack_with_shape(mut elements: Vec<Arc<UOp>>, shape: &[svod_ir::SInt]) -> Option<Arc<UOp>> {
     fn build(elements: &[Arc<UOp>], shape: &[svod_ir::SInt]) -> Option<Arc<UOp>> {
         if shape.is_empty() {
             return (elements.len() == 1).then(|| elements[0].clone());
         }
         let count = shape[0].as_const()?;
         let chunk = elements.len().checked_div(count)?;
-        if count * chunk != elements.len() {
+        // A zero-sized dimension leaves no elements to chunk; `chunks(0)` panics.
+        if chunk == 0 || count * chunk != elements.len() {
             return None;
         }
         Some(UOp::stack(elements.chunks(chunk).map(|part| build(part, &shape[1..])).collect::<Option<_>>()?))
@@ -1731,23 +1727,27 @@ fn maybe_load(value: &Arc<UOp>) -> Arc<UOp> {
 
 /// Move additions into a WMMA accumulator, including movement ops introduced by
 /// output-axis reconstruction in the expander.
+///
+/// Tinygrad `codegen/__init__.py:108-115`. It is guard-free: `wmma.src[2]+add`
+/// asserts inside `alu` on a dtype mismatch. `try_add` is the equivalent that
+/// leaves the WMMA unfused instead of aborting.
 pub fn pm_wmma_add() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         Add[wmma @ Wmma { a, b, c, metadata }, add] => |wmma, a, b, c, metadata, add| {
             Some(UOp::new(
-                Op::Wmma { a: a.clone(), b: b.clone(), c: c.add(add), metadata: metadata.clone() },
+                Op::Wmma { a: a.clone(), b: b.clone(), c: c.try_add(add).ok()?, metadata: metadata.clone() },
                 wmma.dtype(),
             ))
         },
 
         Add[Permute { src: wmma @ Wmma { a: _, b: _, c: _, metadata: _ }, axes }, add] => {
             let moved = add.try_permute(crate::argsort(axes)).ok()?;
-            wmma.add(&moved).try_permute(axes.clone()).ok()
+            wmma.try_add(&moved).ok()?.try_permute(axes.clone()).ok()
         },
 
         Add[Permute { src: reshape @ Reshape { src: wmma @ Wmma { a: _, b: _, c: _, metadata: _ }, .. }, axes }, add] => {
             let moved = add.try_permute(crate::argsort(axes)).ok()?.try_reshape(wmma.shape().ok().flatten()?).ok()?;
-            wmma.add(&moved)
+            wmma.try_add(&moved).ok()?
                 .try_reshape(reshape.shape().ok().flatten()?).ok()?
                 .try_permute(axes.clone()).ok()
         },

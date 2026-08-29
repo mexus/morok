@@ -190,7 +190,7 @@ fn combined_dtype_pass_commits_long_weak_store_before_word_split() {
     let index = UOp::index().buffer(buffer).indices(vec![offset]).call().unwrap();
     let value = UOp::new(
         Op::Binary(
-            svod_ir::BinaryOp::Add,
+            svod_ir::BinaryOp::Shl,
             UOp::const_(DType::WeakInt, ConstValue::Int(0x1_0000_0000)),
             UOp::const_(DType::WeakInt, ConstValue::Int(0x7654_3210)),
         ),
@@ -212,4 +212,22 @@ fn combined_dtype_pass_commits_long_weak_store_before_word_split() {
     assert_eq!(stores.len(), 2, "{}", decomposed.tree());
     assert!(stores.iter().all(|value| value.dtype() == DType::Int32), "{}", decomposed.tree());
     assert!(stores.iter().all(|value| !value.dtype().is_weak()), "{}", decomposed.tree());
+}
+
+/// Word split of `x << s` / `x >> s` at the 32-bit boundary (Svod-only pass; see
+/// `test/property/long_shift.rs`).
+#[test_case::test_case(0)]
+#[test_case::test_case(31)]
+#[test_case::test_case(32)]
+#[test_case::test_case(33)]
+#[test_case::test_case(63)]
+fn long_shift_word_split_matches_native(shift: u64) {
+    use crate::test::property::long_shift::assert_shift_words;
+    use svod_ir::types::BinaryOp::{Shl, Shr};
+
+    for from in [ScalarDType::Int64, ScalarDType::UInt64] {
+        for op in [Shl, Shr] {
+            assert_shift_words(op, 0x89ab_cdef_0123_4567, shift, from);
+        }
+    }
 }

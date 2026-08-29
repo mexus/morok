@@ -448,8 +448,9 @@ where
 /// first), so `build` sees the same PARAM slots as the direct path. Launch
 /// geometry rides on the `Op::Special` ops [`Kernel::new`](crate::Kernel::new)
 /// mints from `grid`/`block` (no launch dims are passed through `CallInfo`); the
-/// `finish()`-stamped `opts_to_apply = Some(vec![])` keeps the optimizer off the
-/// hand-lowered body.
+/// `finish()`-stamped `opts_to_apply = Some(vec![])` makes the optimizer apply
+/// zero schedule opts to the hand-lowered body, which then goes through the same
+/// pre/post-optimization pipeline as any other kernel.
 ///
 /// ```no_run
 /// use svod_tensor::Tensor;

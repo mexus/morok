@@ -850,6 +850,22 @@ struct CacheKey {
     compile_timeout_secs: u64,
     /// Post-optimization behavior not represented by BeamConfig.
     behavior_fingerprint: u64,
+    /// Identity of the action space the plan was searched in.
+    action_space: u64,
+}
+
+/// Structural hash of a beam action space.
+///
+/// [`BEAM_ACTIONS`] is built from `BEAM_PADTO`, `TC` and `TC_OPT`, so a cached
+/// plan is only replayable under the action space that produced it. Tinygrad's
+/// `search.py:116` key is `{ast, amt, allow_test_size, device, suffix}` and has
+/// the same hazard (its `actions` list reads the same env vars at import); this
+/// is a deliberate go-beyond.
+pub(crate) fn action_space_hash(actions: &[Opt]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    actions.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl CacheKey {
@@ -869,7 +885,7 @@ impl CacheKey {
         let ast_hash = hasher.finish();
 
         Self {
-            schema: 7,
+            schema: 8,
             ast_hash,
             beam_width: config.beam_width,
             device: scheduler.ren.device,
@@ -883,13 +899,14 @@ impl CacheKey {
             enable_nolocals: config.enable_nolocals,
             compile_timeout_secs: config.compile_timeout_secs,
             behavior_fingerprint,
+            action_space: action_space_hash(&BEAM_ACTIONS),
         }
     }
 
     /// Convert to bytes for database key.
     fn to_bytes(&self) -> Vec<u8> {
         let device_str = self.device.canonical();
-        let mut bytes = Vec::with_capacity(76 + self.compiler_identity.len() + device_str.len());
+        let mut bytes = Vec::with_capacity(84 + self.compiler_identity.len() + device_str.len());
         bytes.extend_from_slice(&self.schema.to_le_bytes());
         bytes.extend_from_slice(&self.ast_hash.to_le_bytes());
         bytes.extend_from_slice(&self.renderer_fingerprint.to_le_bytes());
@@ -902,6 +919,7 @@ impl CacheKey {
         bytes.push(u8::from(self.enable_nolocals));
         bytes.extend_from_slice(&self.compile_timeout_secs.to_le_bytes());
         bytes.extend_from_slice(&self.behavior_fingerprint.to_le_bytes());
+        bytes.extend_from_slice(&self.action_space.to_le_bytes());
         bytes.extend_from_slice(&self.compiler_identity.len().to_le_bytes());
         bytes.extend_from_slice(self.compiler_identity.as_bytes());
         bytes.extend_from_slice(device_str.as_bytes());
@@ -952,33 +970,12 @@ fn cache_invalidate(key: &CacheKey) {
     }
 }
 
-/// Run beam search with disk caching.
+/// Run beam search with disk caching, replaying a cached plan when one exists.
 ///
-/// Checks the cache before running beam search. If a cached result exists,
-/// replays the optimizations instead of searching. Results are cached after
-/// successful search.
-///
-/// # Arguments
-///
-/// * `scheduler` - Initial scheduler state
-/// * `config` - Beam search configuration (includes disable_cache flag)
-/// * `compile_and_time` - Function to compile and time a scheduler state
-///
-/// # Returns
-///
-/// `BeamResult` containing the best scheduler found.
-pub fn beam_search_cached<F>(
-    scheduler: Scheduler,
-    config: &BeamConfig,
-    compile_and_time: F,
-) -> Result<BeamResult, OptError>
-where
-    F: Fn(&Scheduler, Option<Duration>) -> Option<CandidateMetrics> + Sync,
-{
-    beam_search_cached_with_behavior(scheduler, config, 0, compile_and_time)
-}
-
-/// Run cached beam search with an explicit post-optimization behavior identity.
+/// `behavior_fingerprint` identifies post-optimization behavior that
+/// `BeamConfig` does not capture (see `OptimizerConfig::transcendental` and
+/// `disable_fast_idiv`). It is a required argument: a wrapper that pinned it to
+/// 0 would silently share cache entries across differing post-opt behavior.
 pub fn beam_search_cached_with_behavior<F>(
     scheduler: Scheduler,
     config: &BeamConfig,
