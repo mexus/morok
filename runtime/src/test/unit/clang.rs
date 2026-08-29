@@ -66,3 +66,21 @@ fn clean_compiler_process_produces_valid_object() {
     let object = process.finish().unwrap();
     validate_c_object(&object, "isolated_kernel").unwrap();
 }
+
+/// `-march=native` resolves against the running CPU, so its `-###` probe must
+/// never be shared between hosts; an explicit arch must be.
+#[test_case::test_case("-march=native" => false; "host-resolved arch")]
+#[test_case::test_case("-mcpu=native" => false; "host-resolved cpu")]
+#[test_case::test_case("-march=x86-64" => true; "explicit arch")]
+fn probe_key_is_shared_between_hosts(flag: &str) -> bool {
+    let flags = vec![flag.to_string()];
+    let executable = [7u8; 32];
+    probe_key(&executable, &flags, Some(&[1u8; 32])) == probe_key(&executable, &flags, Some(&[2u8; 32]))
+}
+
+#[test]
+fn unfingerprintable_host_disables_probe_sharing_for_native_flags() {
+    let executable = [7u8; 32];
+    assert!(probe_key(&executable, &["-march=native".into()], None).is_none());
+    assert!(probe_key(&executable, &["-march=x86-64".into()], None).is_some());
+}

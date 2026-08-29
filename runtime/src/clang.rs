@@ -53,13 +53,11 @@ impl ClangToolchain {
         &self.identity
     }
 
+    /// Resolve `flags` into the concrete target description clang will use —
+    /// `-###` reports the selected `-target-cpu` and feature list — so it can
+    /// be persisted as `CompilerIdentity::target_architecture`.
     pub(crate) fn target_identity(&self, cache: Option<&ObjectCache>, flags: &[String]) -> Result<String> {
-        let mut probe_input = Vec::new();
-        probe_input.extend_from_slice(&self.executable_digest);
-        for flag in flags {
-            probe_input.extend_from_slice(&(flag.len() as u64).to_le_bytes());
-            probe_input.extend_from_slice(flag.as_bytes());
-        }
+        let probe_input = probe_key(&self.executable_digest, flags, host_cpu_fingerprint());
         let create = || {
             let mut command = Command::new(&self.executable);
             command.args(flags).arg("-###").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -73,10 +71,9 @@ impl ClangToolchain {
             identity.extend_from_slice(&output.stdout);
             Ok(identity)
         };
-        let output = if let Some(cache) = cache {
-            cache.get_or_create_probe("clang-target", &probe_input, create)?
-        } else {
-            create()?
+        let output = match (cache, &probe_input) {
+            (Some(cache), Some(probe_input)) => cache.get_or_create_probe("clang-target", probe_input, create)?,
+            _ => create()?,
         };
         String::from_utf8(output)
             .map_err(|error| Error::JitCompilation { reason: format!("clang target probe was not UTF-8: {error}") })
@@ -85,6 +82,68 @@ impl ClangToolchain {
     pub(crate) fn command(&self) -> Command {
         Command::new(&self.executable)
     }
+}
+
+/// Probe-cache key for one flag set, or `None` when the result must not be
+/// shared at all.
+///
+/// `-march=native` / `-mcpu=native` resolve against the *running* CPU, so a
+/// `-###` result cached in a directory shared between machines would hand a
+/// second host the first host's `-target-cpu` — and, through
+/// `CompilerIdentity::target_architecture`, its compiled objects. Tinygrad
+/// avoids this by never resolving `native` implicitly: its CPU compiler is
+/// constructed from an explicit `<arch>,<cpu>,<feats>` string
+/// (`runtime/support/compiler_cpu.py:8-15`) that is baked into the cache key
+/// (`compiler_llvm.py:46`). We keep `native` and discriminate on the host
+/// instead.
+fn probe_key(executable_digest: &[u8; 32], flags: &[String], host: Option<&[u8; 32]>) -> Option<Vec<u8>> {
+    let mut input = Vec::with_capacity(executable_digest.len() + flags.len() * 16);
+    input.extend_from_slice(executable_digest);
+    for flag in flags {
+        input.extend_from_slice(&(flag.len() as u64).to_le_bytes());
+        input.extend_from_slice(flag.as_bytes());
+    }
+    if flags.iter().any(|flag| flag.contains("native")) {
+        input.extend_from_slice(host?);
+    }
+    Some(input)
+}
+
+/// Digest of the stable `/proc/cpuinfo` lines that decide what `native`
+/// resolves to. Per-core frequency and bogomips are excluded: they change
+/// between runs on one machine and must not evict the probe.
+fn host_cpu_fingerprint() -> Option<&'static [u8; 32]> {
+    static FINGERPRINT: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+    FINGERPRINT
+        .get_or_init(|| {
+            const STABLE: &[&str] = &[
+                "vendor_id",
+                "cpu family",
+                "model",
+                "model name",
+                "stepping",
+                "flags",
+                "Features",
+                "CPU implementer",
+                "CPU architecture",
+                "CPU variant",
+                "CPU part",
+                "isa",
+                "uarch",
+            ];
+            let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+            let mut digest = Sha256::new();
+            digest.update(std::env::consts::ARCH.as_bytes());
+            for line in cpuinfo.lines() {
+                let Some((key, _)) = line.split_once(':') else { continue };
+                if STABLE.contains(&key.trim()) {
+                    digest.update(line.trim().as_bytes());
+                    digest.update(b"\n");
+                }
+            }
+            Some(digest.finalize().into())
+        })
+        .as_ref()
 }
 
 pub(crate) fn c_object_flags() -> Vec<String> {
