@@ -183,15 +183,29 @@ pub struct RuntimeVar {
     pub max_val: i64,
 }
 
-/// Walk `root` and collect bounds for every reachable `DefineVar`.
+/// Walk `root` and collect bounds for every reachable runtime variable, in
+/// either spelling: a `DefineVar`, or the bounded scalar `Param` a
+/// `svod_tensor::Variable` lowers to.
 pub fn collect_runtime_vars(root: &Arc<UOp>) -> Vec<RuntimeVar> {
     let mut vars = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for node in root.toposort() {
-        if let Op::DefineVar { name, min_val, max_val } = node.op()
+        let bounds = match node.op() {
+            Op::DefineVar { name, min_val, max_val } => Some((name.clone(), *min_val, *max_val)),
+            Op::Param { arg, .. }
+                if arg.addrspace.is_none()
+                    && let Some(name) = arg.name.as_deref()
+                    && let Some((min, max)) = &arg.vmin_vmax
+                    && let (Some(min), Some(max)) = (min.0.try_int(), max.0.try_int()) =>
+            {
+                Some((name.to_string(), min, max))
+            }
+            _ => None,
+        };
+        if let Some((name, min_val, max_val)) = bounds
             && seen.insert(name.clone())
         {
-            vars.push(RuntimeVar { name: name.clone(), min_val: *min_val, max_val: *max_val });
+            vars.push(RuntimeVar { name, min_val, max_val });
         }
     }
     vars
@@ -873,7 +887,17 @@ impl ExecutionPlan {
                         if kernel.fixedvars.contains_key(&var.name) || var.name == "core_id" {
                             continue;
                         }
-                        if let Some(&value) = vals_map.get(var.name.as_str()) {
+                        // A variable left unbound at prepare time still carries a
+                        // placeholder in `vals`; validate that too, so a binding
+                        // that never arrives is caught here rather than at prepare.
+                        let current = kernel
+                            .kernel
+                            .var_names
+                            .iter()
+                            .position(|name| name == &var.name)
+                            .and_then(|index| kernel.vals.get(index))
+                            .copied();
+                        if let Some(value) = vals_map.get(var.name.as_str()).copied().or(current) {
                             validate_var_bound(&var.name, value, var.min_val, var.max_val)?;
                         }
                     }

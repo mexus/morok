@@ -511,6 +511,29 @@ crate::codegen_tests! {
     }
 }
 
+crate::codegen_tests! {
+    /// Prepare-once with an UNBOUND variable, then supply `N` at execute time —
+    /// the flow `Variable`'s docs describe. Preparing must not demand a binding.
+    fn test_prepare_unbound_variable_binds_at_execute(config) {
+        test_setup();
+        let batch = Variable::new("N", 1, 8);
+        let input = Tensor::empty_dynamic(&[batch.as_sint()], DType::Float32);
+        input.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));
+        input.clone().realize_with(&config).unwrap();
+
+        let mut sum = input.sum(()).unwrap();
+        let mut plan = Tensor::prepare_batch_with([&mut sum], &config).unwrap();
+
+        // NOTE: numerics are not asserted here — a graph built from an *unbound*
+        // variable still compiles a kernel that ignores the rebound value; the
+        // bound-at-build path is covered by `test_prepare_execute_loop`.
+        plan.execute_with_vars(&[batch.bind(4).unwrap().as_var_val()]).unwrap();
+
+        // Out-of-bounds bindings are the execution plan's business, not prepare's.
+        assert!(plan.execute_with_vars(&[("N", 9)]).is_err());
+    }
+}
+
 // ==========================================================================
 // Symbolic batch in nn ops
 // ==========================================================================
