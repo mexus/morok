@@ -491,7 +491,7 @@ pub fn xpow(base: &Arc<UOp>, exponent: &Arc<UOp>) -> Arc<UOp> {
 /// Returns (reduced_value, quadrant)
 fn cody_waite_reduction(d: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
     let dtype = scalar_dtype(&d.dtype());
-    let m_1_pi = 0.318_309_886_183_790_7;
+    let m_1_pi = std::f64::consts::FRAC_1_PI;
     let qdh = if dtype.scalar() == Some(ScalarDType::Float64) {
         d.mul(&float_const(&dtype, m_1_pi / 16_777_216.0))
             .cast(DType::Int64)

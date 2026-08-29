@@ -5,7 +5,7 @@ export CARGO_TERM_COLOR=never
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIN="8c8b43de62515abe6c820b1de5aa26b30f48e43a"
-REFERENCE="$ROOT/submodules/new_new_tinygrad"
+REFERENCE="${TINYGRAD_REF:-$ROOT/submodules/tinygrad}"
 ACTUAL="$(git -C "$REFERENCE" rev-parse HEAD)"
 if [[ "$ACTUAL" != "$PIN" ]]; then
   printf 'Tinygrad reference is %s, expected %s\n' "$ACTUAL" "$PIN" >&2

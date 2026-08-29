@@ -11,3 +11,6 @@ tensor/src/test/
 tk/src/test/
 tensor/benches/
 submodules/
+scripts/
+ir/examples/
+tensor/examples/
