@@ -170,7 +170,7 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     let all_idxs: Vec<Arc<UOp>> = if ctx.has_threads {
         // global_shape contains RANGE extents, not range indices. Match
         // Tinygrad's `int(global_shape[0])-1`: Thread(N) has N core IDs.
-        let end = const_to_i64(global_shape[0].vmax()).expect("threaded global shape must have a concrete bound");
+        let end = thread_core_bound(&global_dims, &local_dims, &global_shape)?;
         vec![UOp::variable("core_id".to_string(), 0, end - 1, DType::Int32).cast(DType::WeakInt)]
     } else if dont_use_locals {
         assert!(local_dims.is_empty(), "can't use locals if there's no local dims");
@@ -213,13 +213,17 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     let all_dims: Vec<(svod_ir::AxisId, AxisType)> = global_dims.iter().chain(local_dims.iter()).cloned().collect();
 
-    for (i, (axis_id, axis_type)) in all_dims.iter().enumerate() {
+    // Every branch above yields one index per dim (the threaded branch only
+    // after `thread_core_bound` proved there is exactly one), so `zip` never
+    // truncates — it just makes the `idxs[ii]` bound unindexable.
+    debug_assert_eq!(all_dims.len(), all_idxs.len(), "gpudims: one index per GPU dim");
+    for ((axis_id, axis_type), idx) in all_dims.iter().zip(&all_idxs) {
         if *axis_type == AxisType::Reduce {
             // Don't replace reduce axes (they stay as loops)
             continue;
         }
         if let Some(range_uop) = all_ranges.get(&(axis_id.clone(), *axis_type)) {
-            subs.insert(UOpKey(range_uop.clone()), all_idxs[i].clone());
+            subs.insert(UOpKey(range_uop.clone()), idx.clone());
         }
     }
 
@@ -237,6 +241,34 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     Some(sink.substitute(&subs))
+}
+
+/// `core_id` upper bound for the threaded path (tinygrad `gpudims.py:60`).
+///
+/// Tinygrad's `int(global_shape[0])-1` silently assumes the sink has exactly
+/// one THREAD axis, no local axes, and a concrete extent — the shape a CPU
+/// renderer produces. Anything else means the scheduler handed us a kernel the
+/// threaded path cannot express: one `core_id` cannot stand in for N ranges.
+/// Return `None` so `add_gpudims` declines the rewrite instead of indexing past
+/// the single produced index (or panicking on a symbolic bound).
+fn thread_core_bound(
+    global_dims: &[(svod_ir::AxisId, AxisType)],
+    local_dims: &[(svod_ir::AxisId, AxisType)],
+    global_shape: &[Arc<UOp>],
+) -> Option<i64> {
+    if global_dims.len() != 1 || !local_dims.is_empty() {
+        tracing::warn!(
+            globals = global_dims.len(),
+            locals = local_dims.len(),
+            "gpudims: threaded renderer needs exactly one global axis and no local axes; skipping"
+        );
+        return None;
+    }
+    let bound = const_to_i64(global_shape.first()?.vmax());
+    if bound.is_none() {
+        tracing::warn!("gpudims: threaded global axis has no concrete bound; skipping");
+    }
+    bound
 }
 
 /// Compute store masks for global stores with missing local indices.

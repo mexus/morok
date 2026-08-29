@@ -15,7 +15,7 @@ fn dmax(vs: &[Arc<UOp>]) -> Vec<usize> {
 #[test]
 fn test_thread_extent_maps_to_exact_core_id_cardinality() {
     let thread = UOp::range_axis(UOp::index_const(2), svod_ir::AxisId::Renumbered(0), AxisType::Thread);
-    let sink = UOp::sink(vec![thread]);
+    let sink = UOp::sink(vec![thread.clone()]);
 
     let lowered = add_gpudims(&Renderer::cpu(), &sink).expect("thread range should lower to core_id");
     let core_id = lowered
@@ -30,6 +30,10 @@ fn test_thread_extent_maps_to_exact_core_id_cardinality() {
     let info = svod_ir::ProgramInfo::from_sink(&lowered, svod_dtype::DeviceSpec::Cpu);
     assert_eq!(info.global_size[0].vmin(), &ConstValue::Int(2));
     assert_eq!(info.global_size[0].vmax(), &ConstValue::Int(2));
+
+    // One core_id cannot stand in for two THREAD axes: decline, don't panic.
+    let second = UOp::range_axis(UOp::index_const(3), svod_ir::AxisId::Renumbered(1), AxisType::Thread);
+    assert!(add_gpudims(&Renderer::cpu(), &UOp::sink(vec![thread, second])).is_none());
 }
 
 #[test]
