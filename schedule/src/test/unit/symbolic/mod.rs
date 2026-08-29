@@ -1111,12 +1111,17 @@ fn signed_floor_division_rewrites_keep_negative_cases_exact() {
     assert!(matches!(lifted.op(), Op::Binary(BinaryOp::Lt, lhs, rhs)
         if Arc::ptr_eq(lhs, &x) && matches!(rhs.op(), Op::Const(value) if value.0 == ConstValue::Int(0))));
 
+    // `(-128 // -9) // -2` has a single-bucket quotient, so tinygrad's
+    // cancel_divmod (`uop/divandmod.py:13`) folds it to the exact constant. The
+    // unsound `(a//b)//c -> a//(b*c)` reassociation stays rejected for c < 0.
     let nested = i8_const(-128).floor_div(&i8_const(-9)).floor_div(&i8_const(-2));
-    assert!(matches!(
-        crate::symbolic::patterns::advanced_division_dsl_patterns().rewrite(&nested, &mut ()),
-        RewriteResult::NoMatch
-    ));
+    let RewriteResult::Rewritten(folded) =
+        crate::symbolic::patterns::advanced_division_dsl_patterns().rewrite(&nested, &mut ())
+    else {
+        panic!("single-bucket quotient should fold");
+    };
     assert_eq!(eval_closed_typed(&nested), Some(ConstValue::Int(-7)));
+    assert!(matches!(folded.op(), Op::Const(value) if value.0 == ConstValue::Int(-7)));
 
     let recombine = i8_const(-20)
         .floor_div(&i8_const(-9))

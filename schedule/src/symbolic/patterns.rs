@@ -1211,17 +1211,21 @@ pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
             };
             exact_integer_rewrite(original, replacement)
         },
-        // Affine congruence folding. The helper only constructs a candidate;
-        // recursively prove every source and replacement arithmetic node exact.
-        original @ FloorMod(x, c @const(c_val)) => {
-            let replacement = crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, true)?;
+        // (x + c) % d → (x + c%d) % d for d > 0 (`uop/divandmod.py:102-105`).
+        // The FLOORDIV half lives in `range_based_mod_div_patterns`.
+        original @ FloorMod(Add[x, _c @const(c_val)], d @const(d_val)) => {
+            let c_int = c_val.try_int()?;
+            let d_int = d_val.try_int()?;
+            if d_int <= 0 { return None; }
+            let reduced = c_int.rem_euclid(d_int);
+            if reduced == c_int { return None; }
+            let replacement = x.add(&UOp::const_(d.dtype(), ConstValue::Int(reduced))).mod_(d);
             exact_integer_rewrite(original, replacement)
         },
-        original @ FloorDiv(x, c @const(c_val)) => {
-            let replacement = crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, false)?;
-            exact_integer_rewrite(original, replacement)
-        },
-        // Symbolic divisors: tinygrad's divide_by_gcd / factor_remainder fallback.
+        // Tinygrad's single div/mod folding entry point (`uop/divandmod.py:108`):
+        // constant and symbolic divisors take the same path. The helper only
+        // constructs a candidate; every source and replacement arithmetic node
+        // is proven exact here.
         original @ FloorMod(x, y) => {
             let replacement = crate::symbolic::divmod::fold_divmod_general(BinaryOp::FloorMod, x, y)?;
             exact_integer_rewrite(original, replacement)
@@ -1230,13 +1234,9 @@ pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
             let replacement = crate::symbolic::divmod::fold_divmod_general(BinaryOp::FloorDiv, x, y)?;
             exact_integer_rewrite(original, replacement)
         },
-        // (a + b) // c → (a // c) + (b // c) when both divide evenly
-        original @ FloorDiv(Add(a, b), _c @const(c_val)) => {
-            let d = c_val.try_int()?;
-            let replacement = a.divides(d)?.add(&b.divides(d)?);
-            exact_integer_rewrite(original, replacement)
-        },
-        // (a - b) // c → (a // c) - (b // c) when both divide evenly
+        // (a - b) // c → (a // c) - (b // c) when both divide evenly.
+        // The ADD counterpart is subsumed: `UOp::divides` recurses through ADD,
+        // so `expr // divisor → expr.divides(divisor)` above already covers it.
         original @ FloorDiv(Sub(a, b), _c @const(c_val)) => {
             let d = c_val.try_int()?;
             let replacement = a.divides(d)?.sub(&b.divides(d)?);
