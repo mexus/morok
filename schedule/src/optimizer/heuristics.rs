@@ -219,6 +219,11 @@ pub fn apply_image_upcasts(scheduler: &mut Scheduler) -> bool {
         let Op::Index { buffer, indices, .. } = buf.op() else {
             continue;
         };
+        // The rank-3-with-4-channels shape is only an image when the buffer says so;
+        // an ordinary rank-3 tensor must not be upcast on this path.
+        if !buffer.dtype().is_image() {
+            continue;
+        }
         if !buffer.shape().ok().flatten().is_some_and(|shape| shape.len() == 3 && shape[2].as_const() == Some(4)) {
             continue;
         }

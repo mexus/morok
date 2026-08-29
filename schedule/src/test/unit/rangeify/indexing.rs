@@ -16,6 +16,33 @@ use crate::rangeify::{
     indexing::{broadcast_ranges, data_sources},
 };
 
+// ===== Index Linearization =====
+
+#[test]
+fn test_image_buffers_keep_two_index_addresses() {
+    use svod_ir::ParamArg;
+
+    let ranges = [
+        UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(0), AxisType::Loop),
+        UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), AxisType::Loop),
+    ];
+    let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![2usize.into(), 8usize.into()]);
+
+    for (dtype, expected_indices) in
+        [(DType::Image { kind: svod_dtype::ImageKind::Float, shape: vec![2, 8, 4] }, 2), (DType::Float32, 1)]
+    {
+        let arg = ParamArg::buffer(0, dtype.clone(), svod_dtype::AddrSpace::Global, Some(svod_ir::DeviceSpec::Cpu));
+        let buffer = UOp::new(Op::Buffer { shape: shape.clone(), arg }, dtype);
+        let indexed = crate::rangeify::transforms::transform_single_source(
+            &UOp::sink(vec![]),
+            &buffer,
+            &ranges,
+            &mut IndexingContext::new(),
+        );
+        assert!(matches!(indexed.op(), Op::Index { indices, .. } if indices.len() == expected_indices));
+    }
+}
+
 // ===== Basic Range Creation =====
 
 #[test]

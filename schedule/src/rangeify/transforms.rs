@@ -812,9 +812,11 @@ pub(crate) fn transform_single_source(
 /// image/dynamic coordinates, but flatten statically-shaped tensor accesses at
 /// their rangeify producer.
 fn linearize_static_indices(buffer: &Arc<UOp>, indices: &[Arc<UOp>]) -> Option<Vec<Arc<UOp>>> {
-    if indices.len() <= 1 {
+    if indices.len() <= 1 || buffer.dtype().is_image() {
         return None;
     }
+    // Image coordinates are a (y, x) pair the renderer addresses directly; flattening
+    // them into one linear offset makes the access unrenderable.
     let shape = buffer.shape().ok().flatten()?;
     if shape.len() != indices.len() {
         return None;

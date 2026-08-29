@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
 use svod_ir::{AxisId, AxisType, Op, ParamArg, ReduceOp, UOp};
+use test_case::test_case;
 
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
 use crate::optimizer::heuristics::{apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores};
@@ -67,19 +68,19 @@ fn test_apply_matvec_fast_path_respects_disable_flag() {
     assert!(!applied, "matvec fast-path should be disabled by config");
 }
 
-#[test]
-fn test_apply_image_upcasts_non_stub_behavior() {
+#[test_case(DType::Image { kind: svod_dtype::ImageKind::Float, shape: vec![2, 8, 4] }, true; "image buffer")]
+#[test_case(DType::Float32, false; "plain rank three tensor")]
+fn test_apply_image_upcasts_non_stub_behavior(dtype: DType, expected: bool) {
     let g = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Global);
     let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![2usize.into(), 8usize.into(), 4usize.into()]);
-    let arg = ParamArg::buffer(0, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu));
-    let img = UOp::new(Op::Buffer { shape, arg }, DType::Float32);
+    let arg = ParamArg::buffer(0, dtype.clone(), AddrSpace::Global, Some(DeviceSpec::Cpu));
+    let img = UOp::new(Op::Buffer { shape, arg }, dtype);
     let indexed = UOp::index().buffer(img).indices(vec![g.clone()]).call().expect("image index should build");
     let sink = UOp::sink(vec![indexed, g]);
 
     let mut scheduler = Scheduler::new(sink, Renderer::cpu());
-    let applied = apply_image_upcasts(&mut scheduler);
-    assert!(applied, "image upcast should apply for axis divisible by 4");
-    assert_eq!(scheduler.axes_of(&[AxisType::Upcast]).len(), 1);
+    assert_eq!(apply_image_upcasts(&mut scheduler), expected);
+    assert_eq!(scheduler.axes_of(&[AxisType::Upcast]).len(), usize::from(expected));
 }
 
 #[test]
