@@ -14,19 +14,13 @@ pub fn commit_float(value: f64, dtype: ScalarDType) -> Option<f64> {
         WeakFloat | Float64 => value,
         Float32 => (value as f32) as f64,
         Float16 => f16_bits_to_float(float_to_f16_bits(value)),
+        BFloat16 if !value.is_finite() => value,
         BFloat16 => {
-            if !value.is_finite() {
-                value
-            } else {
-                // float_to_bf16 uses struct.pack('f'), which rejects finite
-                // values outside the f32 range rather than producing infinity.
-                if value.to_bits() & 0x7fff_ffff_ffff_ffff >= 0x47ef_ffff_f000_0000 {
-                    return None;
-                }
-                let bits = (value as f32).to_bits();
-                let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000;
-                f32::from_bits(rounded) as f64
-            }
+            // Tinygrad's `float_to_bf16` (dtype.py:223) packs through f32 and raises
+            // OverflowError past the f32 rounding midpoint; we saturate to +/-inf like
+            // `float_to_fp16` so `truncate` stays total for every scalar dtype.
+            let bits = (value as f32).to_bits();
+            f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000) as f64
         }
         FP8E4M3 | FP8E5M2 | FP8E4M3FNUZ | FP8E5M2FNUZ => fp8_to_float(float_to_fp8(value, dtype)?, dtype)?,
         _ => return None,

@@ -1704,6 +1704,19 @@ fn test_propagate_invalid_through_comparison_preserves_gate() {
     assert!(matches!(value.op(), Op::Binary(BinaryOp::Lt, _, _)));
     assert!(UOp::is_invalid_marker(invalid));
     assert_eq!(invalid.dtype(), DType::Bool);
+
+    // A bare Invalid poisons a non-comparison binary from either side, but a
+    // comparison keeps it as an operand (tinygrad uop/symbolic.py:75-77).
+    // Invalid only reaches an operand slot through source reconstruction, so build
+    // the poisoned nodes directly rather than through the promoting constructors.
+    let index = UOp::var("i", DType::Index, 0, 100);
+    let marker = UOp::invalid_marker();
+    let binary = |op, lhs: &Arc<UOp>, rhs: &Arc<UOp>| UOp::new(Op::Binary(op, lhs.clone(), rhs.clone()), DType::Index);
+    for poisoned in [binary(BinaryOp::Sub, &index, &marker), binary(BinaryOp::Sub, &marker, &index)] {
+        assert!(UOp::is_invalid_marker(&graph_rewrite(propagate_invalid(), poisoned, &mut ())));
+    }
+    let compared = UOp::new(Op::Binary(BinaryOp::Lt, index, marker), DType::Bool);
+    assert!(matches!(graph_rewrite(propagate_invalid(), compared, &mut ()).op(), Op::Binary(BinaryOp::Lt, _, _)));
 }
 
 #[test]
@@ -1717,6 +1730,24 @@ fn test_remove_typed_invalid_lanes_at_final_cleanup() {
     assert!(!result.any_in_subtree(UOp::is_invalid_marker));
     let Op::Stack { sources: elements } = result.op() else { panic!("expected VECTORIZE, got: {}", result.tree()) };
     assert!(matches!(elements[0].op(), Op::Const(cv) if cv.0 == ConstValue::Float(0.0)));
+}
+
+#[test]
+fn single_valued_bounds_collapse_products_but_not_sums() {
+    use crate::symbolic::patterns::vmin_vmax_collapse_patterns;
+
+    let a = UOp::var("a", DType::Int32, 2, 2);
+    let b = UOp::var("b", DType::Int32, 3, 3);
+    let collapse = |root| graph_rewrite(vmin_vmax_collapse_patterns(), root, &mut ());
+
+    let product = collapse(a.try_mul(&b).unwrap());
+    assert!(matches!(product.op(), Op::Const(value) if value.0 == ConstValue::Int(6)));
+
+    // Add/Sub/Max stay: collapsing them replicates the trivial-RANGE collapse that
+    // breaks a hand-built kernel's trip-1 loop carry (tinygrad uop/symbolic.py:248).
+    for sum in [a.try_add(&b).unwrap(), a.try_sub(&b).unwrap(), a.try_max(&b).unwrap()] {
+        assert!(matches!(collapse(sum).op(), Op::Binary(..)));
+    }
 }
 
 // ====== Tests for MINMAX patterns (minmax_dsl_patterns) ======
@@ -3035,6 +3066,20 @@ fn test_simplify_valid_redundant_upper_bounds() {
         assert!(simplified.node_count() <= combined.node_count(), "Simplified result should not be larger");
     }
     // Either way, function should not panic — this is the key test
+}
+
+#[test]
+fn lower_bound_clauses_use_the_bounds_minimum() {
+    use crate::symbolic::valid_simplification::parse_valid;
+
+    let range = UOp::range_const(20, 0);
+    let begin = UOp::var("begin", DType::WeakInt, 2, 9);
+    let ne_form = range.lt(&begin).ne(&UOp::native_const(true));
+    let not_form = range.lt(&begin).not();
+
+    for clause in [ne_form, not_form] {
+        assert_eq!(parse_valid(&clause).map(|(_, upper, bound)| (upper, bound)), Some((false, 2)));
+    }
 }
 
 #[test]

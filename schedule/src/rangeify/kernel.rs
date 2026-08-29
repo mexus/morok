@@ -334,6 +334,37 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(call)
 }
 
+/// A non-copy kernel reads and writes one device.
+///
+/// Tinygrad enforces this in `assert_all_same_devices` (`schedule/__init__.py:141`),
+/// after the copy-kernel rewrites in `pm_copy_from_store` have had their chance to
+/// turn a genuine cross-device store into a COPY. Without it a mixed-device CALL
+/// compiles for one device and is handed the other device's pointer.
+fn validate_normal_kernel_devices(root: &Arc<UOp>) -> svod_ir::Result<()> {
+    for node in root.toposort() {
+        let Op::Call { body, args, .. } = node.op() else { continue };
+        if !matches!(body.op(), Op::Sink { .. }) {
+            continue;
+        }
+
+        let mut devices: Vec<svod_dtype::DeviceSpec> = Vec::new();
+        for arg in args {
+            if matches!(arg.op(), Op::Bind { .. }) {
+                continue;
+            }
+            let Some(device) = arg.device_spec() else { continue };
+            if !devices.contains(&device) {
+                devices.push(device);
+            }
+        }
+        if devices.len() > 1 {
+            return Err(svod_ir::Error::KernelSplitMixedDevices { devices });
+        }
+    }
+
+    Ok(())
+}
+
 /// Fix inter-kernel dependencies (like fix_assign).
 ///
 /// Based on upstream.
@@ -477,6 +508,8 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> Result<(Arc<UOp>, RangeifyBufferC
     let t_stage = std::time::Instant::now();
     let after_split = split_all_stores(&after_ctx_free);
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: split_all_stores complete");
+
+    validate_normal_kernel_devices(&after_split).context(IrSnafu)?;
 
     let t_stage = std::time::Instant::now();
     let result = fix_assign(&after_split).context(IrSnafu)?;

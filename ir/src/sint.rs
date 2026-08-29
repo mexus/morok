@@ -196,14 +196,19 @@ impl SInt {
         match self {
             SInt::Const(_) | SInt::Infer => self.clone(),
             SInt::Symbolic(uop) => {
-                if let crate::Op::Const(const_hash) = uop.op() {
-                    match const_hash.0 {
+                // A cast around a constant is representation-only; STACK lane
+                // unification is one source of them.
+                let mut node = uop;
+                while let crate::Op::Cast { src, .. } = node.op() {
+                    node = src;
+                }
+                match node.op() {
+                    crate::Op::Const(const_hash) => match const_hash.0 {
                         crate::ConstValue::Int(v) if v >= 0 => SInt::Const(v as usize),
                         crate::ConstValue::UInt(v) => SInt::Const(v as usize),
                         _ => self.clone(),
-                    }
-                } else {
-                    self.clone()
+                    },
+                    _ => self.clone(),
                 }
             }
         }

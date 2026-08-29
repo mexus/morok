@@ -218,6 +218,13 @@ fn test_shape_to_uop_non_empty() {
     } else {
         panic!("expected STACK, got {:?}", shape_uop.op());
     }
+
+    // Mixed const/symbolic lanes are materialised at the promoted dtype, so the
+    // constant dim survives the round trip instead of hiding behind a CAST.
+    let mixed = smallvec![SInt::from(3), SInt::Symbolic(UOp::var("n", DType::Int32, 1, 8))];
+    let Op::Stack { sources } = shape_to_uop(&mixed).op().clone() else { panic!("expected STACK") };
+    assert_eq!(SInt::from(&sources[0]), SInt::Const(3));
+    assert_eq!(SInt::from(&sources[1]).as_symbolic().map(|dim| dim.dtype()), Some(DType::Int32));
 }
 
 #[test]

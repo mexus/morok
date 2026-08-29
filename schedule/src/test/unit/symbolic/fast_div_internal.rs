@@ -131,3 +131,20 @@ fn fast_division_replacements_are_exhaustive_for_eight_bit_ranges() {
         }
     }
 }
+
+#[test_case::test_case(8, 64; "byte periods")]
+#[test_case::test_case(16, 16; "fixed period")]
+#[test_case::test_case(64, 4096; "wide periods")]
+fn symbolic_divisor_factors_out_of_an_affine_numerator(period_min: i64, period_max: i64) {
+    // (N*i + j) // N -> i and (N*i + j) % N -> j for a symbolic N, with j in one period.
+    let n = UOp::var("n", svod_ir::DType::Index, period_min, period_max);
+    let i = UOp::var("i", svod_ir::DType::Index, 0, 7);
+    let j = UOp::var("j", svod_ir::DType::Index, 0, period_min - 1);
+    let numerator = n.try_mul(&i).unwrap().try_add(&j).unwrap();
+
+    let quotient = svod_ir::rewrite::graph_rewrite(crate::symbolic::symbolic(), numerator.floor_div(&n), &mut ());
+    assert!(std::sync::Arc::ptr_eq(&quotient, &i), "expected i, got {}", quotient.tree());
+
+    let remainder = svod_ir::rewrite::graph_rewrite(crate::symbolic::symbolic(), numerator.mod_(&n), &mut ());
+    assert!(std::sync::Arc::ptr_eq(&remainder, &j), "expected j, got {}", remainder.tree());
+}

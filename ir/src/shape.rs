@@ -513,15 +513,22 @@ pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
         return shape[0].to_uop(DType::WeakInt);
     }
 
-    let elements: SmallVec<[Arc<UOp>; 4]> = shape
+    // STACK unifies its lane dtypes, so materialise every dim at the promoted
+    // dtype up front. Emitting weak constants and letting STACK wrap them in a
+    // CAST would make mixed const/symbolic shapes read back fully symbolic.
+    let lanes: SmallVec<[DType; 4]> = shape
         .iter()
         .map(|dim| match dim {
-            SInt::Const(value) => UOp::const_(DType::WeakInt, ConstValue::Int(*value as i64)),
-            SInt::Symbolic(value) => value.clone(),
-            SInt::Infer => panic!("cannot encode unresolved SInt::Infer in a shape argument"),
+            SInt::Symbolic(value) => value.dtype(),
+            _ => DType::WeakInt,
         })
         .collect();
-    UOp::stack(elements)
+    let lane_dtype = if lanes.iter().all(|dtype| *dtype == lanes[0]) {
+        lanes[0].clone()
+    } else {
+        DType::least_upper_dtype(&lanes).unwrap_or(DType::WeakInt)
+    };
+    UOp::stack(shape.iter().map(|dim| dim.to_uop(lane_dtype.clone())).collect())
 }
 
 /// Convert a vector of (begin, end) ranges to two UOps for Pad/Shrink operations.

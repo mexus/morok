@@ -105,6 +105,10 @@ fn weak_equivalent_explicit_dtype_is_only_an_index_exception() {
         UOp::index().buffer(buffer.clone()).indices(vec![offset.clone()]).dtype(DType::WeakFloat).call().unwrap();
     assert_eq!(weak_index.dtype(), DType::WeakFloat);
 
+    // A concrete request must match exactly: no weak collapse across widths (IB4).
+    let narrow = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float16);
+    assert!(UOp::index().buffer(narrow).indices(vec![offset.clone()]).dtype(DType::Float32).call().is_err());
+
     let strong_index = UOp::index().buffer(buffer).indices(vec![offset]).call().unwrap();
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

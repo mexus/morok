@@ -32,13 +32,14 @@ pub(crate) fn parse_valid(v: &Arc<UOp>) -> Option<(Arc<UOp>, bool, i64)> {
         }
     }
 
-    // Pattern: NOT(X < c) -> X >= c
+    // Pattern: NOT(X < c) -> X >= c. Only `c`'s lower bound is a sound lower bound
+    // on X (tinygrad `uop/symbolic.py:308` uses vmin for the same clause).
     if let Op::Unary(svod_ir::types::UnaryOp::Not, inner) = v.op()
         && let Op::Binary(BinaryOp::Lt, x, c) = inner.op()
         && x.dtype().is_int()
     {
-        let (_, c_vmax) = SoundVminVmaxProperty::get(c).as_ref()?;
-        if let ConstValue::Int(c_val) = c_vmax {
+        let (c_vmin, _) = SoundVminVmaxProperty::get(c).as_ref()?;
+        if let ConstValue::Int(c_val) = c_vmin {
             return Some((x.clone(), false, *c_val));
         }
     }

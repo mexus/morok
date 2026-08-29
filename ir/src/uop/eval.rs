@@ -557,17 +557,6 @@ use svod_dtype::ScalarDType;
 
 #[inline]
 fn commit_eval_result(value: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
-    // bf16 arithmetic is performed in an f32-capable ALU. A finite f64
-    // intermediate outside f32's range therefore overflows to infinity before
-    // bf16 commitment, even though constructing that same bf16 value directly
-    // remains an unsupported conversion.
-    if dtype == ScalarDType::BFloat16
-        && let ConstValue::Float(value) = value
-        && value.is_finite()
-        && value.abs() > f32::MAX as f64
-    {
-        return Some(ConstValue::Float(value.signum() * f64::INFINITY));
-    }
     value.cast(&svod_dtype::DType::Scalar(dtype))
 }
 

@@ -77,8 +77,10 @@ impl UOp {
         let op = Op::Index { buffer, indices };
         let inferred = crate::dtype_from_op(&op).expect("INDEX has an inferred dtype");
         let result_dtype = dtype.unwrap_or_else(|| inferred.clone());
+        // Tinygrad's INDEX carries exactly the buffer's base dtype (`uop/ops.py:574`);
+        // only a weak request may collapse onto it.
         ensure!(
-            result_dtype == inferred || result_dtype.weak_dtype() == inferred.weak_dtype(),
+            result_dtype == inferred || (result_dtype.is_weak() && result_dtype.weak_dtype() == inferred.weak_dtype()),
             crate::error::DTypeMismatchSnafu { lhs: inferred, rhs: result_dtype.clone() }
         );
         Ok(Self::new(op, result_dtype))

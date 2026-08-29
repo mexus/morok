@@ -258,6 +258,23 @@ fn test_pad_index_transformation() {
     assert!(matches!(result.op(), Op::Index { .. }));
 }
 
+// ===== AFTER Tests =====
+
+#[test]
+fn test_movement_through_after_keeps_the_tag_on_the_after() {
+    let buffer = create_buffer(20);
+    let reshaped = buffer.try_reshape(&vec![SInt::Const(4), SInt::Const(5)].into_iter().collect()).unwrap();
+    let store = buffer.store(UOp::native_const(1.0f32));
+    let after = reshaped.after(smallvec::smallvec![store]).rtag(Some(smallvec::smallvec![7]));
+
+    let result = graph_rewrite(&movement_op_patterns(), after, &mut ());
+
+    let Op::Reshape { src: inner, .. } = result.op() else { panic!("expected RESHAPE outside, got {}", result.tree()) };
+    assert!(matches!(inner.op(), Op::After { .. }));
+    assert_eq!(inner.tag().as_deref(), Some([7usize].as_slice()));
+    assert!(result.tag().is_none(), "the rebuilt movement node is fresh and untagged");
+}
+
 // ===== Non-Movement Op Tests =====
 
 #[test]

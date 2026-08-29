@@ -161,6 +161,8 @@ impl Z3Context {
             }
             ConstValue::Bool(v) => Ok(Dynamic::from_ast(&Bool::from_bool(*v))),
             ConstValue::Float(_) => UnsupportedTypeSnafu { detail: "Float constants not fully supported" }.fail(),
+            // The validity marker has no arithmetic value to encode.
+            ConstValue::Invalid => UnsupportedTypeSnafu { detail: "Invalid marker has no Z3 encoding" }.fail(),
         }
     }
 
@@ -316,7 +318,7 @@ fn const_value_to_i64(cv: &ConstValue) -> Option<i64> {
         ConstValue::Int(v) => Some(*v),
         ConstValue::UInt(v) => i64::try_from(*v).ok(),
         ConstValue::Bool(b) => Some(*b as i64),
-        ConstValue::Float(_) => None,
+        ConstValue::Float(_) | ConstValue::Invalid => None,
     }
 }
 

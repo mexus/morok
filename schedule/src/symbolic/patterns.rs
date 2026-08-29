@@ -468,11 +468,18 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
                 },
         },
 
-        // ALU with bare Invalid → Invalid
+        // ALU with bare Invalid → Invalid, in either operand position
+        // (tinygrad `uop/symbolic.py:77` matches `src=[invalid_pat, UPat()]`
+        // order-insensitively). Comparisons are excluded there and here: they
+        // keep the gate via the two rules above (`symbolic.py:75-76`), which
+        // cover every binary op including `GroupOp.Comparison`.
+        //
         // Tinygrad's Invalid is the bottom of the promotion lattice. Svod uses
         // a typed marker, so create one with the operation's result dtype.
         for op in binary [Add, Mul, Sub, FloorMod, Max, FloorDiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
             op(invalid, _y) if UOp::is_invalid_marker(invalid)
+                ~> { let _ = op; UOp::invalid_marker() },
+            op(_y, invalid) if UOp::is_invalid_marker(invalid)
                 ~> { let _ = op; UOp::invalid_marker() },
         },
     }
@@ -485,9 +492,9 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
 /// retained for late memory gate lowering.
 pub fn pm_remove_invalid() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        r @ Where(cond, x, invalid) if UOp::is_invalid_marker(invalid) =>
+        r @ Where(cond, x, invalid) if UOp::is_invalid_marker(invalid) && r.dtype().base() != ScalarDType::Index =>
             UOp::try_where(cond.clone(), x.clone(), r.const_like(0)).ok(),
-        r @ Stack { sources } if sources.iter().any(UOp::is_invalid_marker) => {
+        r @ Stack { sources } if sources.iter().any(UOp::is_invalid_marker) && r.dtype().base() != ScalarDType::Index => {
             let zero = UOp::const_(r.dtype().scalar_dtype(), ConstValue::Int(0));
             Some(UOp::stack(sources.iter().map(|x| if UOp::is_invalid_marker(x) { zero.clone() } else { x.clone() }).collect()))
         },
@@ -579,8 +586,14 @@ fn symbolic_simple_base() -> TypedPatternMatcher {
 }
 
 /// Collapse `CAST(dtype, CONST(value))` into a constant shaped and typed like
-/// the cast. Upstream keeps this separate from `sym` so matcher composition can
-/// control its priority.
+/// the cast.
+///
+/// Tinygrad `uop/symbolic.py:101` keeps this standalone rather than inside
+/// `symbolic_simple`, and composes it explicitly at every site that wants it
+/// (`codegen/__init__.py:304,349,360`, `codegen/simplify.py:35`, `uop/ops.py:533`,
+/// `schedule/rangeify.py:587`). Morok mirrors that composition one for one, so
+/// devectorize and the image/load rewrites deliberately do not fold cast
+/// constants.
 pub fn pm_fold_cast_const() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         root @ Cast { src: _c @const(c_val), dtype: _ } ~> root.const_like(c_val.clone()),
@@ -662,10 +675,14 @@ pub fn symbolic_no_dead_loop() -> &'static TypedPatternMatcher {
 
 /// Maximum symbolic matcher (tier 3).
 ///
-/// Matches `sym` (upstream symbolic_simple):
+/// Matches upstream `sym` (`uop/symbolic.py:429`):
 /// symbolic + pm_simplify_valid + store/load fold + cast-through-WHERE +
-/// ALU/STACK reorder + x!=0 fold + reciprocal distribution +
-/// opinionated combine terms + reduce hoist.
+/// ALU/STACK reorder + x!=0 fold + opinionated combine terms + reduce hoist.
+///
+/// Upstream's reciprocal distribution (`uop/symbolic.py:448-453`) is deliberately
+/// absent: all six rules are IEEE-inexact, and
+/// `unknown_float_division_power_and_reciprocal_are_not_algebraically_rewritten`
+/// pins the non-rewrite.
 ///
 /// Used at: pre-opt initial, post-opt (Stage 8), expander (Stage 9), devectorize (Stage 14).
 pub fn sym() -> &'static TypedPatternMatcher {
@@ -1240,6 +1257,15 @@ pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
             let replacement = crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, false)?;
             exact_integer_rewrite(original, replacement)
         },
+        // Symbolic divisors: tinygrad's divide_by_gcd / factor_remainder fallback.
+        original @ FloorMod(x, y) => {
+            let replacement = crate::symbolic::divmod::fold_divmod_general(BinaryOp::FloorMod, x, y)?;
+            exact_integer_rewrite(original, replacement)
+        },
+        original @ FloorDiv(x, y) => {
+            let replacement = crate::symbolic::divmod::fold_divmod_general(BinaryOp::FloorDiv, x, y)?;
+            exact_integer_rewrite(original, replacement)
+        },
         // (a + b) // c → (a // c) + (b // c) when both divide evenly
         original @ FloorDiv(Add(a, b), _c @const(c_val)) => {
             let d = c_val.try_int()?;
@@ -1381,8 +1407,9 @@ pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
 ///   * **Float arithmetic** — a sound `[c, c]` integer-style bound does not transfer
 ///     to IEEE floats, where `inf - inf`, `0 * inf`, etc. carry a degenerate range
 ///     but evaluate to NaN at runtime. (Guarded by `!is_float`.)
-///   * **`Add`/`Sub`/`Max`** on integers — upstream does NOT collapse these via the
-///     vmin==vmax rule. Collapsing an integer `Add` whose operands are bounded to a
+///   * **`Add`/`Sub`/`Max`** on integers — upstream (`uop/symbolic.py:248-249`, whose
+///     op set is `{CMPLT, CMPNE, FLOORDIV, FLOORMOD, PARAM, BIND, SPECIAL}`) does NOT
+///     collapse these via the vmin==vmax rule. Collapsing an integer `Add` whose operands are bounded to a
 ///     single value replicates the trivial-RANGE collapse that `symbolic_no_dead_loop`
 ///     intentionally omits: a hand-built kernel's trip-1 loop-carry index folds to a
 ///     constant and the recurrence breaks (the FA online-softmax `m`/`l`/`o` carry

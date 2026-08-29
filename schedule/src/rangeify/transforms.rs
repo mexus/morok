@@ -418,8 +418,9 @@ pub fn pm_flatten_range() -> &'static crate::TypedPatternMatcher {
 ///
 /// When we see `RANGE % const`, we mark the range for splitting at the SINK.
 pub struct SplitRangesContext {
-    /// Maps RANGE ids to their modulo constant for decomposition
-    pub marked_ranges: HashMap<u64, i64>,
+    /// Maps RANGE ids to their modulo constant, or `None` for ranges that must
+    /// not be split at all (image stores address two coordinates directly).
+    pub marked_ranges: HashMap<u64, Option<i64>>,
 }
 
 impl SplitRangesContext {
@@ -452,6 +453,12 @@ pub fn pm_split_ranges() -> crate::TypedPatternMatcher<SplitRangesContext> {
         _modop @ FloorMod(r @ Range { end: _, axis_id: _, axis_type: _ }, c @ Const(_)) => |r, c| {
             mark_range_mod(ctx, r, c);
             None // Don't transform yet, just mark
+        },
+
+        // An image STORE pins its index ranges against splitting.
+        Store { index, value: _, gate: _ } => |index| {
+            dont_split_ranges_for_image(ctx, index);
+            None
         },
 
         // At SINK: perform the substitution
@@ -498,7 +505,20 @@ fn mark_range_mod(ctx: &mut SplitRangesContext, r: &Arc<UOp>, c: &Arc<UOp>) {
         return;
     }
     if let Some(mod_val) = const_uop_to_i64(c) {
-        ctx.marked_ranges.insert(r.id, mod_val);
+        ctx.marked_ranges.insert(r.id, Some(mod_val));
+    }
+}
+
+/// Pin every range an image STORE indexes with, so the SINK substitution leaves it
+/// alone: an image address is a pair of coordinates, not a flat offset that a
+/// divmod split can reconstruct.
+fn dont_split_ranges_for_image(ctx: &mut SplitRangesContext, index: &Arc<UOp>) {
+    let Op::Index { buffer, indices } = index.op() else { return };
+    if !buffer.dtype().is_image() {
+        return;
+    }
+    for range in indices.iter().flat_map(|index| index.ranges()) {
+        ctx.marked_ranges.insert(range.id, None);
     }
 }
 
@@ -522,7 +542,7 @@ fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> 
     let topo = sink.toposort();
 
     for uop in &topo {
-        if let Some(&mod_val) = ctx.marked_ranges.get(&uop.id)
+        if let Some(&Some(mod_val)) = ctx.marked_ranges.get(&uop.id)
             && let Op::Range { end, axis_id, axis_type, .. } = uop.op()
         {
             let Some(outer_end) = end.divides(mod_val) else {
@@ -664,6 +684,10 @@ fn flatten_bufferize(stage: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Push movement op or INDEX through AFTER: `AFTER(r(x, ...), deps) → r(AFTER(x, deps), ...)`.
 ///
 /// Reuses the original op's remaining sources directly (no roundtrip/validation).
+///
+/// Tag placement follows tinygrad `schedule/rangeify.py:54-55`: the rebuilt AFTER
+/// keeps the original AFTER's tag (`a.replace`), and the outer movement node is
+/// constructed fresh, so it carries no tag.
 pub(crate) fn push_op_through_after(
     after: &Arc<UOp>,
     r: &Arc<UOp>,
@@ -788,9 +812,11 @@ pub(crate) fn transform_single_source(
 /// image/dynamic coordinates, but flatten statically-shaped tensor accesses at
 /// their rangeify producer.
 fn linearize_static_indices(buffer: &Arc<UOp>, indices: &[Arc<UOp>]) -> Option<Vec<Arc<UOp>>> {
-    if indices.len() <= 1 {
+    if indices.len() <= 1 || buffer.dtype().is_image() {
         return None;
     }
+    // Image coordinates are a (y, x) pair the renderer addresses directly; flattening
+    // them into one linear offset makes the access unrenderable.
     let shape = buffer.shape().ok().flatten()?;
     if shape.len() != indices.len() {
         return None;
@@ -1319,51 +1345,87 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
     if changed { Some(current) } else { None }
 }
 
+/// Collect the per-range upper bounds an INDEX proves.
+///
+/// Port of tinygrad `codegen/simplify.py:43-53`, widened to every index. Upstream
+/// reads `idx.src[1]` alone because its INDEX carries one flattened index by this
+/// stage; morok still has multi-index INDEX here whenever `linearize_static_indices`
+/// bails (symbolic or dynamic dims), so a range used only in `indices[1..]` would
+/// otherwise be neither bounded nor protected — and could be shrunk by a bound
+/// harvested from a different access.
+///
+/// Guards are merged across indices keeping the largest bound; every range an
+/// index uses without a guard of its own pins that range to its original end.
 fn mark_gated(ctx: &mut SimplifyRangesContext, idx: &Arc<UOp>) {
     let Op::Index { indices, .. } = idx.op() else { return };
 
-    let (x, guards) = if let Some(index) = indices.first()
-        && matches!(index.op(), Op::Ternary(svod_ir::TernaryOp::Where, _, _, _))
-    {
-        let x = index.get_idx();
-        let guards = index
-            .get_valid()
-            .split_uop(BinaryOp::And)
-            .into_iter()
-            .filter_map(|valid| match valid.op() {
-                Op::Binary(BinaryOp::Lt, range, bound)
-                    if matches!(range.op(), Op::Range { .. }) && matches!(bound.op(), Op::Const(_)) =>
-                {
-                    Some((UOpKey(range.clone()), bound.clone()))
-                }
-                _ => None,
-            })
-            .collect::<HashMap<_, _>>();
-        (x, guards)
-    } else {
-        (idx.clone(), HashMap::new())
-    };
+    fn pin(ctx: &mut SimplifyRangesContext, range: &Arc<UOp>) {
+        if let Op::Range { end, .. } = range.op() {
+            ctx.bounds.insert(UOpKey(range.clone()), end.clone());
+        }
+    }
+
+    let is_gate = |index: &Arc<UOp>| matches!(index.op(), Op::Ternary(svod_ir::TernaryOp::Where, _, _, _));
+    if !indices.iter().any(is_gate) {
+        // No gate anywhere: every range the access reaches is an ungated use.
+        for range in idx.ranges() {
+            pin(ctx, range);
+        }
+        return;
+    }
+
+    let mut guards: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+    let mut ungated: Vec<Arc<UOp>> = Vec::new();
+    for index in indices {
+        let index_guards: HashMap<UOpKey, Arc<UOp>> = if is_gate(index) {
+            index
+                .get_valid()
+                .split_uop(BinaryOp::And)
+                .into_iter()
+                .filter_map(|valid| match valid.op() {
+                    Op::Binary(BinaryOp::Lt, range, bound)
+                        if matches!(range.op(), Op::Range { .. }) && matches!(bound.op(), Op::Const(_)) =>
+                    {
+                        Some((UOpKey(range.clone()), bound.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        let expression = index.get_idx();
+        for range in expression.ranges() {
+            if !index_guards.contains_key(&UOpKey(range.clone())) {
+                ungated.push(range.clone());
+            }
+        }
+        for (range, bound) in index_guards {
+            let larger = guards.get(&range).is_none_or(|old| {
+                const_uop_to_i64(old).zip(const_uop_to_i64(&bound)).is_some_and(|(old, new)| old < new)
+            });
+            if larger {
+                guards.insert(range, bound);
+            }
+        }
+    }
 
     // A range may feed several gated accesses. The largest bound is required
     // to preserve every access covered by the original iteration space.
-    for (range, bound) in &guards {
-        let replace = ctx
+    for (range, bound) in guards {
+        let larger = ctx
             .bounds
-            .get(range)
-            .is_none_or(|old| const_uop_to_i64(old).zip(const_uop_to_i64(bound)).is_some_and(|(old, new)| old < new));
-        if replace {
-            ctx.bounds.insert(range.clone(), bound.clone());
+            .get(&range)
+            .is_none_or(|old| const_uop_to_i64(old).zip(const_uop_to_i64(&bound)).is_some_and(|(old, new)| old < new));
+        if larger {
+            ctx.bounds.insert(range, bound);
         }
     }
 
     // Any ungated use protects the range from narrowing.
-    for range in x.ranges() {
-        let key = UOpKey(range.clone());
-        if !guards.contains_key(&key)
-            && let Op::Range { end, .. } = range.op()
-        {
-            ctx.bounds.insert(key, end.clone());
-        }
+    for range in &ungated {
+        pin(ctx, range);
     }
 }
 

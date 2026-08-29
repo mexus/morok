@@ -258,8 +258,9 @@ fn test_div_gcd_factor() {
 
 #[test]
 fn test_mod_self_zero() {
-    // a % a → 0 (for a ≠ 0)
-    let a = UOp::var("a", DType::Int32, 0, 100); // a ≠ 0
+    // a % a → 0 (for a ≠ 0). The bound must exclude 0: morok's exact-integer proof
+    // declines to fold when the divisor's range admits a division by zero.
+    let a = UOp::var("a", DType::Int32, 1, 100);
     let expr = a.try_mod(&a).unwrap();
 
     let matcher = symbolic_simple();

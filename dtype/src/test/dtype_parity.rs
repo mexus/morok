@@ -152,10 +152,13 @@ fn tinygrad_reduced_float_edges_and_exact_storage_bits() {
         commit_float(f32::from_bits(bf_underflow_midpoint.to_bits() + 1) as f64, ScalarDType::BFloat16),
         Some(2f64.powi(-133))
     );
-    assert_eq!(commit_float(1e300, ScalarDType::BFloat16), None);
+    // Divergence from tinygrad's `float_to_bf16`, which raises OverflowError past the
+    // f32 rounding midpoint: morok saturates so `truncate` is total (IB1).
+    assert_eq!(commit_float(1e300, ScalarDType::BFloat16), Some(f64::INFINITY));
+    assert_eq!(commit_float(-1e300, ScalarDType::BFloat16), Some(f64::NEG_INFINITY));
     let f32_max = f32::MAX as f64;
     assert!(commit_float(next_up(f32_max), ScalarDType::BFloat16).unwrap().is_infinite());
-    assert_eq!(commit_float(f64::from_bits(0x47ef_ffff_f000_0000), ScalarDType::BFloat16), None);
+    assert_eq!(commit_float(f64::from_bits(0x47ef_ffff_f000_0000), ScalarDType::BFloat16), Some(f64::INFINITY));
 }
 
 fn fp8_grid_hash(dtype: ScalarDType) -> u64 {

@@ -17,6 +17,9 @@ use svod_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 use crate::pattern::RewriteResult;
 use crate::rangeify::IndexingContext;
 use crate::rangeify::patterns;
+use crate::rewrite::graph_rewrite;
+use smallvec::smallvec;
+use svod_ir::DeviceSpec;
 
 // ===== early_rewrites Pattern Tests =====
 
@@ -50,6 +53,17 @@ fn test_early_rewrites_contiguous_backward_removal() {
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Arc::ptr_eq(&rewritten, &x), "Should return the source");
     }
+}
+
+#[test]
+fn test_early_rewrites_same_device_copy_returns_the_source() {
+    let source = UOp::new_buffer(svod_ir::DeviceSpec::Cpu, 4, svod_dtype::DType::Float32);
+    let copy = source.copy(svod_ir::DeviceSpec::Cpu).rtag(Some(smallvec::smallvec![3]));
+
+    let RewriteResult::Rewritten(rewritten) = patterns::early_rewrites().rewrite(&copy, &mut ()) else {
+        panic!("same-device COPY must be elided");
+    };
+    assert!(Arc::ptr_eq(&rewritten, &source), "tinygrad rangeify.py:153 returns the source verbatim");
 }
 
 #[test]
@@ -242,6 +256,17 @@ fn test_dead_axis_removal_single_dead_axis() {
             // This is also acceptable if dead axis detection has specific conditions
         }
     }
+}
+
+#[test]
+fn test_dead_axis_removal_skips_always_run_ops() {
+    // A COPY destination is sized by the transfer, so a dead axis must not shrink
+    // it — the same guard remove_bufferize applies (tinygrad rangeify.py:198,227).
+    let source = UOp::native_const(1.0f32).copy(svod_ir::DeviceSpec::Cpu);
+    let dead_range = UOp::range_axis(UOp::index_const(1), AxisId::Renumbered(0), AxisType::Loop);
+    let stage = UOp::stage(source, vec![dead_range], BufferizeOpts::local());
+
+    assert!(matches!(patterns::dead_axis_removal().rewrite(&stage, &mut ()), RewriteResult::NoMatch));
 }
 
 #[test]
@@ -516,4 +541,26 @@ fn test_idempotent_patterns() {
     // Second application (should not match on CONST)
     let result2 = matcher.rewrite(&unwrapped, &mut ());
     assert!(matches!(result2, RewriteResult::NoMatch), "Should not match on already-processed node");
+}
+
+#[test]
+fn test_early_rewrites_materialises_a_resized_copy_source() {
+    use svod_ir::SInt;
+
+    // [4] -> reshape -> expand([4,8]) -> to(Amd): without materialising the view the
+    // transfer is sized by the [4] base and the destination is under-allocated.
+    let source = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let reshaped = source.try_reshape(&smallvec![SInt::Const(4), SInt::Const(1)]).unwrap();
+    let expanded = reshaped.try_expand(&smallvec![SInt::Const(4), SInt::Const(8)]).unwrap();
+    let copied = expanded.copy_to_device(DeviceSpec::Amd { device_id: 0 });
+
+    let rewritten = graph_rewrite(&patterns::early_rewrites(), copied, &mut ());
+    let Op::Copy { src, .. } = rewritten.op() else { panic!("expected COPY, got {}", rewritten.tree()) };
+    assert!(matches!(src.op(), Op::Contiguous { .. }), "resized copy source must be materialised");
+
+    // A pure reshape is a contiguous view of the same element count and passes through.
+    let flat = source.try_reshape(&smallvec![SInt::Const(2), SInt::Const(2)]).unwrap();
+    let reshaped_copy = flat.copy_to_device(DeviceSpec::Amd { device_id: 0 });
+    let rewritten = graph_rewrite(&patterns::early_rewrites(), reshaped_copy.clone(), &mut ());
+    assert!(Arc::ptr_eq(&rewritten, &reshaped_copy));
 }

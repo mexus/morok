@@ -127,7 +127,73 @@ pub fn fold_divmod_congruence(x: &Arc<UOp>, _c_uop: &Arc<UOp>, c_val: ConstValue
     try_uop_sum(&quotient_terms, x)
 }
 
-#[allow(dead_code)]
-pub(crate) fn fold_divmod_general(_op: BinaryOp, _x: &Arc<UOp>, _y: &Arc<UOp>) -> Option<Arc<UOp>> {
-    None
+/// Tinygrad's variable-denominator fallback (`uop/divandmod.py:76-96`).
+///
+/// Covers `divide_by_gcd` and `factor_remainder`, which is what folds
+/// `(N*i + j) // N` for a symbolic `N`. Constant divisors are deliberately
+/// excluded: their folds live in `advanced_division_dsl_patterns`, and the
+/// constant-denominator half of upstream's `fold_divmod_general`
+/// (`nested_div`, `remove_nested_mod`, `gcd_with_remainder`, `nest_by_factor`)
+/// is not ported yet.
+///
+/// Like `fold_divmod_congruence` this only constructs a candidate; the caller
+/// must still run the typed no-wrap proof.
+pub(crate) fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> Option<Arc<UOp>> {
+    if matches!(y.op(), svod_ir::Op::Const(_)) || x.dtype().vcount() != 1 {
+        return None;
+    }
+    let is_mod = op == BinaryOp::FloorMod;
+
+    // The quotient is a single bucket, so the whole division is constant.
+    let quotient = x.try_div(y).ok()?;
+    let (ConstValue::Int(q_min), ConstValue::Int(q_max)) = SoundVminVmaxProperty::get(&quotient).as_ref()? else {
+        return None;
+    };
+    if q_min == q_max {
+        return if is_mod { x.try_sub(&scaled(y, *q_min)?).ok() } else { Some(x.const_like(*q_min)) };
+    }
+
+    let terms = x.split_uop(BinaryOp::Add);
+
+    // divide_by_gcd: x op y -> (x/g) op (y/g), rescaled by g for the remainder.
+    let mut with_divisor = terms.clone();
+    with_divisor.push(y.clone());
+    let divisor_gcd = UOp::symbolic_gcd(&with_divisor);
+    if !matches!(divisor_gcd.op(), svod_ir::Op::Const(value) if value.0 == ConstValue::Int(1)) {
+        let folded = binary(op, &x.divide_exact(&divisor_gcd)?, &y.divide_exact(&divisor_gcd)?)?;
+        return if is_mod { folded.try_mul(&divisor_gcd).ok() } else { Some(folded) };
+    }
+
+    // factor_remainder: (y*a + b) op y -> a + b//y / b%y, in the non-negative domain.
+    if non_negative(x).is_none() || non_negative(y).is_none() {
+        return None;
+    }
+    let (quotient, remainder): (Vec<_>, Vec<_>) =
+        terms.iter().map(|term| (term.divide_exact(y), term)).fold((vec![], vec![]), |mut acc, (q, term)| {
+            match q {
+                Some(q) => acc.0.push(q),
+                None => acc.1.push(term.clone()),
+            }
+            acc
+        });
+    if quotient.is_empty() {
+        return None;
+    }
+    let new_x = try_uop_sum(&remainder, x)?;
+    non_negative(&new_x)?;
+    let folded = binary(op, &new_x, y)?;
+    if is_mod { Some(folded) } else { folded.try_add(&try_uop_sum(&quotient, x)?).ok() }
+}
+
+fn binary(op: BinaryOp, lhs: &Arc<UOp>, rhs: &Arc<UOp>) -> Option<Arc<UOp>> {
+    match op {
+        BinaryOp::FloorMod => lhs.try_mod(rhs).ok(),
+        BinaryOp::FloorDiv => lhs.try_div(rhs).ok(),
+        _ => None,
+    }
+}
+
+fn non_negative(u: &Arc<UOp>) -> Option<()> {
+    let (ConstValue::Int(vmin), _) = SoundVminVmaxProperty::get(u).as_ref()? else { return None };
+    (*vmin >= 0).then_some(())
 }

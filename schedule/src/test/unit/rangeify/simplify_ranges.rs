@@ -79,3 +79,26 @@ fn ungated_and_noncanonical_gates_are_noops() {
     assert_eq!(narrowed_end(&result, 4), 16);
     assert_eq!(narrowed_end(&result, 5), 16);
 }
+
+#[test]
+fn ungated_trailing_index_protects_its_range() {
+    // A range narrowed by one access must not be shrunk when another access uses
+    // it in a later, ungated index position.
+    let r = UOp::range_axis(UOp::index_const(16), svod_ir::AxisId::Renumbered(6), AxisType::Loop);
+    let q = UOp::range_axis(UOp::index_const(16), svod_ir::AxisId::Renumbered(7), AxisType::Loop);
+
+    let narrow_gate = r.try_cmplt(&UOp::index_const(4)).unwrap();
+    let narrow = UOp::index().buffer(buffer()).indices(vec![r.valid(narrow_gate)]).call().unwrap();
+
+    let matrix = UOp::new_buffer(DeviceSpec::Cpu, 256, DType::Float32)
+        .try_reshape(&smallvec![svod_ir::SInt::Const(16), svod_ir::SInt::Const(16)])
+        .unwrap();
+    let wide_gate = q.try_cmplt(&UOp::index_const(2)).unwrap();
+    let wide = UOp::index().buffer(matrix).indices(vec![q.valid(wide_gate), r.clone()]).call().unwrap();
+
+    let loads = [narrow, wide].map(|index| UOp::load().index(index).call());
+    let result = simplify(UOp::sink(loads.to_vec()));
+
+    assert_eq!(narrowed_end(&result, 6), 16, "r is used ungated in the second index");
+    assert_eq!(narrowed_end(&result, 7), 2, "q is gated everywhere it is used");
+}

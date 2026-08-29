@@ -47,11 +47,9 @@ fn typed_constants_commit_and_report_unsupported_conversions() {
     let constant = UOp::const_(DType::Float16, ConstValue::Float(value));
     assert!(matches!(constant.op(), Op::Const(value) if value.0 == ConstValue::Float(8.106231689453125e-6)));
 
-    let error = UOp::try_const_(DType::BFloat16, ConstValue::Float(1e300)).unwrap_err();
-    assert!(matches!(
-        error,
-        crate::Error::ConstantConversion { dtype: DType::Scalar(svod_dtype::ScalarDType::BFloat16), .. }
-    ));
+    // bf16 commitment is total (IB1): f32-range overflow saturates instead of failing.
+    let saturated = UOp::try_const_(DType::BFloat16, ConstValue::Float(1e300)).unwrap();
+    assert!(matches!(saturated.op(), Op::Const(value) if value.0 == ConstValue::Float(f64::INFINITY)));
 
     let pointer = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
     assert!(matches!(UOp::try_const_(pointer, ConstValue::Float(1.0)), Err(crate::Error::ConstantConversion { .. })));
@@ -79,6 +77,16 @@ fn const_like_converts_to_receiver_scalar_dtype() {
     assert_eq!(constant.dtype(), DType::Float32);
     assert!(matches!(constant.op(), Op::Const(value) if value.0 == ConstValue::Float(2.0)));
     assert_eq!(constant.shape().unwrap().unwrap().as_slice(), &[]);
+
+    // Tinygrad `uop/ops.py:596` keeps the receiver's vector count (IC2).
+    let vector = UOp::const_(DType::UInt16.vec(4).unwrap(), ConstValue::Int(3));
+    assert_eq!(vector.const_like(1i64).dtype(), vector.dtype());
+    assert_eq!(vector.neg().dtype(), vector.dtype());
+
+    // A shapeless receiver degrades `vconst_like` to the plain constant (IC3).
+    let shapeless = UOp::vconst(vec![ConstValue::Float(1.0), ConstValue::Float(2.0)], DType::Float32);
+    assert!(shapeless.shape().unwrap().is_none());
+    assert_eq!(shapeless.vconst_like(2i64).dtype(), shapeless.dtype());
 }
 
 #[test]

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use svod_dtype::{DType, ScalarDType};
+use svod_dtype::DType;
 use svod_ir::{ConstValue, ConstValueHash, Op, TernaryOp, UOp};
 
 use crate::TypedPatternMatcher;
@@ -16,8 +16,12 @@ fn valid_index(index: &Arc<UOp>) -> Option<(&Arc<UOp>, &Arc<UOp>)> {
     matches!(invalid.op(), Op::Const(ConstValueHash(ConstValue::Invalid))).then_some((gate, index))
 }
 
-fn image_gate(indices: &[Arc<UOp>]) -> Option<(Arc<UOp>, Vec<Arc<UOp>>)> {
-    if indices.len() != 2 {
+/// The two-coordinate image form, gated by one shared condition.
+///
+/// Only image buffers take this path: a plain two-index INDEX keeps its own dtype
+/// and goes through the generic rules below.
+fn image_gate(buffer: &Arc<UOp>, indices: &[Arc<UOp>]) -> Option<(Arc<UOp>, Vec<Arc<UOp>>)> {
+    if indices.len() != 2 || !buffer.dtype().is_image() {
         return None;
     }
     let (gate_y, index_y) = valid_index(&indices[0])?;
@@ -25,18 +29,18 @@ fn image_gate(indices: &[Arc<UOp>]) -> Option<(Arc<UOp>, Vec<Arc<UOp>>)> {
     Arc::ptr_eq(gate_y, gate_x).then(|| (gate_y.clone(), vec![index_y.clone(), index_x.clone()]))
 }
 
-fn move_image_load(load: &Arc<UOp>, buffer: &Arc<UOp>, indices: &[Arc<UOp>]) -> Option<Arc<UOp>> {
+fn move_image_load(load: &Arc<UOp>, index: &Arc<UOp>, buffer: &Arc<UOp>, indices: &[Arc<UOp>]) -> Option<Arc<UOp>> {
     let Op::Load { alt: None, gate: None, .. } = load.op() else {
         return None;
     };
-    let (gate, indices) = image_gate(indices)?;
-    let index =
-        UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.into() }, DType::Scalar(ScalarDType::Float32));
+    let (gate, indices) = image_gate(buffer, indices)?;
+    let index = UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.into() }, index.dtype());
     let result = UOp::load().index(index.clone()).alt(load.vconst_like(0)).gate(gate).call();
     Some(if result.dtype() == load.dtype() { result } else { result.cast(load.dtype()) })
 }
 
 fn move_image_store(
+    index: &Arc<UOp>,
     value: &Arc<UOp>,
     gate: Option<&Arc<UOp>>,
     buffer: &Arc<UOp>,
@@ -45,9 +49,8 @@ fn move_image_store(
     if gate.is_some() {
         return None;
     }
-    let (gate, indices) = image_gate(indices)?;
-    let index =
-        UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.into() }, DType::Scalar(ScalarDType::Float32));
+    let (gate, indices) = image_gate(buffer, indices)?;
+    let index = UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.into() }, index.dtype());
     Some(index.store_gated(value.clone(), gate))
 }
 
@@ -156,12 +159,12 @@ fn move_where_load(
 pub fn pm_move_gates_from_index() -> TypedPatternMatcher {
     crate::patterns! {
         // Two-index image-form rules must precede the generic INDEX rules.
-        load @ Load { index: Index { buffer, indices }, .. }
-            if image_gate(indices).is_some()
-            => move_image_load(load, buffer, indices),
-        Store { index: Index { buffer, indices }, value, gate }
-            if image_gate(indices).is_some()
-            => move_image_store(value, gate.as_ref(), buffer, indices),
+        load @ Load { index: idx @ Index { buffer, indices }, .. }
+            if image_gate(buffer, indices).is_some()
+            => move_image_load(load, idx, buffer, indices),
+        Store { index: idx @ Index { buffer, indices }, value, gate }
+            if image_gate(buffer, indices).is_some()
+            => move_image_store(idx, value, gate.as_ref(), buffer, indices),
 
         load @ Load { index: idx @ Index { buffer, indices }, .. }
             if indices.first().and_then(valid_index).is_some()

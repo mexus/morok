@@ -161,6 +161,22 @@ fn canonical_range_preserves_nested_axis_path() {
 }
 
 #[test]
+fn axis_id_equality_ordering_and_hash_agree() {
+    use std::hash::{BuildHasher, RandomState};
+
+    let hasher = RandomState::new();
+    for (left, right) in [
+        (AxisId::Unrenumbered(3), AxisId::UnrenumberedPath(smallvec::smallvec![3])),
+        (AxisId::Renumbered(3), AxisId::RenumberedPath(smallvec::smallvec![3])),
+    ] {
+        assert_eq!(left.cmp(&right) == std::cmp::Ordering::Equal, left == right);
+        assert_eq!(hasher.hash_one(&left), hasher.hash_one(&right));
+    }
+    assert_ne!(AxisId::Unrenumbered(3), AxisId::Renumbered(3));
+    assert_ne!(AxisId::Unrenumbered(3), AxisId::UnrenumberedPath(smallvec::smallvec![3, 0]));
+}
+
+#[test]
 fn canonical_range_preserves_grouped_reduce_loop_path() {
     let axis = AxisId::Renumbered(4).child(1).group_reduce_loop();
     let range = UOp::range_axis(UOp::index_const(8), axis, AxisType::Reduce);

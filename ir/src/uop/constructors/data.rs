@@ -63,7 +63,7 @@ impl UOp {
         Self::const_(DType::WeakInt, ConstValue::Int(value))
     }
 
-    /// Create a constant with the same scalar dtype and shape as self.
+    /// Create a constant with the same dtype (vector count included) and shape as self.
     ///
     /// This is the Rust equivalent of Tinygrad's `x.const_like(value)`.
     /// Useful for creating identity elements, zeros, or other constants
@@ -80,7 +80,9 @@ impl UOp {
     /// assert_eq!(zero.dtype(), DType::Float32);
     /// ```
     pub fn const_like<T: crate::IntoUOp>(self: &Arc<Self>, value: T) -> Arc<Self> {
-        let ret = value.into_uop(self.dtype().scalar_dtype());
+        // Tinygrad `uop/ops.py:596`: `UOp.const(b, dtype or self.dtype)` — the full
+        // dtype, so a Vector receiver yields a Vector constant.
+        let ret = value.into_uop(self.dtype());
         if let Ok(Some(shape)) = self.shape()
             && !shape.is_empty()
         {
@@ -91,15 +93,17 @@ impl UOp {
 
     /// Create a post-movement constant with this value's dtype and maximum
     /// element count. Tinygrad's `vconst_like` uses `STACK`, not `EXPAND`, because
-    /// movement ops have already been removed when late gating calls it.
+    /// movement ops have already been removed when late gating calls it. An
+    /// unshaped or unbounded receiver degrades to the scalar constant rather than
+    /// aborting, since the late gater applies it to already-lowered addresses.
     pub fn vconst_like<T: crate::IntoUOp>(self: &Arc<Self>, value: T) -> Arc<Self> {
-        let ret = value.into_uop(self.dtype().scalar_dtype());
+        let ret = value.into_uop(self.dtype());
         let count = self
             .shape()
             .ok()
             .flatten()
             .and_then(|shape| shape.iter().try_fold(1usize, |n, dim| n.checked_mul(dim.vmax()?)))
-            .expect("vconst_like requires a bounded shape");
+            .unwrap_or(1);
         if count == 1 { ret } else { Self::stack((0..count).map(|_| ret.clone()).collect()) }
     }
 

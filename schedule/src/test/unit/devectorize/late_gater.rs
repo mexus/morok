@@ -5,7 +5,7 @@ use std::sync::Arc;
 use svod_dtype::DType;
 use svod_ir::{ConstValue, Op, UOp};
 
-use super::helpers::create_buffer;
+use super::helpers::{create_buffer, create_buffer_typed};
 use crate::rewrite::graph_rewrite;
 
 fn apply_gater(root: &Arc<UOp>) -> Arc<UOp> {
@@ -43,6 +43,27 @@ fn test_shaped_load_gate_uses_post_movement_stack_alt() {
     let Op::Load { alt: Some(alt), .. } = result.op() else { panic!("expected gated LOAD") };
     assert!(matches!(alt.op(), Op::Stack { sources } if sources.len() == 4));
     assert!(!alt.toposort().iter().any(|node| node.op().is_movement()));
+}
+
+#[test]
+fn test_two_index_gate_needs_an_image_buffer() {
+    let buffer = create_buffer_typed(16, svod_dtype::ScalarDType::Int32);
+    let gate = UOp::var("gate", DType::Bool, 0, 1);
+    let indices = vec![UOp::index_const(1).valid(gate.clone()), UOp::index_const(2).valid(gate)];
+    let index = UOp::index().buffer(buffer).indices(indices).call().unwrap();
+    let load = UOp::load().index(index).call();
+
+    // The image rules hard-code the two-coordinate form; a plain Int32 two-index
+    // access must fall through to the generic rule and keep its own dtype.
+    let result = apply_gater(&load);
+    let Op::Load { index, alt: Some(_), gate: Some(_) } = result.op() else { panic!("expected a gated LOAD") };
+    assert_eq!(index.dtype(), DType::Int32);
+    let Op::Index { indices, .. } = index.op() else { panic!("expected INDEX") };
+    assert_eq!(indices.len(), 2);
+    assert!(
+        matches!(indices[1].op(), Op::Ternary(svod_ir::TernaryOp::Where, ..)),
+        "the generic rule only lifts the first index's gate; the image rule would lift both"
+    );
 }
 
 #[test]

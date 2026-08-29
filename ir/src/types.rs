@@ -975,7 +975,7 @@ impl std::fmt::Display for AxisType {
 ///
 /// The enum makes the renumber_range pattern naturally idempotent:
 /// it only matches `Unrenumbered` variants and produces `Renumbered` variants.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Eq)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum AxisId {
     /// Range created during rangeify, not yet renumbered.
@@ -1030,6 +1030,21 @@ impl AxisId {
     /// Check if this range has been renumbered.
     pub fn is_renumbered(&self) -> bool {
         matches!(self, AxisId::Renumbered(_) | AxisId::RenumberedPath(_))
+    }
+}
+
+/// `Ord`, `PartialEq` and `Hash` share the `(is_renumbered, path)` key so that the
+/// single-component and path spellings of one axis are one value everywhere.
+impl PartialEq for AxisId {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_renumbered() == other.is_renumbered() && self.path() == other.path()
+    }
+}
+
+impl std::hash::Hash for AxisId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.is_renumbered().hash(state);
+        self.path().hash(state);
     }
 }
 
