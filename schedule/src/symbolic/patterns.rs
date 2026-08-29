@@ -1257,6 +1257,15 @@ pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
             let replacement = crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, false)?;
             exact_integer_rewrite(original, replacement)
         },
+        // Symbolic divisors: tinygrad's divide_by_gcd / factor_remainder fallback.
+        original @ FloorMod(x, y) => {
+            let replacement = crate::symbolic::divmod::fold_divmod_general(BinaryOp::FloorMod, x, y)?;
+            exact_integer_rewrite(original, replacement)
+        },
+        original @ FloorDiv(x, y) => {
+            let replacement = crate::symbolic::divmod::fold_divmod_general(BinaryOp::FloorDiv, x, y)?;
+            exact_integer_rewrite(original, replacement)
+        },
         // (a + b) // c → (a // c) + (b // c) when both divide evenly
         original @ FloorDiv(Add(a, b), _c @const(c_val)) => {
             let d = c_val.try_int()?;
