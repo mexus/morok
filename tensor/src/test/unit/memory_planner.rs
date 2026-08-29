@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use svod_device::Buffer;
 use svod_ir::UOp;
+use test_case::test_case;
 
 fn make_buffer(numel: usize) -> Buffer {
     let alloc = svod_device::registry::cpu().expect("cpu allocator");
@@ -43,8 +44,13 @@ fn make_nonsink_item(id: u64, buffer: Buffer) -> ScheduleItem {
     }
 }
 
-fn make_store_item(buffer_uop: &Arc<UOp>, buffer: Buffer, index: Arc<UOp>) -> ScheduleItem {
-    let ast = UOp::sink(vec![index.store(UOp::native_const(1.0f32))]);
+fn make_store_item(buffer_uop: &Arc<UOp>, buffer: Buffer, index: Arc<UOp>, gate: Option<Arc<UOp>>) -> ScheduleItem {
+    let value = UOp::native_const(1.0f32);
+    let store = match gate {
+        Some(gate) => index.store_gated(value, gate),
+        None => index.store(value),
+    };
+    let ast = UOp::sink(vec![store]);
     ScheduleItem {
         kernel: ast.clone(),
         ast,
@@ -304,7 +310,7 @@ fn test_memory_planner_reuses_unmasked_store_outputs() {
     let target = UOp::new_buffer(DeviceSpec::Cpu, 256, DType::Float32);
     let index = UOp::index().buffer(target.clone()).indices(vec![UOp::index_const(0)]).call().unwrap();
 
-    let mut schedule = vec![make_store_item(&target, b0.clone(), index), make_sink_item(61, b1)];
+    let mut schedule = vec![make_store_item(&target, b0.clone(), index, None), make_sink_item(61, b1)];
     chain_deps(&mut schedule);
     let result = plan(&schedule, &HashSet::new(), PlannerMode::Remap);
 
@@ -312,6 +318,26 @@ fn test_memory_planner_reuses_unmasked_store_outputs() {
     let key = BufferKey { kernel_idx: 1, buffer_idx: 0 };
     let replacement = result.buffer_replace.get(&key).expect("second buffer should be remapped");
     assert_eq!(replacement.id(), b0.id());
+}
+
+#[test_case(false; "bare_index")]
+#[test_case(true; "index_behind_a_cast")]
+fn test_memory_planner_skips_gated_store_outputs(wrap_index: bool) {
+    // b1 is at a later level and would reuse b0 — but a gated store writes only
+    // part of b0, so arena mode must not pack a later tenant over it.
+    let b0 = make_buffer(256);
+    let b1 = make_buffer(256);
+    let target = UOp::new_buffer(DeviceSpec::Cpu, 256, DType::Float32);
+    let index = UOp::index().buffer(target.clone()).indices(vec![UOp::index_const(0)]).call().unwrap();
+    let index = if wrap_index { index.cast(DType::Index) } else { index };
+
+    let mut schedule = vec![make_store_item(&target, b0, index, Some(UOp::native_const(true))), make_sink_item(62, b1)];
+    chain_deps(&mut schedule);
+    let result = plan(&schedule, &HashSet::new(), PlannerMode::Remap);
+
+    assert_eq!(result.buffers_reused, 0);
+    assert!(result.buffer_replace.is_empty());
+    assert_eq!(result.metrics.exclusions[&PlannerExclusionReason::GatedStore].allocations, 1);
 }
 
 #[test]

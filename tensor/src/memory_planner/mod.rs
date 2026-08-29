@@ -29,11 +29,12 @@
 mod tlsf;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use snafu::ResultExt;
 use svod_device::Buffer;
 use svod_dtype::{DType, DeviceSpec};
-use svod_ir::Op;
+use svod_ir::{Op, UOp};
 use tracing::{debug, trace};
 
 use crate::schedule::Schedule;
@@ -199,6 +200,7 @@ pub enum PlannerExclusionReason {
     Output,
     AliasedStorage,
     NonSinkOperation,
+    GatedStore,
 }
 
 /// Unique allocation count and logical bytes excluded for one reason.
@@ -250,12 +252,25 @@ pub struct MemoryPlannerMetrics {
 /// - Already allocated buffers (inputs)
 /// - Output buffers
 /// - Transfer operations
-fn collect_excluded_buffer_ids(schedule: &Schedule) -> (HashSet<u64>, HashSet<u64>) {
+/// Buffer ids excluded from reuse, grouped by the reason that first applies.
+#[derive(Default)]
+struct ExcludedBufferIds {
+    aliased: HashSet<u64>,
+    non_sink: HashSet<u64>,
+    /// Written by a gated STORE: only part of the buffer is written, so arena
+    /// mode must not pack a later tenant over the untouched bytes. Tinygrad's
+    /// TLSF planner (`engine/memory.py:17,70`) has no equivalent because it
+    /// never packs a new tenant over a live one.
+    gated_store: HashSet<u64>,
+}
+
+fn collect_excluded_buffer_ids(schedule: &Schedule) -> ExcludedBufferIds {
     // Alias detection groups views/buffers that share the same underlying
     // storage. Keying by `Buffer::id()` would miss views (since each view
     // mints a fresh handle id); keying by `storage_id()` correctly groups
     // every view of one allocation under one bucket.
     let mut by_storage: HashMap<u64, HashSet<LogicalBufferAlias>> = HashMap::new();
+    let mut gated_store = HashSet::new();
     for item in schedule {
         for buffer in &item.buffers {
             by_storage.entry(buffer.storage_id().0).or_default().insert((
@@ -264,6 +279,13 @@ fn collect_excluded_buffer_ids(schedule: &Schedule) -> (HashSet<u64>, HashSet<u6
                 buffer.dtype(),
                 buffer.shape().to_vec(),
             ));
+        }
+
+        let by_uop_id: HashMap<u64, u64> =
+            item.buffer_uop_ids.iter().copied().zip(item.buffers.iter().map(|b| b.id().0)).collect();
+        for node in item.ast.toposort() {
+            let Op::Store { index, gate: Some(_), .. } = node.op() else { continue };
+            gated_store.extend(indexed_buffer(index).and_then(|uop| by_uop_id.get(&uop.buf_uop().id)).copied());
         }
     }
 
@@ -284,14 +306,22 @@ fn collect_excluded_buffer_ids(schedule: &Schedule) -> (HashSet<u64>, HashSet<u6
         .filter(|item| !matches!(item.ast.op(), Op::Sink { .. }))
         .flat_map(|item| item.buffers.iter().map(|b| b.id().0))
         .collect();
-    (aliased_ids.collect(), non_sink)
+    ExcludedBufferIds { aliased: aliased_ids.collect(), non_sink, gated_store }
+}
+
+/// The buffer an INDEX addresses, looking through the casts and arithmetic a
+/// lowered store index can carry.
+fn indexed_buffer(index: &Arc<UOp>) -> Option<&Arc<UOp>> {
+    match index.op() {
+        Op::Index { buffer, .. } => Some(buffer),
+        other => other.children().into_iter().find_map(indexed_buffer),
+    }
 }
 
 fn exclusion_reason(
     buffer: &Buffer,
     output_buffer_ids: &HashSet<u64>,
-    aliased_buffer_ids: &HashSet<u64>,
-    non_sink_buffer_ids: &HashSet<u64>,
+    excluded: &ExcludedBufferIds,
 ) -> Option<PlannerExclusionReason> {
     let id = buffer.id().0;
     if buffer.allocator().device_spec().is_disk() {
@@ -302,10 +332,12 @@ fn exclusion_reason(
         Some(PlannerExclusionReason::AlreadyAllocated)
     } else if output_buffer_ids.contains(&id) {
         Some(PlannerExclusionReason::Output)
-    } else if aliased_buffer_ids.contains(&id) {
+    } else if excluded.aliased.contains(&id) {
         Some(PlannerExclusionReason::AliasedStorage)
-    } else if non_sink_buffer_ids.contains(&id) {
+    } else if excluded.non_sink.contains(&id) {
         Some(PlannerExclusionReason::NonSinkOperation)
+    } else if excluded.gated_store.contains(&id) {
+        Some(PlannerExclusionReason::GatedStore)
     } else {
         None
     }
@@ -364,7 +396,7 @@ fn analyze_liveness(
     output_buffer_ids: &HashSet<u64>,
     mode: PlannerMode,
 ) -> PlannerInput {
-    let (aliased_buffer_ids, non_sink_buffer_ids) = collect_excluded_buffer_ids(schedule);
+    let excluded = collect_excluded_buffer_ids(schedule);
     let mut liveness: HashMap<u64, BufferLiveness> = HashMap::new();
     let mut occurrences: Vec<(BufferKey, u64)> = Vec::new();
     let mut metrics = MemoryPlannerMetrics { mode, ..Default::default() };
@@ -376,8 +408,7 @@ fn analyze_liveness(
             let key = BufferKey { kernel_idx: step_idx, buffer_idx: buf_idx };
             let buf_id = buffer.id().0;
 
-            if let Some(reason) = exclusion_reason(buffer, output_buffer_ids, &aliased_buffer_ids, &non_sink_buffer_ids)
-            {
+            if let Some(reason) = exclusion_reason(buffer, output_buffer_ids, &excluded) {
                 if classified.insert(buf_id) {
                     let excluded = metrics.exclusions.entry(reason).or_default();
                     excluded.allocations += 1;
