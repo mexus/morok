@@ -17,6 +17,9 @@ use svod_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 use crate::pattern::RewriteResult;
 use crate::rangeify::IndexingContext;
 use crate::rangeify::patterns;
+use crate::rewrite::graph_rewrite;
+use smallvec::smallvec;
+use svod_ir::DeviceSpec;
 
 // ===== early_rewrites Pattern Tests =====
 
@@ -538,4 +541,26 @@ fn test_idempotent_patterns() {
     // Second application (should not match on CONST)
     let result2 = matcher.rewrite(&unwrapped, &mut ());
     assert!(matches!(result2, RewriteResult::NoMatch), "Should not match on already-processed node");
+}
+
+#[test]
+fn test_early_rewrites_materialises_a_resized_copy_source() {
+    use svod_ir::SInt;
+
+    // [4] -> reshape -> expand([4,8]) -> to(Amd): without materialising the view the
+    // transfer is sized by the [4] base and the destination is under-allocated.
+    let source = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let reshaped = source.try_reshape(&smallvec![SInt::Const(4), SInt::Const(1)]).unwrap();
+    let expanded = reshaped.try_expand(&smallvec![SInt::Const(4), SInt::Const(8)]).unwrap();
+    let copied = expanded.copy_to_device(DeviceSpec::Amd { device_id: 0 });
+
+    let rewritten = graph_rewrite(&patterns::early_rewrites(), copied, &mut ());
+    let Op::Copy { src, .. } = rewritten.op() else { panic!("expected COPY, got {}", rewritten.tree()) };
+    assert!(matches!(src.op(), Op::Contiguous { .. }), "resized copy source must be materialised");
+
+    // A pure reshape is a contiguous view of the same element count and passes through.
+    let flat = source.try_reshape(&smallvec![SInt::Const(2), SInt::Const(2)]).unwrap();
+    let reshaped_copy = flat.copy_to_device(DeviceSpec::Amd { device_id: 0 });
+    let rewritten = graph_rewrite(&patterns::early_rewrites(), reshaped_copy.clone(), &mut ());
+    assert!(Arc::ptr_eq(&rewritten, &reshaped_copy));
 }

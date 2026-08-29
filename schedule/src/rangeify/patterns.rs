@@ -64,6 +64,38 @@ pub fn is_always_run_op(op: &Op) -> bool {
     matches!(op, Op::Contiguous { .. } | Op::Copy { .. } | Op::Noop)
 }
 
+/// Element count of a shaped UOp, or `None` when a dimension is symbolic.
+fn static_numel(uop: &Arc<UOp>) -> Option<usize> {
+    uop.shape().ok().flatten()?.iter().try_fold(1usize, |count, dim| count.checked_mul(dim.as_const()?))
+}
+
+/// Whether a COPY over this movement op needs its source materialised.
+///
+/// Tinygrad `schedule/rangeify.py:150` asks for `r.numel() != r.base.numel()` — the
+/// view resizes — or a source with no contiguous view offset, i.e. one a movement
+/// op reorders. Morok has no view-offset model, so PERMUTE/FLIP anywhere in the
+/// chain stands in for the second half; a symbolic extent resolves to `False`
+/// exactly as `resolve(..., False)` does upstream.
+fn copy_needs_contiguous(src: &Arc<UOp>) -> bool {
+    if let (Some(moved), Some(base)) = (static_numel(src), static_numel(&src.base()))
+        && moved != base
+    {
+        return true;
+    }
+    let mut node = src.clone();
+    loop {
+        match node.op() {
+            Op::Permute { .. } | Op::Flip { .. } => return true,
+            Op::Reshape { src, .. }
+            | Op::Expand { src, .. }
+            | Op::Pad { src, .. }
+            | Op::Shrink { src, .. }
+            | Op::Multi { src, .. } => node = src.clone(),
+            _ => return false,
+        }
+    }
+}
+
 /// Check if operation is elementwise (Binary or Ternary).
 pub fn is_elementwise(uop: &Arc<UOp>) -> bool {
     matches!(uop.op(), Op::Binary(..) | Op::Ternary(..))
@@ -88,6 +120,12 @@ pub fn early_rewrites() -> TypedPatternMatcher {
         },
         Detach(x) ~> |x| x.clone(),
         ContiguousBackward(x) ~> |x| x.clone(),
+        // A COPY transfers one contiguous range, so a source that is resized or
+        // reordered by a movement op must be materialised first (tinygrad
+        // `schedule/rangeify.py:149`). Without this the transfer is sized by the
+        // base, not the moved view, and the destination is under-allocated.
+        copy @ Copy { src, .. } if src.op().is_movement() && copy_needs_contiguous(src)
+            => |copy, src| Some(copy.with_sources(vec![src.contiguous()])),
         // Same-device COPY is a no-op and returns its source verbatim, tag included
         // (tinygrad `schedule/rangeify.py:153`). The barrier role a tagged COPY used
         // to carry is covered by `is_always_run_op(Copy)`.
