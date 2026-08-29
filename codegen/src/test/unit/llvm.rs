@@ -220,3 +220,39 @@ fn test_customi_inlines_into_consumer_in_llvm_backend() {
         result.code
     );
 }
+
+/// A gated LOAD renders as branch + phi, and the phi is typed by the load's
+/// shape — a scalar-dtype shape-`[4]` load phis `<4 x float>`, not `float`.
+///
+/// The unpaired-alt/gate and non-bool-gate branches of the renderer's guard are
+/// unreachable: `UOp::new` already asserts both (`ir/src/uop/hash_consing.rs`
+/// `new_tagged`), so they are defense-in-depth, not testable states.
+#[test_case::test_case(1, "= phi float"; "scalar gated load")]
+#[test_case::test_case(4, "= phi <4 x float>"; "grouped gated load")]
+fn llvm_gated_load_phis_the_shaped_load_type(lanes: usize, expected: &str) {
+    let address = |slot| {
+        if lanes == 1 {
+            UOp::index()
+                .buffer(UOp::param(slot, 8, DType::Float32, None))
+                .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+                .call()
+                .unwrap()
+        } else {
+            UOp::new(
+                Op::Shrink {
+                    src: UOp::param(slot, 8, DType::Float32, None),
+                    offsets: UOp::native_const(0i32),
+                    sizes: UOp::native_const(lanes as i32),
+                },
+                DType::Float32,
+            )
+        }
+    };
+    let alt = UOp::const_(DType::Float32, ConstValue::Float(7.0)).broadcast(lanes);
+    let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let load = UOp::load().index(address(1)).alt(alt).gate(gate).call();
+
+    let rendered =
+        render_linearized(&UOp::sink(vec![address(0).store(load)]), Some("gated_load")).expect("render gated load");
+    assert!(rendered.code.contains(expected), "{}", rendered.code);
+}

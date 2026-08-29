@@ -99,6 +99,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         }
 
         Op::Load { index, alt, gate } => {
+            // Defense-in-depth: `UOp::new` (ir hash_consing.rs `new_tagged`) already
+            // asserts the alt/gate pairing, the bool gate and the alt dtype, so no
+            // legal construction path reaches these branches.
             if alt.is_some() != gate.is_some() {
                 ctx.set_invalid_graph(format!("LOAD on uop {} must have either neither or both alt and gate", uop.id));
                 return None;
