@@ -970,9 +970,7 @@ fn cache_invalidate(key: &CacheKey) {
     }
 }
 
-/// Run beam search with disk caching.
-///
-/// Run cached beam search, replaying a cached plan when one exists.
+/// Run beam search with disk caching, replaying a cached plan when one exists.
 ///
 /// `behavior_fingerprint` identifies post-optimization behavior that
 /// `BeamConfig` does not capture (see `OptimizerConfig::transcendental` and
