@@ -549,8 +549,8 @@ pub fn fold_invalid_load_store() -> &'static TypedPatternMatcher {
 }
 
 /// Tier-1 algebraic identities + constant folding WITHOUT the trivial-loop
-/// collapse ([`dead_loop_patterns`]). The shared base for [`symbolic_simple`]
-/// (which re-adds the collapse) and [`symbolic_no_dead_loop`].
+/// collapse ([`dead_loop_patterns`]). The base for [`symbolic_simple`], which
+/// re-adds the collapse.
 ///
 /// Contains algebraic identities and zero propagation rules:
 /// - x + 0 → x, 0 + x → x
@@ -599,10 +599,7 @@ pub fn symbolic_simple() -> &'static TypedPatternMatcher {
 /// rewrite engine applies them. The order is load-bearing: each group may expose
 /// matches for a later one (e.g. commutative canonicalization before term
 /// combining, ALU folding before the comparison/range rules).
-///
-/// `alu_folding` (the two-stage ALU / const push-down group) is gated: it is
-/// omitted on the hand-lowered path (see [`symbolic_no_dead_loop`]).
-fn with_tier2(tier1: TypedPatternMatcher, alu_folding: bool) -> TypedPatternMatcher {
+fn with_tier2(tier1: TypedPatternMatcher) -> TypedPatternMatcher {
     let head = tier1
         + commutative_canonicalization()
         + boolean_dsl_patterns() // x | !x → true
@@ -610,12 +607,8 @@ fn with_tier2(tier1: TypedPatternMatcher, alu_folding: bool) -> TypedPatternMatc
         + dce_dsl_patterns() // WHERE(!cond) branch swap
         + where_alu_combining_patterns() // hoist ALU through WHERE
         + vmin_vmax_collapse_patterns() // vmin == vmax → const
-        + minmax_dsl_patterns(); // bound-based max/min selection
-    let head = if alu_folding {
-        head + alu_folding_dsl_patterns() // two-stage ALU, const push-down
-    } else {
-        head
-    };
+        + minmax_dsl_patterns() // bound-based max/min selection
+        + alu_folding_dsl_patterns(); // two-stage ALU, const push-down
     head + comparison_dsl_patterns() // lt/le/eq simplification
         + range_based_mod_div_patterns() // mod/div against a range bound
         + advanced_division_dsl_patterns() // symbolic div-and-mod
@@ -627,36 +620,7 @@ fn with_tier2(tier1: TypedPatternMatcher, alu_folding: bool) -> TypedPatternMatc
 
 pub fn symbolic() -> &'static TypedPatternMatcher {
     static CACHED: std::sync::LazyLock<TypedPatternMatcher> =
-        std::sync::LazyLock::new(|| with_tier2(symbolic_simple_base() + dead_loop_patterns(), true));
-    &CACHED
-}
-
-/// [`symbolic`] for **hand-lowered tk kernels** — the post-index simplification
-/// they run after `pm_lower_index_dtype`. Like the generic pipeline it folds the
-/// degenerate index arithmetic (`x*0`, `x*1`, `x/1`, `x%1`, redundant casts) that
-/// lowering regenerates; left unfolded, those loop-invariant values reach the
-/// renderer stranded in non-dominating blocks (LLVM "does not dominate all uses").
-///
-/// It differs from [`symbolic`] by exactly two omitted folds, both rooted in the
-/// same gap: hand-built kernels carry loop state through END/AFTER and lane state
-/// through SPECIAL-derived indices, whereas the generic path goes through reduce
-/// accumulators and warp-axis RANGEs. Each omission has a concrete failure:
-///
-/// * **`dead_loop`** (size-1 RANGE→const) — FA's online-softmax `m`/`l`/`o`
-///   recurrence rides a single-trip RANGE; collapsing it to a constant severs the
-///   carry and the kernel returns wrong values.
-/// * **`alu_folding`** (two-stage ALU / const push-down) — it factors per-position
-///   address arithmetic into one range-derived index (`range·stride`) shared
-///   across sibling reduces. The generic path tolerates this because `dead_loop`
-///   then collapses the trivial range away; here, with no collapse, the shared
-///   index is emitted once inside the first reduce's region and fails to dominate
-///   the others (the knn `mul(r,stride)` "does not dominate all uses").
-///
-/// Every other Tier-2 fold runs, matching the generic `symbolic` as closely as the
-/// hand-lowered carry structure allows.
-pub fn symbolic_no_dead_loop() -> &'static TypedPatternMatcher {
-    static CACHED: std::sync::LazyLock<TypedPatternMatcher> =
-        std::sync::LazyLock::new(|| with_tier2(symbolic_simple_base(), false));
+        std::sync::LazyLock::new(|| with_tier2(symbolic_simple_base() + dead_loop_patterns()));
     &CACHED
 }
 
@@ -1383,9 +1347,8 @@ pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
 ///     but evaluate to NaN at runtime. (Guarded by `!is_float`.)
 ///   * **`Add`/`Sub`/`Max`** on integers — upstream does NOT collapse these via the
 ///     vmin==vmax rule. Collapsing an integer `Add` whose operands are bounded to a
-///     single value replicates the trivial-RANGE collapse that `symbolic_no_dead_loop`
-///     intentionally omits: a hand-built kernel's trip-1 loop-carry index folds to a
-///     constant and the recurrence breaks (the FA online-softmax `m`/`l`/`o` carry
+///     single value would fold a hand-built kernel's trip-1 loop-carry index to a
+///     constant and break the recurrence (the FA online-softmax `m`/`l`/`o` carry
 ///     reads a stale slot → NaN). `Mul` is safe because `0 · x = 0` and `c · c` are
 ///     exact regardless of the operand's loop structure.
 fn vmin_vmax_collapse_patterns_unchecked() -> &'static TypedPatternMatcher {

@@ -52,3 +52,27 @@ fn test_opts_to_apply_empty_overrides_beam_strategy() {
 
     assert_eq!(count_axis_type(&optimized, AxisType::Upcast), 0, "explicit opts must win over the beam strategy");
 }
+
+/// The `Op::Special` (gidx/lidx) hand-lowered bypass is gone: a SINK carrying
+/// SPECIAL ops plus `opts_to_apply = Some(vec![])` runs the shared pipeline and
+/// still applies zero schedule opts.
+#[test]
+fn test_opts_to_apply_empty_with_special_uses_the_shared_pipeline() {
+    let out_buf = UOp::param(0, 8, DType::Float32, None);
+    let in_buf = UOp::param(1, 8, DType::Float32, None);
+    let gidx = UOp::special(UOp::index_const(8), "gidx0".into());
+    let in_idx = UOp::index().buffer(in_buf).indices(vec![gidx.clone()]).call().unwrap();
+    let value = UOp::load().index(in_idx).call().try_add(&UOp::const_(DType::Float32, ConstValue::Float(1.0))).unwrap();
+    let out_idx = UOp::index().buffer(out_buf).indices(vec![gidx]).call().unwrap();
+    let sink = UOp::sink_with_info(
+        vec![out_idx.store(value)],
+        KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() },
+    );
+
+    let renderer = Renderer::cpu().with_rewrite_capabilities(svod_ir::RendererOps::all(), None, None);
+    let config = OptimizerConfig { strategy: OptStrategy::Heuristic, ..Default::default() };
+    let optimized = optimize_kernel_with_config(sink, &renderer, &config).expect("optimize");
+
+    assert_eq!(count_axis_type(&optimized, AxisType::Upcast), 0);
+    assert!(optimized.toposort().iter().any(|u| matches!(u.op(), Op::Special { .. })), "{}", optimized.tree());
+}
