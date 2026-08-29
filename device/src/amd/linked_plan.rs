@@ -301,6 +301,9 @@ impl AmdLinkedPlan {
                         tmpring_size: lane.tmpring_size(),
                         target_major: lane.core().arch.gfx_major(),
                         completion_xcc_mask: None,
+                        // Linked timeline stores are placeholders patched per
+                        // replay, so they carry no KFD interrupt companion.
+                        queue_event_mailbox: None,
                     },
                 )?,
                 QueueKind::Compute(_) => {
@@ -312,6 +315,7 @@ impl AmdLinkedPlan {
                             tmpring_size: lane.tmpring_size(),
                             target_major: lane.core().arch.gfx_major(),
                             completion_xcc_mask: (lane.core().node.num_xcc > 1).then_some(1),
+                            queue_event_mailbox: None,
                         },
                         PatchSource::LinkAddress(control_link),
                     )?;
@@ -334,7 +338,7 @@ impl AmdLinkedPlan {
                     });
                     program.aql
                 }
-                QueueKind::Copy(_) => lower_hcq_sdma_command_buffer(&submission, lane.core().arch.gfx_major())?,
+                QueueKind::Copy(_) => lower_hcq_sdma_command_buffer(&submission, lane.core().arch.gfx_major(), None)?,
             };
             match submission.queue {
                 QueueKind::Compute(_) if pm4 => validate_pm4_dword_count(lowered.bytes.len() / 4)?,

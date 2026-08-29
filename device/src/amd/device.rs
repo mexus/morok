@@ -436,6 +436,14 @@ impl AmdDeviceCore {
         &self.iface
     }
 
+    /// The KFD queue-completion event mailbox, when the backend has one. A
+    /// timeline store paired with an interrupting write here wakes a blocked
+    /// `WAIT_EVENTS` immediately instead of at the next poll tier.
+    #[inline]
+    pub(crate) fn queue_event_mailbox(&self) -> Option<crate::amd::iface::QueueEventMailbox> {
+        self.iface.queue_event_mailbox()
+    }
+
     #[inline]
     pub(crate) fn publication_checkpoint(&self, stage: crate::amd::iface::PublicationStage) -> Result<()> {
         #[cfg(test)]

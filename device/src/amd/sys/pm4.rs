@@ -265,6 +265,24 @@ pub fn release_mem_write(
     ]
 }
 
+/// KFD queue-event mailbox write: store `event_id` at `addr`, raise the
+/// completion interrupt, and carry the id in `ctxid` so KFD routes the
+/// interrupt to that event. Mirrors the second RELEASE_MEM of Tinygrad's
+/// `AMDComputeQueue.signal` (`ops_amd.py:392-393`). No cache flush — the
+/// timeline value store that precedes it already carries one.
+pub fn release_mem_event(addr: u64, event_id: u32, is_gfx9: bool) -> [u32; 8] {
+    let mut packet = release_mem_write(
+        addr,
+        u64::from(event_id),
+        /*write_64=*/ false,
+        /*cache_flush=*/ false,
+        true,
+        is_gfx9,
+    );
+    packet[7] = event_id;
+    packet
+}
+
 /// End-of-pipe ordering packet with no memory write, matching Tinygrad's first
 /// timestamp RELEASE_MEM. The zero address is ignored when DATA_SEL is none.
 pub fn release_mem_order(is_gfx9: bool) -> [u32; 8] {

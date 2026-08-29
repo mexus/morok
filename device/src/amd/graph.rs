@@ -295,6 +295,9 @@ impl AmdGraph {
                 tmpring_size: lane.tmpring_size(),
                 target_major: device.core().arch.gfx_major(),
                 completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
+                // Captured timeline stores are placeholders patched per replay, so
+                // they never carry the KFD interrupt companion.
+                queue_event_mailbox: None,
             };
             Some(lower_graph_submission(allocator, &profiled, &links, state, pm4)?)
         };
@@ -304,6 +307,9 @@ impl AmdGraph {
             tmpring_size: lane.tmpring_size(),
             target_major: device.core().arch.gfx_major(),
             completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
+            // Captured timeline stores are placeholders patched per replay, so
+            // they never carry the KFD interrupt companion.
+            queue_event_mailbox: None,
         };
         let (linked, control) = lower_graph_submission(allocator, &submission, &links, state, pm4)?;
         let command = linked.replay_buffer();

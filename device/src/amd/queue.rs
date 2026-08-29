@@ -455,6 +455,21 @@ pub struct Pm4LoweringState {
     /// Restrict PM4 timestamp and timeline writes to one XCC. This is required
     /// for PM4 control runs launched through a multi-XCC AQL vendor IB.
     pub completion_xcc_mask: Option<u32>,
+    /// Address of the device's KFD queue-event mailbox, when it has one. A
+    /// `Store` to exactly this address is the interrupt companion of a queue
+    /// timeline store and lowers to an interrupting `RELEASE_MEM` carrying the
+    /// event id in `ctxid`; every other `Store` stays a plain memory write.
+    pub queue_event_mailbox: Option<u64>,
+}
+
+/// Append Tinygrad's KFD interrupt companion to a just-pushed queue-timeline
+/// store (`ops_amd.py:391-393`): write the event id into the device's event
+/// mailbox so a host blocked in `WAIT_EVENTS` wakes on completion instead of at
+/// its next poll tier. No-op on backends without a KFD event.
+fn push_queue_event_mailbox(submission: &mut crate::hcq::Submission, core: &AmdDeviceCore) {
+    if let Some(mailbox) = core.queue_event_mailbox() {
+        submission.push(crate::hcq::Command::Store { dst: mailbox.address, value: mailbox.event_id.into() });
+    }
 }
 
 /// Queue-finalized dispatch result. The queue owns timestamp allocation and
@@ -501,7 +516,11 @@ pub fn lower_hcq_pm4(submission: &crate::hcq::Submission, state: Pm4LoweringStat
                 if let Some(mask) = state.completion_xcc_mask {
                     q.extend_from_slice(&pm4::pred_exec(mask, 8));
                 }
-                q.extend_from_slice(&pm4::release_mem_write(*dst, *value, true, true, false, is_gfx9));
+                if state.queue_event_mailbox == Some(*dst) {
+                    q.extend_from_slice(&pm4::release_mem_event(*dst, value_u32("event id", *value)?, is_gfx9));
+                } else {
+                    q.extend_from_slice(&pm4::release_mem_write(*dst, *value, true, true, false, is_gfx9));
+                }
             }
             crate::hcq::Command::Timestamp { dst } => {
                 // Tinygrad: EOP drain, clock write, then acquire the timestamp.
@@ -565,7 +584,11 @@ pub fn lower_hcq_pm4(submission: &crate::hcq::Submission, state: Pm4LoweringStat
 }
 
 /// Lower a complete neutral copy submission to one ordered SDMA stream.
-pub fn lower_hcq_sdma(submission: &crate::hcq::Submission, target_major: u32) -> Result<Vec<u32>> {
+pub fn lower_hcq_sdma(
+    submission: &crate::hcq::Submission,
+    target_major: u32,
+    queue_event_mailbox: Option<u64>,
+) -> Result<Vec<u32>> {
     if !matches!(submission.queue, crate::hcq::QueueKind::Copy(_)) {
         return Err(Error::Runtime {
             message: format!("SDMA lowering requires a copy queue, got {:?}", submission.queue),
@@ -591,7 +614,11 @@ pub fn lower_hcq_sdma(submission: &crate::hcq::Submission, target_major: u32) ->
             }
             crate::hcq::Command::Timestamp { dst } => q.extend_from_slice(&sdma::timestamp_global(*dst)),
             crate::hcq::Command::Store { dst, value } => {
-                q.extend_from_slice(&sdma::fence(*dst, value_u32("store", *value)?, target_major));
+                let value = value_u32("store", *value)?;
+                q.extend_from_slice(&sdma::fence(*dst, value, target_major));
+                if queue_event_mailbox == Some(*dst) {
+                    q.extend_from_slice(&sdma::trap(value));
+                }
             }
             crate::hcq::Command::Compute(_) | crate::hcq::Command::Execute { .. } => {
                 return Err(unsupported_hcq(submission.queue, command));
@@ -780,10 +807,11 @@ pub fn lower_hcq_pm4_command_buffer(
 pub fn lower_hcq_sdma_command_buffer(
     submission: &crate::hcq::Submission,
     target_major: u32,
+    queue_event_mailbox: Option<u64>,
 ) -> Result<crate::hcq::LoweredCommandBuffer> {
     use crate::hcq::{Command, CommandField as F, PatchEncoding, PatchSite};
 
-    let dwords = lower_hcq_sdma(submission, target_major)?;
+    let dwords = lower_hcq_sdma(submission, target_major, queue_event_mailbox)?;
     let mut sites = Vec::new();
     let mut consumed = std::collections::BTreeSet::new();
     let mut cursor = 0usize;
@@ -836,7 +864,7 @@ pub fn lower_hcq_sdma_command_buffer(
                 }
                 cursor += 3;
             }
-            Command::Store { .. } => {
+            Command::Store { dst, .. } => {
                 if let Some(source) = command_binding(submission, command_index, F::StoreDst) {
                     record_u64_sites(&mut sites, cursor + 1, source, 0);
                     consumed.insert((command_index, F::StoreDst));
@@ -850,7 +878,7 @@ pub fn lower_hcq_sdma_command_buffer(
                     });
                     consumed.insert((command_index, F::StoreValue));
                 }
-                cursor += 4;
+                cursor += 4 + 2 * usize::from(queue_event_mailbox == Some(*dst));
             }
             Command::Compute(_) | Command::Execute { .. } => unreachable!("validated by lower_hcq_sdma"),
         }
@@ -1484,13 +1512,14 @@ impl AmdComputeQueue {
                 None
             };
 
-            let finalized = finalize_hcq_aql_timeline_submission(
+            let mut finalized = finalize_hcq_aql_timeline_submission(
                 submission,
                 counter_addr,
                 prev,
                 next,
                 timestamps.as_ref().map(|signal| (signal.start_ts_addr(), signal.end_ts_addr())),
             )?;
+            push_queue_event_mailbox(&mut finalized, &self.core);
 
             let program = lower_hcq_aql_submission_program(
                 &finalized,
@@ -1499,6 +1528,7 @@ impl AmdComputeQueue {
                     tmpring_size: pool.tmpring_size(),
                     target_major: self.core.arch.gfx_major(),
                     completion_xcc_mask: (self.core.node.num_xcc > 1).then_some(1),
+                    queue_event_mailbox: self.core.queue_event_mailbox().map(|mailbox| mailbox.address),
                 },
                 crate::hcq::PatchSource::LinkAddress(0),
             )?;
@@ -1561,9 +1591,15 @@ impl AmdComputeQueue {
             }
         }
         finalized.push(crate::hcq::Command::Store { dst: counter_addr, value: next });
+        push_queue_event_mailbox(&mut finalized, &self.core);
 
-        let state =
-            Pm4LoweringState { scratch_address: scratch_addr, tmpring_size, target_major, completion_xcc_mask: None };
+        let state = Pm4LoweringState {
+            scratch_address: scratch_addr,
+            tmpring_size,
+            target_major,
+            completion_xcc_mask: None,
+            queue_event_mailbox: self.core.queue_event_mailbox().map(|mailbox| mailbox.address),
+        };
         let q = if pmc_start.is_empty() && pmc_read.is_empty() {
             lower_hcq_pm4(&finalized, state)?
         } else {
@@ -2143,7 +2179,8 @@ impl AmdCopyQueue {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        let dwords = lower_hcq_sdma(submission, self.core.arch.gfx_major())?;
+        let dwords =
+            lower_hcq_sdma(submission, self.core.arch.gfx_major(), self.core.queue_event_mailbox().map(|m| m.address))?;
         if dwords.len() * 4 >= COPY_RING_BYTES {
             return Err(Error::CommandStreamTooLarge {
                 kind: "SDMA ring submission",
@@ -2248,7 +2285,8 @@ impl AmdCopyQueue {
         let finalizer = {
             let mut g = self.inner.lock();
             let copy_packets = size.div_ceil(sdma::SDMA_MAX_COPY_BYTES);
-            wait_sdma_headroom(&g, copy_packets * 7 * 4 + 4 * 4)
+            // Copy chunks + the timeline fence + the event mailbox fence and trap.
+            wait_sdma_headroom(&g, copy_packets * 7 * 4 + 10 * 4)
                 .inspect_err(|error| self.core.poison(&error.to_string()))?;
             let mut ring = RingRollback::new(&mut g);
             let mut off = 0usize;
@@ -2262,6 +2300,11 @@ impl AmdCopyQueue {
             let mut reservation = CopyTimelineReservation::new(&self.timeline, &self.core, target);
             self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
             push_sdma(&mut ring, &sdma::fence(self.timeline.value_addr(), target as u32, self.core.arch.gfx_major()));
+            if let Some(mailbox) = self.core.queue_event_mailbox() {
+                // Tinygrad `AMDCopyQueue.signal` (ops_amd.py:490-492).
+                push_sdma(&mut ring, &sdma::fence(mailbox.address, mailbox.event_id, self.core.arch.gfx_major()));
+                push_sdma(&mut ring, &sdma::trap(mailbox.event_id));
+            }
             self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
             // GART wptr first, then doorbell — same ordering as the compute
             // queue. SDMA doorbell + wptr are byte counters (= write_idx). Both

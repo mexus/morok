@@ -583,6 +583,7 @@ fn pm4_state() -> Pm4LoweringState {
         tmpring_size: 0x55,
         target_major: 11,
         completion_xcc_mask: None,
+        queue_event_mailbox: None,
     }
 }
 
@@ -592,6 +593,7 @@ fn aql_control_state(multi_xcc: bool) -> Pm4LoweringState {
         tmpring_size: 0x55,
         target_major: 9,
         completion_xcc_mask: multi_xcc.then_some(1),
+        queue_event_mailbox: None,
     }
 }
 
@@ -776,7 +778,7 @@ fn hcq_sdma_command_and_mixed_goldens() {
         .push(Command::Timestamp { dst: 0x4_0000_4000 })
         .push(Command::Store { dst: 0x5_0000_5000, value: 0x5566_7788 });
     assert_eq!(
-        lower_hcq_sdma(&submission, 11).unwrap(),
+        lower_hcq_sdma(&submission, 11, None).unwrap(),
         [
             0xd000_0008,
             0x1000,
@@ -803,13 +805,49 @@ fn hcq_sdma_command_and_mixed_goldens() {
 }
 
 #[test]
+fn hcq_queue_event_mailbox_stores_raise_the_kfd_interrupt() {
+    use crate::hcq::{Command, QueueKind, Submission};
+    const MAILBOX: u64 = 0x7_0000_1234;
+    let int_sel = |dword: u32| (dword >> 24) & 0b11;
+
+    // PM4: the polled timeline store stays interrupt-free; only the mailbox
+    // store interrupts, carrying the event id in both value and ctxid and no
+    // cache flush (tinygrad ops_amd.py:388-393).
+    let mut submission = Submission::new(QueueKind::Compute(0));
+    submission.push(Command::Store { dst: 0x1_0000_1000, value: 7 }).push(Command::Store { dst: MAILBOX, value: 9 });
+    let q = lower_hcq_pm4(&submission, Pm4LoweringState { queue_event_mailbox: Some(MAILBOX), ..pm4_state() }).unwrap();
+    assert_eq!(q.len(), 16);
+    assert_eq!(int_sel(q[2]), 0);
+    assert_eq!(int_sel(q[10]), crate::amd::sys::pm4::INT_SEL_INTERRUPT_AFTER_WRITE);
+    assert_eq!(q[9] & crate::amd::sys::pm4::RELEASE_MEM_CACHE_FLUSH_ALL, 0);
+    assert_eq!(&q[11..16], &[MAILBOX as u32, (MAILBOX >> 32) as u32, 9, 0, 9]);
+    // Without the mailbox address every store stays a plain memory write.
+    assert_eq!(int_sel(lower_hcq_pm4(&submission, pm4_state()).unwrap()[10]), 0);
+
+    // SDMA: mailbox fence followed by SDMA_OP_TRAP (ops_amd.py:490-492).
+    let mut copy = Submission::new(QueueKind::Copy(0));
+    copy.push(Command::Store { dst: MAILBOX, value: 9 });
+    assert_eq!(
+        lower_hcq_sdma(&copy, 11, Some(MAILBOX)).unwrap(),
+        [0x0003_0005, MAILBOX as u32, (MAILBOX >> 32) as u32, 9, 6, 9]
+    );
+    assert_eq!(lower_hcq_sdma(&copy, 11, None).unwrap().len(), 4);
+    // The extra TRAP dwords keep the SDMA patch cursor aligned.
+    copy.bind(0, crate::hcq::CommandField::StoreDst, crate::hcq::PatchSource::LinkAddress(0)).unwrap();
+    copy.push(Command::Store { dst: 0x2000, value: 1 });
+    copy.bind(1, crate::hcq::CommandField::StoreDst, crate::hcq::PatchSource::LinkAddress(1)).unwrap();
+    let lowered = lower_hcq_sdma_command_buffer(&copy, 11, Some(MAILBOX)).unwrap();
+    assert_eq!(lowered.patches.link.iter().map(|site| site.byte_offset).collect::<Vec<_>>(), [4, 8, 28, 32]);
+}
+
+#[test]
 fn hcq_sdma_zero_byte_copy_consumes_its_bindings_without_packets() {
     use crate::hcq::{Command, CommandField, PatchSource, QueueKind, Submission};
     let mut submission = Submission::new(QueueKind::Copy(0));
     submission.push(Command::Copy { dst: 0, src: 0, bytes: 0 });
     submission.bind(0, CommandField::CopySrc, PatchSource::RuntimeBuffer(0)).unwrap();
     submission.bind(0, CommandField::CopyDst, PatchSource::RuntimeBuffer(1)).unwrap();
-    let lowered = lower_hcq_sdma_command_buffer(&submission, 11).expect("zero-byte copy must lower");
+    let lowered = lower_hcq_sdma_command_buffer(&submission, 11, None).expect("zero-byte copy must lower");
     assert!(lowered.bytes.is_empty());
     assert!(lowered.patches.runtime.is_empty());
 }
@@ -822,7 +860,7 @@ fn hcq_amd_rejects_unsupported_packet_forms_and_wide_waits() {
     assert!(lower_hcq_pm4(&compute, pm4_state()).unwrap_err().to_string().contains("does not support"));
     let mut copy = Submission::new(QueueKind::Copy(0));
     copy.push(Command::Execute { operation: 0 });
-    assert!(lower_hcq_sdma(&copy, 11).unwrap_err().to_string().contains("does not support"));
+    assert!(lower_hcq_sdma(&copy, 11, None).unwrap_err().to_string().contains("does not support"));
     let mut wide = Submission::new(QueueKind::Compute(0));
     wide.push(Command::Wait { signal_address: 0x1000, value: u32::MAX as u64 + 1 });
     assert!(lower_hcq_pm4(&wide, pm4_state()).unwrap_err().to_string().contains("32-bit"));
@@ -926,7 +964,7 @@ fn hcq_sdma_dynamic_normal_replay_patches_chunk_addresses_without_relowering() {
     submission.bind(2, CommandField::StoreDst, PatchSource::LinkAddress(0)).unwrap();
     submission.bind(2, CommandField::StoreValue, PatchSource::System(SystemField::TimelineValue(0))).unwrap();
 
-    let lowered = lower_hcq_sdma_command_buffer(&submission, 11).unwrap();
+    let lowered = lower_hcq_sdma_command_buffer(&submission, 11, None).unwrap();
     assert_eq!(lowered.patches.runtime.len(), 8); // src/dst lo+hi for both chunks
     let linked = CommandBufferCache::default().link(&lowered, &LinkPatchValues(vec![0x7000])).unwrap();
     let static_bytes = linked.static_bytes().to_vec();
