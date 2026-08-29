@@ -594,6 +594,91 @@ fn amd_wmma_gfx950_scaled_fp8_uses_i32_vectors_and_scale_immediates() {
     assert_amd_ir_compiles(&result.code, AmdArch::Gfx950.mcpu());
 }
 
+// ── shape-carried lane counts ──────────────────────────────────────────────
+//
+// This branch keeps the lane count in the UOp shape (scalar dtype + shape `[N]`)
+// and gives INDEX the element dtype. Every row below is a value whose LLVM type
+// can only be derived from the shape; `llvm-as` is the oracle.
+
+fn f32_param(slot: usize) -> std::sync::Arc<UOp> {
+    UOp::param(slot, 8, DType::Float32, None)
+}
+
+fn shrink4(src: std::sync::Arc<UOp>, dtype: DType) -> std::sync::Arc<UOp> {
+    UOp::new(Op::Shrink { src, offsets: UOp::native_const(0i32), sizes: UOp::native_const(4i32) }, dtype)
+}
+
+fn element(buffer: std::sync::Arc<UOp>, lane: i64) -> std::sync::Arc<UOp> {
+    UOp::index().buffer(buffer).indices(vec![UOp::const_(DType::Index, ConstValue::Int(lane))]).call().unwrap()
+}
+
+/// STACK over address-carrying INDEX lanes: each lane must be loaded before the
+/// insertelement (CB1).
+fn stack_of_address_index_lanes_row() -> std::sync::Arc<UOp> {
+    let src = f32_param(1);
+    let lanes = (0..4).map(|lane| element(src.clone(), lane)).collect();
+    let out = shrink4(f32_param(0), DType::Float32);
+    UOp::sink(vec![out.store(UOp::stack(lanes).detach())])
+}
+
+/// CAST of a shape-`[4]` scalar-dtype value: both sides need the shaped type.
+fn cast_of_shaped_stack_row() -> std::sync::Arc<UOp> {
+    let src = UOp::param(1, 8, DType::UInt32, None);
+    let lanes = (0..4).map(|lane| UOp::load().index(element(src.clone(), lane)).call()).collect();
+    let out = shrink4(f32_param(0), DType::Float32);
+    UOp::sink(vec![out.store(UOp::stack(lanes).cast(DType::Float32))])
+}
+
+/// INDEX into a SHRINK: the buffer carries an address space, so this is a GEP
+/// over the element dtype, never an extractelement (CA2).
+fn index_into_shrink_row() -> std::sync::Arc<UOp> {
+    let index = element(shrink4(f32_param(1), DType::Float32), 2);
+    UOp::sink(vec![element(f32_param(0), 0).store(UOp::load().index(index).call())])
+}
+
+/// Gated LOAD whose alt is a shape-`[4]` value: load, alt and phi share one type.
+fn gated_load_with_shaped_alt_row() -> std::sync::Arc<UOp> {
+    let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let alt = UOp::const_(DType::Float32, ConstValue::Float(7.0)).broadcast(4);
+    let load = UOp::load().index(shrink4(f32_param(1), DType::Float32)).alt(alt).gate(gate).call();
+    UOp::sink(vec![shrink4(f32_param(0), DType::Float32).store(load)])
+}
+
+/// Gated LOAD with a scalar alt behind a grouped load: the alt splats (CA4).
+fn gated_load_with_scalar_alt_row() -> std::sync::Arc<UOp> {
+    let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let alt = UOp::const_(DType::Float32, ConstValue::Float(7.0));
+    let load = UOp::load().index(shrink4(f32_param(1), DType::Float32)).alt(alt).gate(gate).call();
+    UOp::sink(vec![shrink4(f32_param(0), DType::Float32).store(load)])
+}
+
+/// INDEX with no indices is the buffer pointer itself — an alias, not a bitcast
+/// of a pointer to a float (CA6).
+fn index_without_indices_row() -> std::sync::Arc<UOp> {
+    let base = UOp::index().buffer(f32_param(1)).indices(vec![]).call().unwrap();
+    UOp::sink(vec![element(f32_param(0), 0).store(UOp::load().index(base).call())])
+}
+
+/// STORE of a 4-lane value through a scalar-width address.
+fn store_vector_through_scalar_index_row() -> std::sync::Arc<UOp> {
+    let value = UOp::vconst(vec![ConstValue::Float(1.0); 4], DType::Float32);
+    UOp::sink(vec![element(f32_param(0), 0).store(value)])
+}
+
+#[test_case::test_case(stack_of_address_index_lanes_row; "stack of address index lanes")]
+#[test_case::test_case(cast_of_shaped_stack_row; "cast of shaped stack")]
+#[test_case::test_case(index_into_shrink_row; "index into shrink")]
+#[test_case::test_case(gated_load_with_shaped_alt_row; "gated load with shaped alt")]
+#[test_case::test_case(gated_load_with_scalar_alt_row; "gated load with scalar alt")]
+#[test_case::test_case(index_without_indices_row; "index without indices")]
+#[test_case::test_case(store_vector_through_scalar_index_row; "store vector through scalar index")]
+fn llvm_shaped_values_assemble(build: fn() -> std::sync::Arc<UOp>) {
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(build()).into());
+    let rendered = render(&linear, Some("shaped_values")).expect("render shaped value");
+    println!("{}", rendered.code);
+    assert_llvm_ir_assembles(&rendered.code);
+}
+
 /// Pipe `ir` through an `llvm-as` on PATH and assert it parses. Skips (returns)
 /// when no `llvm-as` is installed, so the test is a no-op on machines without
 /// LLVM tools.
