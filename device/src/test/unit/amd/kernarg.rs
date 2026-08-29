@@ -56,3 +56,28 @@ fn mock_kernarg_wrap_failed_drain_does_not_reset_or_free() {
     drop(pool);
     assert_eq!(iface.free_count(), 0, "all hardware-referenced queue storage must remain quarantined");
 }
+
+#[test]
+fn mock_kernarg_arena_is_shared_by_every_lane_of_one_device() {
+    use crate::amd::connector::PoolQueue;
+    use crate::amd::va_registry::AllocTag;
+
+    let iface = Arc::new(MockAmdIface::default());
+    let dev = iface.device();
+    let allocator = AmdAllocator { dev: Arc::clone(&dev), device_id: 0 };
+    dev.core().install_signal_pool(crate::amd::signal::SignalPool::new(&allocator, 64).unwrap());
+
+    let first = PoolQueue::new_with_resources(Arc::clone(dev.core()), &allocator).unwrap();
+    let second = PoolQueue::new_with_resources(Arc::clone(dev.core()), &allocator).unwrap();
+    // Tinygrad allocates one kernarg buffer per device, not per lane.
+    assert_eq!(iface.alloc_count_for_tag(AllocTag::Kernarg), 1);
+    assert!(std::ptr::eq(first.arena(), second.arena()));
+    // Bumps interleave through one cursor, so no two lanes share a slot.
+    assert_ne!(first.arena().bump(64, 16).unwrap(), second.arena().bump(64, 16).unwrap());
+
+    let frees = iface.free_count();
+    drop(first);
+    assert_eq!(iface.free_count(), frees + 5, "a shared arena outlives the first lane to drop");
+    drop(second);
+    assert_eq!(iface.alloc_count_for_tag(AllocTag::Kernarg), 1);
+}

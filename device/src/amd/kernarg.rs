@@ -1,13 +1,15 @@
 //! `KernargArena`: bump allocator for AMDGPU kernel-argument buffers.
 //!
-//! Sized at 16 MiB GTT-coherent. **One per `PoolQueue`**. A dispatch holds the
-//! lane's exclusive lease across bump + kernarg write + ring submission, so the
-//! bump cursor order matches the ring order — a wrapped slot is provably free
-//! once the whole pool drains. Each `Program::execute` claims `kernarg_size`
-//! bytes (16-byte aligned per ABI). The arena wraps when it fills; on wrap we
-//! drain every live `PoolQueue` via the arena's owning `AmdDeviceCore` —
-//! without that drain a wrap can clobber kernargs the GPU is still consuming
-//! (the host can sprint ahead of the GPU on a `wait=false` burst).
+//! Sized at 16 MiB GTT-coherent. **One per device**, shared by every lane
+//! (tinygrad allocates one `kernargs_buf` per `HCQCompiled`,
+//! `support/hcq.py` `HCQCompiled.__init__`; four private 16 MiB arenas is
+//! four times the resizable-BAR pressure for no gain). Each `Program::execute`
+//! claims `kernarg_size` bytes (16-byte aligned per ABI) under the arena's
+//! cursor lock, so concurrent lanes never share a slot. The arena wraps when it
+//! fills; on wrap we drain every live `PoolQueue` via the arena's owning
+//! `AmdDeviceCore` — without that drain a wrap can clobber kernargs the GPU is
+//! still consuming (the host can sprint ahead on a `wait=false` burst). That
+//! device-wide drain is exactly what makes one shared arena safe.
 
 #![cfg(unix)]
 
@@ -43,18 +45,17 @@ unsafe impl Sync for KernargArena {}
 
 impl Drop for KernargArena {
     /// Free the 16 MiB CPU-visible VRAM backing. `RawBuffer` lacks a `Drop` (the
-    /// allocator path consumes it by destructure), so the arena — owned
-    /// directly by `PoolQueue` — would otherwise leak its allocation every
-    /// time a queue drops. Safe against unmap-while-busy because
-    /// `PoolQueue::Drop` drains the queue before the `arena` field (and hence
-    /// this `Drop`) runs.
+    /// allocator path consumes it by destructure), so the arena would otherwise
+    /// leak its allocation. This runs when the LAST `PoolQueue` sharing the
+    /// arena drops, after that queue's `Drop` has drained it; the core keeps
+    /// only a `Weak`, so the arena does not outlive the lanes that use it.
     fn drop(&mut self) {
         self._buffer.free_amd_device_in_place();
     }
 }
 
 impl KernargArena {
-    pub fn new(allocator: &AmdAllocator, core: &Arc<AmdDeviceCore>) -> Result<Box<Self>> {
+    pub fn new(allocator: &AmdAllocator, core: &Arc<AmdDeviceCore>) -> Result<Arc<Self>> {
         // Tinygrad keeps both the ordinary kernarg arena and graph-owned
         // kernargs in CPU-visible VRAM. Queue publication performs the required
         // store fence before ringing the doorbell.
@@ -65,7 +66,7 @@ impl KernargArena {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => return Err(Error::NotHostVisible { what: "kernarg arena" }),
         };
-        Ok(Box::new(Self {
+        Ok(Arc::new(Self {
             base_gpu,
             base_host,
             size: ARENA_BYTES,

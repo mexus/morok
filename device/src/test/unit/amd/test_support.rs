@@ -94,6 +94,7 @@ struct MockAmdState {
     teardown_script: VecDeque<Result<QueueTeardown>>,
     wait_script: VecDeque<Result<Option<Error>>>,
     publication_script: VecDeque<MockPublicationOutcome>,
+    alloc_tags: Vec<AllocTag>,
     transcript: Vec<MockAmdCall>,
     free_issues: Vec<MockFreeIssue>,
 }
@@ -155,6 +156,11 @@ impl MockAmdIface {
         self.state.lock().frees
     }
 
+    /// Successful allocations recorded for one [`AllocTag`], live or freed.
+    pub(crate) fn alloc_count_for_tag(&self, tag: AllocTag) -> usize {
+        self.state.lock().alloc_tags.iter().filter(|recorded| **recorded == tag).count()
+    }
+
     pub(crate) fn live_handle_count(&self) -> usize {
         self.state.lock().live.len()
     }
@@ -185,7 +191,7 @@ impl AmdIface for MockAmdIface {
         &self,
         size: usize,
         _kind: AllocKind,
-        _tag: AllocTag,
+        tag: AllocTag,
         cpu_access: bool,
         zero: bool,
     ) -> Result<AllocResult> {
@@ -207,6 +213,7 @@ impl AmdIface for MockAmdIface {
         let previous = state.live.insert(handle, MockLiveAllocation { _memory: memory, gpu_va, size });
         debug_assert!(previous.is_none());
         state.allocations += 1;
+        state.alloc_tags.push(tag);
         Ok(AllocResult { gpu_va, host_ptr, handle, size })
     }
 

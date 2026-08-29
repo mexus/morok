@@ -197,6 +197,10 @@ pub struct AmdDeviceCore {
     /// (`PoolQueue::drain_all`) reads only timeline signal slots and does not
     /// take publication locks.
     pub(crate) connectors: parking_lot::Mutex<Vec<Weak<crate::amd::connector::PoolQueue>>>,
+    /// The device's single 16 MiB kernarg arena, shared by every lane (tinygrad
+    /// has one `kernargs_buf` per device). `Weak` so the arena still dies with
+    /// the last `PoolQueue` holding it — the core outlives every queue.
+    pub(crate) kernarg_arena: parking_lot::Mutex<Weak<crate::amd::kernarg::KernargArena>>,
     /// Process-global signal pool, allocated once per physical device. Lazily
     /// installed by the device factory and shared across every `PoolQueue`
     /// (PM4 counter signal acquired here at queue construction) — pool access
@@ -280,6 +284,7 @@ impl AmdDevice {
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
             connectors: parking_lot::Mutex::new(Vec::new()),
+            kernarg_arena: parking_lot::Mutex::new(Weak::new()),
             signal_pool: OnceLock::new(),
             copy_queue: OnceLock::new(),
             queue_pool: crate::amd::connector::QueuePool::new(1),
@@ -362,6 +367,7 @@ impl AmdDevice {
             error_msg: OnceLock::new(),
             copy_queue: OnceLock::new(),
             connectors: parking_lot::Mutex::new(Vec::new()),
+            kernarg_arena: parking_lot::Mutex::new(Weak::new()),
             signal_pool: OnceLock::new(),
             queue_pool: crate::amd::connector::QueuePool::new(hw_queues),
             hw_queues,

@@ -42,12 +42,12 @@ pub(crate) struct PoolQueue {
     /// The KFD compute queue: ring, doorbell, and GART. Its backend-local mutex
     /// is uncontended because publication requires the lane's unique lease.
     queue: Box<AmdComputeQueue>,
-    /// Kernel-argument bump arena (16 MiB GTT). One per `PoolQueue`. The
-    /// Exclusive lane publication makes the bump cursor
-    /// order match the ring submission order, so a wrapped slot is provably free
-    /// once the whole pool drains. Freed on the queue's drop via
-    /// `Drop for KernargArena`, after `Drop for PoolQueue` has drained.
-    arena: Box<KernargArena>,
+    /// Kernel-argument bump arena (16 MiB GTT). One per DEVICE, shared by every
+    /// lane: the wrap path drains all of them through
+    /// `AmdDeviceCore::synchronize_all`, so a wrapped slot is provably free
+    /// whichever lane wrote it. Freed by `Drop for KernargArena` once the last
+    /// sharing queue drops, after `Drop for PoolQueue` has drained.
+    arena: Arc<KernargArena>,
     /// Scratch backing. Grown on demand by [`ensure_has_local_memory`](Self::ensure_has_local_memory)
     /// while the lane's exclusive lease is held.
     scratch_state: Mutex<ScratchState>,
@@ -331,7 +331,17 @@ impl PoolQueue {
         // is the lone raw KFD allocation — keeping it last means a failure
         // before then leaks nothing.
         let queue = AmdComputeQueue::create(allocator)?;
-        let arena = KernargArena::new(allocator, &core)?;
+        let arena = {
+            let mut shared = core.kernarg_arena.lock();
+            match shared.upgrade() {
+                Some(arena) => arena,
+                None => {
+                    let arena = KernargArena::new(allocator, &core)?;
+                    *shared = Arc::downgrade(&arena);
+                    arena
+                }
+            }
+        };
         let pool = core.signal_pool().cloned().ok_or_else(|| Error::Runtime {
             message: "PoolQueue::new_with_resources: signal pool not installed on core — \
                       install via AmdDeviceCore::install_signal_pool before building any queue"
