@@ -95,36 +95,77 @@ fn verification_sources(node: &Arc<UOp>, include_call_bodies: bool) -> Vec<(usiz
     }
 }
 
+/// Toposort for verification — tinygrad's `list(ast.toposort(enter_calls=...))`
+/// (`spec.py:36`). A plain `Vec<Arc<UOp>>`: the source path each node was
+/// reached by is a failure-only diagnostic, so it is not carried here.
+fn verification_order(root: &Arc<UOp>, include_call_bodies: bool) -> Vec<Arc<UOp>> {
+    let mut visited = HashSet::new();
+    let mut nodes = Vec::new();
+    let mut stack = vec![(root.clone(), false)];
+    while let Some((node, processed)) = stack.pop() {
+        if visited.contains(&node.id) {
+            continue;
+        }
+        if processed {
+            visited.insert(node.id);
+            nodes.push(node);
+            continue;
+        }
+        stack.push((node.clone(), true));
+        for (_, child) in verification_sources(&node, include_call_bodies).into_iter().rev() {
+            if !visited.contains(&child.id) {
+                stack.push((child, false));
+            }
+        }
+    }
+    nodes
+}
+
+/// Source indices leading from `root` to `target`, for the rejection message.
+/// Walked only after a node has already failed, so its cost is not on the
+/// verification path.
+fn source_path_to(root: &Arc<UOp>, target: u64, include_call_bodies: bool) -> Vec<usize> {
+    let mut visited = HashSet::new();
+    let mut stack = vec![(root.clone(), Vec::new())];
+    while let Some((node, path)) = stack.pop() {
+        if node.id == target {
+            return path;
+        }
+        if !visited.insert(node.id) {
+            continue;
+        }
+        for (source_index, child) in verification_sources(&node, include_call_bodies).into_iter().rev() {
+            stack.push((child, [path.as_slice(), &[source_index]].concat()));
+        }
+    }
+    Vec::new()
+}
+
+/// Verify an already-linearized list against `spec` — tinygrad's
+/// `type_verify(lst, check_spec)` (`spec.py:35-40`), where `ast` may be a list
+/// and `lst[-1]` is taken to be the sink.
+pub fn type_verify_list(nodes: &[Arc<UOp>], spec: &Spec) -> Result<(), SpecError> {
+    check_nodes(nodes, spec, "linear program", nodes.last(), true)
+}
+
 fn type_verify_call_aware(
     root: &Arc<UOp>,
     spec: &Spec,
     include_call_bodies: bool,
     boundary: &'static str,
 ) -> Result<(), SpecError> {
-    let mut visited = HashSet::new();
-    let mut nodes = Vec::new();
-    let mut stack = vec![(root.clone(), Vec::new(), false)];
-    while let Some((node, path, processed)) = stack.pop() {
-        if visited.contains(&node.id) {
-            continue;
-        }
-        if processed {
-            visited.insert(node.id);
-            nodes.push((node, path));
-            continue;
-        }
-        stack.push((node.clone(), path.clone(), true));
-        let children = verification_sources(&node, include_call_bodies);
-        for (source_index, child) in children.into_iter().rev() {
-            if !visited.contains(&child.id) {
-                let mut child_path = path.clone();
-                child_path.push(source_index);
-                stack.push((child, child_path, false));
-            }
-        }
-    }
+    let nodes = verification_order(root, include_call_bodies);
+    check_nodes(&nodes, spec, boundary, Some(root), include_call_bodies)
+}
 
-    for (index, (u, source_path)) in nodes.iter().enumerate() {
+fn check_nodes(
+    nodes: &[Arc<UOp>],
+    spec: &Spec,
+    boundary: &'static str,
+    root: Option<&Arc<UOp>>,
+    include_call_bodies: bool,
+) -> Result<(), SpecError> {
+    for (index, u) in nodes.iter().enumerate() {
         let reason = match spec.check(u) {
             Some(Ok(())) => continue,
             Some(Err(reason)) => reason,
@@ -143,7 +184,7 @@ fn type_verify_call_aware(
             uop_id: u.id,
             op: u.op().as_ref().to_string(),
             dtype: format!("{:?}", u.dtype()),
-            source_path: source_path.clone(),
+            source_path: root.map(|root| source_path_to(root, u.id, include_call_bodies)).unwrap_or_default(),
             reason,
         }
         .fail();
