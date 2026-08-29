@@ -354,17 +354,20 @@ fn rule_memory() -> SpecRule {
     })
 }
 
-/// `spec.py:71` — every range an END closes must be a `RANGE` (or, after
-/// gpudims has replaced ranges with SPECIAL on the GPU path, a `SPECIAL`).
+/// `spec.py:84-86` — every range an END closes must be a `RANGE`, or the END
+/// carries only backedge sources.
+///
+/// Tinygrad's second rule is `END(x, RANGE(void), bool)`, where a void RANGE is
+/// its bound-less loop header. Svod has no void RANGE (a range's dtype is its
+/// index dtype), so that arm can never fire. What `split_end_with_tag` does
+/// produce is the tail `END` of the split — `ret.end(*backedge)` in tinygrad's
+/// `do_split_ends` (`linearizer.py:88-90`) — whose sources are exactly the
+/// void/bool ones partitioned out, and which are not RANGEs at all. Accept that
+/// shape instead.
 fn rule_end() -> SpecRule {
     Box::new(|u| match u.op() {
         Op::End { ranges, .. } if ranges.iter().all(|r| matches!(r.op(), Op::Range { .. })) => Some(Ok(())),
-        Op::End { ranges, .. }
-            if ranges.len() == 2
-                && matches!(ranges[0].op(), Op::Range { .. })
-                && ranges[0].dtype() == DType::Void
-                && ranges[1].dtype() == DType::Bool =>
-        {
+        Op::End { ranges, .. } if ranges.iter().all(|r| r.dtype() == DType::Void || r.dtype() == DType::Bool) => {
             Some(Ok(()))
         }
         _ => None,

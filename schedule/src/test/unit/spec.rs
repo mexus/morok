@@ -499,3 +499,17 @@ fn spec_program_rejects_op_outside_whitelist() {
     let sink = UOp::sink(vec![multi]);
     assert!(verify_program_err(&sink).contains("no matching rule"));
 }
+
+#[test]
+fn spec_program_accepts_the_backedge_end_left_by_split_ends() {
+    let range = UOp::range_axis_dtype(
+        int_const(DType::Int32, 4),
+        svod_ir::AxisId::Renumbered(0),
+        svod_ir::types::AxisType::Loop,
+        DType::Int32,
+    );
+    let backedge = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let ended = UOp::noop().end(smallvec![range]).end(smallvec![backedge]);
+
+    assert!(type_verify(&UOp::sink(vec![ended]), &spec_program()).is_ok());
+}
