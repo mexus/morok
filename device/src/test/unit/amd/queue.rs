@@ -346,6 +346,28 @@ fn mock_copy_publication_restores_before_doorbell_and_poisons_after() {
 }
 
 #[test]
+fn mock_copy_queue_drains_registered_linked_finalizers_before_teardown() {
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let queue = AmdCopyQueue::create(&allocator).expect("copy queue");
+    let signals = allocator.dev.core().signal_pool().expect("signal pool").clone();
+    let signal = Arc::new(signals.acquire().expect("slot"));
+    signal.reset(5);
+
+    // Linked plans run on their own timeline, so the copy queue only knows
+    // about their SDMA work through this registration.
+    let finalizer = crate::amd::connector::SubmissionFinalizer::timeline(Arc::clone(&signal), 5, None);
+    queue.register_inflight(Arc::clone(&finalizer));
+    assert_eq!(queue.inflight_len(), 1);
+    queue.register_inflight(finalizer);
+    assert_eq!(queue.inflight_len(), 1, "retired entries are pruned, not accumulated");
+
+    drop(queue);
+    assert!(!allocator.dev.is_poisoned());
+    assert_eq!((iface.free_count(), iface.queue_teardown_count()), (3, 1));
+}
+
+#[test]
 fn mock_copy_publication_panic_rolls_the_ring_back_to_the_pre_copy_index() {
     let (iface, allocator) = mock_allocator(1);
     install_signal_pool(&allocator);

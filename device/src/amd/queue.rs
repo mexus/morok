@@ -932,6 +932,13 @@ pub struct AmdCopyQueue {
     /// this and DMA the other leg. Locked for the whole chunked transfer so
     /// concurrent copies don't clobber it.
     staging: Mutex<StagingBuf>,
+    /// Finalizers for linked-plan SDMA work this queue published. Those plans
+    /// advance their own plan-local timeline rather than `timeline`, so without
+    /// this the queue could be torn down under live SDMA traffic. Pruned on
+    /// every registration, so a long-lived queue never accumulates retired
+    /// entries. (Tinygrad needs no equivalent: it has one timeline signal per
+    /// device — `support/hcq.py` `HCQCompiled.timeline_signal`.)
+    inflight: Mutex<std::collections::VecDeque<Arc<SubmissionFinalizer>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1113,7 +1120,9 @@ impl Drop for AmdCopyQueue {
             self.quarantine("copy queue abandoned during panic unwind");
             return;
         }
-        if let Err(error) = self.timeline.drain(COPY_TIMEOUT_MS) {
+        // Both this queue's own staging timeline and every linked plan whose
+        // SDMA work it published must retire before the ring is unmapped.
+        if let Err(error) = self.drain_inflight().and_then(|()| self.timeline.drain(COPY_TIMEOUT_MS)) {
             self.core.poison(&error.to_string());
             self.quarantine("copy queue drain failed; queue and backing quarantined");
             return;
@@ -2171,6 +2180,31 @@ const COPY_TIMEOUT_MS: u64 = 30_000;
 const STAGING_BYTES: usize = sdma::SDMA_MAX_COPY_BYTES;
 
 impl AmdCopyQueue {
+    /// Retain a linked-plan finalizer whose SDMA work this queue published, so
+    /// teardown waits for it. Retired entries are dropped first.
+    pub(crate) fn register_inflight(&self, finalizer: Arc<SubmissionFinalizer>) {
+        let mut inflight = self.inflight.lock();
+        inflight.retain(|entry| !entry.retired());
+        inflight.push_back(finalizer);
+    }
+
+    /// Wait every registered linked-plan finalizer, then forget the retired
+    /// ones. Snapshot under the lock, wait outside it.
+    fn drain_inflight(&self) -> Result<()> {
+        let snapshot = self.inflight.lock().iter().cloned().collect::<Vec<_>>();
+        for finalizer in &snapshot {
+            finalizer.wait(COPY_TIMEOUT_MS)?;
+        }
+        self.inflight.lock().retain(|entry| !entry.retired());
+        Ok(())
+    }
+
+    /// Registered linked-plan finalizers. Test-only.
+    #[cfg(test)]
+    pub(crate) fn inflight_len(&self) -> usize {
+        self.inflight.lock().len()
+    }
+
     /// See [`AmdComputeQueue::quarantine`].
     fn quarantine(&mut self, reason: &str) {
         self.state = QueueState::Quarantined;
@@ -2203,7 +2237,14 @@ impl AmdCopyQueue {
             _ => return Err(Error::NotHostVisible { what: "staging buffer" }),
         };
         let staging = Mutex::new(StagingBuf { _buf: staging_buf.into_inner(), host, gpu, size: STAGING_BYTES });
-        Ok(Arc::new(Self { inner: Mutex::new(inner.into_inner()), state: QueueState::Active, core, timeline, staging }))
+        Ok(Arc::new(Self {
+            inner: Mutex::new(inner.into_inner()),
+            state: QueueState::Active,
+            core,
+            timeline,
+            staging,
+            inflight: Mutex::new(std::collections::VecDeque::new()),
+        }))
     }
 
     /// Lower and publish one complete HCQ copy command buffer with one

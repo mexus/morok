@@ -542,6 +542,14 @@ impl AmdLinkedPlan {
                     self._signals.iter().filter(|candidate| !Arc::ptr_eq(candidate, &signal)).cloned().collect();
                 let finalizer = SubmissionFinalizer::prepared_timeline(signal, final_point.value, progress);
                 lane.register_inflight(Arc::clone(&finalizer));
+                // The plan's SDMA work rides a plan-local timeline, not the
+                // copy queue's own, so the queue must retain this finalizer or
+                // it could tear its ring down under live traffic.
+                if !copy_lengths.is_empty()
+                    && let Some(copy) = copy_queue
+                {
+                    copy.register_inflight(Arc::clone(&finalizer));
+                }
                 Some(finalizer)
             } else {
                 None

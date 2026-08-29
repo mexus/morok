@@ -353,7 +353,7 @@ impl SubmissionFinalizer {
         }
     }
 
-    fn retired(&self) -> bool {
+    pub(crate) fn retired(&self) -> bool {
         match *self.publication.lock() {
             PublicationState::Published => self.signal.value() >= self.value,
             PublicationState::Failed => true,
