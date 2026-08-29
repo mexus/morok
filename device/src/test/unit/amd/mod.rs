@@ -18,11 +18,17 @@ mod allocator;
 #[cfg(unix)]
 mod am;
 #[cfg(unix)]
+mod connector;
+#[cfg(unix)]
 mod device;
 #[cfg(unix)]
 mod kernarg;
 #[cfg(unix)]
+mod linked_plan;
+#[cfg(unix)]
 mod program;
+#[cfg(unix)]
+mod program_abi;
 #[cfg(unix)]
 mod queue;
 #[cfg(unix)]
