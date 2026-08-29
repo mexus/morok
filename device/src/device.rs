@@ -1140,11 +1140,19 @@ pub type CompilerPair = (Arc<dyn Renderer>, Arc<dyn Compiler>);
 ///
 /// # Example
 ///
+/// A `CompiledSpec` reaches [`Device::runtime`] only with a bound semantic
+/// stage identity ([`CompiledSpec::bind_program_stage`]); driving
+/// [`Renderer`]/[`Compiler`] by hand skips that binding and every runtime
+/// factory then rejects the spec with [`Error::ProgramStageMismatch`]. The
+/// staged pipeline in `svod_codegen::program_pipeline` is the supported path
+/// (the example lives there because `svod-codegen` sits above this crate):
+///
 /// ```ignore
-/// let cpu_device = create_cpu_device()?;
-/// let spec = cpu_device.renderer.render(&kernel_ast, Some("E_L3"))?;
-/// let compiled = cpu_device.compiler.compile(&spec)?;
-/// let program = (cpu_device.runtime)(&compiled)?;
+/// let device = create_cpu_device()?;
+/// let program = program_pipeline::program_from_sink(sink, device.device.clone())?;
+/// let (program, _spec) = program_pipeline::do_render(&program, device.renderer.as_ref())?;
+/// let (_program, compiled) = program_pipeline::do_compile(&program, device.compiler.as_ref())?;
+/// let program = (device.runtime)(&compiled)?;
 /// unsafe { program.execute(&buffers, &vals, None, None, /*wait=*/ true)?; }
 /// ```
 pub struct Device {
