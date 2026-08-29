@@ -175,6 +175,26 @@ pub struct PreparedKernel {
     pub runtime_vars: Vec<RuntimeVar>,
 }
 
+impl PreparedKernel {
+    /// Hazard read-set positions: every buffer slot the kernel does not write.
+    ///
+    /// Tinygrad's `DepsTracker.access_resources` (`device.py:280-296`, called
+    /// from `graph/hcq.py:224` with `outs` as the write list) takes the whole
+    /// buffer list and treats every slot outside `write` as a read.
+    /// `input_indices` is only `ProgramSpec.ins` — the declared LOAD slots —
+    /// which misses buffers the kernel reads through an alias or an
+    /// undeclared global, so it must not drive dependency edges.
+    fn read_positions(&self) -> impl Iterator<Item = usize> + '_ {
+        debug_assert!(
+            self.input_indices.iter().all(|position| *position < self.buffer_indices.len()),
+            "kernel {} declares an input position outside its {} buffers",
+            self.id,
+            self.buffer_indices.len()
+        );
+        (0..self.buffer_indices.len()).filter(|position| !self.output_indices.contains(position))
+    }
+}
+
 /// Bound description for one `DefineVar` consumed by a kernel.
 #[derive(Clone, Debug)]
 pub struct RuntimeVar {
@@ -596,7 +616,7 @@ impl ExecutionPlan {
         for &operation in self.op_levels.iter().flatten() {
             let (device, queue, read_indices, write_indices, is_copy) = match &self.ops[operation] {
                 PreparedOp::CompiledProgram(kernel) => {
-                    let reads = kernel.input_indices.iter().map(|&position| kernel.buffer_indices[position]).collect();
+                    let reads = kernel.read_positions().map(|position| kernel.buffer_indices[position]).collect();
                     let writes =
                         kernel.output_indices.iter().map(|&position| kernel.buffer_indices[position]).collect();
                     (kernel.device.clone(), QueueKind::Compute(0), reads, writes, false)
@@ -761,8 +781,7 @@ impl ExecutionPlan {
                     .collect::<Result<Vec<_>>>()?;
                 let writes: Vec<usize> =
                     k.output_indices.iter().filter_map(|&j| current_addresses.get(j).copied()).collect();
-                let reads: Vec<usize> =
-                    k.input_indices.iter().filter_map(|&j| current_addresses.get(j).copied()).collect();
+                let reads: Vec<usize> = k.read_positions().filter_map(|j| current_addresses.get(j).copied()).collect();
 
                 let mut deps: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 for &b in &reads {

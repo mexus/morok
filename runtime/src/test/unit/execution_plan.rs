@@ -1779,3 +1779,56 @@ fn failed_native_replay_poisons_the_plan() {
     assert!(matches!(second, crate::error::Error::PlanPoisoned { .. }), "{second:?}");
     assert_eq!(replays.load(Ordering::SeqCst), 1, "poisoned plan must not resubmit");
 }
+
+#[test]
+fn hazard_reads_cover_buffers_the_kernel_does_not_declare() {
+    // The consumer takes the producer's output as its second buffer but
+    // declares no `ProgramSpec.ins`. The RAW edge must survive anyway.
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let shared_idx = builder.add_buffer(1, Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default()));
+    let out_idx = builder.add_buffer(2, Buffer::new(alloc, DType::Float32, vec![4], Default::default()));
+    let kernel = |id, buffer_indices: Vec<usize>| PreparedKernel {
+        id,
+        ast: UOp::sink(vec![]),
+        kernel: Arc::new(CachedKernel {
+            program: Box::new(RejectDispatchProgram { calls: Arc::clone(&calls) }),
+            device: "CPU".into(),
+            code: String::new(),
+            entry_point: "reject_dispatch".into(),
+            var_names: vec![],
+            globals: (0..buffer_indices.len()).collect(),
+            outs: vec![0],
+            ins: Vec::new(),
+            global_size: default_launch_size(),
+            local_size: Some(default_launch_size()),
+        }),
+        device: DeviceSpec::Cpu,
+        buffer_indices,
+        output_indices: vec![0],
+        input_indices: Vec::new(),
+        vals: vec![],
+        fixedvars: HashMap::new(),
+        dependencies: vec![],
+        buffer_ptrs: vec![],
+        buffer_ids: vec![],
+        runtime_vars: vec![],
+    };
+    builder.add_kernel(kernel(1_001, vec![shared_idx]));
+    builder.add_op_with_instance_dependencies(
+        PreparedOp::CompiledProgram(kernel(1_002, vec![out_idx, shared_idx])),
+        vec![0],
+    );
+    builder.set_output_buffer(out_idx);
+    let plan = builder.build().expect("build plan");
+
+    let operations = plan.hcq_operations().expect("hcq operations");
+    let shared = plan.buffers()[shared_idx].storage_id();
+    assert!(
+        operations[1].reads.iter().any(|access| access.storage == shared),
+        "undeclared read must still enter the hazard read-set: {:?}",
+        operations[1].reads
+    );
+    assert!(operations[1].reads.iter().all(|access| access.storage != plan.buffers()[out_idx].storage_id()));
+}
