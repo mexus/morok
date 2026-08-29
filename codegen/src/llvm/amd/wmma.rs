@@ -215,11 +215,9 @@ fn resolve_intrinsic(
         let in_suffix = match (in_dt, k) {
             (ScalarDType::Float16, 32) if is_cdna4 => ".f16",
             (ScalarDType::BFloat16, 32) if is_cdna4 => ".bf16",
-            (ScalarDType::Float16 | ScalarDType::BFloat16, 32) => return None,
-            (ScalarDType::Float16, _) => "f16",
-            (ScalarDType::BFloat16, _) => "bf16.1k",
+            (ScalarDType::Float16, 16) => "f16",
+            (ScalarDType::BFloat16, 16) => "bf16.1k",
             (ScalarDType::Float32, 4) => "f32",
-            (ScalarDType::Float32, _) => return None,
             (ScalarDType::FP8E4M3, 128) | (ScalarDType::FP8E5M2, 128) if is_cdna4 => ".f8f6f4",
             (ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2, 128) => return None,
             (ScalarDType::FP8E4M3, 32) => ".fp8.fp8",
@@ -232,7 +230,9 @@ fn resolve_intrinsic(
             ScalarDType::Int32 => "i32",
             _ => return None,
         };
-        let scale = if k == 128 { "scale." } else { "" };
+        // Only the K=128 `.f8f6f4` form is a scaled MFMA; keying on K alone would
+        // mint `mfma.scale.*` names for any K=128 input dtype.
+        let scale = if in_suffix == ".f8f6f4" { "scale." } else { "" };
         return Some(format!("llvm.amdgcn.mfma.{scale}{acc_suffix}.{n}x{m}x{k}{in_suffix}"));
     }
 
