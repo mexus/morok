@@ -1226,24 +1226,69 @@ pub(crate) struct LinkedCopyPublication<'a> {
     inner: parking_lot::MutexGuard<'a, QueueInner>,
 }
 
+/// Exclusive ring writer that restores the producer index when a publication is
+/// abandoned — ordinary failure or panic unwind — before its doorbell rings.
+///
+/// Owning the `&mut QueueInner` is the point: nothing reaches the ring except
+/// through this guard, so "snapshot the index before the first push" is enforced
+/// by borrowck instead of call-site discipline, and rollback always lands on the
+/// pre-submission index rather than on whatever the index happened to be when a
+/// timeline reservation was constructed.
+struct RingRollback<'a> {
+    inner: &'a mut QueueInner,
+    saved: u64,
+    committed: bool,
+}
+
+impl<'a> RingRollback<'a> {
+    fn new(inner: &'a mut QueueInner) -> Self {
+        let saved = inner.write_idx;
+        Self { inner, saved, committed: false }
+    }
+
+    /// Keep everything written so far: the doorbell rang and the packets now
+    /// belong to the GPU.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl std::ops::Deref for RingRollback<'_> {
+    type Target = QueueInner;
+
+    fn deref(&self) -> &QueueInner {
+        self.inner
+    }
+}
+
+impl std::ops::DerefMut for RingRollback<'_> {
+    fn deref_mut(&mut self) -> &mut QueueInner {
+        self.inner
+    }
+}
+
+impl Drop for RingRollback<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.inner.write_idx = self.saved;
+        }
+    }
+}
+
 /// Rolls an unpublished queue-timeline reservation back on ordinary failure or
 /// panic. Once a doorbell has been rung, abandonment poisons the device instead.
+/// The ring producer index is owned by the paired [`RingRollback`].
 struct TimelineReservation<'a> {
     pool: &'a PoolQueue,
     core: &'a AmdDeviceCore,
     value: u64,
     published: bool,
     committed: bool,
-    write_idx: Option<(*mut QueueInner, u64)>,
 }
 
 impl<'a> TimelineReservation<'a> {
     fn new(pool: &'a PoolQueue, core: &'a AmdDeviceCore, value: u64) -> Self {
-        Self { pool, core, value, published: false, committed: false, write_idx: None }
-    }
-
-    fn track_write_idx(&mut self, inner: &mut QueueInner) {
-        self.write_idx = Some((inner, inner.write_idx));
+        Self { pool, core, value, published: false, committed: false }
     }
 
     fn mark_published(&mut self) {
@@ -1262,15 +1307,8 @@ impl Drop for TimelineReservation<'_> {
         }
         if self.published {
             self.core.poison("AMD queue publication failed after ringing its doorbell");
-        } else {
-            if let Some((inner, write_idx)) = self.write_idx {
-                // SAFETY: the reservation is declared after, and therefore
-                // drops before, the mutex guard that keeps `inner` stable.
-                unsafe { (*inner).write_idx = write_idx };
-            }
-            if !self.pool.rollback_pm4(self.value) {
-                self.core.poison("AMD timeline reservation rollback lost publication authority");
-            }
+        } else if !self.pool.rollback_pm4(self.value) {
+            self.core.poison("AMD timeline reservation rollback lost publication authority");
         }
     }
 }
@@ -1281,16 +1319,11 @@ struct CopyTimelineReservation<'a> {
     value: u64,
     published: bool,
     committed: bool,
-    write_idx: Option<(*mut QueueInner, u64)>,
 }
 
 impl<'a> CopyTimelineReservation<'a> {
     fn new(timeline: &'a Timeline, core: &'a AmdDeviceCore, value: u64) -> Self {
-        Self { timeline, core, value, published: false, committed: false, write_idx: None }
-    }
-
-    fn track_write_idx(&mut self, inner: &mut QueueInner) {
-        self.write_idx = Some((inner, inner.write_idx));
+        Self { timeline, core, value, published: false, committed: false }
     }
 
     fn mark_published(&mut self) {
@@ -1309,15 +1342,8 @@ impl Drop for CopyTimelineReservation<'_> {
         }
         if self.published {
             self.core.poison("AMD copy publication failed after ringing its doorbell");
-        } else {
-            if let Some((inner, write_idx)) = self.write_idx {
-                // SAFETY: see TimelineReservation::drop; the queue mutex guard
-                // still owns this inner value while the reservation drops.
-                unsafe { (*inner).write_idx = write_idx };
-            }
-            if !self.timeline.rollback(self.value) {
-                self.core.poison("AMD copy timeline reservation rollback lost publication authority");
-            }
+        } else if !self.timeline.rollback(self.value) {
+            self.core.poison("AMD copy timeline reservation rollback lost publication authority");
         }
     }
 }
@@ -1537,19 +1563,16 @@ impl AmdComputeQueue {
 
         validate_pm4_dword_count(q.len())?;
         wait_pm4_headroom(&g, q.len()).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        let mut ring = RingRollback::new(&mut g);
         let reserved = pool.next_pm4();
         debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
         let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
-        reservation.track_write_idx(&mut g);
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
-        let write_idx = g.write_idx;
-        g.push_pm4(&q);
-        if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
-            g.write_idx = write_idx;
-            return Err(error);
-        }
-        g.ring_doorbell(/*is_pm4=*/ true);
+        ring.push_pm4(&q);
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
+        ring.ring_doorbell(/*is_pm4=*/ true);
         reservation.mark_published();
+        ring.commit();
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
         reservation.commit();
         let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps.clone());
@@ -1616,19 +1639,16 @@ impl AmdComputeQueue {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let mut g = self.inner.lock();
         wait_pm4_headroom(&g, indirect.len()).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        let mut ring = RingRollback::new(&mut g);
         let reserved = pool.next_pm4();
         debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
         let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
-        reservation.track_write_idx(&mut g);
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
-        let write_idx = g.write_idx;
-        g.push_pm4(&indirect);
-        if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
-            g.write_idx = write_idx;
-            return Err(error);
-        }
-        g.ring_doorbell(/*is_pm4=*/ true);
+        ring.push_pm4(&indirect);
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
+        ring.ring_doorbell(/*is_pm4=*/ true);
         reservation.mark_published();
+        ring.commit();
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
         reservation.commit();
         Ok(SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, None))
@@ -1731,21 +1751,18 @@ impl AmdComputeQueue {
         validate_aql_packet_count(packets)?;
         let mut g = self.inner.lock();
         wait_aql_headroom(&g, packets).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        let mut ring = RingRollback::new(&mut g);
         let reserved = pool.next_pm4();
         debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
         let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
-        reservation.track_write_idx(&mut g);
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
-        let write_idx = g.write_idx;
         for packet in replay.bytes().chunks_exact(AQL_PACKET_BYTES) {
-            g.push_aql(packet);
+            ring.push_aql(packet);
         }
-        if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
-            g.write_idx = write_idx;
-            return Err(error);
-        }
-        g.ring_doorbell(/*is_pm4=*/ false);
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
+        ring.ring_doorbell(/*is_pm4=*/ false);
         reservation.mark_published();
+        ring.commit();
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
         reservation.commit();
         Ok(())
@@ -1837,6 +1854,13 @@ impl AmdComputeQueue {
     /// when it halted the queue (e.g. `0x401` insufficient-scratch), or `None`
     /// if no exception is recorded (value `0`) / on PM4 queues. Used to turn a
     /// blind dispatch timeout into a diagnosable error.
+    /// Ring producer index. Test-only: proves an abandoned publication left no
+    /// packets behind.
+    #[cfg(test)]
+    pub(crate) fn ring_write_idx(&self) -> u64 {
+        self.inner.lock().write_idx
+    }
+
     pub(crate) fn inactive_exception(&self) -> Option<i64> {
         let h = self.inner.lock().qinactive_host?;
         // SAFETY: host-visible amd_signal_t; `value` is the i64 at +8.
@@ -2141,6 +2165,13 @@ impl AmdCopyQueue {
         Ok(())
     }
 
+    /// Ring producer index (bytes). Test-only; see
+    /// [`AmdComputeQueue::ring_write_idx`].
+    #[cfg(test)]
+    pub(crate) fn ring_write_idx(&self) -> u64 {
+        self.inner.lock().write_idx
+    }
+
     /// Direct device→device VRAM copy (no staging needed).
     pub fn device_to_device(&self, dst_gpu: u64, src_gpu: u64, size: usize) -> Result<()> {
         self.copy_fenced(src_gpu, dst_gpu, size)
@@ -2184,34 +2215,28 @@ impl AmdCopyQueue {
             let copy_packets = size.div_ceil(sdma::SDMA_MAX_COPY_BYTES);
             wait_sdma_headroom(&g, copy_packets * 7 * 4 + 4 * 4)
                 .inspect_err(|error| self.core.poison(&error.to_string()))?;
-            let write_idx = g.write_idx;
+            let mut ring = RingRollback::new(&mut g);
             let mut off = 0usize;
             while off < size {
                 let n = (size - off).min(sdma::SDMA_MAX_COPY_BYTES);
-                push_sdma(&mut g, &sdma::copy_linear(src + off as u64, dst + off as u64, n));
+                push_sdma(&mut ring, &sdma::copy_linear(src + off as u64, dst + off as u64, n));
                 off += n;
             }
             // Reserve + fence the timeline value the host waits on.
             let target = self.timeline.next();
             let mut reservation = CopyTimelineReservation::new(&self.timeline, &self.core, target);
-            reservation.track_write_idx(&mut g);
-            if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)
-            {
-                g.write_idx = write_idx;
-                return Err(error);
-            }
-            push_sdma(&mut g, &sdma::fence(self.timeline.value_addr(), target as u32, self.core.arch.gfx_major()));
+            self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
+            push_sdma(&mut ring, &sdma::fence(self.timeline.value_addr(), target as u32, self.core.arch.gfx_major()));
+            self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
             // GART wptr first, then doorbell — same ordering as the compute
-            // queue. SDMA doorbell + wptr are byte counters (= write_idx).
-            unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), g.write_idx) };
+            // queue. SDMA doorbell + wptr are byte counters (= write_idx). Both
+            // are written after the last abortable step, so an abandoned
+            // submission never leaves an advertised wptr behind.
+            unsafe { std::ptr::write_volatile(ring.write_ptr_host.as_ptr(), ring.write_idx) };
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
-                g.write_idx = write_idx;
-                unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), write_idx) };
-                return Err(error);
-            }
-            unsafe { std::ptr::write_volatile(g.doorbell.as_ptr(), g.write_idx) };
+            unsafe { std::ptr::write_volatile(ring.doorbell.as_ptr(), ring.write_idx) };
             reservation.mark_published();
+            ring.commit();
             self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
             reservation.commit();
             SubmissionFinalizer::timeline(Arc::clone(self.timeline.signal()), target, None)

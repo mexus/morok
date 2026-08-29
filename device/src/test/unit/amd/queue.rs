@@ -269,12 +269,14 @@ fn mock_pm4_and_aql_publication_failures_restore_or_poison_by_doorbell_stage() {
         iface.script_publication(Err(scripted_error("after reservation")));
         assert!(pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]).is_err());
         assert_eq!(pool.pm4_value(), 1);
+        assert_eq!(pool.queue().ring_write_idx(), 0, "xccs={xccs}");
         assert!(!allocator.dev.is_poisoned());
 
         iface.script_publication(Ok(()));
         iface.script_publication(Err(scripted_error("before doorbell")));
         assert!(pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]).is_err());
         assert_eq!(pool.pm4_value(), 1);
+        assert_eq!(pool.queue().ring_write_idx(), 0, "xccs={xccs}");
         assert!(!allocator.dev.is_poisoned());
 
         iface.script_publication(Ok(()));
@@ -319,11 +321,13 @@ fn mock_copy_publication_restores_before_doorbell_and_poisons_after() {
 
     iface.script_publication(Err(scripted_error("copy after reservation")));
     assert!(queue.copy_fenced(0x1000, 0x2000, 4).is_err());
+    assert_eq!(queue.ring_write_idx(), 0, "the abandoned copy packets must be rolled back");
     assert!(!allocator.dev.is_poisoned());
 
     iface.script_publication(Ok(()));
     iface.script_publication(Err(scripted_error("copy before doorbell")));
     assert!(queue.copy_fenced(0x1000, 0x2000, 4).is_err());
+    assert_eq!(queue.ring_write_idx(), 0);
     assert!(!allocator.dev.is_poisoned());
 
     iface.script_publication(Ok(()));
@@ -335,6 +339,24 @@ fn mock_copy_publication_restores_before_doorbell_and_poisons_after() {
     assert_eq!(iface.free_count(), 0);
     assert_eq!(iface.live_handle_count(), baseline + 3);
     assert_eq!(iface.live_queue_count(), 1);
+}
+
+#[test]
+fn mock_copy_publication_panic_rolls_the_ring_back_to_the_pre_copy_index() {
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let queue = AmdCopyQueue::create(&allocator).expect("copy queue");
+
+    iface.script_publication(Ok(()));
+    iface.script_publication_panic();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = queue.copy_fenced(0x1000, 0x2000, 4);
+    }));
+    assert!(result.is_err());
+    // The rollback owns the ring index from before the first copy packet, so an
+    // unwound publication leaves nothing enqueued.
+    assert_eq!(queue.ring_write_idx(), 0);
+    assert!(!allocator.dev.is_poisoned());
 }
 
 #[test]
