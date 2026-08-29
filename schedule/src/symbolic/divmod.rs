@@ -308,7 +308,7 @@ fn nest_by_factor(
             let Ok(high) = nested.try_mod(&outer).and_then(|rest| rest.try_mul(&divisor_uop)) else { continue };
             if low.is_empty() { high } else { high.try_add(&digit).ok()? }
         };
-        let cost = candidate.backward_slice().len();
+        let cost = candidate.backward_slice_ids().len();
         if best.as_ref().is_none_or(|(best_cost, _)| cost < *best_cost) {
             best = Some((cost, candidate));
         }
@@ -345,7 +345,7 @@ fn variable_denominator_rules(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> Optio
         let split = divisor.and_then(|divisor| {
             let factor = term.const_factor();
             let residue = factor.rem_euclid(divisor);
-            (residue != factor).then(|| term.divides(factor).map(|base| (base, residue, factor / divisor)))?
+            (residue != factor).then(|| term.divides(factor).map(|base| (base, residue, factor.div_euclid(divisor))))?
         });
         match split {
             Some((base, residue, carry)) => {

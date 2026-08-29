@@ -219,6 +219,24 @@ fn divmod_case(case: &str) -> DivmodCase {
             let expected = b.add(&a.mod_(&c(2)).mul(&c(4))).add(&c(2));
             build(vec![a.clone(), b.clone()], expr, expected)
         }
+        // divide_by_gcd with a negative coefficient (divandmod.py:79-83),
+        // test_mod_gcd_factor_neg.
+        "divide_by_gcd_negative_coefficient" => {
+            let a = var("a", 0, 10);
+            let expr = a.mul(&c(-4)).add(&c(4)).mod_(&c(8));
+            let expected = a.mul(&c(-1)).add(&c(1)).mod_(&c(2)).mul(&c(4));
+            build(vec![a.clone()], expr, expected)
+        }
+        // factor_remainder must floor the carry, not truncate it: a coefficient
+        // of -7 over a divisor of 5 splits as -7 = 5*(-2) + 3, so the carry is
+        // -2. Truncating division would give -1 and a numerator that is off by
+        // 5 per unit of `a`.
+        "factor_remainder_negative_carry" => {
+            let (a, b) = (var("a", 0, 10), var("b", 70, 100));
+            let expr = a.mul(&c(-7)).add(&b).floor_div(&c(5));
+            let expected = a.mul(&c(3)).add(&b).floor_div(&c(5)).add(&a.mul(&c(-2)));
+            build(vec![a.clone(), b.clone()], expr, expected)
+        }
         // factor_remainder's constant-divisor branch (divandmod.py:88-90),
         // test_div_partial_quotient.
         "factor_remainder_partial_quotient" => {
@@ -271,6 +289,8 @@ fn divmod_eval(expr: &Arc<UOp>, vars: &[Arc<UOp>], point: &[i64]) -> i64 {
 #[test_case::test_case("nest_by_factor_mod"; "nest_by_factor: (gidx0*4+lidx0)%8 -> lidx0+gidx0%2*4")]
 #[test_case::test_case("nest_by_factor_mod_odd"; "nest_by_factor: (a*3+b)%9 -> b+a%3*3")]
 #[test_case::test_case("nest_by_factor_mod_with_const"; "nest_by_factor: (a*4+b+2)%8 -> b+a%2*4+2")]
+#[test_case::test_case("divide_by_gcd_negative_coefficient"; "divide_by_gcd: (a*-4+4)%8 -> (a*-1+1)%2*4")]
+#[test_case::test_case("factor_remainder_negative_carry"; "factor_remainder: (a*-7+b)//5 floors the carry")]
 #[test_case::test_case("factor_remainder_partial_quotient"; "factor_remainder: (b*31+1)//18 -> (b*13+1)//18+b")]
 fn tinygrad_divmod_examples_fold_to_the_upstream_form(name: &str) {
     let DivmodCase { vars, expr, expected } = divmod_case(name);
