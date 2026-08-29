@@ -1347,57 +1347,85 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 /// Collect the per-range upper bounds an INDEX proves.
 ///
-/// Port of tinygrad `codegen/simplify.py:43-53`, including its scope: only the
-/// first index is inspected. When that index is a WHERE gate, the ungated-use
-/// protection is likewise computed from the gate's own index expression, so
-/// ranges appearing only in `indices[1..]` of a gated access are neither bounded
-/// nor protected here. That is upstream's shape at 8c8b43de; narrowing it further
-/// would need a matching change there.
+/// Port of tinygrad `codegen/simplify.py:43-53`, widened to every index. Upstream
+/// reads `idx.src[1]` alone because its INDEX carries one flattened index by this
+/// stage; morok still has multi-index INDEX here whenever `linearize_static_indices`
+/// bails (symbolic or dynamic dims), so a range used only in `indices[1..]` would
+/// otherwise be neither bounded nor protected — and could be shrunk by a bound
+/// harvested from a different access.
+///
+/// Guards are merged across indices keeping the largest bound; every range an
+/// index uses without a guard of its own pins that range to its original end.
 fn mark_gated(ctx: &mut SimplifyRangesContext, idx: &Arc<UOp>) {
     let Op::Index { indices, .. } = idx.op() else { return };
 
-    let (x, guards) = if let Some(index) = indices.first()
-        && matches!(index.op(), Op::Ternary(svod_ir::TernaryOp::Where, _, _, _))
-    {
-        let x = index.get_idx();
-        let guards = index
-            .get_valid()
-            .split_uop(BinaryOp::And)
-            .into_iter()
-            .filter_map(|valid| match valid.op() {
-                Op::Binary(BinaryOp::Lt, range, bound)
-                    if matches!(range.op(), Op::Range { .. }) && matches!(bound.op(), Op::Const(_)) =>
-                {
-                    Some((UOpKey(range.clone()), bound.clone()))
-                }
-                _ => None,
-            })
-            .collect::<HashMap<_, _>>();
-        (x, guards)
-    } else {
-        (idx.clone(), HashMap::new())
-    };
+    fn pin(ctx: &mut SimplifyRangesContext, range: &Arc<UOp>) {
+        if let Op::Range { end, .. } = range.op() {
+            ctx.bounds.insert(UOpKey(range.clone()), end.clone());
+        }
+    }
+
+    let is_gate = |index: &Arc<UOp>| matches!(index.op(), Op::Ternary(svod_ir::TernaryOp::Where, _, _, _));
+    if !indices.iter().any(is_gate) {
+        // No gate anywhere: every range the access reaches is an ungated use.
+        for range in idx.ranges() {
+            pin(ctx, range);
+        }
+        return;
+    }
+
+    let mut guards: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+    let mut ungated: Vec<Arc<UOp>> = Vec::new();
+    for index in indices {
+        let index_guards: HashMap<UOpKey, Arc<UOp>> = if is_gate(index) {
+            index
+                .get_valid()
+                .split_uop(BinaryOp::And)
+                .into_iter()
+                .filter_map(|valid| match valid.op() {
+                    Op::Binary(BinaryOp::Lt, range, bound)
+                        if matches!(range.op(), Op::Range { .. }) && matches!(bound.op(), Op::Const(_)) =>
+                    {
+                        Some((UOpKey(range.clone()), bound.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        let expression = index.get_idx();
+        for range in expression.ranges() {
+            if !index_guards.contains_key(&UOpKey(range.clone())) {
+                ungated.push(range.clone());
+            }
+        }
+        for (range, bound) in index_guards {
+            let larger = guards.get(&range).is_none_or(|old| {
+                const_uop_to_i64(old).zip(const_uop_to_i64(&bound)).is_some_and(|(old, new)| old < new)
+            });
+            if larger {
+                guards.insert(range, bound);
+            }
+        }
+    }
 
     // A range may feed several gated accesses. The largest bound is required
     // to preserve every access covered by the original iteration space.
-    for (range, bound) in &guards {
-        let replace = ctx
+    for (range, bound) in guards {
+        let larger = ctx
             .bounds
-            .get(range)
-            .is_none_or(|old| const_uop_to_i64(old).zip(const_uop_to_i64(bound)).is_some_and(|(old, new)| old < new));
-        if replace {
-            ctx.bounds.insert(range.clone(), bound.clone());
+            .get(&range)
+            .is_none_or(|old| const_uop_to_i64(old).zip(const_uop_to_i64(&bound)).is_some_and(|(old, new)| old < new));
+        if larger {
+            ctx.bounds.insert(range, bound);
         }
     }
 
     // Any ungated use protects the range from narrowing.
-    for range in x.ranges() {
-        let key = UOpKey(range.clone());
-        if !guards.contains_key(&key)
-            && let Op::Range { end, .. } = range.op()
-        {
-            ctx.bounds.insert(key, end.clone());
-        }
+    for range in &ungated {
+        pin(ctx, range);
     }
 }
 
