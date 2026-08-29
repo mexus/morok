@@ -779,6 +779,18 @@ fn hcq_sdma_command_and_mixed_goldens() {
 }
 
 #[test]
+fn hcq_sdma_zero_byte_copy_consumes_its_bindings_without_packets() {
+    use crate::hcq::{Command, CommandField, PatchSource, QueueKind, Submission};
+    let mut submission = Submission::new(QueueKind::Copy(0));
+    submission.push(Command::Copy { dst: 0, src: 0, bytes: 0 });
+    submission.bind(0, CommandField::CopySrc, PatchSource::RuntimeBuffer(0)).unwrap();
+    submission.bind(0, CommandField::CopyDst, PatchSource::RuntimeBuffer(1)).unwrap();
+    let lowered = lower_hcq_sdma_command_buffer(&submission, 11).expect("zero-byte copy must lower");
+    assert!(lowered.bytes.is_empty());
+    assert!(lowered.patches.runtime.is_empty());
+}
+
+#[test]
 fn hcq_amd_rejects_unsupported_packet_forms_and_wide_waits() {
     use crate::hcq::{Command, QueueKind, Submission};
     let mut compute = Submission::new(QueueKind::Compute(0));

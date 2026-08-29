@@ -807,15 +807,22 @@ pub fn lower_hcq_sdma_command_buffer(
             }
             Command::MemoryBarrier => {}
             Command::Copy { bytes, .. } => {
+                // Bindings are consumed by the command, not by its chunks: a
+                // zero-byte copy emits no packets (tinygrad `AMDCopyQueue.copy`
+                // loops over `ceil(size / max_copy_size)` chunks the same way,
+                // `ops_amd.py:474-484`) yet still has to satisfy the arity check
+                // below, or a linked capture containing one hard-fails.
+                let src = command_binding(submission, command_index, F::CopySrc);
+                let dst = command_binding(submission, command_index, F::CopyDst);
+                consumed.extend(src.map(|_| (command_index, F::CopySrc)));
+                consumed.extend(dst.map(|_| (command_index, F::CopyDst)));
                 let mut offset = 0usize;
                 while offset < *bytes {
-                    if let Some(source) = command_binding(submission, command_index, F::CopySrc) {
+                    if let Some(source) = src {
                         record_u64_sites(&mut sites, cursor + 3, source, offset as u64);
-                        consumed.insert((command_index, F::CopySrc));
                     }
-                    if let Some(source) = command_binding(submission, command_index, F::CopyDst) {
+                    if let Some(source) = dst {
                         record_u64_sites(&mut sites, cursor + 5, source, offset as u64);
-                        consumed.insert((command_index, F::CopyDst));
                     }
                     let n = (*bytes - offset).min(sdma::SDMA_MAX_COPY_BYTES);
                     offset += n;
