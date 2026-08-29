@@ -72,6 +72,17 @@ fn test_beam_cache_key_includes_post_optimization_behavior() {
     );
 }
 
+/// A replayed plan is only valid under the action space that produced it, and
+/// `BEAM_ACTIONS` is built from `BEAM_PADTO` / `TC` / `TC_OPT`.
+#[test]
+fn test_beam_cache_key_includes_action_space() {
+    let scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1i32)]), crate::optimizer::Renderer::cpu());
+    let key = CacheKey::from_scheduler(&scheduler, &BeamConfig::default(), "compiler", 0);
+    assert_eq!(key.action_space, action_space_hash(&BEAM_ACTIONS));
+    assert_ne!(key.action_space, action_space_hash(&BEAM_ACTIONS[1..]));
+    assert_ne!(key.to_bytes(), CacheKey { action_space: key.action_space ^ 1, ..key.clone() }.to_bytes());
+}
+
 #[test]
 fn test_beam_cache_key_includes_exact_compiler_identity() {
     let scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1i32)]), crate::optimizer::Renderer::cpu());
