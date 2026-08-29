@@ -784,6 +784,9 @@ fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {
                 "umax"
             }
         }
+        // Ordered float predicates throughout. Tinygrad only has CMPLT/CMPNE/CMPEQ
+        // (`llvmir.py` float_lop: olt/une/oeq); Le/Gt/Ge are svod-only ops, and
+        // ordered matches the C backend, whose `<=`/`>`/`>=` are false on NaN.
         BinaryOp::Lt => {
             if is_float {
                 "fcmp nsz arcp contract afn olt"

@@ -67,7 +67,7 @@ fn test_simple_add() {
 }
 
 #[test]
-fn llvm_float_comparisons_use_tinygrad_nan_predicates() {
+fn llvm_float_comparisons_use_ordered_predicates_matching_c() {
     let lhs = UOp::param(0, 1, DType::Float32, None);
     let rhs = UOp::param(1, 1, DType::Float32, None);
     let index = UOp::const_(DType::Int32, ConstValue::Int(0));
@@ -94,10 +94,10 @@ fn llvm_float_comparisons_use_tinygrad_nan_predicates() {
                 rendered.code
             );
         }
-        for predicate in ["ult", "ule", "ugt", "uge"] {
+        for predicate in ["ult", "ule", "ugt", "uge", "ueq"] {
             assert!(
                 !rendered.code.lines().any(|line| line.contains("fcmp ") && line.contains(predicate)),
-                "unordered relational predicate {predicate}:\n{}",
+                "unordered predicate {predicate}:\n{}",
                 rendered.code
             );
         }
