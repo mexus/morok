@@ -1323,6 +1323,14 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
     if changed { Some(current) } else { None }
 }
 
+/// Collect the per-range upper bounds an INDEX proves.
+///
+/// Port of tinygrad `codegen/simplify.py:43-53`, including its scope: only the
+/// first index is inspected. When that index is a WHERE gate, the ungated-use
+/// protection is likewise computed from the gate's own index expression, so
+/// ranges appearing only in `indices[1..]` of a gated access are neither bounded
+/// nor protected here. That is upstream's shape at 8c8b43de; narrowing it further
+/// would need a matching change there.
 fn mark_gated(ctx: &mut SimplifyRangesContext, idx: &Arc<UOp>) {
     let Op::Index { indices, .. } = idx.op() else { return };
 
