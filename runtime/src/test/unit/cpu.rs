@@ -244,3 +244,32 @@ fn cpu_dispatch_binds_sparse_storage_slots_by_ordinal() {
     unsafe { kernel.execute_with_vals(&buffers, &[]).unwrap() };
     assert_eq!((first, second), (17, -9));
 }
+
+/// libffi reads a `Type::i32()` argument through a pointer at the declared
+/// width. Packing scalars into `u64` slots only worked because a little-endian
+/// read takes the low half; the typed slots make it endian-independent.
+#[test_case::test_case(1)]
+#[test_case::test_case(-7)]
+#[test_case::test_case(i32::MAX)]
+#[test_case::test_case(i32::MIN)]
+fn cpu_dispatch_passes_scalars_at_their_declared_width(value: i32) {
+    use svod_device::device::{AbiParamDescriptor, AbiParamKind};
+    use svod_dtype::{AddrSpace, DType};
+
+    let abi = vec![
+        AbiParamDescriptor { slot: 0, kind: AbiParamKind::Storage(AddrSpace::Global), dtype: DType::Int32, name: None },
+        AbiParamDescriptor { slot: 1, kind: AbiParamKind::Scalar, dtype: DType::Int32, name: Some("n".into()) },
+    ];
+    let kernel = crate::jit_loader::JitKernel::compile_with_abi(
+        "void scalar_width(int *out, int n) { out[0] = n; }",
+        "scalar_width",
+        vec!["n".into()],
+        &abi,
+    )
+    .expect("compile scalar-width fixture");
+
+    let mut out = 0i32;
+    let buffers = [(&mut out as *mut i32).cast::<u8>()];
+    unsafe { kernel.execute_with_vals(&buffers, &[value as i64]).expect("execute scalar-width fixture") };
+    assert_eq!(out, value);
+}
