@@ -1394,8 +1394,9 @@ pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
 ///   * **Float arithmetic** — a sound `[c, c]` integer-style bound does not transfer
 ///     to IEEE floats, where `inf - inf`, `0 * inf`, etc. carry a degenerate range
 ///     but evaluate to NaN at runtime. (Guarded by `!is_float`.)
-///   * **`Add`/`Sub`/`Max`** on integers — upstream does NOT collapse these via the
-///     vmin==vmax rule. Collapsing an integer `Add` whose operands are bounded to a
+///   * **`Add`/`Sub`/`Max`** on integers — upstream (`uop/symbolic.py:248-249`, whose
+///     op set is `{CMPLT, CMPNE, FLOORDIV, FLOORMOD, PARAM, BIND, SPECIAL}`) does NOT
+///     collapse these via the vmin==vmax rule. Collapsing an integer `Add` whose operands are bounded to a
 ///     single value replicates the trivial-RANGE collapse that `symbolic_no_dead_loop`
 ///     intentionally omits: a hand-built kernel's trip-1 loop-carry index folds to a
 ///     constant and the recurrence breaks (the FA online-softmax `m`/`l`/`o` carry

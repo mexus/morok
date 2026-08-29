@@ -1732,6 +1732,24 @@ fn test_remove_typed_invalid_lanes_at_final_cleanup() {
     assert!(matches!(elements[0].op(), Op::Const(cv) if cv.0 == ConstValue::Float(0.0)));
 }
 
+#[test]
+fn single_valued_bounds_collapse_products_but_not_sums() {
+    use crate::symbolic::patterns::vmin_vmax_collapse_patterns;
+
+    let a = UOp::var("a", DType::Int32, 2, 2);
+    let b = UOp::var("b", DType::Int32, 3, 3);
+    let collapse = |root| graph_rewrite(vmin_vmax_collapse_patterns(), root, &mut ());
+
+    let product = collapse(a.try_mul(&b).unwrap());
+    assert!(matches!(product.op(), Op::Const(value) if value.0 == ConstValue::Int(6)));
+
+    // Add/Sub/Max stay: collapsing them replicates the trivial-RANGE collapse that
+    // breaks a hand-built kernel's trip-1 loop carry (tinygrad uop/symbolic.py:248).
+    for sum in [a.try_add(&b).unwrap(), a.try_sub(&b).unwrap(), a.try_max(&b).unwrap()] {
+        assert!(matches!(collapse(sum).op(), Op::Binary(..)));
+    }
+}
+
 // ====== Tests for MINMAX patterns (minmax_dsl_patterns) ======
 
 #[test]
