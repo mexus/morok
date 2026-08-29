@@ -521,10 +521,12 @@ impl Drop for PoolQueue {
     ///
     /// Skipped during panic unwind: `drain_all` can block up to ~30 s per queue
     /// and an unwinding test would pay N × 30 s before teardown. The in-flight
-    /// work is then abandoned — the caller saw a panic anyway.
+    /// work is then abandoned — the caller saw a panic anyway. The lane is
+    /// quarantined but the device is NOT poisoned: an unwind says nothing about
+    /// the hardware, and tinygrad latches its per-device `error_state` only on
+    /// a drain timeout or a reported fault.
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.core.poison("compute queue abandoned during panic unwind");
             self.queue.quarantine();
             tracing::warn!(
                 "PoolQueue drop during panic unwind: skipping drain; \

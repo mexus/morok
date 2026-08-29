@@ -70,3 +70,8 @@ Pinned Tinygrad reference: `8c8b43de62515abe6c820b1de5aa26b30f48e43a`.
 - SDMA `MemoryBarrier` emits no packet, matching Tinygrad's compute-only barrier contract and SDMA FIFO ordering.
 - Multi-XCC AQL non-dispatch commands use linked resident PM4-IB storage retained by the plan. Native AQL dispatch and SDMA packet formats remain unchanged; cross-engine waits/stores target coherent HCQ timeline resources and no unsupported architected AQL packet form is synthesized.
 - AMD currently exposes no verified per-allocation peer-access query or cross-device SDMA submission context. Hardware mixed-device plans therefore conservatively use host staging through `Buffer::copy_from`; direct peer mode is enabled only for targets that explicitly report both required accessibility directions. No family-wide AMD peer access is inferred.
+
+## Teardown Policy
+
+- Panic unwind through `PoolQueue::drop`, `ActivatedQueueGuard::drop`, `AmdComputeQueue::close`, and `AmdCopyQueue::drop` quarantines the abandoned lane but no longer poisons the process-global `AmdDeviceCore` (review decision D3). Tinygrad latches its per-device error state only on a drain timeout or a reported fault, and an unwind reports nothing about the hardware. The HCQ-03/04 latch is correspondingly narrower: it now covers post-doorbell publication failures, failed drains, and faults.
+- Quarantine is queue-local. `QueueInner::quarantined` decides whether the ring/GART/EOP backing is unmapped, so a queue whose KFD queue was never destroyed leaks its mappings regardless of whether the device happens to be poisoned or the process happens to be unwinding.

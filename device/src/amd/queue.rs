@@ -964,6 +964,12 @@ struct QueueInner {
     /// inside the queue isn't useful since the ioctl takes it directly).
     #[allow(dead_code)]
     queue_id: u32,
+    /// Set by every quarantine transition of the owning queue. `Drop` then
+    /// leaks the ring/GART/EOP backing instead of unmapping it: the CP may
+    /// still be reading it because the KFD queue was never destroyed. This is
+    /// queue-local on purpose — the decision must not depend on the ambient
+    /// process-panicking flag or on a device-wide poison latch.
+    quarantined: bool,
     /// Owned bookkeeping buffers we need to keep alive. The EOP and ctx-save
     /// buffers stay alive for the lifetime of the queue — KFD reads them
     /// asynchronously as part of the compute dispatch hardware state.
@@ -981,7 +987,7 @@ unsafe impl Sync for QueueInner {}
 
 /// Owns an activated queue only while later construction remains fallible.
 /// Teardown runs before the backing `QueueInner` is dropped; teardown failure
-/// poisons the device so `QueueInner::drop` quarantines its mappings.
+/// quarantines the inner so `QueueInner::drop` leaks its mappings.
 struct ActivatedQueueGuard {
     inner: Option<QueueInner>,
     core: Arc<AmdDeviceCore>,
@@ -1001,17 +1007,24 @@ impl ActivatedQueueGuard {
 
 impl Drop for ActivatedQueueGuard {
     fn drop(&mut self) {
-        let Some(inner) = self.inner.as_ref() else { return };
+        let Some(inner) = self.inner.as_mut() else { return };
         debug_assert_eq!(self.state, QueueState::Constructing);
+        // Unwinding only abandons this lane. Tinygrad latches `error_state`
+        // per device on a drain timeout or a fault (`hcq.py` `HWQueue`
+        // synchronize), never on an abandoned construction, so quarantining the
+        // backing is the whole remedy here.
         if std::thread::panicking() {
             self.state = QueueState::Quarantined;
-            self.core.poison("partially constructed queue abandoned during panic unwind");
+            inner.quarantined = true;
+            tracing::warn!("partially constructed queue abandoned during panic unwind; backing quarantined");
             return;
         }
-        match self.core.iface().teardown_ring(inner.queue_id, inner.doorbell_base) {
+        let (queue_id, doorbell_base) = (inner.queue_id, inner.doorbell_base);
+        match self.core.iface().teardown_ring(queue_id, doorbell_base) {
             Ok(_) => self.state = QueueState::Destroyed,
             Err(error) => {
                 self.state = QueueState::Quarantined;
+                inner.quarantined = true;
                 self.core.poison(&error.to_string());
                 tracing::warn!(?error, "partial queue teardown failed; backing allocations quarantined");
             }
@@ -1029,14 +1042,15 @@ impl Drop for QueueInner {
     /// Drop` has already invoked `kfd_destroy_queue` AND `PoolQueue::Drop`
     /// has drained the queue, so the GPU is idle on these buffers.
     ///
-    /// Skipped during panic unwind: `PoolQueue::Drop` and
-    /// `AmdComputeQueue::Drop` both skip their drain/destroy on panic, so
-    /// the GPU's CP may still be reading the ring/GART. Unmapping them here
-    /// would fault the VM mid-unwind and could crash before the panic's
-    /// diagnostics flush. Accept the buffer leak — the process is unwinding and
-    /// the OS reclaims at exit.
+    /// Skipped once the owning queue quarantined this backing, and during panic
+    /// unwind: `PoolQueue::Drop` and `AmdComputeQueue::Drop` both skip their
+    /// drain/destroy on panic, so the GPU's CP may still be reading the
+    /// ring/GART. Unmapping them here would fault the VM and could crash before
+    /// the panic's diagnostics flush. Accept the buffer leak — the OS reclaims
+    /// at process exit.
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if self.quarantined || std::thread::panicking() {
+            tracing::warn!(queue_id = self.queue_id, "quarantined AMD queue: leaking ring/GART/EOP backing");
             return;
         }
         self._ring_buf.free_amd_device_in_place();
@@ -1064,15 +1078,16 @@ impl Drop for AmdCopyQueue {
         if self.state != QueueState::Active {
             return;
         }
+        // Unwinding abandons this queue's in-flight copies but says nothing
+        // about the device, so quarantine without poisoning (tinygrad latches
+        // per-device error state on drain timeouts and faults only).
         if std::thread::panicking() {
-            self.core.poison("copy queue abandoned during panic unwind");
-            self.state = QueueState::Quarantined;
+            self.quarantine("copy queue abandoned during panic unwind");
             return;
         }
         if let Err(error) = self.timeline.drain(COPY_TIMEOUT_MS) {
             self.core.poison(&error.to_string());
-            self.state = QueueState::Quarantined;
-            tracing::warn!(?error, "copy queue drain failed; queue and backing quarantined");
+            self.quarantine("copy queue drain failed; queue and backing quarantined");
             return;
         }
         let (queue_id, doorbell_base) = {
@@ -1081,8 +1096,7 @@ impl Drop for AmdCopyQueue {
         };
         if let Err(error) = self.core.iface().teardown_ring(queue_id, doorbell_base) {
             self.core.poison(&error.to_string());
-            self.state = QueueState::Quarantined;
-            tracing::warn!(?error, "copy queue teardown failed; backing allocations quarantined");
+            self.quarantine("copy queue teardown failed; backing allocations quarantined");
         } else {
             self.state = QueueState::Destroyed;
         }
@@ -1096,36 +1110,43 @@ impl AmdComputeQueue {
         if self.state == QueueState::Destroyed {
             return Ok(());
         }
+        // A panic unwind abandons this queue, not the device: quarantine the
+        // lane and leave the process-global poison latch to real hardware
+        // faults and drain timeouts (tinygrad's per-device `error_state`).
         if self.state == QueueState::Quarantined || std::thread::panicking() {
-            if std::thread::panicking() {
-                self.core.poison("compute queue abandoned during panic unwind");
-            }
-            self.state = QueueState::Quarantined;
+            self.quarantine();
             return Err(self
                 .core
                 .poison_error()
                 .unwrap_or_else(|| Error::Runtime { message: "AMD compute queue is quarantined".into() }));
         }
         debug_assert_eq!(self.state, QueueState::Active);
-        let inner = self.inner.get_mut();
-        match self.core.iface().teardown_ring(inner.queue_id, inner.doorbell_base) {
+        let (queue_id, doorbell_base) = {
+            let inner = self.inner.get_mut();
+            (inner.queue_id, inner.doorbell_base)
+        };
+        match self.core.iface().teardown_ring(queue_id, doorbell_base) {
             Ok(_) => {
                 self.state = QueueState::Destroyed;
                 Ok(())
             }
             Err(error) => {
                 self.core.poison(&error.to_string());
-                self.state = QueueState::Quarantined;
+                self.quarantine();
                 tracing::warn!(?error, "compute queue teardown failed; backing allocations quarantined");
                 Err(error)
             }
         }
     }
 
+    /// Abandon this queue's hardware state: the KFD queue is never destroyed
+    /// and its ring/GART/EOP backing is leaked rather than unmapped under a
+    /// possibly live command processor.
     pub(crate) fn quarantine(&mut self) {
-        if self.state == QueueState::Active {
+        if self.state != QueueState::Destroyed {
             self.state = QueueState::Quarantined;
         }
+        self.inner.get_mut().quarantined = true;
     }
 }
 
@@ -2080,6 +2101,13 @@ const COPY_TIMEOUT_MS: u64 = 30_000;
 const STAGING_BYTES: usize = sdma::SDMA_MAX_COPY_BYTES;
 
 impl AmdCopyQueue {
+    /// See [`AmdComputeQueue::quarantine`].
+    fn quarantine(&mut self, reason: &str) {
+        self.state = QueueState::Quarantined;
+        self.inner.get_mut().quarantined = true;
+        tracing::warn!(reason, "AMD copy queue quarantined");
+    }
+
     pub fn create(allocator: &AmdAllocator) -> Result<Arc<Self>> {
         let core = Arc::clone(allocator.dev.core());
         let inner = ActivatedQueueGuard::new(
@@ -2563,6 +2591,7 @@ fn create_queue(
         gart_host,
         write_idx: 0,
         queue_id,
+        quarantined: false,
         qinactive_host,
         _ring_buf: ring_buf.into_inner(),
         _gart_buf: gart_buf.into_inner(),

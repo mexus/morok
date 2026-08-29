@@ -402,6 +402,9 @@ fn mock_pool_failed_drain_and_panic_abandonment_quarantine_every_backing() {
     assert_eq!(iface.free_count(), 0);
     assert_eq!(iface.live_handle_count(), baseline + 6);
 
+    // A panic unwind quarantines the lane it abandons but must NOT poison the
+    // process-global core: tinygrad latches per-device error state on drain
+    // timeouts and faults only.
     let (iface, allocator) = mock_allocator(1);
     install_signal_pool(&allocator);
     let baseline = iface.allocation_count();
@@ -410,9 +413,26 @@ fn mock_pool_failed_drain_and_panic_abandonment_quarantine_every_backing() {
         panic!("scripted pool abandonment");
     }));
     assert!(result.is_err());
-    assert!(allocator.dev.is_poisoned());
+    assert!(!allocator.dev.is_poisoned());
     assert_eq!(iface.free_count(), 0);
     assert_eq!(iface.live_handle_count(), baseline + 6);
+    assert_eq!(iface.queue_teardown_count(), 0, "an abandoned queue is never destroyed");
+}
+
+#[test]
+fn mock_quarantined_queue_leaks_its_backing_without_a_poisoned_device() {
+    let (iface, allocator) = mock_allocator(1);
+    let baseline = iface.allocation_count();
+    let mut queue = AmdComputeQueue::create(&allocator).expect("queue");
+    // Quarantine alone must keep the ring/GART/EOP mapped: the KFD queue is
+    // never destroyed, so the CP may still be reading them. The decision is
+    // queue-local and does not depend on the device poison latch.
+    queue.quarantine();
+    drop(queue);
+    assert!(!allocator.dev.is_poisoned());
+    assert_eq!(iface.free_count(), 0);
+    assert_eq!(iface.live_handle_count(), baseline + 4);
+    assert_eq!((iface.queue_teardown_count(), iface.live_queue_count()), (0, 1));
 }
 
 #[test]
