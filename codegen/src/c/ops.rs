@@ -457,21 +457,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             if sources.is_empty() {
                 return None;
             }
-            let vals: Vec<String> = sources
-                .iter()
-                .map(|source| {
-                    let value = ctx.get(source).to_string();
-                    // Lane reads of an address-carrying INDEX must dereference:
-                    // INDEX renders `buf + idx` exactly when the buffer has an
-                    // address space (tinygrad cstyle.py render_index), so the
-                    // STACK element test has to use the same predicate.
-                    if matches!(source.op(), Op::Index { .. }) && source.addrspace().is_some() {
-                        format!("*({value})")
-                    } else {
-                        value
-                    }
-                })
-                .collect();
+            let vals: Vec<String> = sources.iter().map(|source| ctx.get(source).to_string()).collect();
             if matches!(uop.dtype(), DType::Ptr { .. }) {
                 // Ptr types can't be vectorized in C (no compound literal for pointers).
                 // All elements should be the same scalar pointer — use the first one.

@@ -1,4 +1,4 @@
-//! Property tests for the 64-bit shift word split in [`pm_long_decomp`].
+//! Property tests for the 64-bit word split in [`pm_long_decomp`].
 //!
 //! `pm_long_decomp` has no tinygrad counterpart — tinygrad targets only backends
 //! with native 64-bit integers, so the shift rules in `decompositions.py` are the
@@ -49,30 +49,61 @@ fn word_bits(value: ConstValue) -> u32 {
     }
 }
 
-/// Run `pm_long_decomp` over `STORE(index, value <op> shift)` and return `[low, high]`.
-pub fn split_shift(op: BinaryOp, value: u64, shift: u64, from: ScalarDType) -> [u32; 2] {
+/// The 64-bit constant `value` at `from`.
+pub fn long_const(from: ScalarDType, value: u64) -> Arc<UOp> {
     let long = DType::Scalar(from);
-    let konst = |v: u64| {
-        UOp::const_(
-            long.clone(),
-            if from == ScalarDType::Int64 { ConstValue::Int(v as i64) } else { ConstValue::UInt(v) },
-        )
-    };
+    UOp::const_(long, if from == ScalarDType::Int64 { ConstValue::Int(value as i64) } else { ConstValue::UInt(value) })
+}
+
+/// A leftover 64-bit node means the rewrite stalled: `graph_rewrite_bottom_up`
+/// then returns the input untouched instead of the word split.
+pub fn assert_fully_split(root: &Arc<UOp>) {
+    for node in root.toposort() {
+        assert!(
+            !matches!(node.dtype().base(), ScalarDType::Int64 | ScalarDType::UInt64),
+            "64-bit node survived decomposition: {}",
+            root.tree()
+        );
+    }
+}
+
+/// Split `STORE(buffer[at], value)` with `pm_long_decomp` and return each word's
+/// stored bits and the element of the doubled 32-bit buffer it lands on.
+pub fn split_store(from: ScalarDType, at: i64, value: Arc<UOp>) -> [(u32, i64); 2] {
     let index = UOp::index()
-        .buffer(create_buffer_typed(4, from))
-        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+        .buffer(create_buffer_typed(8, from))
+        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(at))])
         .call()
         .unwrap();
-    let root = index.store(UOp::new(Op::Binary(op, konst(value), konst(shift)), long));
-    let decomposed = graph_rewrite_bottom_up(&pm_long_decomp(), root, &mut ());
+    let decomposed = graph_rewrite_bottom_up(&pm_long_decomp(), index.store(value), &mut ());
+    assert_fully_split(&decomposed);
 
     let mut words = [None; 2];
     for node in decomposed.toposort() {
-        let Op::Store { value, .. } = node.op() else { continue };
+        let Op::Store { index, value, .. } = node.op() else { continue };
+        let Op::Index { indices, .. } = index.op() else { panic!("a split store addresses an INDEX") };
+        let address = eval_word(indices.last().expect("INDEX carries an index")).expect("address must fold");
         let word = node.tag().as_ref().expect("split store is word-tagged")[1];
-        words[word] = Some(word_bits(eval_word(value).expect("word expression must fold")));
+        words[word] = Some((
+            word_bits(eval_word(value).expect("word expression must fold")),
+            address.try_int().expect("address"),
+        ));
     }
     [words[0].expect("low word"), words[1].expect("high word")]
+}
+
+/// Run `pm_long_decomp` over `STORE(index, value)` and return `[low, high]`. The two
+/// words must land on adjacent elements, never both on the same one.
+pub fn split_long(from: ScalarDType, value: Arc<UOp>) -> [u32; 2] {
+    let [(low, low_at), (high, high_at)] = split_store(from, 1, value);
+    assert_eq!([low_at, high_at], [2, 3], "{from:?} word addresses");
+    [low, high]
+}
+
+/// Run `pm_long_decomp` over `STORE(index, value <op> shift)` and return `[low, high]`.
+pub fn split_shift(op: BinaryOp, value: u64, shift: u64, from: ScalarDType) -> [u32; 2] {
+    let operands = Op::Binary(op, long_const(from, value), long_const(from, shift));
+    split_long(from, UOp::new(operands, DType::Scalar(from)))
 }
 
 /// Native reference for `value <op> shift` at 64 bits.
@@ -94,6 +125,25 @@ pub fn assert_shift_words(op: BinaryOp, value: u64, shift: u64, from: ScalarDTyp
     );
 }
 
+fn assert_words(from: ScalarDType, value: Arc<UOp>, expected: u64, what: &str) {
+    assert_eq!(split_long(from, value), [expected as u32, (expected >> 32) as u32], "{from:?} {what}");
+}
+
+/// `a * b` and `-a` at 64 bits, plus the float cast that reads both words.
+pub fn assert_long_arithmetic(a: u64, b: u64, from: ScalarDType) {
+    let mul = Op::Binary(BinaryOp::Mul, long_const(from, a), long_const(from, b));
+    assert_words(from, UOp::new(mul, DType::Scalar(from)), a.wrapping_mul(b), "mul");
+    let neg = Op::Unary(svod_ir::UnaryOp::Neg, long_const(from, a));
+    assert_words(from, UOp::new(neg, DType::Scalar(from)), a.wrapping_neg(), "neg");
+    // A cast away from a long is not itself split, so only the stall is observable.
+    let c = long_const(from, a).cast(DType::Float32);
+    eprintln!("INPUT: {}", c.tree());
+    eprintln!("OUT: {}", graph_rewrite_bottom_up(&pm_long_decomp(), c.clone(), &mut ()).tree());
+    let i32c = long_const(from, a).cast(DType::Int32);
+    eprintln!("OUTI32: {}", graph_rewrite_bottom_up(&pm_long_decomp(), i32c, &mut ()).tree());
+    assert_fully_split(&graph_rewrite_bottom_up(&pm_long_decomp(), c, &mut ()));
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -109,5 +159,15 @@ proptest! {
         let op = if right { BinaryOp::Shr } else { BinaryOp::Shl };
         let expected = native_shift(op, value, shift, from);
         prop_assert_eq!(split_shift(op, value, shift, from), [expected as u32, (expected >> 32) as u32]);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// The word split of `a * b` and `-a` must equal the native 64-bit result.
+    #[test]
+    fn long_arithmetic_words_match_native(a in any::<u64>(), b in any::<u64>(), signed in any::<bool>()) {
+        assert_long_arithmetic(a, b, if signed { ScalarDType::Int64 } else { ScalarDType::UInt64 });
     }
 }
