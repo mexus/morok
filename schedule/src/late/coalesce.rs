@@ -129,9 +129,10 @@ fn drop_valid_stmts(valid: &Arc<UOp>, idx: &Arc<UOp>, height: usize, width: usiz
 }
 
 fn simplify_valid_load(buffer: &Arc<UOp>, start_idx: &Arc<UOp>, valid: &Arc<UOp>) -> Option<Arc<UOp>> {
+    // Tinygrad `codegen/late/coalesce.py:42` short-circuits on `idx is start_idx`
+    // before simplifying, so the rewrite only runs when the gate changed the index.
     let idx = uop_given_valid(valid, start_idx, true);
-    let simplified_start = graph_rewrite(symbolic(), start_idx.clone(), &mut ());
-    if Arc::ptr_eq(&idx, start_idx) || Arc::ptr_eq(&idx, &simplified_start) {
+    if Arc::ptr_eq(&idx, start_idx) || Arc::ptr_eq(&idx, &graph_rewrite(symbolic(), start_idx.clone(), &mut ())) {
         return None;
     }
     UOp::index().buffer(buffer.clone()).indices(vec![idx.valid(valid.clone())]).call().ok()
