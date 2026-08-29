@@ -246,8 +246,10 @@ use svod_ir::shape::{Shape, broadcast_shapes, shapes_equal};
 
 /// Run devectorize pass. Call AFTER `pre_expand`, BEFORE codegen.
 ///
-/// Combined matcher matching Tinygrad's fixed-point `devectorizer2` rewrite.
-///
+/// One `graph_rewrite` over the combined matcher, matching tinygrad
+/// `codegen/__init__.py:333` (`symbolic_simple+devectorizer2+indexing_simplify`).
+/// `graph_rewrite` already re-runs the matcher on every replacement, so an outer
+/// fixed-point loop would only paper over a missing pattern.
 pub fn devectorize(ast: &Arc<UOp>, renderer: &Renderer) -> Arc<UOp> {
     static COMBINED: LazyLock<TypedPatternMatcher<Renderer>> = LazyLock::new(|| {
         symbolic_simple().clone().with_context::<Renderer>()
@@ -255,16 +257,7 @@ pub fn devectorize(ast: &Arc<UOp>, renderer: &Renderer) -> Arc<UOp> {
             + bool_storage_patterns().clone().with_context::<Renderer>()
             + crate::late::indexing_simplify().clone().with_context::<Renderer>()
     });
-    let mut current = ast.clone();
-    let mut seen = HashSet::new();
-    loop {
-        assert!(seen.insert(current.id), "devectorize entered a rewrite cycle");
-        let next = graph_rewrite(&*COMBINED, current.clone(), &mut renderer.clone());
-        if Arc::ptr_eq(&next, &current) {
-            return next;
-        }
-        current = next;
-    }
+    graph_rewrite(&*COMBINED, ast.clone(), &mut renderer.clone())
 }
 
 /// Bool LOAD/STORE via uint8. LLVM i1 can have garbage in upper bits.

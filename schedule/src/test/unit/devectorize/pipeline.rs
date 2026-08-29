@@ -348,3 +348,16 @@ fn test_devectorize_bool_pipeline() {
         "Bool should be handled correctly"
     );
 }
+
+/// `devectorize` is a single `graph_rewrite` (tinygrad `codegen/__init__.py:333`), so it
+/// must reach a fixed point in one pass.
+#[test]
+fn test_devectorize_is_idempotent() {
+    let buffer = create_buffer(64);
+    let load = UOp::load().index(create_vector_index_iota(buffer.clone(), 4)).call();
+    let store = create_vector_index_iota(buffer, 4).store(create_vector_float_iota(4));
+    for root in [load, store] {
+        let once = apply_devectorize(&root);
+        assert!(Arc::ptr_eq(&apply_devectorize(&once), &once), "{}", once.tree());
+    }
+}
