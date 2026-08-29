@@ -664,6 +664,10 @@ fn flatten_bufferize(stage: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Push movement op or INDEX through AFTER: `AFTER(r(x, ...), deps) → r(AFTER(x, deps), ...)`.
 ///
 /// Reuses the original op's remaining sources directly (no roundtrip/validation).
+///
+/// Tag placement follows tinygrad `schedule/rangeify.py:54-55`: the rebuilt AFTER
+/// keeps the original AFTER's tag (`a.replace`), and the outer movement node is
+/// constructed fresh, so it carries no tag.
 pub(crate) fn push_op_through_after(
     after: &Arc<UOp>,
     r: &Arc<UOp>,
