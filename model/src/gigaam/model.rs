@@ -272,7 +272,9 @@ impl GigaAm {
             if (key.starts_with("subsampling.") || key.starts_with("layers."))
                 && tensor.uop().dtype().is_float()
                 && tensor.uop().dtype() != encoder_dtype
-                && !key.ends_with(".weight_scale")
+                // Both scale spellings stay at checkpoint precision: `<x>.weight_scale`
+                // (FFN) and `<x>_weight_scale` (MHSA/conv), matching `prepare_scaled_weights`.
+                && !key.ends_with("weight_scale")
             {
                 *tensor =
                     tensor.cast(encoder_dtype.clone()).map_err(|source| Error::Tensor { source: Box::new(source) })?;

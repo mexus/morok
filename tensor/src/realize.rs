@@ -1597,17 +1597,11 @@ fn initial_kernel_var_values(item: &ScheduleItem, var_names: &[String]) -> Resul
             if name == "core_id" {
                 return Ok(0);
             }
-            if let Some(&(min, max)) = bounds.get(name.as_str())
-                && !(min..=max).contains(&0)
-            {
-                return IrConstructionSnafu {
-                    details: format!(
-                        "missing binding for runtime variable {name}: default value 0 is outside declared bounds {min}..={max}"
-                    ),
-                }
-                .fail();
-            }
-            Ok(0)
+            // Unbound at prepare time: this is the documented prepare-once flow
+            // (`variable.rs`), so seed an in-bounds placeholder and let
+            // `ExecutionPlan::execute_with_vars` reject a value that never
+            // arrives or arrives out of bounds.
+            Ok(bounds.get(name.as_str()).map_or(0, |&(min, _)| min.max(0)))
         })
         .collect()
 }

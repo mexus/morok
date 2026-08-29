@@ -202,10 +202,13 @@ pub(crate) fn concrete_dims(
 /// output buffer(s) in place. `buffers` are ordered output(s)-first then inputs,
 /// matching the `gl()` declaration order in the kernel body (PARAM slots 0,1,…).
 ///
-/// The compiled ABI (`ProgramSpec.globals`) is a *sorted* slot list, so the
-/// concrete pointer for ABI position `i` is `buffers[globals[i]]`. With the
-/// canonical declaration order `globals[i] == i`, but we index through `globals`
-/// so a kernel that declares slots out of order still binds correctly.
+/// Binding is *compact and ordinal*: the compiled ABI (`ProgramSpec.globals`)
+/// is a sorted slot list, and the pointer for ABI position `i` is `buffers[i]`
+/// — the declared slot number is carried only for diagnostics. So a kernel that
+/// declares slots `[0, 5]` takes exactly two buffers, and `buffers[1]` binds to
+/// slot 5; supplying `globals.len()` buffers is required, and a sparse vector
+/// indexed by slot number is not. `plan_compact_buffers` is the mapping, pinned
+/// by `sparse_and_interleaved_program_slots_plan_compact_buffers`.
 pub fn launch(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<()> {
     let compiled = compile(device, sink, buffers)?;
     // SAFETY: `compile` resolved + allocated every ABI buffer pointer, and the

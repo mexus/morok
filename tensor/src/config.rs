@@ -86,7 +86,7 @@ impl Default for PrepareConfig {
         Self {
             optimizer: OptimizerConfig::default(),
             resolver: Arc::new(EnvResolver),
-            planner_mode: PlannerMode::Arena,
+            planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
         }
@@ -150,7 +150,7 @@ impl From<OptimizerConfig> for PrepareConfig {
         Self {
             optimizer,
             resolver: Arc::new(EnvResolver),
-            planner_mode: PlannerMode::Arena,
+            planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
         }

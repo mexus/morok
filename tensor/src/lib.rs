@@ -182,6 +182,25 @@ impl Clone for Tensor {
     }
 }
 
+/// Symbolic ceiling division, mirroring tinygrad `helpers.py:63-66`.
+///
+/// The `(num + amt - 1) / amt` form is exact only for a non-negative numerator
+/// and a positive divisor; everywhere else `-(num / -amt)` is exact for either
+/// sign, because integer division floors.
+pub(crate) fn ceildiv_uop(num: &Arc<UOp>, amt: &Arc<UOp>) -> Arc<UOp> {
+    let nonneg =
+        |value: &ConstValue| matches!(value, ConstValue::Int(v) if *v >= 0) || matches!(value, ConstValue::UInt(_));
+    let positive = |value: &ConstValue| {
+        matches!(value, ConstValue::Int(v) if *v > 0) || matches!(value, ConstValue::UInt(v) if *v > 0)
+    };
+    if nonneg(num.vmin()) && positive(amt.vmin()) {
+        let one = UOp::const_(amt.dtype(), ConstValue::one(amt.dtype().base()));
+        num.add(&amt.sub(&one)).floor_div(amt)
+    } else {
+        num.floor_div(&amt.neg()).neg()
+    }
+}
+
 #[bon]
 impl Tensor {
     /// Create tensor without buffer (for lazy computation graphs).
@@ -416,9 +435,7 @@ impl Tensor {
 
             Self::full(&[ceildiv as usize], *s, dtype.clone())?
         } else {
-            let diff = stop.sub(&start);
-            let one = UOp::const_(dtype.clone(), ConstValue::one(dtype.base()));
-            let ceildiv = diff.add(&step.sub(&one)).floor_div(&step);
+            let ceildiv = ceildiv_uop(&stop.sub(&start), &step);
             let output_len_sint = SInt::from(ceildiv.clone());
             let ones: Shape = vec![SInt::Const(1)].into();
             let target: Shape = vec![output_len_sint].into();

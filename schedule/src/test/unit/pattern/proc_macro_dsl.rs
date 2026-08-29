@@ -1151,6 +1151,111 @@ fn test_load_target_field_bindings() {
     }
 }
 
+// ===== Option-field pattern tests (`gate: None`, `gate: Some(g)`, bare `gate`) =====
+
+/// Shared address for the Option-field tests: `INDEX(const, [offset])`.
+fn address(offset: i64) -> Arc<UOp> {
+    let buffer = UOp::native_const(42.0f32);
+    UOp::index().buffer(buffer).indices(vec![UOp::index_const(offset)]).call().unwrap()
+}
+
+fn bool_gate() -> Arc<UOp> {
+    UOp::const_(DType::Bool, ConstValue::Int(1))
+}
+
+#[test]
+fn test_option_none_pattern() {
+    let matcher = patterns! {
+        Load { index, alt: None, gate: None } ~> index
+    };
+
+    let idx = address(0);
+    let ungated = UOp::load().index(idx.clone()).call();
+    match matcher.rewrite(&ungated, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &idx), "should extract the ungated index"),
+        _ => panic!("Load with alt: None, gate: None should match"),
+    }
+
+    let gated = UOp::load().index(idx).alt(UOp::native_const(0.0f32)).gate(bool_gate()).call();
+    match matcher.rewrite(&gated, &mut ()) {
+        RewriteResult::NoMatch => {}
+        _ => panic!("gated Load must NOT match the None pattern"),
+    }
+}
+
+#[test]
+fn test_option_some_pattern() {
+    let matcher = patterns! {
+        Load { index: _, alt: _, gate: Some(g) } ~> g
+    };
+
+    let idx = address(0);
+    let gate = bool_gate();
+    let gated = UOp::load().index(idx.clone()).alt(UOp::native_const(0.0f32)).gate(gate.clone()).call();
+    match matcher.rewrite(&gated, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &gate), "should extract the gate"),
+        _ => panic!("Load with gate: Some(g) should match"),
+    }
+
+    match matcher.rewrite(&UOp::load().index(idx).call(), &mut ()) {
+        RewriteResult::NoMatch => {}
+        _ => panic!("ungated Load must NOT match the Some pattern"),
+    }
+}
+
+#[test]
+fn test_store_gate_bare_binding() {
+    // A bare `gate` field binds the `Option<Arc<UOp>>` itself, matching either way.
+    let matcher = patterns! {
+        Store { index, value: _, gate } => {
+            match gate {
+                Some(g) => Some(g.clone()),
+                None => Some(index.clone()),
+            }
+        }
+    };
+
+    let idx = address(0);
+    let value = UOp::native_const(1.0f32);
+    match matcher.rewrite(&idx.store(value.clone()), &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &idx), "ungated store binds gate = None"),
+        _ => panic!("bare gate binding should match an ungated Store"),
+    }
+
+    let gate = bool_gate();
+    match matcher.rewrite(&idx.store_gated(value, gate.clone()), &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &gate), "gated store binds gate = Some"),
+        _ => panic!("bare gate binding should match a gated Store"),
+    }
+}
+
+#[test]
+fn test_nested_option_none_pattern() {
+    // Option fields nested at two levels: an ungated store of an ungated load.
+    let matcher = patterns! {
+        Store { index: _, value: Load { index: source, alt: None, gate: None }, gate: None } ~> source
+    };
+
+    let target = address(0);
+    let source = address(1);
+    let load = UOp::load().index(source.clone()).call();
+    match matcher.rewrite(&target.store(load.clone()), &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &source), "should reach the inner load address"),
+        _ => panic!("nested None pattern should match"),
+    }
+
+    match matcher.rewrite(&target.store_gated(load, bool_gate()), &mut ()) {
+        RewriteResult::NoMatch => {}
+        _ => panic!("outer gate: Some must NOT match"),
+    }
+
+    let gated_load = UOp::load().index(source).alt(UOp::native_const(0.0f32)).gate(bool_gate()).call();
+    match matcher.rewrite(&target.store(gated_load), &mut ()) {
+        RewriteResult::NoMatch => {}
+        _ => panic!("inner gate: Some must NOT match"),
+    }
+}
+
 // NOTE: test_prefix_matching_minimum_children was removed - it tested deprecated UPat API
 
 #[test]

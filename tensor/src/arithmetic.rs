@@ -53,6 +53,7 @@ impl Tensor {
             try_div => try_div,
             try_cdiv => try_cdiv,
             try_mod => try_mod,
+            try_cmod => try_cmod,
             try_pow => try_pow,
             try_eq => try_cmpeq,
             try_ne => try_cmpne,

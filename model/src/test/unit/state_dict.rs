@@ -151,6 +151,36 @@ fn gigaam_encoder_dtype_conversion_leaves_head_fp32() {
 }
 
 #[test]
+fn gigaam_quantization_scales_keep_checkpoint_dtype() {
+    // Int8 encoder weights keep their scales in the state dict (they are applied
+    // at matmul time, not folded), so the encoder-dtype coercion must exempt both
+    // scale spellings: `<x>.weight_scale` (FFN) and `<x>_weight_scale` (MHSA).
+    let cfg = test_config();
+    let source = GigaAm::with_random_weights(cfg.clone());
+    let mut sd = compose_state_dict(&source);
+    for (weight, scale) in [
+        ("layers.0.mhsa.q_proj", "layers.0.mhsa.q_weight_scale"),
+        ("layers.0.ffn1.linear1.weight", "layers.0.ffn1.linear1.weight_scale"),
+    ] {
+        let quantized = sd[weight].cast(DType::Int8).expect("quantize weight");
+        let out = quantized.shape().expect("weight shape")[0].as_const().expect("static output dim");
+        sd.insert(weight.into(), quantized);
+        sd.insert(scale.into(), Tensor::full(&[out], 1.0f32, DType::Float32).unwrap());
+    }
+
+    let model = GigaAm::from_state_dict_with_encoder_dtype(&sd, cfg, None, DType::Float16).expect("load FP16 encoder");
+
+    let mhsa = &model.encoder.layers[0].mhsa;
+    let ffn1 = &model.encoder.layers[0].ffn1;
+    for scale in [
+        &mhsa.q_quantization.as_ref().expect("q quantization").weight_scale,
+        &ffn1.linear1_quantization.as_ref().expect("linear1 quantization").weight_scale,
+    ] {
+        assert_eq!(scale.uop().dtype(), DType::Float32);
+    }
+}
+
+#[test]
 fn gigaam_rejects_ctc_head_shape_mismatched_with_config() {
     let cfg = test_config();
     let source = GigaAm::with_random_weights(cfg.clone());
