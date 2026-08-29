@@ -318,9 +318,19 @@ fn hcq_placeholder_packing_aliases_scratch_and_aligns_kernargs() {
         PlaceholderRequest { kind: PlaceholderKind::Scratch, bytes: 256 },
         PlaceholderRequest { kind: PlaceholderKind::Kernargs, bytes: 12 },
     ]);
-    assert_eq!(packing.offsets, [0, 0, 0, 128]);
+    assert_eq!(packing.offsets, [0, 0, 0, 32]);
     assert_eq!(packing.scratch_bytes, 256);
-    assert_eq!(packing.kernarg_bytes, 140);
+    assert_eq!(packing.kernarg_bytes, 44);
+}
+
+/// One packing rule for every kernarg site. Tinygrad bump-allocates its kernarg
+/// blocks at alignment 8 (`runtime/support/hcq.py:352`); 16 covers the largest
+/// AMDHSA member alignment without the 128-byte inflation morok used to apply.
+#[test_case::test_case(&[8, 12, 4], 16 => (vec![0, 16, 32], 36); "records are aligned, the total is not padded")]
+#[test_case::test_case(&[16, 16], 16 => (vec![0, 16], 32); "already-aligned records pack tight")]
+#[test_case::test_case(&[], 16 => (vec![], 0); "no records")]
+fn kernarg_offsets_pack_records_at_one_alignment(sizes: &[usize], align: usize) -> (Vec<usize>, usize) {
+    crate::hcq::kernarg_offsets(sizes.iter().copied(), align)
 }
 
 #[test]

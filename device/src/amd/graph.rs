@@ -19,8 +19,9 @@ use crate::amd::queue::{
 use crate::device::{Graph, GraphKernel};
 use crate::error::{Error, Result};
 use crate::hcq::{
-    AmdPm4Dispatch, Command, CommandBufferCache, CommandField, ComputeDispatch, LinkPatchValues, LinkedCommandBuffer,
-    PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, Submission, SystemField, SystemPatchValues,
+    AmdPm4Dispatch, Command, CommandBufferCache, CommandField, ComputeDispatch, KERNARG_ALIGN, LinkPatchValues,
+    LinkedCommandBuffer, PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, Submission, SystemField,
+    SystemPatchValues, kernarg_offsets,
 };
 
 struct KernargSlot {
@@ -164,8 +165,6 @@ impl AmdGraph {
         let max_private = programs.iter().map(|p| p.private_segment_size()).max().unwrap_or(128).max(128);
         lane.ensure_has_local_memory(max_private)?;
 
-        let mut offsets = Vec::with_capacity(kernels.len());
-        let mut bytes = 0usize;
         for (kernel, program) in kernels.iter().zip(&programs) {
             let (buffer_count, var_count) = program.arg_counts();
             if kernel.buffers.len() != buffer_count || kernel.vals.len() != var_count {
@@ -178,9 +177,9 @@ impl AmdGraph {
                     ),
                 });
             }
-            offsets.push(bytes);
-            bytes += program.kernarg_record_size().next_multiple_of(16);
         }
+        let (offsets, bytes) =
+            kernarg_offsets(programs.iter().map(|program| program.kernarg_record_size()), KERNARG_ALIGN);
         let kernargs_buf = AmdBufferGuard::new(
             allocator.alloc_host_visible_tagged(bytes.max(16), crate::amd::va_registry::AllocTag::Kernarg)?,
         );

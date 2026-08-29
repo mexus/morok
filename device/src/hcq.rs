@@ -1329,6 +1329,28 @@ pub enum PlaceholderKind {
     Kernargs,
 }
 
+/// Byte alignment of one kernarg record.
+///
+/// Tinygrad bump-allocates kernarg blocks at alignment 8
+/// (`runtime/support/hcq.py:352`). 16 is the largest alignment any AMDHSA
+/// kernarg member requires, so it is the smallest value that is correct for
+/// every record we emit; the previous 128 (a cache-line guess) inflated linked
+/// plans and graphs by up to 8x.
+pub const KERNARG_ALIGN: usize = 16;
+
+/// Pack `sizes` as consecutive `align`-aligned kernarg records, returning each
+/// record's byte offset plus the total allocation size.
+pub fn kernarg_offsets(sizes: impl IntoIterator<Item = usize>, align: usize) -> (Vec<usize>, usize) {
+    let mut offsets = Vec::new();
+    let mut bytes = 0usize;
+    for size in sizes {
+        bytes = bytes.next_multiple_of(align);
+        offsets.push(bytes);
+        bytes += size;
+    }
+    (offsets, bytes)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaceholderRequest {
     pub kind: PlaceholderKind,
@@ -1344,7 +1366,8 @@ pub struct PlaceholderPacking {
 
 impl PlaceholderPacking {
     /// HCQ2 packing: scratch placeholders alias one max-sized allocation;
-    /// kernarg blocks are distinct and 128-byte aligned.
+    /// kernarg blocks are distinct and [`KERNARG_ALIGN`]-aligned. The two kinds
+    /// interleave, so this cannot delegate to [`kernarg_offsets`] directly.
     pub fn pack(requests: &[PlaceholderRequest]) -> Self {
         let mut offsets = Vec::with_capacity(requests.len());
         let mut scratch_bytes = 0usize;
@@ -1356,7 +1379,7 @@ impl PlaceholderPacking {
                     scratch_bytes = scratch_bytes.max(request.bytes);
                 }
                 PlaceholderKind::Kernargs => {
-                    kernarg_bytes = kernarg_bytes.next_multiple_of(128);
+                    kernarg_bytes = kernarg_bytes.next_multiple_of(KERNARG_ALIGN);
                     offsets.push(kernarg_bytes);
                     kernarg_bytes += request.bytes;
                 }
