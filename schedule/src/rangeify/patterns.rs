@@ -290,11 +290,13 @@ fn cleanup_dead_axes_bufferize(
     use svod_ir::SInt;
     use svod_ir::shape::Shape;
 
-    // Don't optimize ALWAYS_RUN_OPS (CONTIGUOUS, COPY, NOOP) or AFTER. AFTER
-    // is a buffer-identity wrapper: ranges define consumer access, not the
+    // Don't optimize ALWAYS_RUN_OPS or AFTER (tinygrad `schedule/rangeify.py:198`).
+    // AFTER is a buffer-identity wrapper: ranges define consumer access, not the
     // computation's own shape, so dead-axis pruning would mangle assign-chain
-    // semantics.
-    if !opts.removable || matches!(compute.op(), Op::Contiguous { .. } | Op::Noop | Op::After { .. }) {
+    // semantics. COPY joins them via `is_always_run_op`, matching the guard
+    // `remove_bufferize` already applies: shrinking a copy's destination would
+    // under-allocate the transfer.
+    if !opts.removable || is_always_run_op(compute.op()) || matches!(compute.op(), Op::After { .. }) {
         return None;
     }
 

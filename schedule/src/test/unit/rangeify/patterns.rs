@@ -245,6 +245,17 @@ fn test_dead_axis_removal_single_dead_axis() {
 }
 
 #[test]
+fn test_dead_axis_removal_skips_always_run_ops() {
+    // A COPY destination is sized by the transfer, so a dead axis must not shrink
+    // it — the same guard remove_bufferize applies (tinygrad rangeify.py:198,227).
+    let source = UOp::native_const(1.0f32).copy(svod_ir::DeviceSpec::Cpu);
+    let dead_range = UOp::range_axis(UOp::index_const(1), AxisId::Renumbered(0), AxisType::Loop);
+    let stage = UOp::stage(source, vec![dead_range], BufferizeOpts::local());
+
+    assert!(matches!(patterns::dead_axis_removal().rewrite(&stage, &mut ()), RewriteResult::NoMatch));
+}
+
+#[test]
 fn test_dead_axis_removal_mixed_axes() {
     let matcher = patterns::dead_axis_removal();
 
