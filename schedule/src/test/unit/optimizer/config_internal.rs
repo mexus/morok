@@ -66,7 +66,9 @@ fn test_beam_config_builder() {
 fn test_heuristics_config_default() {
     let config = HeuristicsConfig::default();
     assert_eq!(config.tc_enabled, TcUsage::Enabled);
+    // tinygrad `helpers.py:238`: TC_OPT defaults to 0 on the heuristic path.
     assert_eq!(config.tc_opt, TcOpt::Strict);
+    assert_eq!(config.tc_opt.as_usize(), 0);
     assert!(config.matvec_enabled);
     assert_eq!(config.threads_per_row, 8);
     assert_eq!(config.rows_per_thread, 4);

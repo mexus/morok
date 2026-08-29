@@ -305,6 +305,13 @@ pub struct HeuristicsConfig {
     /// Tensor core usage level.
     pub tc_enabled: TcUsage,
     /// Tensor core optimization level.
+    ///
+    /// Defaults to [`TcOpt::Strict`] (`TC_OPT=0`), matching tinygrad
+    /// `helpers.py:238` (`ContextVar("TC_OPT", 0)`), which `heuristic.py:28-32`
+    /// reads on the hand-coded path. `TC_OPT=2` is only the *BEAM action space*
+    /// default (`search.py:22`), so the heuristic path must not inherit it —
+    /// tensor cores would silently PADTO a shape the author did not ask to pad.
+    /// Benchmarks that want the padded behaviour set it explicitly.
     pub tc_opt: TcOpt,
     /// Tensor core selection mode.
     pub tc_select: TcSelect,
