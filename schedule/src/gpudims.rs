@@ -308,18 +308,13 @@ fn compute_store_masks(
             continue;
         };
 
-        // Check if store targets global memory. Structured PARAM/BUFFER nodes
-        // carry address space in ParamArg; their dtype is the stored element.
-        let is_global_store = match index.op() {
-            Op::Index { buffer, .. } => matches!(
-                buffer.op(),
-                Op::Param { arg, .. } | Op::Buffer { arg, .. }
-                    if arg.addrspace == Some(svod_dtype::AddrSpace::Global)
-            ),
-            _ => continue,
-        };
-
-        if !is_global_store {
+        // Tinygrad reads `idx.src[0].addrspace` (`gpudims.py:76`), and
+        // `UOp.addrspace` is recursive: it projects through AFTER/CAST/INDEX and
+        // agrees across the sources of a STACK. Matching PARAM/BUFFER one level
+        // deep instead missed every wrapped target — a STACK of params, or a
+        // param behind an AFTER — and silently dropped the store mask.
+        let Op::Index { buffer, .. } = index.op() else { continue };
+        if buffer.addrspace() != Some(svod_dtype::AddrSpace::Global) {
             continue;
         }
 

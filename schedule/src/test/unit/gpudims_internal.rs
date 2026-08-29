@@ -112,11 +112,17 @@ fn test_non_device_end_keeps_param_counterexample() {
     assert!(Arc::ptr_eq(&lowered, &ended));
 }
 
-#[test]
-fn test_missing_group_reduce_masks_structured_global_param_store() {
+#[test_case(UOp::param(0, 16, DType::Float32, None); "bare global param")]
+#[test_case(UOp::param(0, 16, DType::Float32, None).after(smallvec::smallvec![UOp::noop()]); "param behind AFTER")]
+#[test_case(UOp::stack(smallvec::smallvec![
+    UOp::param(0, 16, DType::Float32, None),
+    UOp::param(1, 16, DType::Float32, None),
+]); "stack of global params")]
+fn test_missing_group_reduce_masks_structured_global_param_store(buffer: Arc<UOp>) {
     let group = UOp::range_axis(UOp::index_const(4), svod_ir::AxisId::Renumbered(0), AxisType::GroupReduce);
-    let buffer = UOp::param(0, 16, DType::Float32, None);
-    let index = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().expect("index");
+    // A symbolic offset keeps the INDEX from folding through the STACK row.
+    let offset = UOp::variable("off".to_string(), 0, 15, DType::Index);
+    let index = UOp::index().buffer(buffer).indices(vec![offset]).call().expect("index");
     let store = index.store(group.cast(DType::Float32));
     let sink = UOp::sink(vec![store]);
 
