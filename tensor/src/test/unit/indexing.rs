@@ -237,6 +237,27 @@ crate::codegen_tests! {
         assert_eq!(view[[2, 1]], 1);
     }
 
+    fn test_nonzero_interior_singleton(config) {
+        // Every interior axis needs the modulo, singleton dims included: without it
+        // a `[2, 1, 3]` tensor reports `[1, 1, 0]` for the element at `(1, 0, 0)`.
+        for dims in [vec![2usize, 1, 3], vec![1, 3], vec![3, 1, 1]] {
+            let numel: usize = dims.iter().product();
+            let shape = dims.iter().map(|&d| d as isize).collect::<Vec<_>>();
+            let t = Tensor::from_slice(vec![1i32; numel]).try_reshape(shape).unwrap();
+            let mut result = t.nonzero().unwrap().contiguous();
+            result.realize_with(&config).unwrap();
+            assert_eq!(get_shape(&result), vec![numel, dims.len()]);
+            let mut expected = Vec::new();
+            for flat in 0..numel {
+                for axis in 0..dims.len() {
+                    let stride: usize = dims[axis + 1..].iter().product();
+                    expected.push((flat / stride % dims[axis]) as i32);
+                }
+            }
+            assert_eq!(result.as_vec::<i32>().unwrap(), expected, "dims {dims:?}");
+        }
+    }
+
     // =========================================================================
     // Symbolic-batch indexing (the WavLM JIT path: dim 0 is a bound Variable)
     // =========================================================================

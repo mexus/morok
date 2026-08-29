@@ -495,7 +495,9 @@ impl Tensor {
                 } else {
                     selected.try_div(&Tensor::const_(ConstValue::Int(stride as i64), index_dtype.clone()))?
                 };
-                if dims[axis] != 1 {
+                // Axis 0 needs no modulo (the division already bounds it); every interior
+                // axis does, singleton dims included.
+                if axis != 0 {
                     coord = coord.try_mod(&Tensor::const_(ConstValue::Int(dims[axis] as i64), index_dtype.clone()))?;
                 }
                 coord.cast(DType::Int32)
