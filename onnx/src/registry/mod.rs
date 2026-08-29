@@ -103,7 +103,7 @@ impl OpRegistry {
                 vec![if fmod == 1 {
                     // fmod=1: C-style remainder (sign of dividend)
                     if x.uop().dtype().is_int() {
-                        Tensor::from_lazy(x.uop().try_cmod(&y.uop())?)
+                        x.try_cmod(y)?
                     } else {
                         // floats: x - trunc(x/y) * y (primitive MOD is integer-only)
                         let div = x.try_div(y)?;
