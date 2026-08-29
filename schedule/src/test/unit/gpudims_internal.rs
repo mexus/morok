@@ -215,3 +215,23 @@ fn test_group_dims_symbolic_fits_under_vmax() {
     assert_eq!(dim_max(&result[1]), 8);
     assert_eq!(dim_max(&result[2]), 8);
 }
+
+#[test]
+fn test_symbolic_identity_dims_return_bare_specials() {
+    let n = UOp::variable("n".to_string(), 1, 1024, DType::WeakInt);
+    let out = get_grouped_dims("gidx", &[n, UOp::index_const(8)], None, true);
+
+    assert!(
+        out.iter().all(|u| matches!(u.op(), Op::Special { .. })),
+        "an ungrouped, unsplit shape must not leave a symbolic FloorDiv/FloorMod: {:?}",
+        out.iter().map(|u| u.tree()).collect::<Vec<_>>(),
+    );
+    let names: Vec<&str> = out
+        .iter()
+        .map(|u| match u.op() {
+            Op::Special { name, .. } => name.as_str(),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(names, vec!["gidx1", "gidx0"], "reverse=true names the innermost axis gidx0");
+}

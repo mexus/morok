@@ -470,6 +470,23 @@ fn get_grouped_dims(prefix: &str, dims: &[Arc<UOp>], max_sizes: Option<&[usize]>
 
     let raw_idxs: Vec<Arc<UOp>> =
         limited.iter().enumerate().map(|(i, s)| UOp::special(s.clone(), format!("{prefix}{i}"))).collect();
+
+    // Nothing was grouped or split, so the flatten/divmod round-trip below is
+    // the identity on a mixed-radix decomposition whose digits are exactly the
+    // SPECIALs' own bounds: return them directly.
+    //
+    // Tinygrad dropped this early exit (it is `gpudims.py:57` at 1f8b24a6b) once
+    // the four exits collapsed into one expression, because `ssimplify` folds
+    // the round-trip away for concrete dims. It does not fold it away for a
+    // symbolic divisor: `get_grouped_dims("gidx", (n, 8), None, reverse=True)`
+    // still renders `(gidx1%n)` and `(gidx0+gidx1//n)` at the pin, because
+    // nothing there proves `gidx1 < n`. Ours leaves the whole
+    // `(gidx0*n+gidx1)` round-trip standing, so a symbolic launch dimension
+    // burns a FloorDiv and a FloorMod in every index expression downstream.
+    if dims_eq(&limited, dims) {
+        return raw_idxs;
+    }
+
     let product =
         |values: &[Arc<UOp>]| values.iter().cloned().reduce(|a, b| a.mul(&b)).unwrap_or_else(|| UOp::index_const(1));
     let flat = raw_idxs
