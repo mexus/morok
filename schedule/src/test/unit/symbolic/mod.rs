@@ -1704,6 +1704,19 @@ fn test_propagate_invalid_through_comparison_preserves_gate() {
     assert!(matches!(value.op(), Op::Binary(BinaryOp::Lt, _, _)));
     assert!(UOp::is_invalid_marker(invalid));
     assert_eq!(invalid.dtype(), DType::Bool);
+
+    // A bare Invalid poisons a non-comparison binary from either side, but a
+    // comparison keeps it as an operand (tinygrad uop/symbolic.py:75-77).
+    // Invalid only reaches an operand slot through source reconstruction, so build
+    // the poisoned nodes directly rather than through the promoting constructors.
+    let index = UOp::var("i", DType::Index, 0, 100);
+    let marker = UOp::invalid_marker();
+    let binary = |op, lhs: &Arc<UOp>, rhs: &Arc<UOp>| UOp::new(Op::Binary(op, lhs.clone(), rhs.clone()), DType::Index);
+    for poisoned in [binary(BinaryOp::Sub, &index, &marker), binary(BinaryOp::Sub, &marker, &index)] {
+        assert!(UOp::is_invalid_marker(&graph_rewrite(propagate_invalid(), poisoned, &mut ())));
+    }
+    let compared = UOp::new(Op::Binary(BinaryOp::Lt, index, marker), DType::Bool);
+    assert!(matches!(graph_rewrite(propagate_invalid(), compared, &mut ()).op(), Op::Binary(BinaryOp::Lt, _, _)));
 }
 
 #[test]

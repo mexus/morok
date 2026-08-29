@@ -468,11 +468,18 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
                 },
         },
 
-        // ALU with bare Invalid → Invalid
+        // ALU with bare Invalid → Invalid, in either operand position
+        // (tinygrad `uop/symbolic.py:77` matches `src=[invalid_pat, UPat()]`
+        // order-insensitively). Comparisons are excluded there and here: they
+        // keep the gate via the two rules above (`symbolic.py:75-76`), which
+        // cover every binary op including `GroupOp.Comparison`.
+        //
         // Tinygrad's Invalid is the bottom of the promotion lattice. Svod uses
         // a typed marker, so create one with the operation's result dtype.
         for op in binary [Add, Mul, Sub, FloorMod, Max, FloorDiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
             op(invalid, _y) if UOp::is_invalid_marker(invalid)
+                ~> { let _ = op; UOp::invalid_marker() },
+            op(_y, invalid) if UOp::is_invalid_marker(invalid)
                 ~> { let _ = op; UOp::invalid_marker() },
         },
     }
