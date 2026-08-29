@@ -1459,8 +1459,7 @@ impl AmdComputeQueue {
                 );
             }
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            let linked = crate::hcq::CommandBufferCache::default()
-                .link(&program.aql, &crate::hcq::LinkPatchValues(vec![control_gpu]))?;
+            let linked = pool.link(&program.aql, &crate::hcq::LinkPatchValues(vec![control_gpu]))?;
             self.publish_linked_aql_timeline(pool, &linked.replay_buffer(), next)?;
             let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps.clone());
             return Ok(HcqDispatchResult { timestamps, finalizer });

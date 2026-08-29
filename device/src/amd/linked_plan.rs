@@ -12,9 +12,9 @@ use crate::amd::queue::{
 use crate::device::PlanCall;
 use crate::error::{Error, Result};
 use crate::hcq::{
-    AmdPm4Dispatch, Command, CommandBufferCache, CommandField, ComputeDispatch, KERNARG_ALIGN, LinkPatchValues,
-    LinkedCommandBuffer, PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, SemanticLinkedPlan,
-    Submission, SubmissionTimelines, SystemField, SystemPatchValues, kernarg_offsets,
+    AmdPm4Dispatch, Command, CommandField, ComputeDispatch, KERNARG_ALIGN, LinkPatchValues, LinkedCommandBuffer,
+    PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, SemanticLinkedPlan, Submission,
+    SubmissionTimelines, SystemField, SystemPatchValues, kernarg_offsets,
 };
 
 pub(crate) fn native_topology_decline(
@@ -330,8 +330,7 @@ impl AmdLinkedPlan {
                         _ => return Err(Error::NotHostVisible { what: "AQL HCQ submission program" }),
                     };
                     links.push(gpu);
-                    let linked_control =
-                        CommandBufferCache::default().link(&program.control, &LinkPatchValues(links.clone()))?;
+                    let linked_control = lane.link(&program.control, &LinkPatchValues(links.clone()))?;
                     control = Some(NativeControlProgram {
                         replay: linked_control.replay_buffer(),
                         linked: linked_control,
@@ -354,7 +353,7 @@ impl AmdLinkedPlan {
                 }
                 QueueKind::Copy(_) => {}
             }
-            let linked = CommandBufferCache::default().link(&lowered, &LinkPatchValues(links.clone()))?;
+            let linked = lane.link(&lowered, &LinkPatchValues(links.clone()))?;
             native.push(NativeSubmission {
                 queue: submission.queue,
                 operation_slot,

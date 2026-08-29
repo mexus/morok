@@ -19,9 +19,9 @@ use crate::amd::queue::{
 use crate::device::{Graph, GraphKernel};
 use crate::error::{Error, Result};
 use crate::hcq::{
-    AmdPm4Dispatch, Command, CommandBufferCache, CommandField, ComputeDispatch, KERNARG_ALIGN, LinkPatchValues,
-    LinkedCommandBuffer, PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, Submission, SystemField,
-    SystemPatchValues, kernarg_offsets,
+    AmdPm4Dispatch, Command, CommandField, ComputeDispatch, KERNARG_ALIGN, LinkPatchValues, LinkedCommandBuffer,
+    PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, Submission, SystemField, SystemPatchValues,
+    kernarg_offsets,
 };
 
 struct KernargSlot {
@@ -86,6 +86,7 @@ unsafe impl Sync for AmdGraph {}
 
 fn lower_graph_submission(
     allocator: &AmdAllocator,
+    lane: &crate::amd::connector::PoolQueue,
     submission: &Submission,
     links: &[u64],
     state: Pm4LoweringState,
@@ -94,7 +95,7 @@ fn lower_graph_submission(
     if pm4 {
         let lowered = lower_hcq_pm4_command_buffer(submission, state)?;
         build_pm4_indirect_buffer(0, lowered.bytes.len() / 4)?;
-        let linked = CommandBufferCache::default().link(&lowered, &LinkPatchValues(links.to_vec()))?;
+        let linked = lane.link(&lowered, &LinkPatchValues(links.to_vec()))?;
         let buffer = AmdBufferGuard::new(
             allocator.alloc_host_visible_tagged(lowered.bytes.len().max(16), crate::amd::va_registry::AllocTag::Gtt)?,
         );
@@ -119,8 +120,8 @@ fn lower_graph_submission(
     let mut native_links = links.to_vec();
     native_links.push(gpu);
     let values = LinkPatchValues(native_links);
-    let control = CommandBufferCache::default().link(&program.control, &values)?;
-    let linked = CommandBufferCache::default().link(&program.aql, &values)?;
+    let control = lane.link(&program.control, &values)?;
+    let linked = lane.link(&program.aql, &values)?;
     Ok((linked, Some(GraphControl { linked: control, host, gpu, buffer: buffer.into_inner() })))
 }
 
@@ -295,7 +296,7 @@ impl AmdGraph {
                 target_major: device.core().arch.gfx_major(),
                 completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
             };
-            Some(lower_graph_submission(allocator, &profiled, &links, state, pm4)?)
+            Some(lower_graph_submission(allocator, &lane, &profiled, &links, state, pm4)?)
         };
 
         let state = Pm4LoweringState {
@@ -304,7 +305,7 @@ impl AmdGraph {
             target_major: device.core().arch.gfx_major(),
             completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
         };
-        let (linked, control) = lower_graph_submission(allocator, &submission, &links, state, pm4)?;
+        let (linked, control) = lower_graph_submission(allocator, &lane, &submission, &links, state, pm4)?;
         let command = linked.replay_buffer();
         let profile_command = profile_linked.as_ref().map(|(linked, _)| linked.replay_buffer());
         let control_command = control.as_ref().map(|control| control.linked.replay_buffer());

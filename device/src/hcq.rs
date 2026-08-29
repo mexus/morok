@@ -1154,6 +1154,11 @@ pub struct CommandBufferCache {
 }
 
 impl CommandBufferCache {
+    /// Single-shot link with a placeholder `(0, DeviceSpec::Cpu)` context.
+    ///
+    /// Only safe for a cache that is not shared across devices or lanes —
+    /// production AMD paths link through `PoolQueue::link`, which supplies the
+    /// real lane and device.
     pub fn link(
         &mut self,
         lowered: &LoweredCommandBuffer,

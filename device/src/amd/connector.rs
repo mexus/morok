@@ -60,6 +60,12 @@ pub(crate) struct PoolQueue {
     /// `synchronize_all` drains them via the core's `Weak<PoolQueue>` registry
     /// without touching the queue.
     inflight: Mutex<VecDeque<Arc<SubmissionFinalizer>>>,
+    /// Linked command buffers minted against this lane. Linked storage embeds
+    /// this lane's GPU virtual addresses (scratch, kernarg arena, control
+    /// program), so it is only reusable within the lane that produced it —
+    /// hence one cache per lane rather than a fresh
+    /// `CommandBufferCache::default()` at every link site, which never hit.
+    link_cache: Mutex<crate::hcq::CommandBufferCache>,
 }
 
 /// Atomic lane claims, split from queue construction so exclusivity can be
@@ -315,6 +321,21 @@ impl SubmissionFinalizer {
 }
 
 impl PoolQueue {
+    /// Link `lowered` against this lane, reusing the linked storage when the
+    /// same packets and immutable addresses were linked here before.
+    ///
+    /// Keyed on `(lane, device)` rather than `CommandBufferCache::link`'s
+    /// `(0, DeviceSpec::Cpu)` placeholder: the addresses baked into a linked
+    /// buffer are only valid inside the lane's VM.
+    pub(crate) fn link(
+        &self,
+        lowered: &crate::hcq::LoweredCommandBuffer,
+        values: &crate::hcq::LinkPatchValues,
+    ) -> Result<Arc<crate::hcq::LinkedCommandBuffer>> {
+        let device = svod_dtype::DeviceSpec::Amd { device_id: self.core.node.node_id as usize };
+        self.link_cache.lock().link_for_context(self as *const Self as u64, &device, lowered, values)
+    }
+
     /// Build a pool queue with its own KFD compute queue + kernarg arena +
     /// pre-reserved scratch. The PM4 counter signal is acquired from the core's
     /// shared `SignalPool` (which the factory must have installed first —
@@ -357,6 +378,7 @@ impl PoolQueue {
             }),
             pm4_counter,
             inflight: Mutex::new(VecDeque::new()),
+            link_cache: Mutex::default(),
         });
         // Register in the core so `synchronize_all` can drain this queue's
         // in-flight work via `Weak<PoolQueue>`, reading only signal slots and
