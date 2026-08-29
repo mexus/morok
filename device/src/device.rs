@@ -10,8 +10,6 @@
 //! and share compiled kernels via the method cache.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::{Child, ExitStatus};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -965,78 +963,11 @@ pub trait Compiler: Send + Sync {
     /// ```
     fn compile(&self, spec: &ProgramSpec) -> Result<CompiledSpec>;
 
-    /// Start an independently spawned compiler process for BEAM. `None` means
-    /// this compiler has no process boundary and must be called sequentially.
-    fn start_compile_process(&self, _spec: &ProgramSpec) -> Result<Option<CompilerProcessTask>> {
-        Ok(None)
-    }
-
-    /// Validate and publish bytes returned by [`CompilerProcessTask::Spawned`].
-    fn finish_compile_process(&self, _spec: &ProgramSpec, _bytes: Vec<u8>) -> Result<Vec<u8>> {
-        Err(Error::Runtime { message: "compiler does not support isolated process completion".into() })
-    }
-
     /// Cache key identifying the exact compiler configuration.
     ///
     /// This includes the backend and all target/toolchain/ABI settings that can
     /// affect bytes, not merely a family name such as `clang`.
     fn cache_key(&self) -> &str;
-}
-
-/// A compiler result that is either already cached or running in a clean child.
-pub enum CompilerProcessTask {
-    Ready(Vec<u8>),
-    Spawned(CompilerProcess),
-}
-
-/// One directly spawned compiler process with file-backed output.
-///
-/// File-backed stdout avoids pipe-capacity deadlocks while the parent streams
-/// completions with `try_wait`. Dropping a live task kills and reaps it.
-pub struct CompilerProcess {
-    child: Child,
-    output_path: PathBuf,
-    stderr_path: PathBuf,
-    cleanup_dir: PathBuf,
-}
-
-impl CompilerProcess {
-    pub fn new(child: Child, output_path: PathBuf, stderr_path: PathBuf, cleanup_dir: PathBuf) -> Self {
-        Self { child, output_path, stderr_path, cleanup_dir }
-    }
-
-    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
-    }
-
-    pub fn kill(&mut self) -> std::io::Result<()> {
-        self.child.kill()
-    }
-
-    pub fn finish(mut self) -> Result<Vec<u8>> {
-        let status =
-            self.child.wait().map_err(|error| Error::Runtime { message: format!("wait for compiler: {error}") })?;
-        let stderr = std::fs::read_to_string(&self.stderr_path).unwrap_or_default();
-        if !status.success() {
-            return Err(Error::Runtime { message: format!("compiler process failed with {status}:\n{stderr}") });
-        }
-        let bytes = std::fs::read(&self.output_path)
-            .map_err(|error| Error::Runtime { message: format!("read compiler output: {error}\n{stderr}") })?;
-        if bytes.is_empty() {
-            return Err(Error::Runtime { message: format!("compiler produced empty output\n{stderr}") });
-        }
-        Ok(bytes)
-    }
-}
-
-impl Drop for CompilerProcess {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-        let _ = std::fs::remove_dir_all(&self.cleanup_dir);
-    }
 }
 
 /// A renderer that transforms UOp graphs into source code.

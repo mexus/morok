@@ -503,14 +503,13 @@ impl Submission {
 #[derive(Debug)]
 pub struct CpuQueueExecutor {
     signals: std::collections::HashMap<u64, u64>,
-    trace: Vec<(QueueKind, Command)>,
     clock_ns: u64,
     clock_step_ns: u64,
 }
 
 impl Default for CpuQueueExecutor {
     fn default() -> Self {
-        Self { signals: std::collections::HashMap::new(), trace: Vec::new(), clock_ns: 0, clock_step_ns: 1 }
+        Self { signals: std::collections::HashMap::new(), clock_ns: 0, clock_step_ns: 1 }
     }
 }
 
@@ -525,10 +524,6 @@ impl CpuQueueExecutor {
 
     pub fn signal_value(&self, address: u64) -> Option<u64> {
         self.signals.get(&address).copied()
-    }
-
-    pub fn trace(&self) -> &[(QueueKind, Command)] {
-        &self.trace
     }
 
     /// # Safety
@@ -582,7 +577,6 @@ impl CpuQueueExecutor {
                     self.signals.insert(*dst, *value);
                 }
             }
-            self.trace.push((submission.queue, command.clone()));
         }
         Ok(())
     }

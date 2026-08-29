@@ -91,6 +91,7 @@ fn null_hcq_timestamps_use_deterministic_queue_clock() {
     assert_eq!(null.signal_value(0x48), Some(1_025));
     assert_eq!(null.signal_value(0x50), Some(1_050));
     assert_eq!(null.signal_value(0x58), Some(1_075));
+    assert_eq!(null.trace().len(), compute.commands.len() + copy.commands.len());
 }
 
 #[test]
@@ -131,7 +132,6 @@ fn cpu_hcq_mixed_compute_copy_waits_and_finalizers_are_ordered() {
     assert_eq!(executor.signal_value(0x30), Some(100));
     assert_eq!(executor.signal_value(0x38), Some(110));
     assert_eq!(executor.signal_value(0x28), Some(2));
-    assert_eq!(executor.trace().len(), compute.commands.len() + copy.commands.len());
 }
 
 #[test]

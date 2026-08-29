@@ -224,33 +224,6 @@ impl Compiler for AmdCompiler {
     fn cache_key(&self) -> &str {
         &self.cache_key
     }
-
-    fn start_compile_process(&self, spec: &ProgramSpec) -> Result<Option<svod_device::device::CompilerProcessTask>> {
-        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
-        if let Some(cache) = &self.cache
-            && let Some(bytes) = cache
-                .get_validated(&key, |bytes| crate::amd::compile::validate_amd_object(bytes, self.arch, &spec.name))
-                .map_err(runtime_as_device)?
-        {
-            return Ok(Some(svod_device::device::CompilerProcessTask::Ready(bytes)));
-        }
-        let process = crate::amd::compile::spawn_ir_to_amd_object(&self.toolchain, &spec.src, self.arch)?;
-        Ok(Some(svod_device::device::CompilerProcessTask::Spawned(process)))
-    }
-
-    fn finish_compile_process(&self, spec: &ProgramSpec, bytes: Vec<u8>) -> Result<Vec<u8>> {
-        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
-        if let Some(cache) = &self.cache {
-            cache
-                .publish_compiled(&key, bytes, |bytes| {
-                    crate::amd::compile::validate_amd_object(bytes, self.arch, &spec.name)
-                })
-                .map_err(runtime_as_device)
-        } else {
-            crate::amd::compile::validate_amd_object(&bytes, self.arch, &spec.name).map_err(runtime_as_device)?;
-            Ok(bytes)
-        }
-    }
 }
 
 fn runtime_as_device(error: crate::Error) -> svod_device::Error {

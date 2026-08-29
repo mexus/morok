@@ -56,17 +56,6 @@ fn cpu_object_validation_checks_header_and_entry_symbol() {
     assert!(validate_c_object(&wrong_machine, "cached_kernel").is_err());
 }
 
-#[test]
-fn clean_compiler_process_produces_valid_object() {
-    let toolchain = ClangToolchain::discover(None).unwrap();
-    let mut process = spawn_compile_process(&toolchain, "void isolated_kernel(void) {}\n", &c_object_flags()).unwrap();
-    while process.try_wait().unwrap().is_none() {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    let object = process.finish().unwrap();
-    validate_c_object(&object, "isolated_kernel").unwrap();
-}
-
 /// `-march=native` resolves against the running CPU, so its `-###` probe must
 /// never be shared between hosts; an explicit arch must be.
 #[test_case::test_case("-march=native" => false; "host-resolved arch")]
