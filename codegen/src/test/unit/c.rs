@@ -209,7 +209,7 @@ fn clang_store_width_follows_the_stored_value() {
 }
 
 #[test]
-fn clang_stack_dereferences_address_carrying_index_lanes() {
+fn clang_stack_packs_loaded_index_lanes() {
     let shrink = UOp::new(
         Op::Shrink {
             src: UOp::param(0, 8, DType::Float32, None),
@@ -220,11 +220,12 @@ fn clang_stack_dereferences_address_carrying_index_lanes() {
     );
     let lanes = (0..4)
         .map(|lane| {
-            UOp::index()
+            let index = UOp::index()
                 .buffer(shrink.clone())
                 .indices(vec![UOp::const_(DType::Index, ConstValue::Int(lane))])
                 .call()
-                .unwrap()
+                .unwrap();
+            UOp::load().index(index).call()
         })
         .collect();
     let output = UOp::new(
@@ -237,8 +238,8 @@ fn clang_stack_dereferences_address_carrying_index_lanes() {
     );
     let rendered =
         render_linearized(&UOp::sink(vec![output.store(UOp::stack(lanes).detach())]), Some("stack_index_lanes"))
-            .expect("render STACK of address INDEX lanes");
-    assert!(rendered.code.contains("(float4){*("), "{}", rendered.code);
+            .expect("render STACK of loaded INDEX lanes");
+    assert!(rendered.code.contains("(float4){val0, val1, val2, val3}"), "{}", rendered.code);
     assert_c_compiles(&rendered.code);
 }
 

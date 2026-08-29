@@ -950,16 +950,7 @@ fn render_vectorize(dst: &str, elements: &[Arc<UOp>], ctx: &RenderContext, kerne
 
     let mut prev = "poison".to_string();
     for (i, elem) in elements.iter().enumerate() {
-        // Devectorize builds STACK(INDEX(..)) where tinygrad builds
-        // VECTORIZE(LOAD(INDEX(..))), so an address-carrying lane has to be
-        // loaded here — the same compensation the C renderer makes in STACK.
-        let val = if matches!(elem.op(), Op::Index { .. }) && elem.addrspace().is_some() {
-            let loaded = format!("{dst}.l{i}");
-            kernel.push(format!("  {loaded} = load {scalar_type}, ptr {}", ctx.get(elem)));
-            loaded
-        } else {
-            ctx.get(elem).to_string()
-        };
+        let val = ctx.get(elem);
         let next = if i == count - 1 { dst.to_string() } else { format!("{dst}.v{i}") };
         kernel.push(format!("  {next} = insertelement {vec_type} {prev}, {scalar_type} {val}, i32 {i}"));
         prev = next;

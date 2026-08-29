@@ -1484,7 +1484,10 @@ pub fn devectorize_patterns() -> &'static TypedPatternMatcher {
                 // WMMA operands must be STACK or WMMA before later lowering.
                 wmma @ Wmma { a: _, b: _, c: _, metadata: _ } => stack_wmma_sources(wmma),
 
-                // A shaped index argument represents independent INDEX operations.
+                // A shaped index argument represents independent INDEX operations. The
+                // lanes stay addresses -- tinygrad `codegen/__init__.py:155-157` -- because
+                // `devectorize_alu` on the enclosing LOAD or STORE is what materialises the
+                // per-lane LOAD(INDEX) / STORE(INDEX).
                 Index { buffer, indices }
                     if matches!(buffer.op(), Op::Param { .. } | Op::Buffer { .. })
                         && indices.len() == 1 && matches!(indices[0].op(), Op::Stack { .. })
@@ -1694,7 +1697,13 @@ fn stack_wmma_sources(wmma: &Arc<UOp>) -> Option<Arc<UOp>> {
             let count = shape.iter().try_fold(1usize, |product, dim| Some(product * dim.as_const()?))?;
             Some(UOp::stack(
                 (0..count)
-                    .map(|i| UOp::index().buffer(source.clone()).indices(vec![UOp::index_const(i as i64)]).call().ok())
+                    .map(|i| {
+                        // WMMA operands are values. tinygrad's `do_stack_wmma` runs after
+                        // `pm_add_loads`, so its lanes are already loaded; this pass shares a
+                        // rewrite with the index split, so the LOAD is materialised here.
+                        let lane = UOp::index().buffer(source.clone()).indices(vec![UOp::index_const(i as i64)]);
+                        Some(maybe_load(&lane.call().ok()?))
+                    })
                     .collect::<Option<_>>()?,
             ))
         })

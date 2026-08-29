@@ -620,11 +620,11 @@ fn element(buffer: std::sync::Arc<UOp>, lane: i64) -> std::sync::Arc<UOp> {
     UOp::index().buffer(buffer).indices(vec![UOp::const_(DType::Index, ConstValue::Int(lane))]).call().unwrap()
 }
 
-/// STACK over address-carrying INDEX lanes: each lane must be loaded before the
-/// insertelement (CB1).
-fn stack_of_address_index_lanes_row() -> std::sync::Arc<UOp> {
+/// STACK over LOAD(INDEX) lanes: the load is a node, not something the renderer
+/// invents at the insertelement (CB1).
+fn stack_of_loaded_index_lanes_row() -> std::sync::Arc<UOp> {
     let src = f32_param(1);
-    let lanes = (0..4).map(|lane| element(src.clone(), lane)).collect();
+    let lanes = (0..4).map(|lane| UOp::load().index(element(src.clone(), lane)).call()).collect();
     let out = shrink4(f32_param(0), DType::Float32);
     UOp::sink(vec![out.store(UOp::stack(lanes).detach())])
 }
@@ -673,7 +673,7 @@ fn store_vector_through_scalar_index_row() -> std::sync::Arc<UOp> {
     UOp::sink(vec![element(f32_param(0), 0).store(value)])
 }
 
-#[test_case::test_case(stack_of_address_index_lanes_row; "stack of address index lanes")]
+#[test_case::test_case(stack_of_loaded_index_lanes_row; "stack of loaded index lanes")]
 #[test_case::test_case(cast_of_shaped_stack_row; "cast of shaped stack")]
 #[test_case::test_case(index_into_shrink_row; "index into shrink")]
 #[test_case::test_case(gated_load_with_shaped_alt_row; "gated load with shaped alt")]
