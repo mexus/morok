@@ -55,7 +55,7 @@ pub mod types;
 
 // Re-exports
 pub use beam::{
-    BeamResult, CandidateMetrics, apply_remote_candidate, beam_search, beam_search_cached, beam_search_cached_remote,
+    BeamResult, CandidateMetrics, apply_remote_candidate, beam_search, beam_search_cached_remote,
     beam_search_cached_with_behavior, clear_cache, compute_ops_estimate, hash_post_codegen_ir, replay_opts,
 };
 pub use config::{BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcOpt as TcOptLevel, TcSelect, TcUsage};
@@ -1091,7 +1091,7 @@ fn early_decomposition_patterns(supported: &svod_ir::RendererOps) -> crate::Type
 /// - MUL → SHL: `x * 2^n → x << n` for power-of-two multiplier
 /// - NEG from MUL: `x * -1 → NEG(x)`
 /// - Fast integer division (magic number multiplication)
-fn get_late_rewrite_patterns(renderer: &Renderer, disable_fast_idiv: bool) -> crate::TypedPatternMatcher {
+pub(crate) fn get_late_rewrite_patterns(renderer: &Renderer, disable_fast_idiv: bool) -> crate::TypedPatternMatcher {
     use svod_ir::{BinaryOp as B, TernaryOp as T, UnaryOp as U};
     let supported = renderer.supported_ops().expect("late rewrites require concrete renderer capabilities");
     let mut pm = pm_mod_to_and().clone() + pm_half_bf16_cast().clone();
@@ -1373,6 +1373,7 @@ pub fn optimize_kernel_with_strategy(
 /// * `ast` - The kernel AST to optimize
 /// * `renderer` - Backend capabilities descriptor
 /// * `config` - Beam search configuration
+/// * `behavior_fingerprint` - Identity of post-optimization behavior outside `BeamConfig`
 /// * `compile_and_time` - Function to compile and time a scheduler
 ///
 /// # Returns
@@ -1395,13 +1396,14 @@ pub fn optimize_kernel_with_strategy(
 ///     Some(result.min)
 /// };
 ///
-/// let result = optimize_kernel_beam(ast, &renderer, &config, compile_and_time)?;
+/// let result = optimize_kernel_beam(ast, &renderer, &config, 0, compile_and_time)?;
 /// let optimized_ast = result.scheduler.get_optimized_ast(None);
 /// ```
 pub fn optimize_kernel_beam<F>(
     ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     config: &BeamConfig,
+    behavior_fingerprint: u64,
     compile_and_time: F,
 ) -> Result<BeamResult, error::OptError>
 where
@@ -1417,7 +1419,7 @@ where
     let _ = scheduler.convert_loop_to_global();
 
     // Step 4: Run beam search (with caching)
-    beam::beam_search_cached(scheduler, config, compile_and_time)
+    beam::beam_search_cached_with_behavior(scheduler, config, behavior_fingerprint, compile_and_time)
 }
 
 /// Create a scheduler ready for optimization without applying any opts.

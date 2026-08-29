@@ -972,31 +972,12 @@ fn cache_invalidate(key: &CacheKey) {
 
 /// Run beam search with disk caching.
 ///
-/// Checks the cache before running beam search. If a cached result exists,
-/// replays the optimizations instead of searching. Results are cached after
-/// successful search.
+/// Run cached beam search, replaying a cached plan when one exists.
 ///
-/// # Arguments
-///
-/// * `scheduler` - Initial scheduler state
-/// * `config` - Beam search configuration (includes disable_cache flag)
-/// * `compile_and_time` - Function to compile and time a scheduler state
-///
-/// # Returns
-///
-/// `BeamResult` containing the best scheduler found.
-pub fn beam_search_cached<F>(
-    scheduler: Scheduler,
-    config: &BeamConfig,
-    compile_and_time: F,
-) -> Result<BeamResult, OptError>
-where
-    F: Fn(&Scheduler, Option<Duration>) -> Option<CandidateMetrics> + Sync,
-{
-    beam_search_cached_with_behavior(scheduler, config, 0, compile_and_time)
-}
-
-/// Run cached beam search with an explicit post-optimization behavior identity.
+/// `behavior_fingerprint` identifies post-optimization behavior that
+/// `BeamConfig` does not capture (see `OptimizerConfig::transcendental` and
+/// `disable_fast_idiv`). It is a required argument: a wrapper that pinned it to
+/// 0 would silently share cache entries across differing post-opt behavior.
 pub fn beam_search_cached_with_behavior<F>(
     scheduler: Scheduler,
     config: &BeamConfig,

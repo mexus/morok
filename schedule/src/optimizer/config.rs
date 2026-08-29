@@ -504,6 +504,10 @@ pub struct OptimizerConfig {
     /// Tinygrad-compatible transcendental mode. Values >= 2 force decomposition.
     pub transcendental: i32,
     /// Disable non-power-of-two magic integer division rewrites.
+    ///
+    /// Defaults to `true`, matching tinygrad `helpers.py:245`
+    /// (`DISABLE_FAST_IDIV = ContextVar("DISABLE_FAST_IDIV", 1)`); its own tests
+    /// opt in with `Context(DISABLE_FAST_IDIV=0)`.
     pub disable_fast_idiv: bool,
 }
 
