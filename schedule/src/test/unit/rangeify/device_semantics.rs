@@ -33,6 +33,19 @@ fn test_copy_device_metadata() {
     assert_eq!(copy.op().children().len(), 1);
 }
 
+#[test]
+fn test_mixed_device_kernel_is_rejected() {
+    let cpu = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
+    let amd = UOp::new_buffer(DeviceSpec::Amd { device_id: 0 }, 8, DType::Float32);
+    let sink = UOp::sink(vec![cpu.try_mul(&amd).unwrap().contiguous()]);
+
+    let (rangeified, _ctx) = crate::rangeify::rangeify(sink).expect("rangeify accepts the mixed graph");
+    assert!(
+        crate::rangeify::try_get_kernel_graph(rangeified).is_err(),
+        "a non-copy kernel must read and write one device"
+    );
+}
+
 // ===== Address Space Tests =====
 
 #[test]
