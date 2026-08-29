@@ -1211,17 +1211,10 @@ pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
             };
             exact_integer_rewrite(original, replacement)
         },
-        // Affine congruence folding. The helper only constructs a candidate;
-        // recursively prove every source and replacement arithmetic node exact.
-        original @ FloorMod(x, c @const(c_val)) => {
-            let replacement = crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, true)?;
-            exact_integer_rewrite(original, replacement)
-        },
-        original @ FloorDiv(x, c @const(c_val)) => {
-            let replacement = crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, false)?;
-            exact_integer_rewrite(original, replacement)
-        },
-        // Symbolic divisors: tinygrad's divide_by_gcd / factor_remainder fallback.
+        // Tinygrad's single div/mod folding entry point (`uop/divandmod.py:108`):
+        // constant and symbolic divisors take the same path. The helper only
+        // constructs a candidate; every source and replacement arithmetic node
+        // is proven exact here.
         original @ FloorMod(x, y) => {
             let replacement = crate::symbolic::divmod::fold_divmod_general(BinaryOp::FloorMod, x, y)?;
             exact_integer_rewrite(original, replacement)
