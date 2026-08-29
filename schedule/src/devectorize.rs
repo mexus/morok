@@ -842,10 +842,18 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
     if let Some((word, from)) = tagged_long(x)
         && let Op::Index { buffer, indices } = x.op()
     {
+        // Re-type exactly as the buffer above: INDEX over a global buffer carries the
+        // element dtype, and `with_ptr_base` is `None` for anything but a Ptr -- which
+        // aborted the whole arm and left both words addressing the same element.
+        let word_dt = long_word_dtype(from)?;
+        let dtype = if matches!(x.dtype(), DType::Ptr { .. }) {
+            x.dtype().with_ptr_base(DType::Scalar(word_dt))?
+        } else {
+            x.dtype().with_base(word_dt)
+        };
         let mut indices = indices.clone();
         let index = indices.last_mut()?;
         *index = index.mul(&index.const_like(2)).add(&index.const_like(word as i64));
-        let dtype = x.dtype().with_ptr_base(DType::Scalar(long_word_dtype(from)?))?;
         return Some(UOp::new(Op::Index { buffer: buffer.clone(), indices }, dtype));
     }
 

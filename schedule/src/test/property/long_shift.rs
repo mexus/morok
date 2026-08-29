@@ -67,11 +67,12 @@ pub fn assert_fully_split(root: &Arc<UOp>) {
     }
 }
 
-/// Run `pm_long_decomp` over `STORE(index, value)` and return `[low, high]`.
-pub fn split_long(from: ScalarDType, value: Arc<UOp>) -> [u32; 2] {
+/// Split `STORE(buffer[at], value)` with `pm_long_decomp` and return each word's
+/// stored bits and the element of the doubled 32-bit buffer it lands on.
+pub fn split_store(from: ScalarDType, at: i64, value: Arc<UOp>) -> [(u32, i64); 2] {
     let index = UOp::index()
-        .buffer(create_buffer_typed(4, from))
-        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+        .buffer(create_buffer_typed(8, from))
+        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(at))])
         .call()
         .unwrap();
     let decomposed = graph_rewrite_bottom_up(&pm_long_decomp(), index.store(value), &mut ());
@@ -79,11 +80,24 @@ pub fn split_long(from: ScalarDType, value: Arc<UOp>) -> [u32; 2] {
 
     let mut words = [None; 2];
     for node in decomposed.toposort() {
-        let Op::Store { value, .. } = node.op() else { continue };
+        let Op::Store { index, value, .. } = node.op() else { continue };
+        let Op::Index { indices, .. } = index.op() else { panic!("a split store addresses an INDEX") };
+        let address = eval_word(indices.last().expect("INDEX carries an index")).expect("address must fold");
         let word = node.tag().as_ref().expect("split store is word-tagged")[1];
-        words[word] = Some(word_bits(eval_word(value).expect("word expression must fold")));
+        words[word] = Some((
+            word_bits(eval_word(value).expect("word expression must fold")),
+            address.try_int().expect("address"),
+        ));
     }
     [words[0].expect("low word"), words[1].expect("high word")]
+}
+
+/// Run `pm_long_decomp` over `STORE(index, value)` and return `[low, high]`. The two
+/// words must land on adjacent elements, never both on the same one.
+pub fn split_long(from: ScalarDType, value: Arc<UOp>) -> [u32; 2] {
+    let [(low, low_at), (high, high_at)] = split_store(from, 1, value);
+    assert_eq!([low_at, high_at], [2, 3], "{from:?} word addresses");
+    [low, high]
 }
 
 /// Run `pm_long_decomp` over `STORE(index, value <op> shift)` and return `[low, high]`.
