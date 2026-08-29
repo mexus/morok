@@ -687,6 +687,18 @@ fn long_bin(op: BinaryOp, a: Arc<UOp>, b: Arc<UOp>, dtype: DType) -> Arc<UOp> {
     UOp::new(Op::Binary(op, a, b), dtype)
 }
 
+/// A constant carrying the 32-bit *word* dtype of `from`.
+///
+/// `const_like` off one of the tagged long references keeps the 64-bit dtype, so the
+/// constant is never word-split and the leftover node stalls the whole rewrite.
+fn word_const(from: ScalarDType, value: i64) -> Arc<UOp> {
+    let word = DType::Scalar(long_word_dtype(from).expect("word constant of a 64-bit dtype"));
+    UOp::const_(
+        word,
+        if from == ScalarDType::Int64 { ConstValue::Int(value) } else { ConstValue::UInt(value as u32 as u64) },
+    )
+}
+
 fn pair_sub(a: (Arc<UOp>, Arc<UOp>), b: (Arc<UOp>, Arc<UOp>)) -> (Arc<UOp>, Arc<UOp>) {
     let borrow = long_bin(BinaryOp::Lt, a.0.clone(), b.0.clone(), DType::Bool).cast(DType::UInt32);
     (
@@ -883,25 +895,30 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Cast away from a long reconstructs the value from its two words.
     if let Op::Cast { src, dtype } = x.op()
-        && long_word_dtype(src.dtype().base()).is_some()
+        && let Some(word) = long_word_dtype(src.dtype().base())
         && long_word_dtype(dtype.base()).is_none()
     {
         let from = src.dtype().base();
-        let a0 = long_part(src, 0, from);
-        let a1 = long_part(src, 1, from);
+        // BITCAST pins each word at 32 bits. A bare tagged reference still reports the
+        // 64-bit dtype, so the comparison rule below would re-split it against its own
+        // words and `a0.cast(dtype)` would re-enter this very arm, feeding a WHERE that
+        // is its own source -- which deadlocks the rewrite into returning the input.
+        let a0 = long_part(src, 0, from).bitcast(DType::Scalar(word));
+        let a1 = long_part(src, 1, from).bitcast(DType::Scalar(word));
+        let a0u = long_part(src, 0, from).bitcast(DType::UInt32);
         if dtype.is_float() {
             let small = long_bin(
                 Or,
                 long_bin(
                     And,
-                    long_bin(Eq, a1.clone(), a1.const_like(0), DType::Bool),
-                    long_bin(Lt, a0.const_like(-1), a0.clone(), DType::Bool),
+                    long_bin(Eq, word_const(from, 0), a1.clone(), DType::Bool),
+                    long_bin(Lt, word_const(from, -1), a0.clone(), DType::Bool),
                     DType::Bool,
                 ),
                 long_bin(
                     And,
-                    long_bin(Eq, a1.clone(), a1.const_like(-1), DType::Bool),
-                    long_bin(Lt, a0.clone(), a0.const_like(0), DType::Bool),
+                    long_bin(Eq, word_const(from, -1), a1.clone(), DType::Bool),
+                    long_bin(Lt, a0.clone(), word_const(from, 0), DType::Bool),
                     DType::Bool,
                 ),
                 DType::Bool,
@@ -913,11 +930,10 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
                 UOp::const_(DType::Float32, ConstValue::Float(4294967296.0)),
                 DType::Float32,
             );
-            let low = a0.bitcast(DType::UInt32).cast(DType::Float32);
-            let combined = long_bin(Add, high, low, DType::Float32).cast(dtype.clone());
+            let combined = long_bin(Add, high, a0u.cast(DType::Float32), DType::Float32).cast(dtype.clone());
             return UOp::try_where(small, direct, combined).ok();
         }
-        return Some(a0.bitcast(DType::UInt32).cast(dtype.clone()));
+        return Some(a0u.cast(dtype.clone()));
     }
 
     let (word, from) = tagged_long(x)?;
@@ -981,13 +997,13 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
     if let Op::Unary(svod_ir::UnaryOp::Neg, src) = x.op() {
         let a0 = long_part(src, 0, from);
         let a1 = long_part(src, 1, from);
-        let low = long_bin(Sub, a0.const_like(0), a0.clone(), word_dt.clone());
+        let low = long_bin(Sub, word_const(from, 0), a0.clone(), word_dt.clone());
         return Some(if word == 0 {
             low
         } else {
-            let borrow = long_bin(Lt, a0.const_like(0).bitcast(DType::UInt32), a0.bitcast(DType::UInt32), DType::Bool)
-                .cast(word_dt.clone());
-            long_bin(Sub, long_bin(Sub, a1.const_like(0), a1, word_dt.clone()), borrow, word_dt)
+            let zero = UOp::const_(DType::UInt32, ConstValue::UInt(0));
+            let borrow = long_bin(Lt, zero, a0.bitcast(DType::UInt32), DType::Bool).cast(word_dt.clone());
+            long_bin(Sub, long_bin(Sub, word_const(from, 0), a1, word_dt.clone()), borrow, word_dt)
         });
     }
 
@@ -1015,8 +1031,8 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
                 }
             }
             Mul => {
-                let mask = a0.const_like(0xFFFF);
-                let shift = a0.const_like(16);
+                let mask = UOp::const_(DType::UInt32, ConstValue::UInt(0xFFFF));
+                let shift = UOp::const_(DType::UInt32, ConstValue::UInt(16));
                 let a0u = a0.bitcast(DType::UInt32);
                 let b0u = b0.bitcast(DType::UInt32);
                 let a00 = long_bin(And, a0u.clone(), mask.clone(), DType::UInt32);
@@ -1077,14 +1093,7 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
                 }
             }
             Shl | Shr => {
-                // Constants must carry the *word* dtype: a `const_like` off a tagged long
-                // reference would stay 64-bit and never be split.
-                let wconst = |v: i64| {
-                    UOp::const_(
-                        word_dt.clone(),
-                        if from == ScalarDType::Int64 { ConstValue::Int(v) } else { ConstValue::UInt(v as u64) },
-                    )
-                };
+                let wconst = |v: i64| word_const(from, v);
                 let uconst = |v: u64| UOp::const_(DType::UInt32, ConstValue::UInt(v));
                 // `n` is the shift inside one word; `ge32` picks the "shift crosses the word" case.
                 let n = long_bin(And, b0.clone(), wconst(31), word_dt.clone());

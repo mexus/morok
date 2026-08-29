@@ -231,3 +231,16 @@ fn long_shift_word_split_matches_native(shift: u64) {
         }
     }
 }
+
+/// Word split of `a * b`, `-a` and the cast away from a long (Svod-only pass; see
+/// `test/property/long_shift.rs`).
+#[test_case::test_case(0x89ab_cdef_0123_4567, 0x0000_0001_0000_0003; "mixed words")]
+#[test_case::test_case(u64::MAX, u64::MAX; "all ones")]
+#[test_case::test_case(0x0000_0000_ffff_ffff, 0x0000_0000_0000_0002; "low word carry")]
+fn long_arithmetic_word_split_matches_native(a: u64, b: u64) {
+    use crate::test::property::long_shift::assert_long_arithmetic;
+
+    for from in [ScalarDType::Int64, ScalarDType::UInt64] {
+        assert_long_arithmetic(a, b, from);
+    }
+}
