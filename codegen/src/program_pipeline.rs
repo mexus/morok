@@ -82,6 +82,24 @@ fn validate_program_shape(program: &Arc<UOp>) -> Result<()> {
     Ok(())
 }
 
+/// Verify the linearized list, after `line_rewrite_cleanups` and any renderer
+/// instruction-selection rewrites have run over it.
+///
+/// The sink is verified before linearization (`verify_final_sink`), which is
+/// where the pin does it (`codegen/__init__.py:387`). That leaves the ops only
+/// the list ever holds unchecked: the IF/STORE/ENDIF triple the cleanup
+/// substitutes for a gated STORE never exists in the graph — `spec_program`'s
+/// IF and ENDIF rules had no reachable input at all. tinygrad 1f8b24a6b ran
+/// `type_verify(lst, program_spec)` here (`codegen/__init__.py:141`); keep both
+/// gates.
+fn verify_linear_list(nodes: &[Arc<UOp>]) -> Result<()> {
+    if svod_schedule::spec::spec_enabled() {
+        svod_schedule::spec::type_verify_list(nodes, &svod_schedule::spec::spec_program())
+            .map_err(|error| invalid_program_state(error.to_string()))?;
+    }
+    Ok(())
+}
+
 fn verify_final_sink(sink: &Arc<UOp>) -> Result<()> {
     if svod_schedule::spec::spec_enabled() {
         svod_schedule::spec::type_verify(sink, &svod_schedule::spec::spec_program())
@@ -316,6 +334,7 @@ pub fn do_linearize(program: &Arc<UOp>) -> Result<Arc<UOp>> {
     }
 
     let linear_clean = line_rewrite_cleanups(linear_ops);
+    verify_linear_list(&linear_clean)?;
     let linear_uop = UOp::linear(linear_clean.into());
     let linearized = rebuild_program(program, Some(linear_uop), source, binary)?;
     svod_ir::dump_canonical_stage("linearized", &linearized);

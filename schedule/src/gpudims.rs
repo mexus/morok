@@ -170,7 +170,7 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     let all_idxs: Vec<Arc<UOp>> = if ctx.has_threads {
         // global_shape contains RANGE extents, not range indices. Match
         // Tinygrad's `int(global_shape[0])-1`: Thread(N) has N core IDs.
-        let end = const_to_i64(global_shape[0].vmax()).expect("threaded global shape must have a concrete bound");
+        let end = thread_core_bound(&global_dims, &local_dims, &global_shape)?;
         vec![UOp::variable("core_id".to_string(), 0, end - 1, DType::Int32).cast(DType::WeakInt)]
     } else if dont_use_locals {
         assert!(local_dims.is_empty(), "can't use locals if there's no local dims");
@@ -184,13 +184,7 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
 
         // Create local indices (lidx0, lidx1, ...)
         let local_idxs = get_grouped_dims("lidx", &local_shape, local_max_slice, false);
-        let hw_local: Vec<usize> = local_idxs
-            .iter()
-            .filter_map(|uop| match uop.op() {
-                Op::Special { end, .. } => Some(dim_max(end)),
-                _ => None,
-            })
-            .collect();
+        let hw_local = hardware_local_extents(&local_idxs);
         let global_max = ctx.global_prod_max.as_ref().map_or_else(
             || ctx.global_max.clone(),
             |prod_max| {
@@ -198,7 +192,9 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
                 base.iter()
                     .zip(prod_max)
                     .zip(hw_local.iter().copied().chain(std::iter::repeat(1)).take(3))
-                    .map(|((&global, &product), local)| global.min(product / local))
+                    // A zero-extent local axis would divide by zero; it occupies
+                    // one work-item slot either way, so clamp to 1.
+                    .map(|((&global, &product), local)| global.min(product / local.max(1)))
                     .collect::<Vec<_>>()
                     .into()
             },
@@ -213,13 +209,17 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     let all_dims: Vec<(svod_ir::AxisId, AxisType)> = global_dims.iter().chain(local_dims.iter()).cloned().collect();
 
-    for (i, (axis_id, axis_type)) in all_dims.iter().enumerate() {
+    // Every branch above yields one index per dim (the threaded branch only
+    // after `thread_core_bound` proved there is exactly one), so `zip` never
+    // truncates — it just makes the `idxs[ii]` bound unindexable.
+    debug_assert_eq!(all_dims.len(), all_idxs.len(), "gpudims: one index per GPU dim");
+    for ((axis_id, axis_type), idx) in all_dims.iter().zip(&all_idxs) {
         if *axis_type == AxisType::Reduce {
             // Don't replace reduce axes (they stay as loops)
             continue;
         }
         if let Some(range_uop) = all_ranges.get(&(axis_id.clone(), *axis_type)) {
-            subs.insert(UOpKey(range_uop.clone()), all_idxs[i].clone());
+            subs.insert(UOpKey(range_uop.clone()), idx.clone());
         }
     }
 
@@ -237,6 +237,57 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     Some(sink.substitute(&subs))
+}
+
+/// Hardware extent of each `lidx*` axis behind the local indices.
+///
+/// Tinygrad (`gpudims.py:67`) reads `u.src[0]` off entries that *are* SPECIAL:
+/// `[_dim_max(u.src[0]) for u in local_idxs if u.op is Ops.SPECIAL]`. That only
+/// sees the axes `get_grouped_dims` handed back unchanged — as soon as a local
+/// dim is grouped or split, the returned entry is div/mod arithmetic over the
+/// SPECIALs and the list comes back short (empty in the fully-contracted case),
+/// silently dropping the AMD work-item product cap it feeds. Collect the
+/// SPECIAL leaves instead, deduplicated by `lidx` name so a leaf reachable from
+/// two decomposed indices is counted once, in axis order.
+fn hardware_local_extents(local_idxs: &[Arc<UOp>]) -> Vec<usize> {
+    local_idxs
+        .iter()
+        .flat_map(|idx| idx.toposort())
+        .filter_map(|u| match u.op() {
+            Op::Special { end, name } if name.starts_with("lidx") => Some((name.clone(), dim_max(end))),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
+/// `core_id` upper bound for the threaded path (tinygrad `gpudims.py:60`).
+///
+/// Tinygrad's `int(global_shape[0])-1` silently assumes the sink has exactly
+/// one THREAD axis, no local axes, and a concrete extent — the shape a CPU
+/// renderer produces. Anything else means the scheduler handed us a kernel the
+/// threaded path cannot express: one `core_id` cannot stand in for N ranges.
+/// Return `None` so `add_gpudims` declines the rewrite instead of indexing past
+/// the single produced index (or panicking on a symbolic bound).
+fn thread_core_bound(
+    global_dims: &[(svod_ir::AxisId, AxisType)],
+    local_dims: &[(svod_ir::AxisId, AxisType)],
+    global_shape: &[Arc<UOp>],
+) -> Option<i64> {
+    if global_dims.len() != 1 || !local_dims.is_empty() {
+        tracing::warn!(
+            globals = global_dims.len(),
+            locals = local_dims.len(),
+            "gpudims: threaded renderer needs exactly one global axis and no local axes; skipping"
+        );
+        return None;
+    }
+    let bound = const_to_i64(global_shape.first()?.vmax());
+    if bound.is_none() {
+        tracing::warn!("gpudims: threaded global axis has no concrete bound; skipping");
+    }
+    bound
 }
 
 /// Compute store masks for global stores with missing local indices.
@@ -257,18 +308,13 @@ fn compute_store_masks(
             continue;
         };
 
-        // Check if store targets global memory. Structured PARAM/BUFFER nodes
-        // carry address space in ParamArg; their dtype is the stored element.
-        let is_global_store = match index.op() {
-            Op::Index { buffer, .. } => matches!(
-                buffer.op(),
-                Op::Param { arg, .. } | Op::Buffer { arg, .. }
-                    if arg.addrspace == Some(svod_dtype::AddrSpace::Global)
-            ),
-            _ => continue,
-        };
-
-        if !is_global_store {
+        // Tinygrad reads `idx.src[0].addrspace` (`gpudims.py:76`), and
+        // `UOp.addrspace` is recursive: it projects through AFTER/CAST/INDEX and
+        // agrees across the sources of a STACK. Matching PARAM/BUFFER one level
+        // deep instead missed every wrapped target — a STACK of params, or a
+        // param behind an AFTER — and silently dropped the store mask.
+        let Op::Index { buffer, .. } = index.op() else { continue };
+        if buffer.addrspace() != Some(svod_dtype::AddrSpace::Global) {
             continue;
         }
 
@@ -424,6 +470,23 @@ fn get_grouped_dims(prefix: &str, dims: &[Arc<UOp>], max_sizes: Option<&[usize]>
 
     let raw_idxs: Vec<Arc<UOp>> =
         limited.iter().enumerate().map(|(i, s)| UOp::special(s.clone(), format!("{prefix}{i}"))).collect();
+
+    // Nothing was grouped or split, so the flatten/divmod round-trip below is
+    // the identity on a mixed-radix decomposition whose digits are exactly the
+    // SPECIALs' own bounds: return them directly.
+    //
+    // Tinygrad dropped this early exit (it is `gpudims.py:57` at 1f8b24a6b) once
+    // the four exits collapsed into one expression, because `ssimplify` folds
+    // the round-trip away for concrete dims. It does not fold it away for a
+    // symbolic divisor: `get_grouped_dims("gidx", (n, 8), None, reverse=True)`
+    // still renders `(gidx1%n)` and `(gidx0+gidx1//n)` at the pin, because
+    // nothing there proves `gidx1 < n`. Ours leaves the whole
+    // `(gidx0*n+gidx1)` round-trip standing, so a symbolic launch dimension
+    // burns a FloorDiv and a FloorMod in every index expression downstream.
+    if dims_eq(&limited, dims) {
+        return raw_idxs;
+    }
+
     let product =
         |values: &[Arc<UOp>]| values.iter().cloned().reduce(|a, b| a.mul(&b)).unwrap_or_else(|| UOp::index_const(1));
     let flat = raw_idxs

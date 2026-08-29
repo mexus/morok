@@ -1,4 +1,5 @@
 use super::*;
+use test_case::test_case;
 
 /// Build a Vec<Arc<UOp>> of concrete `index_const` dims for tests that only
 /// exercise the numeric grouping/splitting logic.
@@ -15,7 +16,7 @@ fn dmax(vs: &[Arc<UOp>]) -> Vec<usize> {
 #[test]
 fn test_thread_extent_maps_to_exact_core_id_cardinality() {
     let thread = UOp::range_axis(UOp::index_const(2), svod_ir::AxisId::Renumbered(0), AxisType::Thread);
-    let sink = UOp::sink(vec![thread]);
+    let sink = UOp::sink(vec![thread.clone()]);
 
     let lowered = add_gpudims(&Renderer::cpu(), &sink).expect("thread range should lower to core_id");
     let core_id = lowered
@@ -30,6 +31,10 @@ fn test_thread_extent_maps_to_exact_core_id_cardinality() {
     let info = svod_ir::ProgramInfo::from_sink(&lowered, svod_dtype::DeviceSpec::Cpu);
     assert_eq!(info.global_size[0].vmin(), &ConstValue::Int(2));
     assert_eq!(info.global_size[0].vmax(), &ConstValue::Int(2));
+
+    // One core_id cannot stand in for two THREAD axes: decline, don't panic.
+    let second = UOp::range_axis(UOp::index_const(3), svod_ir::AxisId::Renumbered(1), AxisType::Thread);
+    assert!(add_gpudims(&Renderer::cpu(), &UOp::sink(vec![thread, second])).is_none());
 }
 
 #[test]
@@ -41,14 +46,18 @@ fn test_existing_special_skips_all_gpudims_lowering() {
     assert!(add_gpudims(&Renderer::amd_cdna3(), &sink).is_none());
 }
 
-#[test]
-fn test_global_product_cap_accounts_for_local_extent() {
-    let global = UOp::range_axis(UOp::index_const(1 << 30), svod_ir::AxisId::Renumbered(0), AxisType::Global);
-    let local = UOp::range_axis(UOp::index_const(8), svod_ir::AxisId::Renumbered(1), AxisType::Local);
-    let sink = UOp::sink(vec![global, local]);
-
-    let lowered = add_gpudims(&Renderer::amd_cdna3(), &sink).expect("GPU ranges should lower");
-    let global_special_ends: Vec<usize> = lowered
+/// Extents of the `gidx*` SPECIALs `add_gpudims` emits for the given axes,
+/// sorted so the assertion does not depend on toposort order.
+fn global_special_extents(renderer: &Renderer, global_extents: &[i64], local_extents: &[i64]) -> Vec<usize> {
+    let mut ranges = Vec::new();
+    for (extents, axis_type) in [(global_extents, AxisType::Global), (local_extents, AxisType::Local)] {
+        for &extent in extents {
+            let axis = svod_ir::AxisId::Renumbered(ranges.len());
+            ranges.push(UOp::range_axis(UOp::index_const(extent), axis, axis_type));
+        }
+    }
+    let lowered = add_gpudims(renderer, &UOp::sink(ranges)).expect("GPU ranges should lower");
+    let mut ends: Vec<usize> = lowered
         .toposort()
         .into_iter()
         .filter_map(|uop| match uop.op() {
@@ -56,9 +65,15 @@ fn test_global_product_cap_accounts_for_local_extent() {
             _ => None,
         })
         .collect();
+    ends.sort_unstable();
+    ends
+}
 
-    assert_eq!(global_special_ends, vec![4, 1 << 28]);
-    assert!(global_special_ends.iter().all(|&end| end <= u32::MAX as usize / 8));
+#[test_case(&[8], &[4, 1 << 28]; "one local axis divides the work item cap")]
+#[test_case(&[0], &[1 << 30]; "zero extent local axis does not divide by zero")]
+#[test_case(&[64, 64, 64, 4], &[32, 1 << 25]; "contracted locals still cap the grid")]
+fn test_global_product_cap_accounts_for_local_extent(local_extents: &[i64], expected: &[usize]) {
+    assert_eq!(global_special_extents(&Renderer::amd_cdna3(), &[1 << 30], local_extents), expected);
 }
 
 #[test]
@@ -97,11 +112,17 @@ fn test_non_device_end_keeps_param_counterexample() {
     assert!(Arc::ptr_eq(&lowered, &ended));
 }
 
-#[test]
-fn test_missing_group_reduce_masks_structured_global_param_store() {
+#[test_case(UOp::param(0, 16, DType::Float32, None); "bare global param")]
+#[test_case(UOp::param(0, 16, DType::Float32, None).after(smallvec::smallvec![UOp::noop()]); "param behind AFTER")]
+#[test_case(UOp::stack(smallvec::smallvec![
+    UOp::param(0, 16, DType::Float32, None),
+    UOp::param(1, 16, DType::Float32, None),
+]); "stack of global params")]
+fn test_missing_group_reduce_masks_structured_global_param_store(buffer: Arc<UOp>) {
     let group = UOp::range_axis(UOp::index_const(4), svod_ir::AxisId::Renumbered(0), AxisType::GroupReduce);
-    let buffer = UOp::param(0, 16, DType::Float32, None);
-    let index = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().expect("index");
+    // A symbolic offset keeps the INDEX from folding through the STACK row.
+    let offset = UOp::variable("off".to_string(), 0, 15, DType::Index);
+    let index = UOp::index().buffer(buffer).indices(vec![offset]).call().expect("index");
     let store = index.store(group.cast(DType::Float32));
     let sink = UOp::sink(vec![store]);
 
@@ -193,4 +214,24 @@ fn test_group_dims_symbolic_fits_under_vmax() {
     assert_eq!(dim_max(&result[0]), 400);
     assert_eq!(dim_max(&result[1]), 8);
     assert_eq!(dim_max(&result[2]), 8);
+}
+
+#[test]
+fn test_symbolic_identity_dims_return_bare_specials() {
+    let n = UOp::variable("n".to_string(), 1, 1024, DType::WeakInt);
+    let out = get_grouped_dims("gidx", &[n, UOp::index_const(8)], None, true);
+
+    assert!(
+        out.iter().all(|u| matches!(u.op(), Op::Special { .. })),
+        "an ungrouped, unsplit shape must not leave a symbolic FloorDiv/FloorMod: {:?}",
+        out.iter().map(|u| u.tree()).collect::<Vec<_>>(),
+    );
+    let names: Vec<&str> = out
+        .iter()
+        .map(|u| match u.op() {
+            Op::Special { name, .. } => name.as_str(),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(names, vec!["gidx1", "gidx0"], "reverse=true names the innermost axis gidx0");
 }

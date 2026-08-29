@@ -1180,3 +1180,31 @@ fn test_get_program_rejects_sink_input() {
 
     assert!(format!("{err}").contains("expected PROGRAM input"));
 }
+
+#[test]
+fn linearized_list_is_verified_after_the_cleanup_rewrite() {
+    let buffer = UOp::param(0, 4, DType::Float32, Some(DeviceSpec::Cpu));
+    let index = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().expect("index");
+    let gate = UOp::const_(DType::Bool, svod_ir::ConstValue::Bool(true));
+    let value = UOp::const_(DType::Float32, svod_ir::ConstValue::Float(1.0));
+    let gated = UOp::new(Op::Store { index, value, gate: Some(gate) }, DType::Void);
+
+    let program = program(committed_sink(vec![gated]), DeviceSpec::Cpu, None, None, None);
+    let linearized = crate::program_pipeline::do_linearize(&program).expect("gated store must linearize and verify");
+
+    let Op::Program { linear: Some(linear), .. } = linearized.op() else { panic!("expected LINEAR stage") };
+    let Op::Linear { ops: instructions } = linear.op() else { panic!("expected LINEAR") };
+    assert!(instructions.iter().any(|u| matches!(u.op(), Op::If { .. })), "cleanup must inject IF");
+    assert!(instructions.iter().any(|u| matches!(u.op(), Op::EndIf { .. })), "cleanup must inject ENDIF");
+
+    // The same gate now reaches spec_program's IF rule, which was unreachable
+    // while verification only ran on the pre-linearization sink.
+    let bare_if = UOp::new(
+        Op::If {
+            condition: UOp::const_(DType::Bool, svod_ir::ConstValue::Bool(true)),
+            body: smallvec::smallvec![UOp::native_const(0i32)],
+        },
+        DType::Void,
+    );
+    assert!(svod_schedule::spec::type_verify_list(&[bare_if], &svod_schedule::spec::spec_program()).is_err());
+}

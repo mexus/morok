@@ -518,10 +518,33 @@ fn partial_tuplize_cmp(
     partial_tuplize_ref_cmp(PartialTuplizeRef::Node(left.clone()), PartialTuplizeRef::Node(right.clone()), cache)
 }
 
+/// Upper bound on the memo below. A rewrite run over one model reaches a few
+/// thousand distinct pairs; the cap only bounds a long-lived worker thread.
+const TUPLIZE_CMP_MEMO_CAP: usize = 1 << 16;
+
+thread_local! {
+    /// Cross-call memo for [`tinygrad_tuplize_cmp`]. Tinygrad gets this for
+    /// free: `tuplize` is a `cached_property` on the UOp (`uop/ops.py:187-189`),
+    /// so a comparison walks each node's key once per process. Ours rebuilt the
+    /// whole comparison from scratch on every call, and the caller is a rewrite
+    /// pattern (`symbolic/patterns.rs:692`) that runs per candidate node.
+    ///
+    /// Keyed by UOp id pairs, which is sound because ids are monotonic and
+    /// never reused (`ir/src/uop/hash_consing.rs:46-52`), so a verdict for a
+    /// pair stays true for the life of the process.
+    static TUPLIZE_CMP_MEMO: std::cell::RefCell<HashMap<(u64, u64), Option<Ordering>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
 /// Compare pinned Tinygrad `(op, arg, dtype, *src.tuplize)` keys without
 /// inventing an order for Python-incomparable or Svod-only values.
 pub(crate) fn tinygrad_tuplize_cmp(left: &Arc<UOp>, right: &Arc<UOp>) -> Option<Ordering> {
-    partial_tuplize_cmp(left, right, &mut HashMap::new())
+    TUPLIZE_CMP_MEMO.with_borrow_mut(|memo| {
+        if memo.len() >= TUPLIZE_CMP_MEMO_CAP {
+            memo.clear();
+        }
+        partial_tuplize_cmp(left, right, memo)
+    })
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -694,31 +717,77 @@ impl PartialOrd for TuplizeKey {
     }
 }
 
+/// One suspended `compare_tuplize` call: `next` is how many of this pair's
+/// source pairs have already come back Equal.
+struct TuplizeFrame {
+    left: Arc<TuplizeKey>,
+    right: Arc<TuplizeKey>,
+    next: usize,
+}
+
+impl TuplizeFrame {
+    fn pair(&self) -> (usize, usize) {
+        (Arc::as_ptr(&self.left) as usize, Arc::as_ptr(&self.right) as usize)
+    }
+}
+
+/// Lexicographic comparison of two tuplize keys.
+///
+/// Iterative rather than recursive: the key mirrors the UOp graph, so a deep
+/// chain (long CAST/PRECAST ladders, unrolled reductions) recursed once per
+/// level and overflowed the 8 MiB main stack around 20-30k deep. The memo is
+/// unchanged; the 128-element key truncation this replaced is *not* reinstated,
+/// because truncating makes the order non-total.
 fn compare_tuplize(
     left: &Arc<TuplizeKey>,
     right: &Arc<TuplizeKey>,
     cache: &mut HashMap<(usize, usize), Ordering>,
 ) -> Ordering {
-    let pair = (Arc::as_ptr(left) as usize, Arc::as_ptr(right) as usize);
-    if let Some(order) = cache.get(&pair) {
-        return *order;
-    }
-    let mut order =
-        left.op.cmp(&right.op).then_with(|| left.arg.cmp(&right.arg)).then_with(|| left.dtype.cmp(&right.dtype));
-    if order == Ordering::Equal {
-        for (a, b) in left.src.iter().zip(&right.src) {
-            order = compare_tuplize(a, b, cache);
-            if order != Ordering::Equal {
-                break;
+    let mut stack = vec![TuplizeFrame { left: left.clone(), right: right.clone(), next: 0 }];
+    // Verdict of the frame just popped, still to be consumed by its parent.
+    let mut settled: Option<Ordering> = None;
+
+    loop {
+        let frame = stack.last_mut().expect("the root frame is popped only by returning");
+        let mut decided = match settled.take() {
+            // A source pair came back: Equal moves on to the next one, anything
+            // else settles this frame.
+            Some(Ordering::Equal) => {
+                frame.next += 1;
+                None
             }
+            Some(order) => Some(order),
+            None => cache.get(&frame.pair()).copied().or_else(|| {
+                let shallow = frame
+                    .left
+                    .op
+                    .cmp(&frame.right.op)
+                    .then_with(|| frame.left.arg.cmp(&frame.right.arg))
+                    .then_with(|| frame.left.dtype.cmp(&frame.right.dtype));
+                (shallow != Ordering::Equal).then_some(shallow)
+            }),
+        };
+
+        if decided.is_none() {
+            decided = match (frame.left.src.get(frame.next), frame.right.src.get(frame.next)) {
+                (Some(a), Some(b)) => {
+                    let (a, b) = (a.clone(), b.clone());
+                    stack.push(TuplizeFrame { left: a, right: b, next: 0 });
+                    None
+                }
+                _ => Some(frame.left.src.len().cmp(&frame.right.src.len())),
+            };
         }
-        if order == Ordering::Equal {
-            order = left.src.len().cmp(&right.src.len());
+
+        let Some(order) = decided else { continue };
+        let pair = stack.pop().expect("the frame was borrowed from the stack").pair();
+        cache.insert(pair, order);
+        cache.insert((pair.1, pair.0), order.reverse());
+        if stack.is_empty() {
+            return order;
         }
+        settled = Some(order);
     }
-    cache.insert(pair, order);
-    cache.insert((pair.1, pair.0), order.reverse());
-    order
 }
 
 fn compute_tuplize(nodes: &[Arc<UOp>]) -> HashMap<u64, Arc<TuplizeKey>> {
@@ -780,8 +849,19 @@ fn run_count(uop: &Arc<UOp>) -> u64 {
         .product()
 }
 
-/// Priority assignment matching tinygrad's linearizer.py:24-32.
-/// Returns `(priority, extra)` where extra is `Some(slot)` for PARAM.
+/// Priority assignment matching tinygrad `codegen/late/linearizer.py:24-32`
+/// (pin `8c8b43de`). Returns `(priority, extra)`; `extra` is the PARAM slot.
+///
+/// Three arms older tinygrad had are absent because upstream removed them, not
+/// because the port dropped them:
+/// - `DEFINE_VAR = -19` — `4a4b6956d "remove DEFINE_VAR from codebase"`: the op
+///   is gone, symbolic variables are PARAMs and take the `-20` arm.
+/// - `CONST = -10` — `52b989c6c "don't place consts early"`: consts sort at the
+///   generic `0` so they sink next to their consumer.
+/// - `DEFINE_LOCAL = -18` / `DEFINE_REG = -17` — `649971f02 "remove
+///   DEFINE_LOCAL and DEFINE_REG"` folded both into BUFFER and *inverted* the
+///   pair: LOCAL is `-17`, REG (like GLOBAL) `-18`. Restoring the old order
+///   would regress against the pin.
 fn priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
     match uop.op() {
         Op::Param { arg, .. } => (-20, Some(arg.slot as i64)),
