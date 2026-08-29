@@ -675,10 +675,14 @@ pub fn symbolic_no_dead_loop() -> &'static TypedPatternMatcher {
 
 /// Maximum symbolic matcher (tier 3).
 ///
-/// Matches `sym` (upstream symbolic_simple):
+/// Matches upstream `sym` (`uop/symbolic.py:429`):
 /// symbolic + pm_simplify_valid + store/load fold + cast-through-WHERE +
-/// ALU/STACK reorder + x!=0 fold + reciprocal distribution +
-/// opinionated combine terms + reduce hoist.
+/// ALU/STACK reorder + x!=0 fold + opinionated combine terms + reduce hoist.
+///
+/// Upstream's reciprocal distribution (`uop/symbolic.py:448-453`) is deliberately
+/// absent: all six rules are IEEE-inexact, and
+/// `unknown_float_division_power_and_reciprocal_are_not_algebraically_rewritten`
+/// pins the non-rewrite.
 ///
 /// Used at: pre-opt initial, post-opt (Stage 8), expander (Stage 9), devectorize (Stage 14).
 pub fn sym() -> &'static TypedPatternMatcher {
