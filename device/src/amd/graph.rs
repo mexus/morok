@@ -30,7 +30,9 @@ struct KernargSlot {
     buffer_count: usize,
     var_count: usize,
     record_size: usize,
-    abi: Vec<crate::device::AbiParamDescriptor>,
+    /// Built once at capture: the ABI is fixed for the graph's lifetime, so
+    /// rebuilding it on every replay was pure overhead.
+    layout: crate::hcq::ClikeKernargLayout,
 }
 
 enum NativeGraph {
@@ -43,6 +45,12 @@ struct ReplayState {
     profile_command: Option<ReplayCommandBuffer>,
     control: Option<ReplayCommandBuffer>,
     profile_control: Option<ReplayCommandBuffer>,
+    /// Arguments the graph-owned kernarg storage currently holds, so an
+    /// identical replay skips repacking every slot (tinygrad's
+    /// `_prev_resolved_syms` skip in `graph/hcq.py`).
+    packed: Option<(Vec<u64>, Vec<i64>)>,
+    #[cfg(test)]
+    packs: usize,
 }
 
 struct ProfileGraph {
@@ -139,6 +147,16 @@ impl Drop for AmdGraph {
 
 impl AmdGraph {
     pub fn capture(allocator: &AmdAllocator, kernels: &[GraphKernel]) -> Result<Option<Box<dyn Graph>>> {
+        Ok(Self::capture_amd(allocator, kernels)?.map(|graph| graph as Box<dyn Graph>))
+    }
+
+    /// Immutable linked command stream as captured. Test-only.
+    #[cfg(test)]
+    pub(crate) fn linked_bytes(&self) -> &[u8] {
+        self.linked.static_bytes()
+    }
+
+    pub(crate) fn capture_amd(allocator: &AmdAllocator, kernels: &[GraphKernel]) -> Result<Option<Box<Self>>> {
         if kernels.is_empty() {
             return Ok(None);
         }
@@ -194,6 +212,15 @@ impl AmdGraph {
         submission.push(Command::Wait { signal_address: 0, value: 0 });
         submission.bind(wait, CommandField::WaitAddress, PatchSource::System(SystemField::TimelineSignal(0)))?;
         submission.bind(wait, CommandField::WaitValue, PatchSource::System(SystemField::TimelineValue(0)))?;
+        // ONE memory barrier per graph, matching tinygrad's
+        // `comp_queues[dev].memory_barrier()` at the head of a captured device
+        // queue (`graph/hcq.py:157`). Per-dispatch coherence is the narrow
+        // `acquire_mem` + `CS_PARTIAL_FLUSH` that `build_exec_pm4` already
+        // emits, and the AQL packets carry the header BARRIER bit; a full HDP
+        // flush plus full-invalidate acquire per kernel bought nothing. Morok
+        // keeps the barrier AFTER the timeline wait, matching its own
+        // `Wait -> MemoryBarrier -> Compute` per-call finalization.
+        submission.push(Command::MemoryBarrier);
         let mut links = Vec::with_capacity(kernels.len() * 2);
         let mut slots = Vec::with_capacity(kernels.len());
         for (((kernel, program), &offset), index) in kernels.iter().zip(&programs).zip(&offsets).zip(0usize..) {
@@ -207,10 +234,9 @@ impl AmdGraph {
                 buffer_count,
                 var_count,
                 record_size: program.kernarg_record_size(),
-                abi: program.abi().to_vec(),
+                layout: crate::hcq::ClikeKernargLayout::from_abi(program.abi()),
             });
 
-            submission.push(Command::MemoryBarrier);
             let g = kernel.global_size.unwrap_or([1, 1, 1]);
             let l = kernel.local_size.unwrap_or([1, 1, 1]);
             let (rsrc1, rsrc2, rsrc3) = program.rsrc();
@@ -295,6 +321,9 @@ impl AmdGraph {
                 tmpring_size: lane.tmpring_size(),
                 target_major: device.core().arch.gfx_major(),
                 completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
+                // Captured timeline stores are placeholders patched per replay, so
+                // they never carry the KFD interrupt companion.
+                queue_event_mailbox: None,
             };
             Some(lower_graph_submission(allocator, &profiled, &links, state, pm4)?)
         };
@@ -304,6 +333,9 @@ impl AmdGraph {
             tmpring_size: lane.tmpring_size(),
             target_major: device.core().arch.gfx_major(),
             completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
+            // Captured timeline stores are placeholders patched per replay, so
+            // they never carry the KFD interrupt companion.
+            queue_event_mailbox: None,
         };
         let (linked, control) = lower_graph_submission(allocator, &submission, &links, state, pm4)?;
         let command = linked.replay_buffer();
@@ -329,13 +361,26 @@ impl AmdGraph {
                 profile_command,
                 control: control_command,
                 profile_control: profile_control_command,
+                packed: None,
+                #[cfg(test)]
+                packs: 0,
             }),
             slots,
             kernargs_buf: kernargs_buf.into_inner(),
         })))
     }
 
-    fn patch_kernargs(&self, buffers: &[u64], vals: &[i64]) -> Result<()> {
+    /// Pack graph kernargs the way a replay does and report the number of packs
+    /// performed so far. Test-only: proving the skip through a real replay
+    /// needs a GPU to retire the first submission.
+    #[cfg(test)]
+    pub(crate) fn kernarg_pack_probe(&self, buffers: &[u64], vals: &[i64]) -> Result<usize> {
+        let mut state = self.state.lock();
+        self.patch_kernargs(&mut state, buffers, vals)?;
+        Ok(state.packs)
+    }
+
+    fn patch_kernargs(&self, state: &mut ReplayState, buffers: &[u64], vals: &[i64]) -> Result<()> {
         let expected_buffers: usize = self.slots.iter().map(|slot| slot.buffer_count).sum();
         let expected_vals: usize = self.slots.iter().map(|slot| slot.var_count).sum();
         if (!buffers.is_empty() && buffers.len() != expected_buffers)
@@ -349,6 +394,11 @@ impl AmdGraph {
                 ),
             });
         }
+        // Graph-owned kernarg storage is written by nothing else, so identical
+        // arguments mean the bytes are already correct.
+        if state.packed.as_ref().is_some_and(|(packed, packed_vals)| packed == buffers && packed_vals == vals) {
+            return Ok(());
+        }
         let mut buffer_offset = 0;
         let mut var_offset = 0;
         for slot in &self.slots {
@@ -360,9 +410,14 @@ impl AmdGraph {
             let slot_vals = if vals.is_empty() { &slot.vals } else { &vals[var_offset..var_offset + slot.var_count] };
             // SAFETY: each slot is disjoint, graph-owned, and replay is serialized.
             let dst = unsafe { std::slice::from_raw_parts_mut(slot.host, slot.record_size) };
-            crate::hcq::ClikeKernargLayout::from_abi(&slot.abi).pack(dst, slot_buffers, slot_vals)?;
+            slot.layout.pack(dst, slot_buffers, slot_vals)?;
             buffer_offset += slot.buffer_count;
             var_offset += slot.var_count;
+        }
+        state.packed = Some((buffers.to_vec(), vals.to_vec()));
+        #[cfg(test)]
+        {
+            state.packs += 1;
         }
         Ok(())
     }
@@ -374,10 +429,15 @@ impl Graph for AmdGraph {
             return Err(error);
         }
         let mut state = self.state.lock();
+        // Not covered by the linked stream's timeline wait: that wait runs on
+        // the GPU, whereas `patch_kernargs` and the replay-buffer patch below
+        // rewrite graph-owned host storage a still-in-flight previous replay
+        // may be reading. Retiring the owner's last submission first is what
+        // makes those in-place rewrites safe.
         self.owner.synchronize()?;
         let lane = self.owner.lease()?;
         lane.ensure_has_local_memory(self.max_private)?;
-        self.patch_kernargs(buffers, vals)?;
+        self.patch_kernargs(&mut state, buffers, vals)?;
         match self.native {
             NativeGraph::Aql => {
                 let control = self.control.as_ref().expect("AQL graph control");
@@ -423,10 +483,15 @@ impl Graph for AmdGraph {
             return Err(error);
         }
         let mut state = self.state.lock();
+        // Not covered by the linked stream's timeline wait: that wait runs on
+        // the GPU, whereas `patch_kernargs` and the replay-buffer patch below
+        // rewrite graph-owned host storage a still-in-flight previous replay
+        // may be reading. Retiring the owner's last submission first is what
+        // makes those in-place rewrites safe.
         self.owner.synchronize()?;
         let lane = self.owner.lease()?;
         lane.ensure_has_local_memory(self.max_private)?;
-        self.patch_kernargs(buffers, vals)?;
+        self.patch_kernargs(&mut state, buffers, vals)?;
         let signals = (0..profile.signal_count).map(|_| lane.acquire_timestamp_signal()).collect::<Result<Vec<_>>>()?;
         for signal in &signals {
             signal.reset(0);

@@ -301,6 +301,9 @@ impl AmdLinkedPlan {
                         tmpring_size: lane.tmpring_size(),
                         target_major: lane.core().arch.gfx_major(),
                         completion_xcc_mask: None,
+                        // Linked timeline stores are placeholders patched per
+                        // replay, so they carry no KFD interrupt companion.
+                        queue_event_mailbox: None,
                     },
                 )?,
                 QueueKind::Compute(_) => {
@@ -312,6 +315,7 @@ impl AmdLinkedPlan {
                             tmpring_size: lane.tmpring_size(),
                             target_major: lane.core().arch.gfx_major(),
                             completion_xcc_mask: (lane.core().node.num_xcc > 1).then_some(1),
+                            queue_event_mailbox: None,
                         },
                         PatchSource::LinkAddress(control_link),
                     )?;
@@ -334,7 +338,7 @@ impl AmdLinkedPlan {
                     });
                     program.aql
                 }
-                QueueKind::Copy(_) => lower_hcq_sdma_command_buffer(&submission, lane.core().arch.gfx_major())?,
+                QueueKind::Copy(_) => lower_hcq_sdma_command_buffer(&submission, lane.core().arch.gfx_major(), None)?,
             };
             match submission.queue {
                 QueueKind::Compute(_) if pm4 => validate_pm4_dword_count(lowered.bytes.len() / 4)?,
@@ -504,10 +508,20 @@ impl AmdLinkedPlan {
                 .filter(|submission| matches!(submission.queue, QueueKind::Copy(_)))
                 .map(|submission| submission.replay.bytes().len())
                 .collect::<Vec<_>>();
+            // Wait each ring's headroom with no guard held, then take both
+            // guards back-to-back: holding the compute guard while polling the
+            // process-shared SDMA ring stalled every host staging copy for up
+            // to the full timeout, and doubled this plan's worst case.
+            let copy_queue = owner.core().copy_queue();
+            if !compute_lengths.is_empty() {
+                lane.queue().wait_publication_headroom(&compute_lengths)?;
+            }
+            if !copy_lengths.is_empty() {
+                copy_queue.unwrap().wait_publication_headroom(&copy_lengths)?;
+            }
             let mut compute_publication = (!compute_lengths.is_empty())
                 .then(|| lane.queue().prepare_linked_publication(&compute_lengths))
                 .transpose()?;
-            let copy_queue = owner.core().copy_queue();
             let mut copy_publication = (!copy_lengths.is_empty())
                 .then(|| copy_queue.unwrap().prepare_linked_publication(&copy_lengths))
                 .transpose()?;
@@ -528,6 +542,14 @@ impl AmdLinkedPlan {
                     self._signals.iter().filter(|candidate| !Arc::ptr_eq(candidate, &signal)).cloned().collect();
                 let finalizer = SubmissionFinalizer::prepared_timeline(signal, final_point.value, progress);
                 lane.register_inflight(Arc::clone(&finalizer));
+                // The plan's SDMA work rides a plan-local timeline, not the
+                // copy queue's own, so the queue must retain this finalizer or
+                // it could tear its ring down under live traffic.
+                if !copy_lengths.is_empty()
+                    && let Some(copy) = copy_queue
+                {
+                    copy.register_inflight(Arc::clone(&finalizer));
+                }
                 Some(finalizer)
             } else {
                 None

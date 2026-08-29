@@ -268,6 +268,95 @@ attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
 }
 
 #[test]
+fn mock_graph_replay_skips_repacking_unchanged_kernargs() {
+    use crate::device::{AbiParamDescriptor, AbiParamKind};
+    use svod_dtype::{AddrSpace, DType};
+
+    let ir = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @graph_program(ptr addrspace(1) %out) #0 {
+entry:
+  store float 0.0, ptr addrspace(1) %out, align 4
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
+    let Some(bytes) = clang_amdgcn(ir, "gfx1100") else {
+        eprintln!("skipping: clang amdgcn target unavailable");
+        return;
+    };
+    let iface = Arc::new(MockAmdIface::default());
+    let device = iface.device();
+    let allocator = AmdAllocator { dev: Arc::clone(&device), device_id: 0 };
+    device.core().install_signal_pool(crate::amd::signal::SignalPool::new(&allocator, 64).unwrap());
+    device.core().set_pm4_graph(true);
+    let abi = [AbiParamDescriptor {
+        slot: 0,
+        kind: AbiParamKind::Storage(AddrSpace::Global),
+        dtype: DType::Float32,
+        name: None,
+    }];
+    let program = AmdProgram::load(Arc::clone(&device), &allocator, &bytes, "graph_program", &abi).unwrap();
+    let kernels = [crate::device::GraphKernel {
+        program: &program,
+        buffers: vec![0x1000 as *mut u8],
+        vals: Vec::new(),
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+        deps: Vec::new(),
+    }];
+    let graph = crate::amd::graph::AmdGraph::capture_amd(&allocator, &kernels).unwrap().expect("graph");
+
+    assert_eq!(graph.kernarg_pack_probe(&[0x2000], &[]).unwrap(), 1);
+    assert_eq!(graph.kernarg_pack_probe(&[0x2000], &[]).unwrap(), 1, "identical arguments must not repack");
+    assert_eq!(graph.kernarg_pack_probe(&[0x3000], &[]).unwrap(), 2, "changed arguments repack");
+}
+
+#[test]
+fn mock_graph_capture_emits_one_memory_barrier_for_the_whole_chain() {
+    let ir = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @graph_program() #0 {
+entry:
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
+    let Some(bytes) = clang_amdgcn(ir, "gfx1100") else {
+        eprintln!("skipping: clang amdgcn target unavailable");
+        return;
+    };
+    let iface = Arc::new(MockAmdIface::default());
+    let device = iface.device();
+    let allocator = AmdAllocator { dev: Arc::clone(&device), device_id: 0 };
+    device.core().install_signal_pool(crate::amd::signal::SignalPool::new(&allocator, 64).unwrap());
+    device.core().set_pm4_graph(true);
+    let program = AmdProgram::load(Arc::clone(&device), &allocator, &bytes, "graph_program", &[]).unwrap();
+    let kernels = std::array::from_fn::<_, 3, _>(|_| crate::device::GraphKernel {
+        program: &program,
+        buffers: Vec::new(),
+        vals: Vec::new(),
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+        deps: Vec::new(),
+    });
+    let graph = crate::amd::graph::AmdGraph::capture_amd(&allocator, &kernels).unwrap().expect("graph");
+    let dwords = graph
+        .linked_bytes()
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect::<Vec<_>>();
+
+    // One HDP flush + full acquire for the whole graph (tinygrad graph/hcq.py:157)...
+    let barrier = crate::amd::sys::pm4::hdp_flush();
+    assert_eq!(dwords.windows(barrier.len()).filter(|run| **run == barrier).count(), 1);
+    // ...while every dispatch keeps its own CS_PARTIAL_FLUSH.
+    let flush = crate::amd::sys::pm4::event_write(
+        crate::amd::sys::pm4::CS_PARTIAL_FLUSH,
+        crate::amd::sys::pm4::EVENT_INDEX_PARTIAL_FLUSH,
+    );
+    assert_eq!(dwords.windows(flush.len()).filter(|run| **run == flush).count(), 3);
+}
+
+#[test]
 fn mock_graph_failed_drain_quarantines_graph_program_and_queue_storage() {
     let ir = r#"target triple = "amdgcn-amd-amdhsa"
 define amdgpu_kernel void @graph_program() #0 {

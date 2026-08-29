@@ -162,13 +162,17 @@ fn mock_copy_queue_construction_unwinds_ring_signal_and_staging_stages() {
         assert!(iface.free_issues().is_empty());
     }
 
+    // An exhausted signal pool grows another chunk instead of failing the queue.
     let (iface, allocator) = mock_allocator(1);
     let pool = crate::amd::signal::SignalPool::new(&allocator, 64).expect("signal pool");
-    let held = (0..64).map(|_| pool.acquire().unwrap()).collect::<Vec<_>>();
+    let held = (0..pool.capacity()).map(|_| pool.acquire().unwrap()).collect::<Vec<_>>();
     allocator.dev.core().install_signal_pool(Arc::clone(&pool));
-    assert!(AmdCopyQueue::create(&allocator).is_err());
-    assert_eq!((iface.allocation_count(), iface.free_count()), (3, 2));
-    assert_eq!((iface.queue_setup_count(), iface.queue_teardown_count()), (1, 1));
+    let queue = AmdCopyQueue::create(&allocator).expect("copy queue over a grown signal pool");
+    assert_eq!(pool.capacity(), 128);
+    assert_eq!((iface.allocation_count(), iface.free_count()), (5, 0));
+    assert_eq!((iface.queue_setup_count(), iface.queue_teardown_count()), (1, 0));
+    drop(queue);
+    assert_eq!((iface.free_count(), iface.queue_teardown_count()), (3, 1));
     drop(held);
 
     let (iface, allocator) = mock_allocator(1);
@@ -269,12 +273,14 @@ fn mock_pm4_and_aql_publication_failures_restore_or_poison_by_doorbell_stage() {
         iface.script_publication(Err(scripted_error("after reservation")));
         assert!(pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]).is_err());
         assert_eq!(pool.pm4_value(), 1);
+        assert_eq!(pool.queue().ring_write_idx(), 0, "xccs={xccs}");
         assert!(!allocator.dev.is_poisoned());
 
         iface.script_publication(Ok(()));
         iface.script_publication(Err(scripted_error("before doorbell")));
         assert!(pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]).is_err());
         assert_eq!(pool.pm4_value(), 1);
+        assert_eq!(pool.queue().ring_write_idx(), 0, "xccs={xccs}");
         assert!(!allocator.dev.is_poisoned());
 
         iface.script_publication(Ok(()));
@@ -319,11 +325,13 @@ fn mock_copy_publication_restores_before_doorbell_and_poisons_after() {
 
     iface.script_publication(Err(scripted_error("copy after reservation")));
     assert!(queue.copy_fenced(0x1000, 0x2000, 4).is_err());
+    assert_eq!(queue.ring_write_idx(), 0, "the abandoned copy packets must be rolled back");
     assert!(!allocator.dev.is_poisoned());
 
     iface.script_publication(Ok(()));
     iface.script_publication(Err(scripted_error("copy before doorbell")));
     assert!(queue.copy_fenced(0x1000, 0x2000, 4).is_err());
+    assert_eq!(queue.ring_write_idx(), 0);
     assert!(!allocator.dev.is_poisoned());
 
     iface.script_publication(Ok(()));
@@ -335,6 +343,46 @@ fn mock_copy_publication_restores_before_doorbell_and_poisons_after() {
     assert_eq!(iface.free_count(), 0);
     assert_eq!(iface.live_handle_count(), baseline + 3);
     assert_eq!(iface.live_queue_count(), 1);
+}
+
+#[test]
+fn mock_copy_queue_drains_registered_linked_finalizers_before_teardown() {
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let queue = AmdCopyQueue::create(&allocator).expect("copy queue");
+    let signals = allocator.dev.core().signal_pool().expect("signal pool").clone();
+    let signal = Arc::new(signals.acquire().expect("slot"));
+    signal.reset(5);
+
+    // Linked plans run on their own timeline, so the copy queue only knows
+    // about their SDMA work through this registration.
+    let finalizer = crate::amd::connector::SubmissionFinalizer::timeline(Arc::clone(&signal), 5, None);
+    queue.register_inflight(Arc::clone(&finalizer));
+    assert_eq!(queue.inflight_len(), 1);
+    queue.register_inflight(finalizer);
+    assert_eq!(queue.inflight_len(), 1, "retired entries are pruned, not accumulated");
+
+    drop(queue);
+    assert!(!allocator.dev.is_poisoned());
+    assert_eq!((iface.free_count(), iface.queue_teardown_count()), (3, 1));
+}
+
+#[test]
+fn mock_copy_publication_panic_rolls_the_ring_back_to_the_pre_copy_index() {
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let queue = AmdCopyQueue::create(&allocator).expect("copy queue");
+
+    iface.script_publication(Ok(()));
+    iface.script_publication_panic();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = queue.copy_fenced(0x1000, 0x2000, 4);
+    }));
+    assert!(result.is_err());
+    // The rollback owns the ring index from before the first copy packet, so an
+    // unwound publication leaves nothing enqueued.
+    assert_eq!(queue.ring_write_idx(), 0);
+    assert!(!allocator.dev.is_poisoned());
 }
 
 #[test]
@@ -380,6 +428,9 @@ fn mock_pool_failed_drain_and_panic_abandonment_quarantine_every_backing() {
     assert_eq!(iface.free_count(), 0);
     assert_eq!(iface.live_handle_count(), baseline + 6);
 
+    // A panic unwind quarantines the lane it abandons but must NOT poison the
+    // process-global core: tinygrad latches per-device error state on drain
+    // timeouts and faults only.
     let (iface, allocator) = mock_allocator(1);
     install_signal_pool(&allocator);
     let baseline = iface.allocation_count();
@@ -388,9 +439,63 @@ fn mock_pool_failed_drain_and_panic_abandonment_quarantine_every_backing() {
         panic!("scripted pool abandonment");
     }));
     assert!(result.is_err());
-    assert!(allocator.dev.is_poisoned());
+    assert!(!allocator.dev.is_poisoned());
     assert_eq!(iface.free_count(), 0);
     assert_eq!(iface.live_handle_count(), baseline + 6);
+    assert_eq!(iface.queue_teardown_count(), 0, "an abandoned queue is never destroyed");
+}
+
+#[test]
+fn mock_linked_publication_headroom_waits_before_taking_either_guard() {
+    let (_iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    let copy = AmdCopyQueue::create(&allocator).expect("copy queue");
+
+    // An idle ring clears both waits without holding a guard, so the guards can
+    // then be taken back-to-back.
+    pool.queue().wait_publication_headroom(&[64]).expect("compute headroom");
+    copy.wait_publication_headroom(&[64]).expect("copy headroom");
+    drop((
+        pool.queue().prepare_linked_publication(&[64]).expect("compute guard"),
+        copy.prepare_linked_publication(&[64]).expect("copy guard"),
+    ));
+
+    // Malformed lengths still fail before any guard is taken.
+    assert!(pool.queue().wait_publication_headroom(&[7]).is_err());
+    assert!(copy.wait_publication_headroom(&[7]).is_err());
+}
+
+#[test]
+fn mock_lane_acquisition_times_out_instead_of_parking_forever() {
+    let (_iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let core = Arc::clone(allocator.dev.core());
+    let held = core.lease_queue(&allocator).expect("first lane");
+
+    // The synthetic device has a single lane, so this cannot be satisfied: a
+    // lease leaked by a wedged publisher must surface as a typed timeout.
+    let error = core.lease_queue(&allocator).expect_err("a full pool must not park forever");
+    assert!(matches!(error, Error::TimelineTimeout { what: "AMD lane acquisition", .. }), "{error:?}");
+
+    drop(held);
+    core.lease_queue(&allocator).expect("a released lane is acquired again");
+}
+
+#[test]
+fn mock_quarantined_queue_leaks_its_backing_without_a_poisoned_device() {
+    let (iface, allocator) = mock_allocator(1);
+    let baseline = iface.allocation_count();
+    let mut queue = AmdComputeQueue::create(&allocator).expect("queue");
+    // Quarantine alone must keep the ring/GART/EOP mapped: the KFD queue is
+    // never destroyed, so the CP may still be reading them. The decision is
+    // queue-local and does not depend on the device poison latch.
+    queue.quarantine();
+    drop(queue);
+    assert!(!allocator.dev.is_poisoned());
+    assert_eq!(iface.free_count(), 0);
+    assert_eq!(iface.live_handle_count(), baseline + 4);
+    assert_eq!((iface.queue_teardown_count(), iface.live_queue_count()), (0, 1));
 }
 
 #[test]
@@ -427,6 +532,11 @@ fn mock_scratch_growth_preserves_old_state_on_drain_or_allocation_failure() {
     pool.ensure_has_local_memory(4096).expect("scratch growth");
     assert_eq!(iface.allocation_count(), baseline + 7);
     assert_eq!(iface.free_count(), 1, "successful publication frees exactly the drained old scratch");
+    // Idempotent: a satisfied request neither drains nor reallocates.
+    pool.ensure_has_local_memory(4096).expect("satisfied scratch request");
+    pool.ensure_has_local_memory(1).expect("smaller scratch request");
+    assert_eq!(iface.alloc_count_for_tag(crate::amd::va_registry::AllocTag::Scratch), 2);
+    assert_eq!(iface.allocation_count(), baseline + 7);
     drop(pool);
     assert_eq!(iface.free_count(), 7);
     assert!(iface.free_issues().is_empty());
@@ -537,6 +647,7 @@ fn pm4_state() -> Pm4LoweringState {
         tmpring_size: 0x55,
         target_major: 11,
         completion_xcc_mask: None,
+        queue_event_mailbox: None,
     }
 }
 
@@ -546,6 +657,7 @@ fn aql_control_state(multi_xcc: bool) -> Pm4LoweringState {
         tmpring_size: 0x55,
         target_major: 9,
         completion_xcc_mask: multi_xcc.then_some(1),
+        queue_event_mailbox: None,
     }
 }
 
@@ -730,7 +842,7 @@ fn hcq_sdma_command_and_mixed_goldens() {
         .push(Command::Timestamp { dst: 0x4_0000_4000 })
         .push(Command::Store { dst: 0x5_0000_5000, value: 0x5566_7788 });
     assert_eq!(
-        lower_hcq_sdma(&submission, 11).unwrap(),
+        lower_hcq_sdma(&submission, 11, None).unwrap(),
         [
             0xd000_0008,
             0x1000,
@@ -757,6 +869,54 @@ fn hcq_sdma_command_and_mixed_goldens() {
 }
 
 #[test]
+fn hcq_queue_event_mailbox_stores_raise_the_kfd_interrupt() {
+    use crate::hcq::{Command, QueueKind, Submission};
+    const MAILBOX: u64 = 0x7_0000_1234;
+    let int_sel = |dword: u32| (dword >> 24) & 0b11;
+
+    // PM4: the polled timeline store stays interrupt-free; only the mailbox
+    // store interrupts, carrying the event id in both value and ctxid and no
+    // cache flush (tinygrad ops_amd.py:388-393).
+    let mut submission = Submission::new(QueueKind::Compute(0));
+    submission.push(Command::Store { dst: 0x1_0000_1000, value: 7 }).push(Command::Store { dst: MAILBOX, value: 9 });
+    let q = lower_hcq_pm4(&submission, Pm4LoweringState { queue_event_mailbox: Some(MAILBOX), ..pm4_state() }).unwrap();
+    assert_eq!(q.len(), 16);
+    assert_eq!(int_sel(q[2]), 0);
+    assert_eq!(int_sel(q[10]), crate::amd::sys::pm4::INT_SEL_INTERRUPT_AFTER_WRITE);
+    assert_eq!(q[9] & crate::amd::sys::pm4::RELEASE_MEM_CACHE_FLUSH_ALL, 0);
+    assert_eq!(&q[11..16], &[MAILBOX as u32, (MAILBOX >> 32) as u32, 9, 0, 9]);
+    // Without the mailbox address every store stays a plain memory write.
+    assert_eq!(int_sel(lower_hcq_pm4(&submission, pm4_state()).unwrap()[10]), 0);
+
+    // SDMA: mailbox fence followed by SDMA_OP_TRAP (ops_amd.py:490-492).
+    let mut copy = Submission::new(QueueKind::Copy(0));
+    copy.push(Command::Store { dst: MAILBOX, value: 9 });
+    assert_eq!(
+        lower_hcq_sdma(&copy, 11, Some(MAILBOX)).unwrap(),
+        [0x0003_0005, MAILBOX as u32, (MAILBOX >> 32) as u32, 9, 6, 9]
+    );
+    assert_eq!(lower_hcq_sdma(&copy, 11, None).unwrap().len(), 4);
+    // The extra TRAP dwords keep the SDMA patch cursor aligned.
+    copy.bind(0, crate::hcq::CommandField::StoreDst, crate::hcq::PatchSource::LinkAddress(0)).unwrap();
+    copy.push(Command::Store { dst: 0x2000, value: 1 });
+    copy.bind(1, crate::hcq::CommandField::StoreDst, crate::hcq::PatchSource::LinkAddress(1)).unwrap();
+    let lowered = lower_hcq_sdma_command_buffer(&copy, 11, Some(MAILBOX)).unwrap();
+    assert_eq!(lowered.patches.link.iter().map(|site| site.byte_offset).collect::<Vec<_>>(), [4, 8, 28, 32]);
+}
+
+#[test]
+fn hcq_sdma_zero_byte_copy_consumes_its_bindings_without_packets() {
+    use crate::hcq::{Command, CommandField, PatchSource, QueueKind, Submission};
+    let mut submission = Submission::new(QueueKind::Copy(0));
+    submission.push(Command::Copy { dst: 0, src: 0, bytes: 0 });
+    submission.bind(0, CommandField::CopySrc, PatchSource::RuntimeBuffer(0)).unwrap();
+    submission.bind(0, CommandField::CopyDst, PatchSource::RuntimeBuffer(1)).unwrap();
+    let lowered = lower_hcq_sdma_command_buffer(&submission, 11, None).expect("zero-byte copy must lower");
+    assert!(lowered.bytes.is_empty());
+    assert!(lowered.patches.runtime.is_empty());
+}
+
+#[test]
 fn hcq_amd_rejects_unsupported_packet_forms_and_wide_waits() {
     use crate::hcq::{Command, QueueKind, Submission};
     let mut compute = Submission::new(QueueKind::Compute(0));
@@ -764,7 +924,7 @@ fn hcq_amd_rejects_unsupported_packet_forms_and_wide_waits() {
     assert!(lower_hcq_pm4(&compute, pm4_state()).unwrap_err().to_string().contains("does not support"));
     let mut copy = Submission::new(QueueKind::Copy(0));
     copy.push(Command::Execute { operation: 0 });
-    assert!(lower_hcq_sdma(&copy, 11).unwrap_err().to_string().contains("does not support"));
+    assert!(lower_hcq_sdma(&copy, 11, None).unwrap_err().to_string().contains("does not support"));
     let mut wide = Submission::new(QueueKind::Compute(0));
     wide.push(Command::Wait { signal_address: 0x1000, value: u32::MAX as u64 + 1 });
     assert!(lower_hcq_pm4(&wide, pm4_state()).unwrap_err().to_string().contains("32-bit"));
@@ -868,7 +1028,7 @@ fn hcq_sdma_dynamic_normal_replay_patches_chunk_addresses_without_relowering() {
     submission.bind(2, CommandField::StoreDst, PatchSource::LinkAddress(0)).unwrap();
     submission.bind(2, CommandField::StoreValue, PatchSource::System(SystemField::TimelineValue(0))).unwrap();
 
-    let lowered = lower_hcq_sdma_command_buffer(&submission, 11).unwrap();
+    let lowered = lower_hcq_sdma_command_buffer(&submission, 11, None).unwrap();
     assert_eq!(lowered.patches.runtime.len(), 8); // src/dst lo+hi for both chunks
     let linked = CommandBufferCache::default().link(&lowered, &LinkPatchValues(vec![0x7000])).unwrap();
     let static_bytes = linked.static_bytes().to_vec();

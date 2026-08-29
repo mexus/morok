@@ -42,12 +42,12 @@ pub(crate) struct PoolQueue {
     /// The KFD compute queue: ring, doorbell, and GART. Its backend-local mutex
     /// is uncontended because publication requires the lane's unique lease.
     queue: Box<AmdComputeQueue>,
-    /// Kernel-argument bump arena (16 MiB GTT). One per `PoolQueue`. The
-    /// Exclusive lane publication makes the bump cursor
-    /// order match the ring submission order, so a wrapped slot is provably free
-    /// once the whole pool drains. Freed on the queue's drop via
-    /// `Drop for KernargArena`, after `Drop for PoolQueue` has drained.
-    arena: Box<KernargArena>,
+    /// Kernel-argument bump arena (16 MiB GTT). One per DEVICE, shared by every
+    /// lane: the wrap path drains all of them through
+    /// `AmdDeviceCore::synchronize_all`, so a wrapped slot is provably free
+    /// whichever lane wrote it. Freed by `Drop for KernargArena` once the last
+    /// sharing queue drops, after `Drop for PoolQueue` has drained.
+    arena: Arc<KernargArena>,
     /// Scratch backing. Grown on demand by [`ensure_has_local_memory`](Self::ensure_has_local_memory)
     /// while the lane's exclusive lease is held.
     scratch_state: Mutex<ScratchState>,
@@ -108,6 +108,16 @@ impl LaneClaims {
     }
 }
 
+/// How long one lane-acquisition park may last before it counts as expired.
+/// Matches the device drain bound (tinygrad's `HCQDEV_WAIT_TIMEOUT_MS`).
+#[cfg(not(test))]
+const LANE_ACQUIRE_TIMEOUT_MS: u64 = 30_000;
+#[cfg(test)]
+const LANE_ACQUIRE_TIMEOUT_MS: u64 = 25;
+/// Consecutive expiries tolerated before acquisition fails. One expiry can be a
+/// legitimately long dispatch holding its lane; two in a row is a wedge.
+const LANE_ACQUIRE_MAX_EXPIRIES: u32 = 2;
+
 /// Bounded lazy pool of compute lanes. Queue creation is serialized and cold;
 /// acquisition of an initialized idle lane is lock-free.
 #[derive(Debug)]
@@ -133,7 +143,11 @@ impl QueuePool {
         }
     }
 
+    /// Claim an idle lane, creating one while the pool is below capacity.
+    /// Parking is bounded: a lease leaked by a wedged publisher must surface as
+    /// a typed timeout rather than hanging every subsequent dispatch.
     pub(crate) fn acquire(&self, core: &Arc<AmdDeviceCore>, allocator: &AmdAllocator) -> Result<QueueLease> {
+        let mut expiries = 0u32;
         loop {
             if let Some(error) = core.poison_error() {
                 return Err(error);
@@ -170,7 +184,20 @@ impl QueuePool {
                 let queue = Arc::clone(self.queues[slot].get().expect("initialized lane missing queue"));
                 return Ok(QueueLease { core: Arc::clone(core), slot, queue: Some(queue) });
             }
-            self.available.wait(&mut wait);
+            if self.available.wait_for(&mut wait, std::time::Duration::from_millis(LANE_ACQUIRE_TIMEOUT_MS)).timed_out()
+            {
+                expiries += 1;
+                if expiries >= LANE_ACQUIRE_MAX_EXPIRIES {
+                    return Err(Error::TimelineTimeout {
+                        what: "AMD lane acquisition",
+                        target: self.claims.capacity as u64,
+                        current: u64::from(self.claims.claimed.load(Ordering::Acquire).count_ones()),
+                        waited_ms: LANE_ACQUIRE_TIMEOUT_MS * u64::from(LANE_ACQUIRE_MAX_EXPIRIES),
+                    });
+                }
+            } else {
+                expiries = 0;
+            }
         }
     }
 
@@ -288,15 +315,36 @@ impl SubmissionFinalizer {
         self.code.lock().push(code);
     }
 
+    /// Wait for this submission's terminal timeline point, bounded by
+    /// `timeout_ms` across BOTH phases. A publisher that faults or panics may
+    /// never transition a `Prepared` finalizer, so parking untimed here wedged
+    /// the caller for good; tinygrad bounds every device wait with
+    /// `HCQDEV_WAIT_TIMEOUT_MS`.
     pub fn wait(&self, timeout_ms: u64) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         let mut publication = self.publication.lock();
         while *publication == PublicationState::Prepared {
-            self.publication_changed.wait(&mut publication);
+            if let Some(error) = self.signal.device_poison() {
+                return Err(error);
+            }
+            if self.publication_changed.wait_until(&mut publication, deadline).timed_out()
+                && *publication == PublicationState::Prepared
+            {
+                return Err(Error::TimelineTimeout {
+                    what: "AMD submission publication",
+                    target: self.value,
+                    current: self.signal.value(),
+                    waited_ms: timeout_ms,
+                });
+            }
         }
         match *publication {
             PublicationState::Published => {
                 drop(publication);
-                self.signal.wait_signal_value_with_progress(self.value, timeout_ms, &self.progress)
+                // Whatever the publication wait consumed comes off the signal
+                // wait's budget; never hand it 0, which means "no timeout".
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u64;
+                self.signal.wait_signal_value_with_progress(self.value, remaining.max(1), &self.progress)
             }
             PublicationState::Failed => Err(Error::Runtime {
                 message: "AMD submission failed before its terminal timeline point was published".into(),
@@ -305,7 +353,7 @@ impl SubmissionFinalizer {
         }
     }
 
-    fn retired(&self) -> bool {
+    pub(crate) fn retired(&self) -> bool {
         match *self.publication.lock() {
             PublicationState::Published => self.signal.value() >= self.value,
             PublicationState::Failed => true,
@@ -331,7 +379,17 @@ impl PoolQueue {
         // is the lone raw KFD allocation — keeping it last means a failure
         // before then leaks nothing.
         let queue = AmdComputeQueue::create(allocator)?;
-        let arena = KernargArena::new(allocator, &core)?;
+        let arena = {
+            let mut shared = core.kernarg_arena.lock();
+            match shared.upgrade() {
+                Some(arena) => arena,
+                None => {
+                    let arena = KernargArena::new(allocator, &core)?;
+                    *shared = Arc::downgrade(&arena);
+                    arena
+                }
+            }
+        };
         let pool = core.signal_pool().cloned().ok_or_else(|| Error::Runtime {
             message: "PoolQueue::new_with_resources: signal pool not installed on core — \
                       install via AmdDeviceCore::install_signal_pool before building any queue"
@@ -486,12 +544,10 @@ impl PoolQueue {
     /// bytes per thread, growing it on demand. The old scratch buffer is freed
     /// (drain → unmap → munmap → free).
     pub fn ensure_has_local_memory(&self, private_segment_size: u32) -> Result<()> {
-        let current = self.scratch_state.lock().size_per_thread;
-        if private_segment_size <= current {
-            return Ok(());
-        }
-        // QueueLease is the exclusive publication authority, so no publisher
-        // can enqueue the stale scratch VA during this transaction.
+        // One check is enough: `QueueLease` is the exclusive publication
+        // authority for this lane, so no concurrent grow can land between the
+        // read and the replacement below, and no publisher can enqueue the
+        // stale scratch VA during the transaction.
         if private_segment_size <= self.scratch_state.lock().size_per_thread {
             return Ok(());
         }
@@ -521,10 +577,12 @@ impl Drop for PoolQueue {
     ///
     /// Skipped during panic unwind: `drain_all` can block up to ~30 s per queue
     /// and an unwinding test would pay N × 30 s before teardown. The in-flight
-    /// work is then abandoned — the caller saw a panic anyway.
+    /// work is then abandoned — the caller saw a panic anyway. The lane is
+    /// quarantined but the device is NOT poisoned: an unwind says nothing about
+    /// the hardware, and tinygrad latches its per-device `error_state` only on
+    /// a drain timeout or a reported fault.
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.core.poison("compute queue abandoned during panic unwind");
             self.queue.quarantine();
             tracing::warn!(
                 "PoolQueue drop during panic unwind: skipping drain; \
@@ -680,6 +738,10 @@ impl crate::device::PlanContext for OwnerCtx {
                 *session = Some(self.lease()?);
             }
             let lane = session.as_ref().unwrap();
+            // Kept under the session mutex despite the drain it may run: that
+            // mutex is what lets `synchronize` snapshot `newest` without racing
+            // an already-doorbelled submission, and a grow only drains when the
+            // pre-sized scratch is genuinely too small.
             lane.ensure_has_local_memory(amd.private_segment_size())?;
             // Only profiling callers retain timestamp handles long enough to
             // synchronize them; fire-and-forget dispatch must not arm probes.

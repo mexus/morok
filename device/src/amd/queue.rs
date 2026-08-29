@@ -455,6 +455,21 @@ pub struct Pm4LoweringState {
     /// Restrict PM4 timestamp and timeline writes to one XCC. This is required
     /// for PM4 control runs launched through a multi-XCC AQL vendor IB.
     pub completion_xcc_mask: Option<u32>,
+    /// Address of the device's KFD queue-event mailbox, when it has one. A
+    /// `Store` to exactly this address is the interrupt companion of a queue
+    /// timeline store and lowers to an interrupting `RELEASE_MEM` carrying the
+    /// event id in `ctxid`; every other `Store` stays a plain memory write.
+    pub queue_event_mailbox: Option<u64>,
+}
+
+/// Append Tinygrad's KFD interrupt companion to a just-pushed queue-timeline
+/// store (`ops_amd.py:391-393`): write the event id into the device's event
+/// mailbox so a host blocked in `WAIT_EVENTS` wakes on completion instead of at
+/// its next poll tier. No-op on backends without a KFD event.
+fn push_queue_event_mailbox(submission: &mut crate::hcq::Submission, core: &AmdDeviceCore) {
+    if let Some(mailbox) = core.queue_event_mailbox() {
+        submission.push(crate::hcq::Command::Store { dst: mailbox.address, value: mailbox.event_id.into() });
+    }
 }
 
 /// Queue-finalized dispatch result. The queue owns timestamp allocation and
@@ -501,7 +516,11 @@ pub fn lower_hcq_pm4(submission: &crate::hcq::Submission, state: Pm4LoweringStat
                 if let Some(mask) = state.completion_xcc_mask {
                     q.extend_from_slice(&pm4::pred_exec(mask, 8));
                 }
-                q.extend_from_slice(&pm4::release_mem_write(*dst, *value, true, true, false, is_gfx9));
+                if state.queue_event_mailbox == Some(*dst) {
+                    q.extend_from_slice(&pm4::release_mem_event(*dst, value_u32("event id", *value)?, is_gfx9));
+                } else {
+                    q.extend_from_slice(&pm4::release_mem_write(*dst, *value, true, true, false, is_gfx9));
+                }
             }
             crate::hcq::Command::Timestamp { dst } => {
                 // Tinygrad: EOP drain, clock write, then acquire the timestamp.
@@ -565,7 +584,11 @@ pub fn lower_hcq_pm4(submission: &crate::hcq::Submission, state: Pm4LoweringStat
 }
 
 /// Lower a complete neutral copy submission to one ordered SDMA stream.
-pub fn lower_hcq_sdma(submission: &crate::hcq::Submission, target_major: u32) -> Result<Vec<u32>> {
+pub fn lower_hcq_sdma(
+    submission: &crate::hcq::Submission,
+    target_major: u32,
+    queue_event_mailbox: Option<u64>,
+) -> Result<Vec<u32>> {
     if !matches!(submission.queue, crate::hcq::QueueKind::Copy(_)) {
         return Err(Error::Runtime {
             message: format!("SDMA lowering requires a copy queue, got {:?}", submission.queue),
@@ -591,7 +614,11 @@ pub fn lower_hcq_sdma(submission: &crate::hcq::Submission, target_major: u32) ->
             }
             crate::hcq::Command::Timestamp { dst } => q.extend_from_slice(&sdma::timestamp_global(*dst)),
             crate::hcq::Command::Store { dst, value } => {
-                q.extend_from_slice(&sdma::fence(*dst, value_u32("store", *value)?, target_major));
+                let value = value_u32("store", *value)?;
+                q.extend_from_slice(&sdma::fence(*dst, value, target_major));
+                if queue_event_mailbox == Some(*dst) {
+                    q.extend_from_slice(&sdma::trap(value));
+                }
             }
             crate::hcq::Command::Compute(_) | crate::hcq::Command::Execute { .. } => {
                 return Err(unsupported_hcq(submission.queue, command));
@@ -780,10 +807,11 @@ pub fn lower_hcq_pm4_command_buffer(
 pub fn lower_hcq_sdma_command_buffer(
     submission: &crate::hcq::Submission,
     target_major: u32,
+    queue_event_mailbox: Option<u64>,
 ) -> Result<crate::hcq::LoweredCommandBuffer> {
     use crate::hcq::{Command, CommandField as F, PatchEncoding, PatchSite};
 
-    let dwords = lower_hcq_sdma(submission, target_major)?;
+    let dwords = lower_hcq_sdma(submission, target_major, queue_event_mailbox)?;
     let mut sites = Vec::new();
     let mut consumed = std::collections::BTreeSet::new();
     let mut cursor = 0usize;
@@ -807,15 +835,22 @@ pub fn lower_hcq_sdma_command_buffer(
             }
             Command::MemoryBarrier => {}
             Command::Copy { bytes, .. } => {
+                // Bindings are consumed by the command, not by its chunks: a
+                // zero-byte copy emits no packets (tinygrad `AMDCopyQueue.copy`
+                // loops over `ceil(size / max_copy_size)` chunks the same way,
+                // `ops_amd.py:474-484`) yet still has to satisfy the arity check
+                // below, or a linked capture containing one hard-fails.
+                let src = command_binding(submission, command_index, F::CopySrc);
+                let dst = command_binding(submission, command_index, F::CopyDst);
+                consumed.extend(src.map(|_| (command_index, F::CopySrc)));
+                consumed.extend(dst.map(|_| (command_index, F::CopyDst)));
                 let mut offset = 0usize;
                 while offset < *bytes {
-                    if let Some(source) = command_binding(submission, command_index, F::CopySrc) {
+                    if let Some(source) = src {
                         record_u64_sites(&mut sites, cursor + 3, source, offset as u64);
-                        consumed.insert((command_index, F::CopySrc));
                     }
-                    if let Some(source) = command_binding(submission, command_index, F::CopyDst) {
+                    if let Some(source) = dst {
                         record_u64_sites(&mut sites, cursor + 5, source, offset as u64);
-                        consumed.insert((command_index, F::CopyDst));
                     }
                     let n = (*bytes - offset).min(sdma::SDMA_MAX_COPY_BYTES);
                     offset += n;
@@ -829,7 +864,7 @@ pub fn lower_hcq_sdma_command_buffer(
                 }
                 cursor += 3;
             }
-            Command::Store { .. } => {
+            Command::Store { dst, .. } => {
                 if let Some(source) = command_binding(submission, command_index, F::StoreDst) {
                     record_u64_sites(&mut sites, cursor + 1, source, 0);
                     consumed.insert((command_index, F::StoreDst));
@@ -843,7 +878,7 @@ pub fn lower_hcq_sdma_command_buffer(
                     });
                     consumed.insert((command_index, F::StoreValue));
                 }
-                cursor += 4;
+                cursor += 4 + 2 * usize::from(queue_event_mailbox == Some(*dst));
             }
             Command::Compute(_) | Command::Execute { .. } => unreachable!("validated by lower_hcq_sdma"),
         }
@@ -897,6 +932,13 @@ pub struct AmdCopyQueue {
     /// this and DMA the other leg. Locked for the whole chunked transfer so
     /// concurrent copies don't clobber it.
     staging: Mutex<StagingBuf>,
+    /// Finalizers for linked-plan SDMA work this queue published. Those plans
+    /// advance their own plan-local timeline rather than `timeline`, so without
+    /// this the queue could be torn down under live SDMA traffic. Pruned on
+    /// every registration, so a long-lived queue never accumulates retired
+    /// entries. (Tinygrad needs no equivalent: it has one timeline signal per
+    /// device — `support/hcq.py` `HCQCompiled.timeline_signal`.)
+    inflight: Mutex<std::collections::VecDeque<Arc<SubmissionFinalizer>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -957,6 +999,12 @@ struct QueueInner {
     /// inside the queue isn't useful since the ioctl takes it directly).
     #[allow(dead_code)]
     queue_id: u32,
+    /// Set by every quarantine transition of the owning queue. `Drop` then
+    /// leaks the ring/GART/EOP backing instead of unmapping it: the CP may
+    /// still be reading it because the KFD queue was never destroyed. This is
+    /// queue-local on purpose — the decision must not depend on the ambient
+    /// process-panicking flag or on a device-wide poison latch.
+    quarantined: bool,
     /// Owned bookkeeping buffers we need to keep alive. The EOP and ctx-save
     /// buffers stay alive for the lifetime of the queue — KFD reads them
     /// asynchronously as part of the compute dispatch hardware state.
@@ -974,7 +1022,7 @@ unsafe impl Sync for QueueInner {}
 
 /// Owns an activated queue only while later construction remains fallible.
 /// Teardown runs before the backing `QueueInner` is dropped; teardown failure
-/// poisons the device so `QueueInner::drop` quarantines its mappings.
+/// quarantines the inner so `QueueInner::drop` leaks its mappings.
 struct ActivatedQueueGuard {
     inner: Option<QueueInner>,
     core: Arc<AmdDeviceCore>,
@@ -994,17 +1042,24 @@ impl ActivatedQueueGuard {
 
 impl Drop for ActivatedQueueGuard {
     fn drop(&mut self) {
-        let Some(inner) = self.inner.as_ref() else { return };
+        let Some(inner) = self.inner.as_mut() else { return };
         debug_assert_eq!(self.state, QueueState::Constructing);
+        // Unwinding only abandons this lane. Tinygrad latches `error_state`
+        // per device on a drain timeout or a fault (`hcq.py` `HWQueue`
+        // synchronize), never on an abandoned construction, so quarantining the
+        // backing is the whole remedy here.
         if std::thread::panicking() {
             self.state = QueueState::Quarantined;
-            self.core.poison("partially constructed queue abandoned during panic unwind");
+            inner.quarantined = true;
+            tracing::warn!("partially constructed queue abandoned during panic unwind; backing quarantined");
             return;
         }
-        match self.core.iface().teardown_ring(inner.queue_id, inner.doorbell_base) {
+        let (queue_id, doorbell_base) = (inner.queue_id, inner.doorbell_base);
+        match self.core.iface().teardown_ring(queue_id, doorbell_base) {
             Ok(_) => self.state = QueueState::Destroyed,
             Err(error) => {
                 self.state = QueueState::Quarantined;
+                inner.quarantined = true;
                 self.core.poison(&error.to_string());
                 tracing::warn!(?error, "partial queue teardown failed; backing allocations quarantined");
             }
@@ -1022,14 +1077,15 @@ impl Drop for QueueInner {
     /// Drop` has already invoked `kfd_destroy_queue` AND `PoolQueue::Drop`
     /// has drained the queue, so the GPU is idle on these buffers.
     ///
-    /// Skipped during panic unwind: `PoolQueue::Drop` and
-    /// `AmdComputeQueue::Drop` both skip their drain/destroy on panic, so
-    /// the GPU's CP may still be reading the ring/GART. Unmapping them here
-    /// would fault the VM mid-unwind and could crash before the panic's
-    /// diagnostics flush. Accept the buffer leak — the process is unwinding and
-    /// the OS reclaims at exit.
+    /// Skipped once the owning queue quarantined this backing, and during panic
+    /// unwind: `PoolQueue::Drop` and `AmdComputeQueue::Drop` both skip their
+    /// drain/destroy on panic, so the GPU's CP may still be reading the
+    /// ring/GART. Unmapping them here would fault the VM and could crash before
+    /// the panic's diagnostics flush. Accept the buffer leak — the OS reclaims
+    /// at process exit.
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if self.quarantined || std::thread::panicking() {
+            tracing::warn!(queue_id = self.queue_id, "quarantined AMD queue: leaking ring/GART/EOP backing");
             return;
         }
         self._ring_buf.free_amd_device_in_place();
@@ -1057,15 +1113,18 @@ impl Drop for AmdCopyQueue {
         if self.state != QueueState::Active {
             return;
         }
+        // Unwinding abandons this queue's in-flight copies but says nothing
+        // about the device, so quarantine without poisoning (tinygrad latches
+        // per-device error state on drain timeouts and faults only).
         if std::thread::panicking() {
-            self.core.poison("copy queue abandoned during panic unwind");
-            self.state = QueueState::Quarantined;
+            self.quarantine("copy queue abandoned during panic unwind");
             return;
         }
-        if let Err(error) = self.timeline.drain(COPY_TIMEOUT_MS) {
+        // Both this queue's own staging timeline and every linked plan whose
+        // SDMA work it published must retire before the ring is unmapped.
+        if let Err(error) = self.drain_inflight().and_then(|()| self.timeline.drain(COPY_TIMEOUT_MS)) {
             self.core.poison(&error.to_string());
-            self.state = QueueState::Quarantined;
-            tracing::warn!(?error, "copy queue drain failed; queue and backing quarantined");
+            self.quarantine("copy queue drain failed; queue and backing quarantined");
             return;
         }
         let (queue_id, doorbell_base) = {
@@ -1074,8 +1133,7 @@ impl Drop for AmdCopyQueue {
         };
         if let Err(error) = self.core.iface().teardown_ring(queue_id, doorbell_base) {
             self.core.poison(&error.to_string());
-            self.state = QueueState::Quarantined;
-            tracing::warn!(?error, "copy queue teardown failed; backing allocations quarantined");
+            self.quarantine("copy queue teardown failed; backing allocations quarantined");
         } else {
             self.state = QueueState::Destroyed;
         }
@@ -1089,36 +1147,43 @@ impl AmdComputeQueue {
         if self.state == QueueState::Destroyed {
             return Ok(());
         }
+        // A panic unwind abandons this queue, not the device: quarantine the
+        // lane and leave the process-global poison latch to real hardware
+        // faults and drain timeouts (tinygrad's per-device `error_state`).
         if self.state == QueueState::Quarantined || std::thread::panicking() {
-            if std::thread::panicking() {
-                self.core.poison("compute queue abandoned during panic unwind");
-            }
-            self.state = QueueState::Quarantined;
+            self.quarantine();
             return Err(self
                 .core
                 .poison_error()
                 .unwrap_or_else(|| Error::Runtime { message: "AMD compute queue is quarantined".into() }));
         }
         debug_assert_eq!(self.state, QueueState::Active);
-        let inner = self.inner.get_mut();
-        match self.core.iface().teardown_ring(inner.queue_id, inner.doorbell_base) {
+        let (queue_id, doorbell_base) = {
+            let inner = self.inner.get_mut();
+            (inner.queue_id, inner.doorbell_base)
+        };
+        match self.core.iface().teardown_ring(queue_id, doorbell_base) {
             Ok(_) => {
                 self.state = QueueState::Destroyed;
                 Ok(())
             }
             Err(error) => {
                 self.core.poison(&error.to_string());
-                self.state = QueueState::Quarantined;
+                self.quarantine();
                 tracing::warn!(?error, "compute queue teardown failed; backing allocations quarantined");
                 Err(error)
             }
         }
     }
 
+    /// Abandon this queue's hardware state: the KFD queue is never destroyed
+    /// and its ring/GART/EOP backing is leaked rather than unmapped under a
+    /// possibly live command processor.
     pub(crate) fn quarantine(&mut self) {
-        if self.state == QueueState::Active {
+        if self.state != QueueState::Destroyed {
             self.state = QueueState::Quarantined;
         }
+        self.inner.get_mut().quarantined = true;
     }
 }
 
@@ -1226,24 +1291,69 @@ pub(crate) struct LinkedCopyPublication<'a> {
     inner: parking_lot::MutexGuard<'a, QueueInner>,
 }
 
+/// Exclusive ring writer that restores the producer index when a publication is
+/// abandoned — ordinary failure or panic unwind — before its doorbell rings.
+///
+/// Owning the `&mut QueueInner` is the point: nothing reaches the ring except
+/// through this guard, so "snapshot the index before the first push" is enforced
+/// by borrowck instead of call-site discipline, and rollback always lands on the
+/// pre-submission index rather than on whatever the index happened to be when a
+/// timeline reservation was constructed.
+struct RingRollback<'a> {
+    inner: &'a mut QueueInner,
+    saved: u64,
+    committed: bool,
+}
+
+impl<'a> RingRollback<'a> {
+    fn new(inner: &'a mut QueueInner) -> Self {
+        let saved = inner.write_idx;
+        Self { inner, saved, committed: false }
+    }
+
+    /// Keep everything written so far: the doorbell rang and the packets now
+    /// belong to the GPU.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl std::ops::Deref for RingRollback<'_> {
+    type Target = QueueInner;
+
+    fn deref(&self) -> &QueueInner {
+        self.inner
+    }
+}
+
+impl std::ops::DerefMut for RingRollback<'_> {
+    fn deref_mut(&mut self) -> &mut QueueInner {
+        self.inner
+    }
+}
+
+impl Drop for RingRollback<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.inner.write_idx = self.saved;
+        }
+    }
+}
+
 /// Rolls an unpublished queue-timeline reservation back on ordinary failure or
 /// panic. Once a doorbell has been rung, abandonment poisons the device instead.
+/// The ring producer index is owned by the paired [`RingRollback`].
 struct TimelineReservation<'a> {
     pool: &'a PoolQueue,
     core: &'a AmdDeviceCore,
     value: u64,
     published: bool,
     committed: bool,
-    write_idx: Option<(*mut QueueInner, u64)>,
 }
 
 impl<'a> TimelineReservation<'a> {
     fn new(pool: &'a PoolQueue, core: &'a AmdDeviceCore, value: u64) -> Self {
-        Self { pool, core, value, published: false, committed: false, write_idx: None }
-    }
-
-    fn track_write_idx(&mut self, inner: &mut QueueInner) {
-        self.write_idx = Some((inner, inner.write_idx));
+        Self { pool, core, value, published: false, committed: false }
     }
 
     fn mark_published(&mut self) {
@@ -1262,15 +1372,8 @@ impl Drop for TimelineReservation<'_> {
         }
         if self.published {
             self.core.poison("AMD queue publication failed after ringing its doorbell");
-        } else {
-            if let Some((inner, write_idx)) = self.write_idx {
-                // SAFETY: the reservation is declared after, and therefore
-                // drops before, the mutex guard that keeps `inner` stable.
-                unsafe { (*inner).write_idx = write_idx };
-            }
-            if !self.pool.rollback_pm4(self.value) {
-                self.core.poison("AMD timeline reservation rollback lost publication authority");
-            }
+        } else if !self.pool.rollback_pm4(self.value) {
+            self.core.poison("AMD timeline reservation rollback lost publication authority");
         }
     }
 }
@@ -1281,16 +1384,11 @@ struct CopyTimelineReservation<'a> {
     value: u64,
     published: bool,
     committed: bool,
-    write_idx: Option<(*mut QueueInner, u64)>,
 }
 
 impl<'a> CopyTimelineReservation<'a> {
     fn new(timeline: &'a Timeline, core: &'a AmdDeviceCore, value: u64) -> Self {
-        Self { timeline, core, value, published: false, committed: false, write_idx: None }
-    }
-
-    fn track_write_idx(&mut self, inner: &mut QueueInner) {
-        self.write_idx = Some((inner, inner.write_idx));
+        Self { timeline, core, value, published: false, committed: false }
     }
 
     fn mark_published(&mut self) {
@@ -1309,15 +1407,8 @@ impl Drop for CopyTimelineReservation<'_> {
         }
         if self.published {
             self.core.poison("AMD copy publication failed after ringing its doorbell");
-        } else {
-            if let Some((inner, write_idx)) = self.write_idx {
-                // SAFETY: see TimelineReservation::drop; the queue mutex guard
-                // still owns this inner value while the reservation drops.
-                unsafe { (*inner).write_idx = write_idx };
-            }
-            if !self.timeline.rollback(self.value) {
-                self.core.poison("AMD copy timeline reservation rollback lost publication authority");
-            }
+        } else if !self.timeline.rollback(self.value) {
+            self.core.poison("AMD copy timeline reservation rollback lost publication authority");
         }
     }
 }
@@ -1430,13 +1521,14 @@ impl AmdComputeQueue {
                 None
             };
 
-            let finalized = finalize_hcq_aql_timeline_submission(
+            let mut finalized = finalize_hcq_aql_timeline_submission(
                 submission,
                 counter_addr,
                 prev,
                 next,
                 timestamps.as_ref().map(|signal| (signal.start_ts_addr(), signal.end_ts_addr())),
             )?;
+            push_queue_event_mailbox(&mut finalized, &self.core);
 
             let program = lower_hcq_aql_submission_program(
                 &finalized,
@@ -1445,6 +1537,7 @@ impl AmdComputeQueue {
                     tmpring_size: pool.tmpring_size(),
                     target_major: self.core.arch.gfx_major(),
                     completion_xcc_mask: (self.core.node.num_xcc > 1).then_some(1),
+                    queue_event_mailbox: self.core.queue_event_mailbox().map(|mailbox| mailbox.address),
                 },
                 crate::hcq::PatchSource::LinkAddress(0),
             )?;
@@ -1507,9 +1600,15 @@ impl AmdComputeQueue {
             }
         }
         finalized.push(crate::hcq::Command::Store { dst: counter_addr, value: next });
+        push_queue_event_mailbox(&mut finalized, &self.core);
 
-        let state =
-            Pm4LoweringState { scratch_address: scratch_addr, tmpring_size, target_major, completion_xcc_mask: None };
+        let state = Pm4LoweringState {
+            scratch_address: scratch_addr,
+            tmpring_size,
+            target_major,
+            completion_xcc_mask: None,
+            queue_event_mailbox: self.core.queue_event_mailbox().map(|mailbox| mailbox.address),
+        };
         let q = if pmc_start.is_empty() && pmc_read.is_empty() {
             lower_hcq_pm4(&finalized, state)?
         } else {
@@ -1537,19 +1636,16 @@ impl AmdComputeQueue {
 
         validate_pm4_dword_count(q.len())?;
         wait_pm4_headroom(&g, q.len()).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        let mut ring = RingRollback::new(&mut g);
         let reserved = pool.next_pm4();
         debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
         let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
-        reservation.track_write_idx(&mut g);
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
-        let write_idx = g.write_idx;
-        g.push_pm4(&q);
-        if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
-            g.write_idx = write_idx;
-            return Err(error);
-        }
-        g.ring_doorbell(/*is_pm4=*/ true);
+        ring.push_pm4(&q);
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
+        ring.ring_doorbell(/*is_pm4=*/ true);
         reservation.mark_published();
+        ring.commit();
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
         reservation.commit();
         let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps.clone());
@@ -1616,19 +1712,16 @@ impl AmdComputeQueue {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let mut g = self.inner.lock();
         wait_pm4_headroom(&g, indirect.len()).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        let mut ring = RingRollback::new(&mut g);
         let reserved = pool.next_pm4();
         debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
         let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
-        reservation.track_write_idx(&mut g);
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
-        let write_idx = g.write_idx;
-        g.push_pm4(&indirect);
-        if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
-            g.write_idx = write_idx;
-            return Err(error);
-        }
-        g.ring_doorbell(/*is_pm4=*/ true);
+        ring.push_pm4(&indirect);
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
+        ring.ring_doorbell(/*is_pm4=*/ true);
         reservation.mark_published();
+        ring.commit();
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
         reservation.commit();
         Ok(SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, None))
@@ -1731,26 +1824,47 @@ impl AmdComputeQueue {
         validate_aql_packet_count(packets)?;
         let mut g = self.inner.lock();
         wait_aql_headroom(&g, packets).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        let mut ring = RingRollback::new(&mut g);
         let reserved = pool.next_pm4();
         debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
         let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
-        reservation.track_write_idx(&mut g);
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
-        let write_idx = g.write_idx;
         for packet in replay.bytes().chunks_exact(AQL_PACKET_BYTES) {
-            g.push_aql(packet);
+            ring.push_aql(packet);
         }
-        if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
-            g.write_idx = write_idx;
-            return Err(error);
-        }
-        g.ring_doorbell(/*is_pm4=*/ false);
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
+        ring.ring_doorbell(/*is_pm4=*/ false);
         reservation.mark_published();
+        ring.commit();
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
         reservation.commit();
         Ok(())
     }
 
+    /// Wait for linked-publication headroom WITHOUT pinning the queue lock
+    /// across the poll. A linked plan spanning both engines waits each ring
+    /// here first and only then takes the two guards back-to-back; holding the
+    /// compute guard while polling the shared SDMA ring stalled every host
+    /// staging copy for up to the full timeout. Tinygrad completes the compute
+    /// `_submit` before the copy one and never nests engine locks.
+    pub(crate) fn wait_publication_headroom(&self, byte_lengths: &[usize]) -> Result<()> {
+        if let Some(error) = self.core.poison_error() {
+            return Err(error);
+        }
+        // `ring_size` and `is_pm4` are fixed at queue creation.
+        let units = validate_linked_compute_lengths(self.is_pm4, self.inner.lock().ring_size, byte_lengths)?;
+        let what = if self.is_pm4 { "PM4 linked publication headroom" } else { "AQL linked publication headroom" };
+        spin_until_headroom(what, HEADROOM_TIMEOUT_MS, || {
+            let inner = self.inner.lock();
+            if self.is_pm4 { pm4_shortfall(&inner, units) } else { aql_shortfall(&inner, units) }
+        })
+        .inspect_err(|error| self.core.poison(&error.to_string()))
+    }
+
+    /// Take the publication guard, re-verifying headroom. Cheap after
+    /// [`wait_publication_headroom`](Self::wait_publication_headroom); it keeps
+    /// its own bounded wait so a ring consumed between the two calls still
+    /// blocks rather than lapping.
     pub(crate) fn prepare_linked_publication(&self, byte_lengths: &[usize]) -> Result<LinkedComputePublication<'_>> {
         if let Some(error) = self.core.poison_error() {
             return Err(error);
@@ -1837,6 +1951,13 @@ impl AmdComputeQueue {
     /// when it halted the queue (e.g. `0x401` insufficient-scratch), or `None`
     /// if no exception is recorded (value `0`) / on PM4 queues. Used to turn a
     /// blind dispatch timeout into a diagnosable error.
+    /// Ring producer index. Test-only: proves an abandoned publication left no
+    /// packets behind.
+    #[cfg(test)]
+    pub(crate) fn ring_write_idx(&self) -> u64 {
+        self.inner.lock().write_idx
+    }
+
     pub(crate) fn inactive_exception(&self) -> Option<i64> {
         let h = self.inner.lock().qinactive_host?;
         // SAFETY: host-visible amd_signal_t; `value` is the i64 at +8.
@@ -1913,27 +2034,23 @@ pub(crate) fn absolute_pm4_read_idx(write_idx: u64, reported_read: u64, capacity
     read
 }
 
-fn wait_pm4_headroom(g: &QueueInner, dwords: usize) -> Result<()> {
-    let capacity = g.ring_size / 4;
-    if dwords == 0 || dwords >= capacity {
-        return Err(Error::CommandStreamTooLarge { kind: "PM4 ring submission", actual: dwords, limit: capacity - 1 });
-    }
+/// Bound on any single ring-headroom wait.
+const HEADROOM_TIMEOUT_MS: u64 = 30_000;
+
+/// Spin (then yield) until `probe` reports headroom. `probe` returns `None`
+/// once the ring has room, or the `(target, observed read index)` pair to
+/// report if the deadline expires. Taking a closure lets a caller that must not
+/// pin a ring re-take the queue lock on every attempt.
+fn spin_until_headroom(
+    what: &'static str,
+    timeout_ms: u64,
+    mut probe: impl FnMut() -> Option<(u64, u64)>,
+) -> Result<()> {
     let start = std::time::Instant::now();
     loop {
-        // PM4 reports only the queue-relative RPTR bits. Reconstruct its epoch
-        // from the monotonic producer index, as KFD does when restoring a HQD.
-        let reported_read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
-        let read = absolute_pm4_read_idx(g.write_idx, reported_read, capacity);
-        if g.write_idx + dwords as u64 - read <= capacity as u64 {
-            return Ok(());
-        }
-        if start.elapsed().as_millis() >= 30_000 {
-            return Err(Error::TimelineTimeout {
-                what: "PM4 ring headroom",
-                target: g.write_idx + dwords as u64 - capacity as u64,
-                current: read,
-                waited_ms: 30_000,
-            });
+        let Some((target, current)) = probe() else { return Ok(()) };
+        if start.elapsed().as_millis() as u64 >= timeout_ms {
+            return Err(Error::TimelineTimeout { what, target, current, waited_ms: timeout_ms });
         }
         std::hint::spin_loop();
         if start.elapsed().as_micros() >= 100 {
@@ -1942,27 +2059,41 @@ fn wait_pm4_headroom(g: &QueueInner, dwords: usize) -> Result<()> {
     }
 }
 
-fn wait_aql_headroom(g: &QueueInner, packets: usize) -> Result<()> {
-    let slots = g.ring_size / AQL_PACKET_BYTES;
-    let start = std::time::Instant::now();
-    loop {
-        let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
-        if g.write_idx + packets as u64 - read <= slots as u64 {
-            return Ok(());
-        }
-        if start.elapsed().as_millis() >= 30_000 {
-            return Err(Error::TimelineTimeout {
-                what: "AQL ring headroom",
-                target: g.write_idx + packets as u64 - slots as u64,
-                current: read,
-                waited_ms: 30_000,
-            });
-        }
-        std::hint::spin_loop();
-        if start.elapsed().as_micros() >= 100 {
-            std::thread::yield_now();
-        }
+/// `None` when `dwords` fit, else the producer index that must be retired to
+/// plus the consumer index observed now.
+fn pm4_shortfall(g: &QueueInner, dwords: usize) -> Option<(u64, u64)> {
+    let capacity = g.ring_size / 4;
+    // PM4 reports only the queue-relative RPTR bits. Reconstruct its epoch from
+    // the monotonic producer index, as KFD does when restoring a HQD.
+    let reported_read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+    let read = absolute_pm4_read_idx(g.write_idx, reported_read, capacity);
+    let needed = g.write_idx + dwords as u64;
+    (needed - read > capacity as u64).then(|| (needed - capacity as u64, read))
+}
+
+fn aql_shortfall(g: &QueueInner, packets: usize) -> Option<(u64, u64)> {
+    let slots = (g.ring_size / AQL_PACKET_BYTES) as u64;
+    let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+    let needed = g.write_idx + packets as u64;
+    (needed - read > slots).then(|| (needed - slots, read))
+}
+
+fn sdma_shortfall(g: &QueueInner, published: u64) -> Option<(u64, u64)> {
+    let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+    let needed = g.write_idx + published;
+    (needed - read > g.ring_size as u64).then(|| (needed - g.ring_size as u64, read))
+}
+
+fn wait_pm4_headroom(g: &QueueInner, dwords: usize) -> Result<()> {
+    let capacity = g.ring_size / 4;
+    if dwords == 0 || dwords >= capacity {
+        return Err(Error::CommandStreamTooLarge { kind: "PM4 ring submission", actual: dwords, limit: capacity - 1 });
     }
+    spin_until_headroom("PM4 ring headroom", HEADROOM_TIMEOUT_MS, || pm4_shortfall(g, dwords))
+}
+
+fn wait_aql_headroom(g: &QueueInner, packets: usize) -> Result<()> {
+    spin_until_headroom("AQL ring headroom", HEADROOM_TIMEOUT_MS, || aql_shortfall(g, packets))
 }
 
 /// View a `[u32; 16]` AQL packet as its 64 little-endian bytes.
@@ -2049,6 +2180,38 @@ const COPY_TIMEOUT_MS: u64 = 30_000;
 const STAGING_BYTES: usize = sdma::SDMA_MAX_COPY_BYTES;
 
 impl AmdCopyQueue {
+    /// Retain a linked-plan finalizer whose SDMA work this queue published, so
+    /// teardown waits for it. Retired entries are dropped first.
+    pub(crate) fn register_inflight(&self, finalizer: Arc<SubmissionFinalizer>) {
+        let mut inflight = self.inflight.lock();
+        inflight.retain(|entry| !entry.retired());
+        inflight.push_back(finalizer);
+    }
+
+    /// Wait every registered linked-plan finalizer, then forget the retired
+    /// ones. Snapshot under the lock, wait outside it.
+    fn drain_inflight(&self) -> Result<()> {
+        let snapshot = self.inflight.lock().iter().cloned().collect::<Vec<_>>();
+        for finalizer in &snapshot {
+            finalizer.wait(COPY_TIMEOUT_MS)?;
+        }
+        self.inflight.lock().retain(|entry| !entry.retired());
+        Ok(())
+    }
+
+    /// Registered linked-plan finalizers. Test-only.
+    #[cfg(test)]
+    pub(crate) fn inflight_len(&self) -> usize {
+        self.inflight.lock().len()
+    }
+
+    /// See [`AmdComputeQueue::quarantine`].
+    fn quarantine(&mut self, reason: &str) {
+        self.state = QueueState::Quarantined;
+        self.inner.get_mut().quarantined = true;
+        tracing::warn!(reason, "AMD copy queue quarantined");
+    }
+
     pub fn create(allocator: &AmdAllocator) -> Result<Arc<Self>> {
         let core = Arc::clone(allocator.dev.core());
         let inner = ActivatedQueueGuard::new(
@@ -2074,7 +2237,14 @@ impl AmdCopyQueue {
             _ => return Err(Error::NotHostVisible { what: "staging buffer" }),
         };
         let staging = Mutex::new(StagingBuf { _buf: staging_buf.into_inner(), host, gpu, size: STAGING_BYTES });
-        Ok(Arc::new(Self { inner: Mutex::new(inner.into_inner()), state: QueueState::Active, core, timeline, staging }))
+        Ok(Arc::new(Self {
+            inner: Mutex::new(inner.into_inner()),
+            state: QueueState::Active,
+            core,
+            timeline,
+            staging,
+            inflight: Mutex::new(std::collections::VecDeque::new()),
+        }))
     }
 
     /// Lower and publish one complete HCQ copy command buffer with one
@@ -2084,7 +2254,8 @@ impl AmdCopyQueue {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        let dwords = lower_hcq_sdma(submission, self.core.arch.gfx_major())?;
+        let dwords =
+            lower_hcq_sdma(submission, self.core.arch.gfx_major(), self.core.queue_event_mailbox().map(|m| m.address))?;
         if dwords.len() * 4 >= COPY_RING_BYTES {
             return Err(Error::CommandStreamTooLarge {
                 kind: "SDMA ring submission",
@@ -2099,6 +2270,22 @@ impl AmdCopyQueue {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         unsafe { std::ptr::write_volatile(g.doorbell.as_ptr(), g.write_idx) };
         Ok(())
+    }
+
+    /// SDMA counterpart of
+    /// [`AmdComputeQueue::wait_publication_headroom`](AmdComputeQueue::wait_publication_headroom).
+    pub(crate) fn wait_publication_headroom(&self, byte_lengths: &[usize]) -> Result<()> {
+        if let Some(error) = self.core.poison_error() {
+            return Err(error);
+        }
+        let published = {
+            let inner = self.inner.lock();
+            linked_sdma_published_bytes(inner.write_idx, inner.ring_size, byte_lengths)?
+        };
+        spin_until_headroom("SDMA linked publication headroom", COPY_TIMEOUT_MS, || {
+            sdma_shortfall(&self.inner.lock(), published)
+        })
+        .inspect_err(|error| self.core.poison(&error.to_string()))
     }
 
     pub(crate) fn prepare_linked_publication(&self, byte_lengths: &[usize]) -> Result<LinkedCopyPublication<'_>> {
@@ -2139,6 +2326,13 @@ impl AmdCopyQueue {
             off += n;
         }
         Ok(())
+    }
+
+    /// Ring producer index (bytes). Test-only; see
+    /// [`AmdComputeQueue::ring_write_idx`].
+    #[cfg(test)]
+    pub(crate) fn ring_write_idx(&self) -> u64 {
+        self.inner.lock().write_idx
     }
 
     /// Direct device→device VRAM copy (no staging needed).
@@ -2182,36 +2376,36 @@ impl AmdCopyQueue {
         let finalizer = {
             let mut g = self.inner.lock();
             let copy_packets = size.div_ceil(sdma::SDMA_MAX_COPY_BYTES);
-            wait_sdma_headroom(&g, copy_packets * 7 * 4 + 4 * 4)
+            // Copy chunks + the timeline fence + the event mailbox fence and trap.
+            wait_sdma_headroom(&g, copy_packets * 7 * 4 + 10 * 4)
                 .inspect_err(|error| self.core.poison(&error.to_string()))?;
-            let write_idx = g.write_idx;
+            let mut ring = RingRollback::new(&mut g);
             let mut off = 0usize;
             while off < size {
                 let n = (size - off).min(sdma::SDMA_MAX_COPY_BYTES);
-                push_sdma(&mut g, &sdma::copy_linear(src + off as u64, dst + off as u64, n));
+                push_sdma(&mut ring, &sdma::copy_linear(src + off as u64, dst + off as u64, n));
                 off += n;
             }
             // Reserve + fence the timeline value the host waits on.
             let target = self.timeline.next();
             let mut reservation = CopyTimelineReservation::new(&self.timeline, &self.core, target);
-            reservation.track_write_idx(&mut g);
-            if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)
-            {
-                g.write_idx = write_idx;
-                return Err(error);
+            self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
+            push_sdma(&mut ring, &sdma::fence(self.timeline.value_addr(), target as u32, self.core.arch.gfx_major()));
+            if let Some(mailbox) = self.core.queue_event_mailbox() {
+                // Tinygrad `AMDCopyQueue.signal` (ops_amd.py:490-492).
+                push_sdma(&mut ring, &sdma::fence(mailbox.address, mailbox.event_id, self.core.arch.gfx_major()));
+                push_sdma(&mut ring, &sdma::trap(mailbox.event_id));
             }
-            push_sdma(&mut g, &sdma::fence(self.timeline.value_addr(), target as u32, self.core.arch.gfx_major()));
+            self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
             // GART wptr first, then doorbell — same ordering as the compute
-            // queue. SDMA doorbell + wptr are byte counters (= write_idx).
-            unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), g.write_idx) };
+            // queue. SDMA doorbell + wptr are byte counters (= write_idx). Both
+            // are written after the last abortable step, so an abandoned
+            // submission never leaves an advertised wptr behind.
+            unsafe { std::ptr::write_volatile(ring.write_ptr_host.as_ptr(), ring.write_idx) };
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
-                g.write_idx = write_idx;
-                unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), write_idx) };
-                return Err(error);
-            }
-            unsafe { std::ptr::write_volatile(g.doorbell.as_ptr(), g.write_idx) };
+            unsafe { std::ptr::write_volatile(ring.doorbell.as_ptr(), ring.write_idx) };
             reservation.mark_published();
+            ring.commit();
             self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
             reservation.commit();
             SubmissionFinalizer::timeline(Arc::clone(self.timeline.signal()), target, None)
@@ -2277,48 +2471,12 @@ fn wait_sdma_headroom(g: &QueueInner, bytes: usize) -> Result<()> {
         });
     }
     let pos = (g.write_idx as usize) % g.ring_size;
-    let published = bytes + if pos + bytes > g.ring_size { g.ring_size - pos } else { 0 };
-    let start = std::time::Instant::now();
-    loop {
-        let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
-        if g.write_idx + published as u64 - read <= g.ring_size as u64 {
-            return Ok(());
-        }
-        if start.elapsed().as_millis() >= COPY_TIMEOUT_MS as u128 {
-            return Err(Error::TimelineTimeout {
-                what: "SDMA ring headroom",
-                target: g.write_idx + published as u64 - g.ring_size as u64,
-                current: read,
-                waited_ms: COPY_TIMEOUT_MS,
-            });
-        }
-        std::hint::spin_loop();
-        if start.elapsed().as_micros() >= 100 {
-            std::thread::yield_now();
-        }
-    }
+    let published = (bytes + if pos + bytes > g.ring_size { g.ring_size - pos } else { 0 }) as u64;
+    spin_until_headroom("SDMA ring headroom", COPY_TIMEOUT_MS, || sdma_shortfall(g, published))
 }
 
 fn wait_sdma_sequence_headroom(g: &QueueInner, published: u64) -> Result<()> {
-    let start = std::time::Instant::now();
-    loop {
-        let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
-        if g.write_idx + published - read <= g.ring_size as u64 {
-            return Ok(());
-        }
-        if start.elapsed().as_millis() >= COPY_TIMEOUT_MS as u128 {
-            return Err(Error::TimelineTimeout {
-                what: "SDMA linked transaction headroom",
-                target: g.write_idx + published - g.ring_size as u64,
-                current: read,
-                waited_ms: COPY_TIMEOUT_MS,
-            });
-        }
-        std::hint::spin_loop();
-        if start.elapsed().as_micros() >= 100 {
-            std::thread::yield_now();
-        }
-    }
+    spin_until_headroom("SDMA linked transaction headroom", COPY_TIMEOUT_MS, || sdma_shortfall(g, published))
 }
 
 impl std::fmt::Debug for AmdComputeQueue {
@@ -2531,6 +2689,7 @@ fn create_queue(
         gart_host,
         write_idx: 0,
         queue_id,
+        quarantined: false,
         qinactive_host,
         _ring_buf: ring_buf.into_inner(),
         _gart_buf: gart_buf.into_inner(),

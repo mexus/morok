@@ -66,12 +66,29 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// wake-up/timeout, `Err` if the WAIT_EVENTS ioctl itself failed.
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
 
+    /// The KFD queue-completion event mailbox, when this backend has one.
+    /// A completion packet that writes `event_id` there and raises an interrupt
+    /// wakes a blocked `WAIT_EVENTS` immediately instead of leaving it to the
+    /// poll tier (tinygrad `AMDComputeQueue.signal`, `ops_amd.py:391-393`).
+    /// `None` on backends with no KFD event page (AM, host mocks), which then
+    /// rely on the coherent GTT slot alone.
+    fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
+        None
+    }
+
     /// Fault-injection checkpoint around queue publication. Production
     /// backends keep the default no-op; the host mock scripts failures here to
     /// prove reservation rollback and post-doorbell poisoning.
     fn publication_checkpoint(&self, _stage: PublicationStage) -> Result<()> {
         Ok(())
     }
+}
+
+/// Address of a KFD event's mailbox slot plus the id written into it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueEventMailbox {
+    pub address: u64,
+    pub event_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,7 +188,6 @@ pub struct KfdIface {
     queue_event_id: u32,
     #[allow(dead_code)]
     queue_event_slot_index: u32,
-    #[allow(dead_code)]
     queue_event_mailbox_ptr: u64,
     mem_fault_event_id: u32,
     hw_fault_event_id: u32,
@@ -319,6 +335,10 @@ impl Drop for EventGuard {
 }
 
 impl AmdIface for KfdIface {
+    fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
+        Some(QueueEventMailbox { address: self.queue_event_mailbox_ptr, event_id: self.queue_event_id })
+    }
+
     fn alloc_raw(
         &self,
         size: usize,
