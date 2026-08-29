@@ -3038,6 +3038,20 @@ fn test_simplify_valid_redundant_upper_bounds() {
 }
 
 #[test]
+fn lower_bound_clauses_use_the_bounds_minimum() {
+    use crate::symbolic::valid_simplification::parse_valid;
+
+    let range = UOp::range_const(20, 0);
+    let begin = UOp::var("begin", DType::WeakInt, 2, 9);
+    let ne_form = range.lt(&begin).ne(&UOp::native_const(true));
+    let not_form = range.lt(&begin).not();
+
+    for clause in [ne_form, not_form] {
+        assert_eq!(parse_valid(&clause).map(|(_, upper, bound)| (upper, bound)), Some((false, 2)));
+    }
+}
+
+#[test]
 fn test_simplify_valid_no_parseable_clauses() {
     use crate::symbolic::valid_simplification::simplify_valid;
 
