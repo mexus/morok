@@ -1360,14 +1360,15 @@ fn broadcast_and_devec_wmma(wmma: &Arc<UOp>) -> Option<Arc<UOp>> {
     UOp::stack(lanes.into()).try_reshape(&output_shape).ok()
 }
 
-fn stack_with_shape(mut elements: Vec<Arc<UOp>>, shape: &[svod_ir::SInt]) -> Option<Arc<UOp>> {
+pub(crate) fn stack_with_shape(mut elements: Vec<Arc<UOp>>, shape: &[svod_ir::SInt]) -> Option<Arc<UOp>> {
     fn build(elements: &[Arc<UOp>], shape: &[svod_ir::SInt]) -> Option<Arc<UOp>> {
         if shape.is_empty() {
             return (elements.len() == 1).then(|| elements[0].clone());
         }
         let count = shape[0].as_const()?;
         let chunk = elements.len().checked_div(count)?;
-        if count * chunk != elements.len() {
+        // A zero-sized dimension leaves no elements to chunk; `chunks(0)` panics.
+        if chunk == 0 || count * chunk != elements.len() {
             return None;
         }
         Some(UOp::stack(elements.chunks(chunk).map(|part| build(part, &shape[1..])).collect::<Option<_>>()?))
