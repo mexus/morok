@@ -104,6 +104,21 @@ fn test_parse_mode_default_is_arena() {
 }
 
 #[test]
+fn test_prepare_config_planner_mode_follows_env() {
+    // `default()` and `From<OptimizerConfig>` hardcoded Arena, so the
+    // `SVOD_MEMORY_PLANNER` escape hatch only worked on `from_env()`.
+    let expected = parse_mode(std::env::var("SVOD_MEMORY_PLANNER").ok().as_deref());
+    for (name, config) in [
+        ("default", crate::PrepareConfig::default()),
+        ("from_env", crate::PrepareConfig::from_env()),
+        ("for_cpu_backend", crate::PrepareConfig::for_cpu_backend(crate::CpuBackend::Clang)),
+        ("from_optimizer", crate::PrepareConfig::from(svod_schedule::OptimizerConfig::default())),
+    ] {
+        assert_eq!(config.planner_mode, expected, "{name}");
+    }
+}
+
+#[test]
 fn test_parse_mode_disabled_aliases() {
     for raw in ["0", "off", "none", "disabled", "OFF", " disabled ", "Disabled"] {
         assert_eq!(parse_mode(Some(raw)), PlannerMode::Disabled, "raw={raw:?}");
