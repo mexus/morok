@@ -119,7 +119,10 @@ pub fn create_amd_codegen(device_id: usize, arch: AmdArch) -> Result<(Arc<dyn Re
     let renderer = Arc::new(AmdRendererWrapper { device: spec, arch });
     let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
     let toolchain = ClangToolchain::discover(cache.as_deref()).map_err(runtime_as_device)?;
-    let flags = crate::amd::compile::amd_object_flags(arch);
+    // The per-kernel `-nogpulib` decision comes from the IR, which is already
+    // part of every object-cache key; the persisted identity records the
+    // arch-stable, ocml-free flag set.
+    let flags = crate::amd::compile::amd_object_flags("", arch);
     let identity = CompilerIdentity {
         schema: OBJECT_CACHE_SCHEMA,
         backend: "amd-clang".into(),

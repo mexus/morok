@@ -363,12 +363,13 @@ fn generate_intrinsic_declarations(kernel: &[String], target: &LlvmTarget) -> St
     }
 
     if target.is_amd() {
-        for (suffix, llvm_type) in [("f16", "half"), ("f32", "float"), ("f64", "double")] {
-            for op in ["sqrt", "log2", "exp2", "sin"] {
-                let name = format!("@__ocml_{op}_{suffix}");
-                if kernel_str.contains(&name) {
-                    decls.push(format!("declare {llvm_type} {name}({llvm_type})"));
-                }
+        // Only the f64 transcendentals the AMDGPU backend cannot select stay on
+        // ROCm device libraries; everything else is an `@llvm.*` intrinsic
+        // declared by the generic loop above. See `amd::ops::render_float_unary`.
+        for op in ["log2", "exp2", "sin"] {
+            let name = format!("@__ocml_{op}_f64");
+            if kernel_str.contains(&name) {
+                decls.push(format!("declare double {name}(double)"));
             }
         }
         // Scalar (non-mangled) amdgcn intrinsics; declared whenever referenced

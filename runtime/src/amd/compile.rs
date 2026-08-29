@@ -27,8 +27,17 @@ pub fn compile_ir_to_amd_object(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8
     compile_ir_to_amd_object_with(&toolchain, ir, arch)
 }
 
-pub(crate) fn amd_object_flags(arch: AmdArch) -> Vec<String> {
-    vec![
+/// Clang driver flags for one kernel.
+///
+/// `-nogpulib` skips the ROCm device-library search entirely, the way tinygrad
+/// drives amdgcn straight through LLVM (`runtime/support/compiler_llvm.py:19-24`
+/// links no device libs). The renderer emits `@llvm.*` intrinsics for every
+/// float unary the AMDGPU backend can select, so the libraries are only needed
+/// when the IR still references the f64 `__ocml_*` entry points
+/// (`codegen/src/llvm/amd/ops.rs::render_float_unary`). The IR is part of the
+/// object-cache key, so keying a flag off it keeps the key sound.
+pub(crate) fn amd_object_flags(ir: &str, arch: AmdArch) -> Vec<String> {
+    let mut flags: Vec<String> = vec![
         "-x".into(),
         "ir".into(),
         "-c".into(),
@@ -39,10 +48,12 @@ pub(crate) fn amd_object_flags(arch: AmdArch) -> Vec<String> {
         "-nogpuinc".into(),
         "-Wno-override-module".into(),
         "-fno-math-errno".into(),
-        "-".into(),
-        "-o".into(),
-        "-".into(),
-    ]
+    ];
+    if !ir.contains("@__ocml_") {
+        flags.push("-nogpulib".into());
+    }
+    flags.extend(["-", "-o", "-"].map(str::to_string));
+    flags
 }
 
 pub(crate) fn compile_ir_to_amd_object_with(
@@ -81,7 +92,7 @@ pub(crate) fn compile_ir_to_amd_object_with(
 
     debug!(arch = arch.mcpu(), ir.length = ir.len(), "compiling amdgcn IR via clang");
 
-    let args = amd_object_flags(arch);
+    let args = amd_object_flags(ir, arch);
 
     let mut child = toolchain
         .command()
@@ -121,7 +132,7 @@ pub(crate) fn spawn_ir_to_amd_object(
             message: "AMD GPU support requires clang built with the AMDGPU target".into(),
         });
     }
-    crate::clang::spawn_compile_process(toolchain, ir, &amd_object_flags(arch))
+    crate::clang::spawn_compile_process(toolchain, ir, &amd_object_flags(ir, arch))
 }
 
 /// Validate both the generic ELF contract and the architecture encoded in
