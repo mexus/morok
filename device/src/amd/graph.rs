@@ -30,7 +30,9 @@ struct KernargSlot {
     buffer_count: usize,
     var_count: usize,
     record_size: usize,
-    abi: Vec<crate::device::AbiParamDescriptor>,
+    /// Built once at capture: the ABI is fixed for the graph's lifetime, so
+    /// rebuilding it on every replay was pure overhead.
+    layout: crate::hcq::ClikeKernargLayout,
 }
 
 enum NativeGraph {
@@ -43,6 +45,12 @@ struct ReplayState {
     profile_command: Option<ReplayCommandBuffer>,
     control: Option<ReplayCommandBuffer>,
     profile_control: Option<ReplayCommandBuffer>,
+    /// Arguments the graph-owned kernarg storage currently holds, so an
+    /// identical replay skips repacking every slot (tinygrad's
+    /// `_prev_resolved_syms` skip in `graph/hcq.py`).
+    packed: Option<(Vec<u64>, Vec<i64>)>,
+    #[cfg(test)]
+    packs: usize,
 }
 
 struct ProfileGraph {
@@ -226,7 +234,7 @@ impl AmdGraph {
                 buffer_count,
                 var_count,
                 record_size: program.kernarg_record_size(),
-                abi: program.abi().to_vec(),
+                layout: crate::hcq::ClikeKernargLayout::from_abi(program.abi()),
             });
 
             let g = kernel.global_size.unwrap_or([1, 1, 1]);
@@ -353,13 +361,26 @@ impl AmdGraph {
                 profile_command,
                 control: control_command,
                 profile_control: profile_control_command,
+                packed: None,
+                #[cfg(test)]
+                packs: 0,
             }),
             slots,
             kernargs_buf: kernargs_buf.into_inner(),
         })))
     }
 
-    fn patch_kernargs(&self, buffers: &[u64], vals: &[i64]) -> Result<()> {
+    /// Pack graph kernargs the way a replay does and report the number of packs
+    /// performed so far. Test-only: proving the skip through a real replay
+    /// needs a GPU to retire the first submission.
+    #[cfg(test)]
+    pub(crate) fn kernarg_pack_probe(&self, buffers: &[u64], vals: &[i64]) -> Result<usize> {
+        let mut state = self.state.lock();
+        self.patch_kernargs(&mut state, buffers, vals)?;
+        Ok(state.packs)
+    }
+
+    fn patch_kernargs(&self, state: &mut ReplayState, buffers: &[u64], vals: &[i64]) -> Result<()> {
         let expected_buffers: usize = self.slots.iter().map(|slot| slot.buffer_count).sum();
         let expected_vals: usize = self.slots.iter().map(|slot| slot.var_count).sum();
         if (!buffers.is_empty() && buffers.len() != expected_buffers)
@@ -373,6 +394,11 @@ impl AmdGraph {
                 ),
             });
         }
+        // Graph-owned kernarg storage is written by nothing else, so identical
+        // arguments mean the bytes are already correct.
+        if state.packed.as_ref().is_some_and(|(packed, packed_vals)| packed == buffers && packed_vals == vals) {
+            return Ok(());
+        }
         let mut buffer_offset = 0;
         let mut var_offset = 0;
         for slot in &self.slots {
@@ -384,9 +410,14 @@ impl AmdGraph {
             let slot_vals = if vals.is_empty() { &slot.vals } else { &vals[var_offset..var_offset + slot.var_count] };
             // SAFETY: each slot is disjoint, graph-owned, and replay is serialized.
             let dst = unsafe { std::slice::from_raw_parts_mut(slot.host, slot.record_size) };
-            crate::hcq::ClikeKernargLayout::from_abi(&slot.abi).pack(dst, slot_buffers, slot_vals)?;
+            slot.layout.pack(dst, slot_buffers, slot_vals)?;
             buffer_offset += slot.buffer_count;
             var_offset += slot.var_count;
+        }
+        state.packed = Some((buffers.to_vec(), vals.to_vec()));
+        #[cfg(test)]
+        {
+            state.packs += 1;
         }
         Ok(())
     }
@@ -406,7 +437,7 @@ impl Graph for AmdGraph {
         self.owner.synchronize()?;
         let lane = self.owner.lease()?;
         lane.ensure_has_local_memory(self.max_private)?;
-        self.patch_kernargs(buffers, vals)?;
+        self.patch_kernargs(&mut state, buffers, vals)?;
         match self.native {
             NativeGraph::Aql => {
                 let control = self.control.as_ref().expect("AQL graph control");
@@ -460,7 +491,7 @@ impl Graph for AmdGraph {
         self.owner.synchronize()?;
         let lane = self.owner.lease()?;
         lane.ensure_has_local_memory(self.max_private)?;
-        self.patch_kernargs(buffers, vals)?;
+        self.patch_kernargs(&mut state, buffers, vals)?;
         let signals = (0..profile.signal_count).map(|_| lane.acquire_timestamp_signal()).collect::<Result<Vec<_>>>()?;
         for signal in &signals {
             signal.reset(0);
