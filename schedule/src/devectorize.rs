@@ -1084,32 +1084,35 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
                 }
             }
             Shl | Shr => {
-                let n = long_bin(And, b0.clone(), b0.const_like(31), word_dt.clone());
-                let ge32 = long_bin(Lt, b0.const_like(31), b0.clone(), DType::Bool);
+                // Constants must carry the *word* dtype: a `const_like` off a tagged long
+                // reference would stay 64-bit and never be split.
+                let wconst = |v: i64| {
+                    UOp::const_(
+                        word_dt.clone(),
+                        if from == ScalarDType::Int64 { ConstValue::Int(v) } else { ConstValue::UInt(v as u64) },
+                    )
+                };
+                let uconst = |v: u64| UOp::const_(DType::UInt32, ConstValue::UInt(v));
+                // `n` is the shift inside one word; `ge32` picks the "shift crosses the word" case.
+                let n = long_bin(And, b0.clone(), wconst(31), word_dt.clone());
+                let nu = n.clone().bitcast(DType::UInt32);
+                let ge32 = long_bin(Lt, wconst(31), b0.clone(), DType::Bool);
                 if *op == Shl {
-                    let low = long_bin(Shl, a0.clone(), n.clone(), word_dt.clone());
+                    // carry = a0 >>u (32 - n), spelled as two shifts so n == 0 stays in range.
                     let carry = long_bin(
                         Shr,
-                        long_bin(
-                            Shr,
-                            a0.clone().bitcast(DType::UInt32),
-                            a0.const_like(1).bitcast(DType::UInt32),
-                            DType::UInt32,
-                        ),
-                        long_bin(
-                            Sub,
-                            a0.const_like(31).bitcast(DType::UInt32),
-                            n.bitcast(DType::UInt32),
-                            DType::UInt32,
-                        ),
+                        long_bin(Shr, a0.clone().bitcast(DType::UInt32), uconst(1), DType::UInt32),
+                        long_bin(Sub, uconst(31), nu, DType::UInt32),
                         DType::UInt32,
                     )
                     .bitcast(word_dt.clone());
-                    let high = long_bin(Or, long_bin(Shl, a1, b0.clone(), word_dt.clone()), carry, word_dt.clone());
+                    let low = long_bin(Shl, a0, n.clone(), word_dt.clone());
+                    let high = long_bin(Or, long_bin(Shl, a1, n, word_dt.clone()), carry, word_dt.clone());
                     if word == 0 {
-                        UOp::try_where(ge32, low.const_like(0), low).expect("long shift where")
+                        UOp::try_where(ge32, wconst(0), low).expect("long shift where")
                     } else {
-                        UOp::try_where(ge32, a0, high).expect("long shift where")
+                        // shift >= 32: the high word is the low word shifted by n = shift - 32.
+                        UOp::try_where(ge32, low, high).expect("long shift where")
                     }
                 } else {
                     let carry = long_bin(
