@@ -1195,14 +1195,17 @@ impl ExecutionPlan {
             .hcq_executor
             .lock()
             .map_err(|_| crate::error::Error::Execution { reason: "CPU HCQ executor lock poisoned".into() })?;
-        let graph = self.graph_endpoints_match_device()?.then(|| self.graph()).and_then(|graph| graph.as_deref());
-        if graph.is_none()
-            && matches!(self.replay_native_linked_plan()?, svod_device::device::NativeReplayOutcome::Executed)
-        {
-            return Ok(());
-        }
         let mut graph_replayed = false;
+        // Both pre-flight checks run inside the poisoning closure: a failed
+        // endpoint validation or native submit leaves the plan's timelines in
+        // an unknown state, so it must not stay retryable.
         let result = (|| {
+            let graph = self.graph_endpoints_match_device()?.then(|| self.graph()).and_then(|graph| graph.as_deref());
+            if graph.is_none()
+                && matches!(self.replay_native_linked_plan()?, svod_device::device::NativeReplayOutcome::Executed)
+            {
+                return Ok(());
+            }
             let linked = self.hcq_linked.get().expect("HCQ plan linked by builder");
             let mut staging = HashMap::new();
             // SAFETY: semantic plan submissions contain only waits, callback
@@ -1361,7 +1364,7 @@ impl ExecutionPlan {
                                     handle,
                                 );
                             }
-                            PreparedOp::BufferCopy(_) => unreachable!(),
+                            PreparedOp::BufferCopy(copy) => self.execute_copy(copy)?,
                             PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom)?,
                         }
                     }
@@ -1672,7 +1675,22 @@ impl ExecutionPlanBuilder {
     /// for zero-allocation execution.
     pub fn build(mut self) -> Result<ExecutionPlan> {
         for op in &mut self.ops {
-            let PreparedOp::CompiledProgram(kernel) = op else { continue };
+            let kernel = match op {
+                PreparedOp::CompiledProgram(kernel) => kernel,
+                // `execute_copy`, `copy_buffers` and `hcq_operations` all need
+                // the (dst, src) pair; a shorter copy degrades to a no-op edge
+                // in the hazard graph. Reject it here instead of at execute.
+                PreparedOp::BufferCopy(copy) if copy.buffer_indices.len() < 2 => {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!(
+                            "BufferCopy {} requires two buffer indices (dst, src), got {}",
+                            copy.id,
+                            copy.buffer_indices.len()
+                        ),
+                    });
+                }
+                PreparedOp::BufferCopy(_) | PreparedOp::CustomFunction(_) => continue,
+            };
 
             if kernel.output_indices.is_empty() {
                 return Err(crate::error::Error::Execution {

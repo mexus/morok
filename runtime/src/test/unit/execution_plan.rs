@@ -1390,6 +1390,7 @@ impl Allocator for TaggedCpuAllocator {
 #[derive(Debug)]
 struct NativeReplayProgram {
     replays: Arc<AtomicUsize>,
+    fail: bool,
 }
 
 #[derive(Debug)]
@@ -1432,13 +1433,14 @@ impl Program for NativeReplayProgram {
     }
 
     fn new_exec_context(&self) -> svod_device::Result<Option<Box<dyn PlanContext>>> {
-        Ok(Some(Box::new(NativeReplayContext { replays: Arc::clone(&self.replays) })))
+        Ok(Some(Box::new(NativeReplayContext { replays: Arc::clone(&self.replays), fail: self.fail })))
     }
 }
 
 #[derive(Debug)]
 struct NativeReplayContext {
     replays: Arc<AtomicUsize>,
+    fail: bool,
 }
 
 impl PlanContext for NativeReplayContext {
@@ -1460,6 +1462,9 @@ impl PlanContext for NativeReplayContext {
         _calls: &[PlanCall<'_>],
     ) -> svod_device::Result<NativeReplayOutcome> {
         self.replays.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            return Err(svod_device::Error::Runtime { message: "native submit rejected".into() });
+        }
         Ok(NativeReplayOutcome::Executed)
     }
 
@@ -1569,7 +1574,10 @@ fn graph_replay_rejects_forged_amd_allocation_ownership() {
     assert_eq!(replays.load(Ordering::SeqCst), 0, "forged endpoint reached graph backend");
 }
 
-fn native_copy_plan_with_source(source_device: DeviceSpec) -> (ExecutionPlan, Arc<AtomicUsize>, usize, usize, usize) {
+fn native_copy_plan_with_source(
+    source_device: DeviceSpec,
+    fail_native: bool,
+) -> (ExecutionPlan, Arc<AtomicUsize>, usize, usize, usize) {
     let owner = DeviceSpec::Cpu;
     let replays = Arc::new(AtomicUsize::new(0));
     let mut builder = ExecutionPlanBuilder::new(owner.clone());
@@ -1580,7 +1588,7 @@ fn native_copy_plan_with_source(source_device: DeviceSpec) -> (ExecutionPlan, Ar
         id: 21_010,
         ast: UOp::sink(vec![]),
         kernel: Arc::new(CachedKernel {
-            program: Box::new(NativeReplayProgram { replays: Arc::clone(&replays) }),
+            program: Box::new(NativeReplayProgram { replays: Arc::clone(&replays), fail: fail_native }),
             device: "AMD:0".into(),
             code: String::new(),
             entry_point: "native_replay_recorder".into(),
@@ -1612,12 +1620,12 @@ fn native_copy_plan_with_source(source_device: DeviceSpec) -> (ExecutionPlan, Ar
 }
 
 fn native_copy_plan() -> (ExecutionPlan, Arc<AtomicUsize>, usize, usize, usize) {
-    native_copy_plan_with_source(DeviceSpec::Cpu)
+    native_copy_plan_with_source(DeviceSpec::Cpu, false)
 }
 
 #[test]
 fn native_replay_rejects_staged_semantic_copy() {
-    let (plan, replays, _, _, _) = native_copy_plan_with_source(DeviceSpec::Amd { device_id: 0 });
+    let (plan, replays, _, _, _) = native_copy_plan_with_source(DeviceSpec::Amd { device_id: 0 }, false);
     assert_eq!(
         plan.replay_native_linked_plan().unwrap(),
         NativeReplayOutcome::Declined(NativeReplayDecline::StagedCopy { operation: 1 })
@@ -1736,4 +1744,38 @@ fn hcq_same_queue_dependencies_are_fifo_elided() {
     use svod_device::hcq::QueueKind;
     let plan = hcq_plan(&[hcq_op(0, QueueKind::Compute(0), &[], &[1]), hcq_op(1, QueueKind::Compute(0), &[1], &[2])]);
     assert!(operation_submission(&plan, 1).waits.is_empty());
+}
+
+#[test]
+fn build_rejects_buffer_copy_without_source_and_destination() {
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let dst_idx = builder.add_buffer(1, Buffer::new(alloc, DType::Float32, vec![4], Default::default()));
+    builder.add_op(PreparedOp::BufferCopy(PreparedCopy {
+        id: 77,
+        buffer_indices: vec![dst_idx],
+        dependencies: Vec::new(),
+    }));
+    builder.set_output_buffer(dst_idx);
+
+    let err = builder.build().expect_err("one-endpoint copy must not build");
+    match err {
+        crate::error::Error::Execution { reason } => {
+            assert!(reason.contains("requires two buffer indices"), "unexpected error: {reason}");
+        }
+        other => panic!("unexpected error variant: {other:?}"),
+    }
+}
+
+#[test]
+fn failed_native_replay_poisons_the_plan() {
+    let (plan, replays, _, _, _) = native_copy_plan_with_source(DeviceSpec::Cpu, true);
+
+    let first = plan.execute().expect_err("failing native submit must surface");
+    assert!(matches!(first, crate::error::Error::Exec { .. }), "{first:?}");
+    assert_eq!(replays.load(Ordering::SeqCst), 1);
+
+    let second = plan.execute().expect_err("a failed native submit must not stay retryable");
+    assert!(matches!(second, crate::error::Error::PlanPoisoned { .. }), "{second:?}");
+    assert_eq!(replays.load(Ordering::SeqCst), 1, "poisoned plan must not resubmit");
 }
