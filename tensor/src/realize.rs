@@ -1780,7 +1780,7 @@ fn beam_search_optimize(
         log_surpass,
     };
     let mut worker_pool = crate::beam_worker::WorkerPool::new(beam_config.compile_workers.max(1), worker_init)
-        .map_err(|message| svod_device::Error::Runtime { message })
+        .map_err(|error| svod_device::Error::Runtime { message: error.to_string() })
         .context(DeviceSnafu)?;
     let benchmark_ast = scheduler.ast().clone();
     let launch_placeholder = [UOp::index_const(1), UOp::index_const(1), UOp::index_const(1)];
@@ -1843,7 +1843,7 @@ fn beam_search_optimize(
                 binary_key, compute_ops: artifact.compute_ops, preparation, compilation,
             });
         })
-            .map_err(|message| svod_schedule::optimizer::OptError::BeamWorker { message })
+            .map_err(|error| svod_schedule::optimizer::OptError::BeamWorker { message: error.to_string() })
     };
 
     let dev_runtime = device.runtime.clone();

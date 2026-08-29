@@ -222,6 +222,44 @@ pub enum Error {
 
     #[snafu(display("Cannot read data from tensor with symbolic shape — reduce or slice to concrete shape first"))]
     SymbolicShape,
+
+    #[snafu(display("BEAM compile helper: {source}"))]
+    BeamWorker { source: BeamWorker },
+}
+
+/// Failures of the out-of-process BEAM candidate compiler.
+///
+/// The pool treats most of these as a dropped candidate rather than a fatal
+/// error, so they carry the structure the caller acts on instead of a rendered
+/// message.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum BeamWorker {
+    #[snafu(display("spawn BEAM helper {path}: {source}"))]
+    SpawnHelper { source: std::io::Error, path: String },
+
+    #[snafu(display("BEAM helper is unavailable: {reason}"))]
+    HelperUnavailable { reason: String },
+
+    #[snafu(display("BEAM helper frame ({what}): {source}"))]
+    Frame { source: std::io::Error, what: &'static str },
+
+    #[snafu(display("BEAM helper protocol version {actual}, expected {expected}"))]
+    ProtocolMismatch { expected: u32, actual: u32 },
+
+    #[snafu(display("BEAM helper returned candidate {got}, expected {expected:?}"))]
+    WorkerMisorder { got: usize, expected: Option<usize> },
+
+    #[snafu(display("BEAM candidate {stage}: {reason}"))]
+    CompileStage { stage: &'static str, reason: String },
+}
+
+impl BeamWorker {
+    /// `map_err` adapter for a pipeline stage whose upstream error is only ever
+    /// reported, never matched on.
+    pub(crate) fn at<E: std::fmt::Display>(stage: &'static str) -> impl Fn(E) -> Self {
+        move |error| Self::CompileStage { stage, reason: error.to_string() }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -51,7 +51,10 @@ fn helper_resolution_failures_are_not_cached() {
 
     unsafe { std::env::set_var("SVOD_BEAM_WORKER", &missing) };
     let failure = helper_path().expect_err("a missing helper must not resolve");
-    assert!(failure.contains("is not a file"), "{failure}");
+    assert!(
+        matches!(&failure, BeamWorker::HelperUnavailable { reason } if reason.contains("is not a file")),
+        "{failure}"
+    );
 
     unsafe { std::env::set_var("SVOD_BEAM_WORKER", helper.path()) };
     let resolved = helper_path().expect("a valid helper must resolve after a failure");
@@ -76,4 +79,13 @@ fn last_executable_takes_cargos_final_artifact() {
         Some(std::path::PathBuf::from("/custom/target/dir/debug/svod-beam-worker"))
     );
     assert_eq!(last_executable(b"not json\n"), None);
+}
+
+/// CV3: pool failures are typed, so a caller can tell an out-of-order helper
+/// from an unavailable one instead of matching on a rendered string.
+#[test]
+fn worker_misorder_is_a_distinguishable_variant() {
+    let misorder = BeamWorker::WorkerMisorder { got: 3, expected: Some(1) };
+    assert!(matches!(misorder, BeamWorker::WorkerMisorder { got: 3, expected: Some(1) }));
+    assert!(misorder.to_string().contains("expected Some(1)"), "{misorder}");
 }
