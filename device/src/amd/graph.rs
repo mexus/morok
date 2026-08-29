@@ -139,6 +139,16 @@ impl Drop for AmdGraph {
 
 impl AmdGraph {
     pub fn capture(allocator: &AmdAllocator, kernels: &[GraphKernel]) -> Result<Option<Box<dyn Graph>>> {
+        Ok(Self::capture_amd(allocator, kernels)?.map(|graph| graph as Box<dyn Graph>))
+    }
+
+    /// Immutable linked command stream as captured. Test-only.
+    #[cfg(test)]
+    pub(crate) fn linked_bytes(&self) -> &[u8] {
+        self.linked.static_bytes()
+    }
+
+    pub(crate) fn capture_amd(allocator: &AmdAllocator, kernels: &[GraphKernel]) -> Result<Option<Box<Self>>> {
         if kernels.is_empty() {
             return Ok(None);
         }
@@ -194,6 +204,15 @@ impl AmdGraph {
         submission.push(Command::Wait { signal_address: 0, value: 0 });
         submission.bind(wait, CommandField::WaitAddress, PatchSource::System(SystemField::TimelineSignal(0)))?;
         submission.bind(wait, CommandField::WaitValue, PatchSource::System(SystemField::TimelineValue(0)))?;
+        // ONE memory barrier per graph, matching tinygrad's
+        // `comp_queues[dev].memory_barrier()` at the head of a captured device
+        // queue (`graph/hcq.py:157`). Per-dispatch coherence is the narrow
+        // `acquire_mem` + `CS_PARTIAL_FLUSH` that `build_exec_pm4` already
+        // emits, and the AQL packets carry the header BARRIER bit; a full HDP
+        // flush plus full-invalidate acquire per kernel bought nothing. Morok
+        // keeps the barrier AFTER the timeline wait, matching its own
+        // `Wait -> MemoryBarrier -> Compute` per-call finalization.
+        submission.push(Command::MemoryBarrier);
         let mut links = Vec::with_capacity(kernels.len() * 2);
         let mut slots = Vec::with_capacity(kernels.len());
         for (((kernel, program), &offset), index) in kernels.iter().zip(&programs).zip(&offsets).zip(0usize..) {
@@ -210,7 +229,6 @@ impl AmdGraph {
                 abi: program.abi().to_vec(),
             });
 
-            submission.push(Command::MemoryBarrier);
             let g = kernel.global_size.unwrap_or([1, 1, 1]);
             let l = kernel.local_size.unwrap_or([1, 1, 1]);
             let (rsrc1, rsrc2, rsrc3) = program.rsrc();
@@ -380,6 +398,11 @@ impl Graph for AmdGraph {
             return Err(error);
         }
         let mut state = self.state.lock();
+        // Not covered by the linked stream's timeline wait: that wait runs on
+        // the GPU, whereas `patch_kernargs` and the replay-buffer patch below
+        // rewrite graph-owned host storage a still-in-flight previous replay
+        // may be reading. Retiring the owner's last submission first is what
+        // makes those in-place rewrites safe.
         self.owner.synchronize()?;
         let lane = self.owner.lease()?;
         lane.ensure_has_local_memory(self.max_private)?;
@@ -429,6 +452,11 @@ impl Graph for AmdGraph {
             return Err(error);
         }
         let mut state = self.state.lock();
+        // Not covered by the linked stream's timeline wait: that wait runs on
+        // the GPU, whereas `patch_kernargs` and the replay-buffer patch below
+        // rewrite graph-owned host storage a still-in-flight previous replay
+        // may be reading. Retiring the owner's last submission first is what
+        // makes those in-place rewrites safe.
         self.owner.synchronize()?;
         let lane = self.owner.lease()?;
         lane.ensure_has_local_memory(self.max_private)?;
