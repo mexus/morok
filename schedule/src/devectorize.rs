@@ -1115,29 +1115,28 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
                         UOp::try_where(ge32, low, high).expect("long shift where")
                     }
                 } else {
+                    // carry = a1 <<u (32 - n), spelled as two shifts so n == 0 stays in range.
                     let carry = long_bin(
                         Shl,
-                        long_bin(
-                            Shl,
-                            a1.clone().bitcast(DType::UInt32),
-                            a1.const_like(1).bitcast(DType::UInt32),
-                            DType::UInt32,
-                        ),
-                        long_bin(
-                            Sub,
-                            a1.const_like(31).bitcast(DType::UInt32),
-                            n.clone().bitcast(DType::UInt32),
-                            DType::UInt32,
-                        ),
+                        long_bin(Shl, a1.clone().bitcast(DType::UInt32), uconst(1), DType::UInt32),
+                        long_bin(Sub, uconst(31), nu.clone(), DType::UInt32),
                         DType::UInt32,
                     )
                     .bitcast(word_dt.clone());
-                    let low = long_bin(Or, long_bin(Shr, a0, n, word_dt.clone()), carry, word_dt.clone());
-                    let high = long_bin(Shr, a1.clone(), b0, word_dt.clone());
+                    // The low word always shifts logically: an Int32 `Shr` is arithmetic and
+                    // would smear the sign of `a0` into the bits `carry` supplies.
+                    let low = long_bin(
+                        Or,
+                        long_bin(Shr, a0.bitcast(DType::UInt32), nu, DType::UInt32).bitcast(word_dt.clone()),
+                        carry,
+                        word_dt.clone(),
+                    );
+                    // shift >= 32: the low word is the high word shifted by n = shift - 32.
+                    let high = long_bin(Shr, a1.clone(), n, word_dt.clone());
                     let fill = if from == ScalarDType::Int64 {
-                        long_bin(Shr, a1.clone(), a1.const_like(31), word_dt.clone())
+                        long_bin(Shr, a1.clone(), wconst(31), word_dt.clone())
                     } else {
-                        a1.const_like(0)
+                        wconst(0)
                     };
                     if word == 0 {
                         UOp::try_where(ge32, high.clone(), low).expect("long shift where")

@@ -97,14 +97,17 @@ pub fn assert_shift_words(op: BinaryOp, value: u64, shift: u64, from: ScalarDTyp
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// The word split of `x << s` must equal the native 64-bit shift for every `s < 64`.
+    /// The word split of `x << s` / `x >> s` must equal the native 64-bit shift for every `s < 64`.
     #[test]
-    fn long_shl_words_match_native(value in any::<u64>(), shift in 0u64..64, signed in any::<bool>()) {
+    fn long_shift_words_match_native(
+        value in any::<u64>(),
+        shift in 0u64..64,
+        signed in any::<bool>(),
+        right in any::<bool>(),
+    ) {
         let from = if signed { ScalarDType::Int64 } else { ScalarDType::UInt64 };
-        let expected = native_shift(BinaryOp::Shl, value, shift, from);
-        prop_assert_eq!(
-            split_shift(BinaryOp::Shl, value, shift, from),
-            [expected as u32, (expected >> 32) as u32]
-        );
+        let op = if right { BinaryOp::Shr } else { BinaryOp::Shl };
+        let expected = native_shift(op, value, shift, from);
+        prop_assert_eq!(split_shift(op, value, shift, from), [expected as u32, (expected >> 32) as u32]);
     }
 }
