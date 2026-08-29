@@ -88,6 +88,9 @@ pub fn early_rewrites() -> TypedPatternMatcher {
         },
         Detach(x) ~> |x| x.clone(),
         ContiguousBackward(x) ~> |x| x.clone(),
+        // Same-device COPY is a no-op and returns its source verbatim, tag included
+        // (tinygrad `schedule/rangeify.py:153`). The barrier role a tagged COPY used
+        // to carry is covered by `is_always_run_op(Copy)`.
         Copy { src, device } if src.device_spec().as_ref() == Some(device)
             ~> |src| src.clone(),
         // Reduce of zero-sized input → identity element.

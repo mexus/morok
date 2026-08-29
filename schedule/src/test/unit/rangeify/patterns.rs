@@ -53,6 +53,17 @@ fn test_early_rewrites_contiguous_backward_removal() {
 }
 
 #[test]
+fn test_early_rewrites_same_device_copy_returns_the_source() {
+    let source = UOp::new_buffer(svod_ir::DeviceSpec::Cpu, 4, svod_dtype::DType::Float32);
+    let copy = source.copy(svod_ir::DeviceSpec::Cpu).rtag(Some(smallvec::smallvec![3]));
+
+    let RewriteResult::Rewritten(rewritten) = patterns::early_rewrites().rewrite(&copy, &mut ()) else {
+        panic!("same-device COPY must be elided");
+    };
+    assert!(Arc::ptr_eq(&rewritten, &source), "tinygrad rangeify.py:153 returns the source verbatim");
+}
+
+#[test]
 fn test_early_rewrites_no_match_for_other_ops() {
     let matcher = patterns::early_rewrites();
 
