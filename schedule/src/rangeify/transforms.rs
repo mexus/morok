@@ -418,8 +418,9 @@ pub fn pm_flatten_range() -> &'static crate::TypedPatternMatcher {
 ///
 /// When we see `RANGE % const`, we mark the range for splitting at the SINK.
 pub struct SplitRangesContext {
-    /// Maps RANGE ids to their modulo constant for decomposition
-    pub marked_ranges: HashMap<u64, i64>,
+    /// Maps RANGE ids to their modulo constant, or `None` for ranges that must
+    /// not be split at all (image stores address two coordinates directly).
+    pub marked_ranges: HashMap<u64, Option<i64>>,
 }
 
 impl SplitRangesContext {
@@ -452,6 +453,12 @@ pub fn pm_split_ranges() -> crate::TypedPatternMatcher<SplitRangesContext> {
         _modop @ FloorMod(r @ Range { end: _, axis_id: _, axis_type: _ }, c @ Const(_)) => |r, c| {
             mark_range_mod(ctx, r, c);
             None // Don't transform yet, just mark
+        },
+
+        // An image STORE pins its index ranges against splitting.
+        Store { index, value: _, gate: _ } => |index| {
+            dont_split_ranges_for_image(ctx, index);
+            None
         },
 
         // At SINK: perform the substitution
@@ -498,7 +505,20 @@ fn mark_range_mod(ctx: &mut SplitRangesContext, r: &Arc<UOp>, c: &Arc<UOp>) {
         return;
     }
     if let Some(mod_val) = const_uop_to_i64(c) {
-        ctx.marked_ranges.insert(r.id, mod_val);
+        ctx.marked_ranges.insert(r.id, Some(mod_val));
+    }
+}
+
+/// Pin every range an image STORE indexes with, so the SINK substitution leaves it
+/// alone: an image address is a pair of coordinates, not a flat offset that a
+/// divmod split can reconstruct.
+fn dont_split_ranges_for_image(ctx: &mut SplitRangesContext, index: &Arc<UOp>) {
+    let Op::Index { buffer, indices } = index.op() else { return };
+    if !buffer.dtype().is_image() {
+        return;
+    }
+    for range in indices.iter().flat_map(|index| index.ranges()) {
+        ctx.marked_ranges.insert(range.id, None);
     }
 }
 
@@ -522,7 +542,7 @@ fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> 
     let topo = sink.toposort();
 
     for uop in &topo {
-        if let Some(&mod_val) = ctx.marked_ranges.get(&uop.id)
+        if let Some(&Some(mod_val)) = ctx.marked_ranges.get(&uop.id)
             && let Op::Range { end, axis_id, axis_type, .. } = uop.op()
         {
             let Some(outer_end) = end.divides(mod_val) else {

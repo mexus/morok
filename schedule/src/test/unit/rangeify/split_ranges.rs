@@ -50,6 +50,21 @@ fn test_modulo_split_rejects_only_warp_and_device_axes() {
 }
 
 #[test]
+fn test_image_store_ranges_are_never_split() {
+    let range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Loop);
+    let image = UOp::new(Op::Noop, DType::Image { kind: svod_dtype::ImageKind::Float, shape: vec![4, 2, 4] });
+    let address = UOp::new(
+        Op::Index { buffer: image, indices: smallvec::smallvec![range.clone()] },
+        DType::Image { kind: svod_dtype::ImageKind::Float, shape: vec![4, 2, 4] },
+    );
+    let store = UOp::new(Op::Store { index: address, value: UOp::native_const(1.0f32), gate: None }, DType::Void);
+    let sink = UOp::sink(vec![range.mod_(&UOp::index_const(2)).end(smallvec::smallvec![range.clone()]), store]);
+
+    let result = graph_rewrite(&pm_split_ranges(), sink.clone(), &mut SplitRangesContext::default());
+    assert!(Arc::ptr_eq(&result, &sink), "image coordinates must survive range splitting");
+}
+
+#[test]
 fn split_simplifies_substituted_parent_in_preopt_composition() {
     let range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Loop);
     let ended = range.mod_(&UOp::index_const(2)).end(smallvec::smallvec![range.clone()]);
