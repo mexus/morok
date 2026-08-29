@@ -1734,23 +1734,27 @@ fn maybe_load(value: &Arc<UOp>) -> Arc<UOp> {
 
 /// Move additions into a WMMA accumulator, including movement ops introduced by
 /// output-axis reconstruction in the expander.
+///
+/// Tinygrad `codegen/__init__.py:108-115`. It is guard-free: `wmma.src[2]+add`
+/// asserts inside `alu` on a dtype mismatch. `try_add` is the equivalent that
+/// leaves the WMMA unfused instead of aborting.
 pub fn pm_wmma_add() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         Add[wmma @ Wmma { a, b, c, metadata }, add] => |wmma, a, b, c, metadata, add| {
             Some(UOp::new(
-                Op::Wmma { a: a.clone(), b: b.clone(), c: c.add(add), metadata: metadata.clone() },
+                Op::Wmma { a: a.clone(), b: b.clone(), c: c.try_add(add).ok()?, metadata: metadata.clone() },
                 wmma.dtype(),
             ))
         },
 
         Add[Permute { src: wmma @ Wmma { a: _, b: _, c: _, metadata: _ }, axes }, add] => {
             let moved = add.try_permute(crate::argsort(axes)).ok()?;
-            wmma.add(&moved).try_permute(axes.clone()).ok()
+            wmma.try_add(&moved).ok()?.try_permute(axes.clone()).ok()
         },
 
         Add[Permute { src: reshape @ Reshape { src: wmma @ Wmma { a: _, b: _, c: _, metadata: _ }, .. }, axes }, add] => {
             let moved = add.try_permute(crate::argsort(axes)).ok()?.try_reshape(wmma.shape().ok().flatten()?).ok()?;
-            wmma.add(&moved)
+            wmma.try_add(&moved).ok()?
                 .try_reshape(reshape.shape().ok().flatten()?).ok()?
                 .try_permute(axes.clone()).ok()
         },

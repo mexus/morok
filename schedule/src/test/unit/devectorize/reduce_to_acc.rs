@@ -64,6 +64,20 @@ fn test_wmma_add_direct_moves_into_accumulator() {
         if Arc::ptr_eq(lhs, &accumulator) && Arc::ptr_eq(rhs, &add)));
 }
 
+/// A non-broadcastable ADD must leave the WMMA unfused rather than abort (tinygrad's
+/// `codegen/__init__.py:110` asserts inside `alu`; we decline the rewrite).
+#[test]
+fn test_wmma_add_with_mismatched_operand_does_not_fuse() {
+    let accumulator = shaped_values("acc", &[6]);
+    let add = shaped_values("add", &[6]);
+    let mismatched = shaped_values("bad", &[3]);
+    let fusable = test_wmma(accumulator).add(&add);
+    let root = fusable.with_sources(vec![fusable.op().sources()[0].clone(), mismatched]);
+
+    let result = crate::rewrite::graph_rewrite(crate::devectorize::pm_wmma_add(), root.clone(), &mut ());
+    assert!(Arc::ptr_eq(&result, &root), "mismatched WMMA add must stay unfused");
+}
+
 #[test]
 fn test_wmma_add_moves_through_permute() {
     let accumulator = shaped_values("acc", &[2, 3]);
