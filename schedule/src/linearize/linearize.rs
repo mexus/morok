@@ -780,8 +780,19 @@ fn run_count(uop: &Arc<UOp>) -> u64 {
         .product()
 }
 
-/// Priority assignment matching tinygrad's linearizer.py:24-32.
-/// Returns `(priority, extra)` where extra is `Some(slot)` for PARAM.
+/// Priority assignment matching tinygrad `codegen/late/linearizer.py:24-32`
+/// (pin `8c8b43de`). Returns `(priority, extra)`; `extra` is the PARAM slot.
+///
+/// Three arms older tinygrad had are absent because upstream removed them, not
+/// because the port dropped them:
+/// - `DEFINE_VAR = -19` — `4a4b6956d "remove DEFINE_VAR from codebase"`: the op
+///   is gone, symbolic variables are PARAMs and take the `-20` arm.
+/// - `CONST = -10` — `52b989c6c "don't place consts early"`: consts sort at the
+///   generic `0` so they sink next to their consumer.
+/// - `DEFINE_LOCAL = -18` / `DEFINE_REG = -17` — `649971f02 "remove
+///   DEFINE_LOCAL and DEFINE_REG"` folded both into BUFFER and *inverted* the
+///   pair: LOCAL is `-17`, REG (like GLOBAL) `-18`. Restoring the old order
+///   would regress against the pin.
 fn priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
     match uop.op() {
         Op::Param { arg, .. } => (-20, Some(arg.slot as i64)),

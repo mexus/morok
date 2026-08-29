@@ -210,6 +210,11 @@ fn test_pinned_param_and_buffer_priorities() {
     assert_eq!(priority(&local), (-17, None));
     assert_eq!(priority(&global), (-18, None));
     assert_eq!(priority(&reg), (-18, None));
+
+    // The pin has no CONST arm (upstream 52b989c6c "don't place consts early")
+    // and no DEFINE_VAR arm (4a4b6956d): a symbolic variable is a PARAM.
+    assert_eq!(priority(&UOp::const_(DType::Int32, ConstValue::Int(7))), (0, None));
+    assert_eq!(priority(&UOp::variable("n".to_string(), 0, 8, DType::Int32)), (-20, Some(-1)));
 }
 
 #[test]
