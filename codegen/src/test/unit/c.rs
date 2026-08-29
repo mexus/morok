@@ -174,6 +174,40 @@ fn clang_preserves_shape_width_across_materialized_values_and_store_aliases() {
 }
 
 #[test]
+fn clang_stack_dereferences_address_carrying_index_lanes() {
+    let shrink = UOp::new(
+        Op::Shrink {
+            src: UOp::param(0, 8, DType::Float32, None),
+            offsets: UOp::const_(DType::Int32, ConstValue::Int(0)),
+            sizes: UOp::const_(DType::Int32, ConstValue::Int(4)),
+        },
+        DType::Float32,
+    );
+    let lanes = (0..4)
+        .map(|lane| {
+            UOp::index()
+                .buffer(shrink.clone())
+                .indices(vec![UOp::const_(DType::Index, ConstValue::Int(lane))])
+                .call()
+                .unwrap()
+        })
+        .collect();
+    let output = UOp::new(
+        Op::Shrink {
+            src: UOp::param(1, 8, DType::Float32, None),
+            offsets: UOp::const_(DType::Int32, ConstValue::Int(0)),
+            sizes: UOp::const_(DType::Int32, ConstValue::Int(4)),
+        },
+        DType::Float32,
+    );
+    let rendered =
+        render_linearized(&UOp::sink(vec![output.store(UOp::stack(lanes).detach())]), Some("stack_index_lanes"))
+            .expect("render STACK of address INDEX lanes");
+    assert!(rendered.code.contains("(float4){*("), "{}", rendered.code);
+    assert_c_compiles(&rendered.code);
+}
+
+#[test]
 fn clang_preserves_address_casts_as_pointers() {
     let index = UOp::index()
         .buffer(UOp::param(0, 1, DType::Float32, None))

@@ -428,7 +428,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 .iter()
                 .map(|source| {
                     let value = ctx.get(source).to_string();
-                    if matches!(source.op(), Op::Index { buffer, .. } if is_storage_source(buffer)) {
+                    // Lane reads of an address-carrying INDEX must dereference:
+                    // INDEX renders `buf + idx` exactly when the buffer has an
+                    // address space (tinygrad cstyle.py render_index), so the
+                    // STACK element test has to use the same predicate.
+                    if matches!(source.op(), Op::Index { .. }) && source.addrspace().is_some() {
                         format!("*({value})")
                     } else {
                         value
@@ -683,14 +687,6 @@ fn render_reduce_accumulate(op: ReduceOp, acc: &str, val: &str, dtype: &DType) -
                 format!("{acc} = ({acc} < {val} ? {acc} : {val});")
             }
         }
-    }
-}
-
-fn is_storage_source(uop: &Arc<UOp>) -> bool {
-    match uop.op() {
-        Op::Param { .. } | Op::Buffer { .. } | Op::Slice { .. } => true,
-        Op::After { passthrough, .. } | Op::Precast { src: passthrough } => is_storage_source(passthrough),
-        _ => false,
     }
 }
 
