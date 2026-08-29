@@ -450,6 +450,31 @@ fn test_matmul_explicit_dtype() {
     assert_eq!(c.uop().dtype(), DType::Float64);
 }
 
+/// A wider integer accumulator must widen the operands before the product.
+/// Before the fix the MUL stayed at int8, so `127 * 2` wrapped to -2: the C
+/// backend hid it behind C integer promotion while LLVM emitted `mul i8` and
+/// produced 62 instead of 318. Assert both the IR dtype (backend independent)
+/// and the realized value.
+#[test]
+fn test_matmul_int8_widens_operands_for_int32_accumulator() {
+    use svod_ir::Op;
+
+    let a = Tensor::from_ndarray(&array![[127i8, -64, 32, 0]]);
+    let b = Tensor::from_ndarray(&array![[2i8], [-1], [0], [1]]);
+
+    let c = a.matmul_with().other(&b).dtype(DType::Int32).call().unwrap();
+    assert_eq!(c.uop().dtype(), DType::Int32);
+    for uop in c.uop().toposort() {
+        if matches!(uop.op(), Op::Binary(svod_ir::BinaryOp::Mul, ..)) {
+            assert_ne!(uop.dtype(), DType::Int8, "int8 MUL survives a wider integer accumulator");
+        }
+    }
+
+    let mut c = c;
+    c.realize().unwrap();
+    assert_eq!(c.as_vec::<i32>().unwrap(), vec![318]);
+}
+
 /// RDNA4 follows Tinygrad 8c8b43de's tensor-core table: FP8 storage is
 /// emulated as bytes, arithmetic is widened to f16, and the resulting matmul
 /// uses the f16->f32 gfx12 WMMA. This is compile-only and never opens a GPU.

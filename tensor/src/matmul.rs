@@ -104,7 +104,28 @@ impl Tensor {
         let w_reshaped = other.uop().try_reshape(&w_new_shape).map(Self::new).context(UOpSnafu)?;
 
         // Step 4: Transpose, multiply, and sum
-        let product = x_reshaped.try_mul(&w_reshaped.try_transpose(-1, axis_w)?)?;
+        let w_t = w_reshaped.try_transpose(-1, axis_w)?;
+
+        // A wider integer accumulator must widen the operands *before* the
+        // product. `int8 * int8` wraps at 8 bits on any backend that honours the
+        // IR dtype (LLVM emits `mul i8`), while C's integer promotion silently
+        // evaluates it at `int` width -- the two backends disagreed. Widening
+        // first makes them agree and matches ONNX MatMulInteger semantics.
+        let widen_to = |t: &Tensor| -> Option<DType> {
+            dtype
+                .as_ref()
+                .filter(|dt| dt.is_int() && t.uop().dtype().is_int() && dt.bytes() > t.uop().dtype().bytes())
+                .cloned()
+        };
+        let x_wide = match widen_to(&x_reshaped) {
+            Some(dt) => x_reshaped.cast(dt)?,
+            None => x_reshaped,
+        };
+        let w_wide = match widen_to(&w_t) {
+            Some(dt) => w_t.cast(dt)?,
+            None => w_t,
+        };
+        let product = x_wide.try_mul(&w_wide)?;
 
         // Cast the contraction result back to `product`'s dtype (the promoted
         // operand dtype), so an int8·int8 dot returns int8 rather than the widened
