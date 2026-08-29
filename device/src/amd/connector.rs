@@ -288,15 +288,36 @@ impl SubmissionFinalizer {
         self.code.lock().push(code);
     }
 
+    /// Wait for this submission's terminal timeline point, bounded by
+    /// `timeout_ms` across BOTH phases. A publisher that faults or panics may
+    /// never transition a `Prepared` finalizer, so parking untimed here wedged
+    /// the caller for good; tinygrad bounds every device wait with
+    /// `HCQDEV_WAIT_TIMEOUT_MS`.
     pub fn wait(&self, timeout_ms: u64) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         let mut publication = self.publication.lock();
         while *publication == PublicationState::Prepared {
-            self.publication_changed.wait(&mut publication);
+            if let Some(error) = self.signal.device_poison() {
+                return Err(error);
+            }
+            if self.publication_changed.wait_until(&mut publication, deadline).timed_out()
+                && *publication == PublicationState::Prepared
+            {
+                return Err(Error::TimelineTimeout {
+                    what: "AMD submission publication",
+                    target: self.value,
+                    current: self.signal.value(),
+                    waited_ms: timeout_ms,
+                });
+            }
         }
         match *publication {
             PublicationState::Published => {
                 drop(publication);
-                self.signal.wait_signal_value_with_progress(self.value, timeout_ms, &self.progress)
+                // Whatever the publication wait consumed comes off the signal
+                // wait's budget; never hand it 0, which means "no timeout".
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u64;
+                self.signal.wait_signal_value_with_progress(self.value, remaining.max(1), &self.progress)
             }
             PublicationState::Failed => Err(Error::Runtime {
                 message: "AMD submission failed before its terminal timeline point was published".into(),

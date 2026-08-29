@@ -96,6 +96,13 @@ impl AmdSignal {
         self.base_gpu + SIGNAL_END_TS_OFFSET as u64
     }
 
+    /// The owning device's latched fault, if any. Lets waiters that are not
+    /// polling this slot (a submission still awaiting publication) bail on a
+    /// dead device instead of burning their whole deadline.
+    pub(crate) fn device_poison(&self) -> Option<Error> {
+        self.device.upgrade().and_then(|device| device.poison_error())
+    }
+
     /// Slot index inside the pool. Useful for debugging.
     pub fn slot(&self) -> u32 {
         self.slot

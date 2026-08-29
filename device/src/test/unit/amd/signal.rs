@@ -165,3 +165,13 @@ fn mock_signal_pool_grows_a_chunk_and_releases_unwound_slots() {
     drop((extra, held));
     assert_eq!(pool.free(), pool.capacity());
 }
+
+#[test]
+fn prepared_finalizer_wait_is_bounded_by_its_deadline() {
+    let (_iface, _device, _pool, signal) = mock_signal();
+    let finalizer = crate::amd::connector::SubmissionFinalizer::prepared_timeline(signal, 1, Vec::new());
+    let started = std::time::Instant::now();
+    let error = finalizer.wait(50).expect_err("an unpublished submission must not park forever");
+    assert!(matches!(error, Error::TimelineTimeout { what: "AMD submission publication", .. }), "{error:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
