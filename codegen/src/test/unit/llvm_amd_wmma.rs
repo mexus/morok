@@ -49,6 +49,25 @@ fn cdna_k32_dotted_forms_are_gfx950_only() {
     );
 }
 
+/// The f16/bf16 MFMA suffixes are exhaustive in K: the catch-all arms used to
+/// accept any K, so a K=128 f16 WMMA minted `mfma.scale.f32.16x16x128f16` — a
+/// name LLVM lowers to a silent extern call. `scale.` now keys on the
+/// `.f8f6f4` suffix, the only scaled MFMA form.
+#[test_case::test_case(ScalarDType::Float16; "f16")]
+#[test_case::test_case(ScalarDType::BFloat16; "bf16")]
+fn cdna_scaled_mfma_is_fp8_only(in_dt: ScalarDType) {
+    assert!(
+        resolve_intrinsic(AmdArch::Gfx950, Some(in_dt), Some(ScalarDType::Float32), (16, 16, 128)).is_none(),
+        "{in_dt:?} K=128 must not resolve"
+    );
+    for k in [8, 64] {
+        assert!(
+            resolve_intrinsic(AmdArch::Gfx950, Some(in_dt), Some(ScalarDType::Float32), (16, 16, k)).is_none(),
+            "{in_dt:?} K={k} must not resolve"
+        );
+    }
+}
+
 #[test]
 fn cdna_f32_requires_k4() {
     // fp32 MFMA selects only at K=4 (`v_mfma_f32_16x16x4_f32`, verified with

@@ -89,6 +89,7 @@ fn grouped_shrink_renders_single_vector_load_and_store() {
 
     let rendered = render_linearized(&sink, Some("grouped_memory")).expect("render grouped C memory");
     assert_eq!(rendered.code.matches("float4").count(), 4, "{}", rendered.code);
+    assert_c_compiles(&rendered.code);
 }
 
 #[test]
@@ -170,6 +171,75 @@ fn clang_preserves_shape_width_across_materialized_values_and_store_aliases() {
     let rendered = render_linearized(&UOp::sink(vec![output.store(value)]), Some("store_shaped_alias"))
         .expect("render shaped alias STORE");
     assert!(rendered.code.contains("*((int4*)(data0 + 0)) ="), "{}", rendered.code);
+}
+
+#[test]
+fn clang_hoists_addresses_that_escape_their_loop() {
+    // The linearizer can place a shared node inside a range whose consumer sits
+    // outside it. Addresses are inlined, so without a hoist the STORE after the
+    // loop would reference `ridx0` — an out-of-scope identifier.
+    let param = UOp::param(0, 8, DType::Float32, None);
+    let bound = UOp::const_(DType::Int32, ConstValue::Int(4));
+    let range = UOp::range_axis_dtype(bound.clone(), AxisId::Renumbered(0), AxisType::Loop, DType::Int32);
+    let index = UOp::index().buffer(param.clone()).indices(vec![range.clone()]).call().unwrap();
+    let load = UOp::load().index(index.clone()).call();
+    let end = load.end(smallvec::smallvec![range.clone()]);
+    let store = index.clone().store(load.clone());
+    let linear = UOp::linear(smallvec::smallvec![bound, param, range, index, load, end, store]);
+
+    let rendered = render(&linear, Some("escaping_address")).expect("render escaping address");
+    assert!(rendered.code.contains("  float* bidx0;"), "{}", rendered.code);
+    let (_, after_loop) = rendered.code.split_once("\n  }\n").expect("loop must close");
+    assert!(!after_loop.contains("ridx0"), "{}", rendered.code);
+    assert_c_compiles(&rendered.code);
+}
+
+#[test]
+fn clang_store_width_follows_the_stored_value() {
+    let index = UOp::index()
+        .buffer(UOp::param(0, 8, DType::Float32, None))
+        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+        .call()
+        .unwrap();
+    let value = UOp::vconst(vec![ConstValue::Float(1.0); 4], DType::Float32);
+    let rendered = render_linearized(&UOp::sink(vec![index.store(value)]), Some("store_vector_through_scalar_index"))
+        .expect("render vector STORE through a scalar-width index");
+    assert!(rendered.code.contains("*((float4*)(data0 + 0"), "{}", rendered.code);
+    assert_c_compiles(&rendered.code);
+}
+
+#[test]
+fn clang_stack_dereferences_address_carrying_index_lanes() {
+    let shrink = UOp::new(
+        Op::Shrink {
+            src: UOp::param(0, 8, DType::Float32, None),
+            offsets: UOp::const_(DType::Int32, ConstValue::Int(0)),
+            sizes: UOp::const_(DType::Int32, ConstValue::Int(4)),
+        },
+        DType::Float32,
+    );
+    let lanes = (0..4)
+        .map(|lane| {
+            UOp::index()
+                .buffer(shrink.clone())
+                .indices(vec![UOp::const_(DType::Index, ConstValue::Int(lane))])
+                .call()
+                .unwrap()
+        })
+        .collect();
+    let output = UOp::new(
+        Op::Shrink {
+            src: UOp::param(1, 8, DType::Float32, None),
+            offsets: UOp::const_(DType::Int32, ConstValue::Int(0)),
+            sizes: UOp::const_(DType::Int32, ConstValue::Int(4)),
+        },
+        DType::Float32,
+    );
+    let rendered =
+        render_linearized(&UOp::sink(vec![output.store(UOp::stack(lanes).detach())]), Some("stack_index_lanes"))
+            .expect("render STACK of address INDEX lanes");
+    assert!(rendered.code.contains("(float4){*("), "{}", rendered.code);
+    assert_c_compiles(&rendered.code);
 }
 
 #[test]
@@ -641,4 +711,30 @@ fn test_custom_template_rejects_mixed_auto_and_manual_placeholders() {
     let err = render_linearized(&sink, Some("test_custom_mixed_placeholders"))
         .expect_err("mixed placeholder modes must fail");
     assert!(format!("{err}").contains("mixes automatic"), "unexpected error: {err}");
+}
+
+/// Pipe `src` through `clang -fsyntax-only` and assert it parses. Skips when no
+/// clang is on PATH, so the test is a no-op on machines without a C compiler.
+/// Mirrors `assert_llvm_ir_assembles` in `llvm_text.rs`.
+fn assert_c_compiles(src: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let Ok(mut child) = Command::new("clang")
+        .args(["-fsyntax-only", "-Wno-unused-value", "-x", "c", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        eprintln!("skipping C compile check: no clang on PATH");
+        return;
+    };
+    child.stdin.take().unwrap().write_all(src.as_bytes()).expect("write C source to clang");
+    let output = child.wait_with_output().expect("wait for clang");
+    assert!(
+        output.status.success(),
+        "clang rejected the emitted C:\n{src}\n--- clang stderr ---\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

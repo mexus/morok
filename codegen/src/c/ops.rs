@@ -10,8 +10,8 @@ use std::sync::Arc;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
-use super::types::{access_width, c_cast, c_dtype, c_math_fn, value_width};
-use crate::common::format_custom_template_strict;
+use super::types::{c_cast, c_dtype, c_math_fn};
+use crate::common::{access_dtype, format_custom_template_strict, shaped_dtype};
 
 /// Context for C code generation, tracking variable names and SSA inlining.
 pub struct CContext {
@@ -136,6 +136,35 @@ impl CContext {
         }
     }
 
+    /// Register an address (INDEX/SHRINK/pointer CAST) expression.
+    ///
+    /// Addresses are inlined like tinygrad's `cstyle.py` INDEX rendering, which
+    /// is safe there because its linearizer never places a node inside a range
+    /// that is consumed outside it. Morok's can, so an escaping address is
+    /// hoisted to function scope and assigned at its declaration depth —
+    /// otherwise the inlined text references a loop variable that is out of
+    /// scope at the use site.
+    pub fn emit_address(&mut self, uop: &Arc<UOp>, expr: String, kernel: &mut Vec<String>) -> String {
+        if !self.scope_escaping.contains(&uop.id) {
+            self.register(uop.id, expr.clone());
+            return expr;
+        }
+        let declared = if is_address_value(uop) {
+            match uop.dtype() {
+                dtype @ DType::Ptr { .. } => c_dtype(&dtype),
+                dtype => format!("{}*", c_dtype(&dtype)),
+            }
+        } else {
+            c_dtype(&shaped_dtype(uop))
+        };
+        let name = self.next_name("bidx");
+        let indent = self.indent();
+        self.hoisted_declarations.push(format!("  {declared} {name};"));
+        kernel.push(format!("{indent}{name} = {expr};"));
+        self.register(uop.id, name.clone());
+        name
+    }
+
     fn emit_expr_dtype(
         &mut self,
         uop: &Arc<UOp>,
@@ -199,7 +228,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
 
             if indices.is_empty() {
                 // No index - just alias the buffer pointer
-                ctx.register(uop.id, buf);
+                ctx.emit_address(uop, buf, kernel);
             } else {
                 let idx = if indices.len() == 1 {
                     ctx.get(&indices[0]).to_string()
@@ -215,17 +244,21 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 // carrying an address space remain addresses for LOAD/STORE.
                 let expr =
                     if buffer.addrspace().is_none() { format!("({buf})[{idx}]") } else { format!("{buf} + {idx}") };
-                ctx.register(uop.id, expr);
+                ctx.emit_address(uop, expr, kernel);
             }
             Some(())
         }
 
         Op::Shrink { src, offsets, sizes: _ } => {
-            ctx.register(uop.id, format!("{} + {}", ctx.get(src), ctx.get(offsets)));
+            let expr = format!("{} + {}", ctx.get(src), ctx.get(offsets));
+            ctx.emit_address(uop, expr, kernel);
             Some(())
         }
 
         Op::Load { index, alt, gate } => {
+            // Defense-in-depth: `UOp::new` (ir hash_consing.rs `new_tagged`) already
+            // asserts the alt/gate pairing, the bool gate and the alt dtype, so no
+            // legal construction path reaches these branches.
             if alt.is_some() != gate.is_some() {
                 ctx.set_invalid_graph(format!("LOAD on uop {} must have either neither or both alt and gate", uop.id));
                 return None;
@@ -278,7 +311,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             let idx = ctx.get(index).to_string();
             let val = ctx.get(value).to_string();
             let indent = ctx.indent();
-            let val_dtype = value.dtype().scalar_dtype().vec(access_width(index)).unwrap_or_else(|| value.dtype());
+            let val_dtype = access_dtype(index, value);
             kernel.push(format!("{indent}{} = {val};", render_access(index, &val_dtype, &idx)));
             Some(())
         }
@@ -329,7 +362,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 let target = c_dtype(dtype);
                 let pointer_type = if matches!(dtype, DType::Ptr { .. }) { target } else { format!("{target}*") };
                 let expr = format!("(({pointer_type})({s}))");
-                ctx.register(uop.id, expr);
+                ctx.emit_address(uop, expr, kernel);
                 return Some(());
             }
             let rendered_dtype = shaped_dtype(uop);
@@ -428,7 +461,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 .iter()
                 .map(|source| {
                     let value = ctx.get(source).to_string();
-                    if matches!(source.op(), Op::Index { buffer, .. } if is_storage_source(buffer)) {
+                    // Lane reads of an address-carrying INDEX must dereference:
+                    // INDEX renders `buf + idx` exactly when the buffer has an
+                    // address space (tinygrad cstyle.py render_index), so the
+                    // STACK element test has to use the same predicate.
+                    if matches!(source.op(), Op::Index { .. }) && source.addrspace().is_some() {
                         format!("*({value})")
                     } else {
                         value
@@ -565,15 +602,6 @@ fn render_access(index: &Arc<UOp>, access_dtype: &DType, address: &str) -> Strin
     }
 }
 
-fn shaped_dtype(value: &Arc<UOp>) -> DType {
-    let count = value_width(value);
-    if count > 1 {
-        value.dtype().scalar_dtype().vec(count).expect("grouped value dtype must be vectorizable")
-    } else {
-        value.dtype()
-    }
-}
-
 /// Render a binary operation as a C expression.
 fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
     match op {
@@ -692,14 +720,6 @@ fn render_reduce_accumulate(op: ReduceOp, acc: &str, val: &str, dtype: &DType) -
                 format!("{acc} = ({acc} < {val} ? {acc} : {val});")
             }
         }
-    }
-}
-
-fn is_storage_source(uop: &Arc<UOp>) -> bool {
-    match uop.op() {
-        Op::Param { .. } | Op::Buffer { .. } | Op::Slice { .. } => true,
-        Op::After { passthrough, .. } | Op::Precast { src: passthrough } => is_storage_source(passthrough),
-        _ => false,
     }
 }
 
