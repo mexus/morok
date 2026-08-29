@@ -489,6 +489,11 @@ fn mock_scratch_growth_preserves_old_state_on_drain_or_allocation_failure() {
     pool.ensure_has_local_memory(4096).expect("scratch growth");
     assert_eq!(iface.allocation_count(), baseline + 7);
     assert_eq!(iface.free_count(), 1, "successful publication frees exactly the drained old scratch");
+    // Idempotent: a satisfied request neither drains nor reallocates.
+    pool.ensure_has_local_memory(4096).expect("satisfied scratch request");
+    pool.ensure_has_local_memory(1).expect("smaller scratch request");
+    assert_eq!(iface.alloc_count_for_tag(crate::amd::va_registry::AllocTag::Scratch), 2);
+    assert_eq!(iface.allocation_count(), baseline + 7);
     drop(pool);
     assert_eq!(iface.free_count(), 7);
     assert!(iface.free_issues().is_empty());

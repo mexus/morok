@@ -544,12 +544,10 @@ impl PoolQueue {
     /// bytes per thread, growing it on demand. The old scratch buffer is freed
     /// (drain → unmap → munmap → free).
     pub fn ensure_has_local_memory(&self, private_segment_size: u32) -> Result<()> {
-        let current = self.scratch_state.lock().size_per_thread;
-        if private_segment_size <= current {
-            return Ok(());
-        }
-        // QueueLease is the exclusive publication authority, so no publisher
-        // can enqueue the stale scratch VA during this transaction.
+        // One check is enough: `QueueLease` is the exclusive publication
+        // authority for this lane, so no concurrent grow can land between the
+        // read and the replacement below, and no publisher can enqueue the
+        // stale scratch VA during the transaction.
         if private_segment_size <= self.scratch_state.lock().size_per_thread {
             return Ok(());
         }
@@ -740,6 +738,10 @@ impl crate::device::PlanContext for OwnerCtx {
                 *session = Some(self.lease()?);
             }
             let lane = session.as_ref().unwrap();
+            // Kept under the session mutex despite the drain it may run: that
+            // mutex is what lets `synchronize` snapshot `newest` without racing
+            // an already-doorbelled submission, and a grow only drains when the
+            // pre-sized scratch is genuinely too small.
             lane.ensure_has_local_memory(amd.private_segment_size())?;
             // Only profiling callers retain timestamp handles long enough to
             // synchronize them; fire-and-forget dispatch must not arm probes.
