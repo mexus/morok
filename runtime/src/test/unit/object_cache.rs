@@ -49,3 +49,23 @@ fn uncreatable_cache_directory_disables_the_cache() {
     unsafe { std::env::remove_var("SVOD_OBJECT_CACHE_DIR") };
     assert!(matches!(cache, Ok(None)), "an unopenable store must disable the cache, not fail: {cache:?}");
 }
+
+#[test]
+fn abandoned_lock_file_does_not_stall_compilation() {
+    // Pre-UA4 this spun for `STALE_LOCK_AGE` (120 s) because the lock was the
+    // file's existence and the recorded pid was alive (it is this process).
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ObjectCache::open(dir.path(), 4096).unwrap();
+    let key = ObjectCacheKey::new(b"abandoned", identity());
+    let digest = key.digest();
+    let lock_path =
+        dir.path().join(format!("{}.lock", digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()));
+    std::fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
+
+    let start = std::time::Instant::now();
+    let bytes = cache.get_or_compile(&key, |_| Ok(()), || Ok(b"object".to_vec())).unwrap();
+    assert_eq!(bytes, b"object");
+    assert!(start.elapsed() < std::time::Duration::from_secs(5), "took {:?}", start.elapsed());
+    // The entry is published: an unheld lock file never blocked publication.
+    assert_eq!(cache.get_or_compile(&key, |_| Ok(()), || panic!("must be a cache hit")).unwrap(), b"object");
+}
