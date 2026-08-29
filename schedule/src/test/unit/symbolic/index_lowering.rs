@@ -250,6 +250,21 @@ fn where_invalid_is_preserved() {
 }
 
 #[test]
+fn final_invalid_removal_leaves_addresses_gated() {
+    let gate = UOp::var("gate", DType::Bool, 0, 1);
+    let address = UOp::var("i", DType::Index, 0, 16).valid(gate);
+    let lanes = [address.clone(), UOp::invalid_marker()].into_iter().collect();
+    let stacked = UOp::new(Op::Stack { sources: lanes }, DType::Index);
+
+    // Rewriting an address Invalid to 0 would turn a skipped access into an
+    // unconditional read of element 0; only pm_lower_index_dtype may lower these.
+    for gated in [address, stacked] {
+        let result = graph_rewrite(crate::symbolic::patterns::pm_remove_invalid(), gated.clone(), &mut ());
+        assert!(Arc::ptr_eq(&result, &gated));
+    }
+}
+
+#[test]
 fn stack_invalid_lowers_weak_lane_without_replacing_marker() {
     let invalid = UOp::invalid_marker();
     let vector = UOp::stack([UOp::const_(DType::WeakInt, ConstValue::Int(7)), invalid.clone()].into_iter().collect());

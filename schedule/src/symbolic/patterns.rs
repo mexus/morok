@@ -492,9 +492,9 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
 /// retained for late memory gate lowering.
 pub fn pm_remove_invalid() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        r @ Where(cond, x, invalid) if UOp::is_invalid_marker(invalid) =>
+        r @ Where(cond, x, invalid) if UOp::is_invalid_marker(invalid) && r.dtype().base() != ScalarDType::Index =>
             UOp::try_where(cond.clone(), x.clone(), r.const_like(0)).ok(),
-        r @ Stack { sources } if sources.iter().any(UOp::is_invalid_marker) => {
+        r @ Stack { sources } if sources.iter().any(UOp::is_invalid_marker) && r.dtype().base() != ScalarDType::Index => {
             let zero = UOp::const_(r.dtype().scalar_dtype(), ConstValue::Int(0));
             Some(UOp::stack(sources.iter().map(|x| if UOp::is_invalid_marker(x) { zero.clone() } else { x.clone() }).collect()))
         },
