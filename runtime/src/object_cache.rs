@@ -112,7 +112,16 @@ impl ObjectCache {
             })?,
             Err(_) => DEFAULT_MAX_BYTES,
         };
-        Self::open(root, max_bytes).map(Some)
+        match Self::open(root, max_bytes) {
+            Ok(cache) => Ok(Some(cache)),
+            // A store we cannot even create is a missing store, not a broken
+            // compiler: tinygrad's `diskcache_get` (helpers.py:415-424)
+            // swallows the store's own errors and reports a miss.
+            Err(error) => {
+                warn_degraded("open object cache", &error);
+                Ok(None)
+            }
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -128,23 +137,33 @@ impl ObjectCache {
     {
         let digest = key.digest();
         let path = self.entry_path(&digest);
-        if let Some(bytes) = self.read_validated(&path, &digest, &validate)? {
+        if let Some(bytes) = self.read_validated(&path, &digest, &validate) {
             return Ok(bytes);
         }
 
-        let lock_path = path.with_extension("lock");
-        let _lock = LockFile::acquire(&lock_path)?;
-        if let Some(bytes) = self.read_validated(&path, &digest, &validate)? {
+        // The lock only deduplicates concurrent compilers. Losing it costs a
+        // duplicated compile, never a failed one.
+        let lock = LockFile::acquire(&path.with_extension("lock"))
+            .inspect_err(|error| warn_degraded("acquire object cache lock", error))
+            .ok();
+        if lock.is_some()
+            && let Some(bytes) = self.read_validated(&path, &digest, &validate)
+        {
             return Ok(bytes);
         }
 
         let bytes = compile()?;
         validate(&bytes)?;
         let encoded = encode_entry(&digest, &bytes);
-        if self.max_bytes > 0 && encoded.len() as u64 <= self.max_bytes {
-            atomic_write(&path, &encoded)?;
+        if self.max_bytes > 0
+            && encoded.len() as u64 <= self.max_bytes
+            && let Err(error) = atomic_write(&path, &encoded)
+        {
+            warn_degraded("publish object cache entry", &error);
         }
-        self.evict_to_budget(path.file_name())?;
+        if let Err(error) = self.evict_to_budget(path.file_name()) {
+            warn_degraded("evict object cache entries", &error);
+        }
         Ok(bytes)
     }
 
@@ -153,7 +172,7 @@ impl ObjectCache {
         V: Fn(&[u8]) -> Result<()>,
     {
         let digest = key.digest();
-        self.read_validated(&self.entry_path(&digest), &digest, &validate)
+        Ok(self.read_validated(&self.entry_path(&digest), &digest, &validate))
     }
 
     pub(crate) fn publish_compiled<V>(&self, key: &ObjectCacheKey, bytes: Vec<u8>, validate: V) -> Result<Vec<u8>>
@@ -172,18 +191,30 @@ impl ObjectCache {
     {
         let digest = digest_fields([namespace.as_bytes(), input]);
         let path = self.root.join(format!("probe-{}-{}.data", sanitize(namespace), hex(&digest)));
-        if let Some(bytes) = read_entry(&path, &digest)? {
+        let cached = |path: &Path| {
+            read_entry(path, &digest).unwrap_or_else(|error| {
+                warn_degraded("read compiler probe", &error);
+                None
+            })
+        };
+        if let Some(bytes) = cached(&path) {
             return Ok(bytes);
         }
-        let _lock = LockFile::acquire(&path.with_extension("lock"))?;
-        if let Some(bytes) = read_entry(&path, &digest)? {
+        let lock = LockFile::acquire(&path.with_extension("lock"))
+            .inspect_err(|error| warn_degraded("acquire compiler probe lock", error))
+            .ok();
+        if lock.is_some()
+            && let Some(bytes) = cached(&path)
+        {
             return Ok(bytes);
         }
         let bytes = create()?;
         if bytes.is_empty() {
             return Err(Error::JitCompilation { reason: format!("empty {namespace} compiler probe") });
         }
-        atomic_write(&path, &encode_entry(&digest, &bytes))?;
+        if let Err(error) = atomic_write(&path, &encode_entry(&digest, &bytes)) {
+            warn_degraded("publish compiler probe", &error);
+        }
         Ok(bytes)
     }
 
@@ -191,16 +222,19 @@ impl ObjectCache {
         self.root.join(format!("{}.obj", hex(digest)))
     }
 
-    fn read_validated<V>(&self, path: &Path, digest: &[u8; 32], validate: &V) -> Result<Option<Vec<u8>>>
+    fn read_validated<V>(&self, path: &Path, digest: &[u8; 32], validate: &V) -> Option<Vec<u8>>
     where
         V: Fn(&[u8]) -> Result<()>,
     {
-        let Some(bytes) = read_entry(path, digest)? else { return Ok(None) };
+        let bytes = read_entry(path, digest).unwrap_or_else(|error| {
+            warn_degraded("read object cache entry", &error);
+            None
+        })?;
         if validate(&bytes).is_ok() {
-            return Ok(Some(bytes));
+            return Some(bytes);
         }
         let _ = fs::remove_file(path);
-        Ok(None)
+        None
     }
 
     fn evict_to_budget(&self, protected: Option<&std::ffi::OsStr>) -> Result<()> {
@@ -389,6 +423,14 @@ fn lock_owner_is_alive(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn lock_owner_is_alive(_path: &Path) -> bool {
     false
+}
+
+/// The object cache is advisory storage: every failure to read, lock, publish
+/// or evict degrades to a miss instead of failing the caller's compile, the way
+/// tinygrad's `diskcache_get` (`helpers.py:415-424`) reports a miss when the
+/// store itself errors.
+fn warn_degraded(action: &str, error: &Error) {
+    tracing::warn!(target: "svod_runtime::object_cache", action, %error, "object cache degraded to a miss");
 }
 
 fn cache_io(action: &'static str, source: std::io::Error) -> Error {
