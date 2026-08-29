@@ -152,6 +152,18 @@ fn shaped_width_eight_load_uses_two_scalar_dtype_width_four_accesses() {
 }
 
 #[test]
+fn shaped_width_sixteen_load_folds_to_one_access_on_apple_amx() {
+    let buffer = UOp::param(0, 16, DType::Float32, None);
+    let offsets: Vec<i64> = (0..16).collect();
+    let old = UOp::new(Op::Load { index: shaped_index(&buffer, &offsets), alt: None, gate: None }, DType::Float32);
+
+    let result = target_coalesce(UOp::sink(vec![old]), &Renderer::apple_amx());
+    let folded = loads(&result);
+    assert_eq!(folded.len(), 1, "AMX folds a whole 16-lane register, got {}", result.tree());
+    assert_eq!(folded[0].shape().unwrap().unwrap()[0].as_const(), Some(16));
+}
+
+#[test]
 fn shaped_store_is_devectorized_then_coalesced_with_scalar_memory_dtype() {
     let buffer = UOp::param(0, 16, DType::Float32, None);
     let value = UOp::stack((0..4).map(|value| UOp::const_(DType::Float32, ConstValue::Float(value as f64))).collect());
