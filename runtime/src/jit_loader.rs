@@ -49,7 +49,7 @@ impl JitKernel {
     ) -> crate::Result<Self> {
         let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
         svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
-        crate::clang::validate_c_object(object, name)?;
+        crate::clang::validate_relocatable_object(object, name)?;
         let (fn_ptr, mmap) = jit_load(object, name)?;
         let cif = KernelCif::from_abi(abi);
         Ok(Self { _mmap: mmap, fn_ptr, name: name.to_string(), var_names, cif })
