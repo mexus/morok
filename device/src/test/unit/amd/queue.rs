@@ -1354,3 +1354,22 @@ fn set_aql_scratch_round_trips_through_gart() {
     // Free the scratch we allocated for the test.
     alloc.dev.core().iface().free_raw(va, _size, _handle);
 }
+
+/// ES4: each lane keeps one linked-buffer cache, so re-linking the same packets
+/// and immutable addresses reuses the storage instead of relinking per site.
+#[test]
+fn mock_lane_reuses_linked_command_buffers() {
+    let (_iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let first = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    let second = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+
+    let lowered = crate::hcq::LoweredCommandBuffer { bytes: vec![0; 8], patches: crate::hcq::PatchTable::default() };
+    let values = crate::hcq::LinkPatchValues::default();
+    let linked = first.link(&lowered, &values).expect("link");
+    let again = first.link(&lowered, &values).expect("relink");
+    let other_lane = second.link(&lowered, &values).expect("other lane link");
+
+    assert!(Arc::ptr_eq(&linked, &again), "a lane must reuse its own linked storage");
+    assert!(!Arc::ptr_eq(&linked, &other_lane), "linked storage must not cross lanes");
+}

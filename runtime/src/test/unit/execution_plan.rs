@@ -1363,7 +1363,7 @@ fn repeated_normal_execution_repatches_vars_buffers_and_mixed_copy_plan() {
 }
 
 #[derive(Debug)]
-struct TaggedCpuAllocator(DeviceSpec);
+struct TaggedCpuAllocator(DeviceSpec, Arc<AtomicUsize>);
 
 impl Allocator for TaggedCpuAllocator {
     fn _alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> svod_device::Result<RawBuffer> {
@@ -1383,6 +1383,7 @@ impl Allocator for TaggedCpuAllocator {
     }
 
     fn device_spec(&self) -> DeviceSpec {
+        self.1.fetch_add(1, Ordering::Relaxed);
         self.0.clone()
     }
 }
@@ -1390,6 +1391,7 @@ impl Allocator for TaggedCpuAllocator {
 #[derive(Debug)]
 struct NativeReplayProgram {
     replays: Arc<AtomicUsize>,
+    fail: bool,
 }
 
 #[derive(Debug)]
@@ -1432,13 +1434,14 @@ impl Program for NativeReplayProgram {
     }
 
     fn new_exec_context(&self) -> svod_device::Result<Option<Box<dyn PlanContext>>> {
-        Ok(Some(Box::new(NativeReplayContext { replays: Arc::clone(&self.replays) })))
+        Ok(Some(Box::new(NativeReplayContext { replays: Arc::clone(&self.replays), fail: self.fail })))
     }
 }
 
 #[derive(Debug)]
 struct NativeReplayContext {
     replays: Arc<AtomicUsize>,
+    fail: bool,
 }
 
 impl PlanContext for NativeReplayContext {
@@ -1460,6 +1463,9 @@ impl PlanContext for NativeReplayContext {
         _calls: &[PlanCall<'_>],
     ) -> svod_device::Result<NativeReplayOutcome> {
         self.replays.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            return Err(svod_device::Error::Runtime { message: "native submit rejected".into() });
+        }
         Ok(NativeReplayOutcome::Executed)
     }
 
@@ -1469,7 +1475,13 @@ impl PlanContext for NativeReplayContext {
 }
 
 fn tagged_buffer(device: DeviceSpec) -> Buffer {
-    Buffer::new(Arc::new(TaggedCpuAllocator(device)), DType::UInt8, vec![4], Default::default())
+    tagged_buffer_counting(device, Arc::new(AtomicUsize::new(0)))
+}
+
+/// `spec_calls` counts `Allocator::device_spec` — the per-buffer work the
+/// native-replay validation walk performs.
+fn tagged_buffer_counting(device: DeviceSpec, spec_calls: Arc<AtomicUsize>) -> Buffer {
+    Buffer::new(Arc::new(TaggedCpuAllocator(device, spec_calls)), DType::UInt8, vec![4], Default::default())
 }
 
 #[test]
@@ -1569,18 +1581,22 @@ fn graph_replay_rejects_forged_amd_allocation_ownership() {
     assert_eq!(replays.load(Ordering::SeqCst), 0, "forged endpoint reached graph backend");
 }
 
-fn native_copy_plan_with_source(source_device: DeviceSpec) -> (ExecutionPlan, Arc<AtomicUsize>, usize, usize, usize) {
+fn native_copy_plan_with_source(
+    source_device: DeviceSpec,
+    fail_native: bool,
+    spec_calls: Arc<AtomicUsize>,
+) -> (ExecutionPlan, Arc<AtomicUsize>, usize, usize, usize) {
     let owner = DeviceSpec::Cpu;
     let replays = Arc::new(AtomicUsize::new(0));
     let mut builder = ExecutionPlanBuilder::new(owner.clone());
-    let kernel_idx = builder.add_buffer(21_001, tagged_buffer(owner.clone()));
-    let dst_idx = builder.add_buffer(21_002, tagged_buffer(owner.clone()));
-    let src_idx = builder.add_buffer(21_003, tagged_buffer(source_device));
+    let kernel_idx = builder.add_buffer(21_001, tagged_buffer_counting(owner.clone(), Arc::clone(&spec_calls)));
+    let dst_idx = builder.add_buffer(21_002, tagged_buffer_counting(owner.clone(), Arc::clone(&spec_calls)));
+    let src_idx = builder.add_buffer(21_003, tagged_buffer_counting(source_device, spec_calls));
     builder.add_kernel(PreparedKernel {
         id: 21_010,
         ast: UOp::sink(vec![]),
         kernel: Arc::new(CachedKernel {
-            program: Box::new(NativeReplayProgram { replays: Arc::clone(&replays) }),
+            program: Box::new(NativeReplayProgram { replays: Arc::clone(&replays), fail: fail_native }),
             device: "AMD:0".into(),
             code: String::new(),
             entry_point: "native_replay_recorder".into(),
@@ -1612,12 +1628,13 @@ fn native_copy_plan_with_source(source_device: DeviceSpec) -> (ExecutionPlan, Ar
 }
 
 fn native_copy_plan() -> (ExecutionPlan, Arc<AtomicUsize>, usize, usize, usize) {
-    native_copy_plan_with_source(DeviceSpec::Cpu)
+    native_copy_plan_with_source(DeviceSpec::Cpu, false, Arc::new(AtomicUsize::new(0)))
 }
 
 #[test]
 fn native_replay_rejects_staged_semantic_copy() {
-    let (plan, replays, _, _, _) = native_copy_plan_with_source(DeviceSpec::Amd { device_id: 0 });
+    let (plan, replays, _, _, _) =
+        native_copy_plan_with_source(DeviceSpec::Amd { device_id: 0 }, false, Arc::new(AtomicUsize::new(0)));
     assert_eq!(
         plan.replay_native_linked_plan().unwrap(),
         NativeReplayOutcome::Declined(NativeReplayDecline::StagedCopy { operation: 1 })
@@ -1736,4 +1753,115 @@ fn hcq_same_queue_dependencies_are_fifo_elided() {
     use svod_device::hcq::QueueKind;
     let plan = hcq_plan(&[hcq_op(0, QueueKind::Compute(0), &[], &[1]), hcq_op(1, QueueKind::Compute(0), &[1], &[2])]);
     assert!(operation_submission(&plan, 1).waits.is_empty());
+}
+
+#[test]
+fn build_rejects_buffer_copy_without_source_and_destination() {
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let dst_idx = builder.add_buffer(1, Buffer::new(alloc, DType::Float32, vec![4], Default::default()));
+    builder.add_op(PreparedOp::BufferCopy(PreparedCopy {
+        id: 77,
+        buffer_indices: vec![dst_idx],
+        dependencies: Vec::new(),
+    }));
+    builder.set_output_buffer(dst_idx);
+
+    let err = builder.build().expect_err("one-endpoint copy must not build");
+    match err {
+        crate::error::Error::Execution { reason } => {
+            assert!(reason.contains("requires two buffer indices"), "unexpected error: {reason}");
+        }
+        other => panic!("unexpected error variant: {other:?}"),
+    }
+}
+
+#[test]
+fn failed_native_replay_poisons_the_plan() {
+    let (plan, replays, _, _, _) = native_copy_plan_with_source(DeviceSpec::Cpu, true, Arc::new(AtomicUsize::new(0)));
+
+    let first = plan.execute().expect_err("failing native submit must surface");
+    assert!(matches!(first, crate::error::Error::Exec { .. }), "{first:?}");
+    assert_eq!(replays.load(Ordering::SeqCst), 1);
+
+    let second = plan.execute().expect_err("a failed native submit must not stay retryable");
+    assert!(matches!(second, crate::error::Error::PlanPoisoned { .. }), "{second:?}");
+    assert_eq!(replays.load(Ordering::SeqCst), 1, "poisoned plan must not resubmit");
+}
+
+#[test]
+fn hazard_reads_cover_buffers_the_kernel_does_not_declare() {
+    // The consumer takes the producer's output as its second buffer but
+    // declares no `ProgramSpec.ins`. The RAW edge must survive anyway.
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let shared_idx = builder.add_buffer(1, Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default()));
+    let out_idx = builder.add_buffer(2, Buffer::new(alloc, DType::Float32, vec![4], Default::default()));
+    let kernel = |id, buffer_indices: Vec<usize>| PreparedKernel {
+        id,
+        ast: UOp::sink(vec![]),
+        kernel: Arc::new(CachedKernel {
+            program: Box::new(RejectDispatchProgram { calls: Arc::clone(&calls) }),
+            device: "CPU".into(),
+            code: String::new(),
+            entry_point: "reject_dispatch".into(),
+            var_names: vec![],
+            globals: (0..buffer_indices.len()).collect(),
+            outs: vec![0],
+            ins: Vec::new(),
+            global_size: default_launch_size(),
+            local_size: Some(default_launch_size()),
+        }),
+        device: DeviceSpec::Cpu,
+        buffer_indices,
+        output_indices: vec![0],
+        input_indices: Vec::new(),
+        vals: vec![],
+        fixedvars: HashMap::new(),
+        dependencies: vec![],
+        buffer_ptrs: vec![],
+        buffer_ids: vec![],
+        runtime_vars: vec![],
+    };
+    builder.add_kernel(kernel(1_001, vec![shared_idx]));
+    builder.add_op_with_instance_dependencies(
+        PreparedOp::CompiledProgram(kernel(1_002, vec![out_idx, shared_idx])),
+        vec![0],
+    );
+    builder.set_output_buffer(out_idx);
+    let plan = builder.build().expect("build plan");
+
+    let operations = plan.hcq_operations().expect("hcq operations");
+    let shared = plan.buffers()[shared_idx].storage_id();
+    assert!(
+        operations[1].reads.iter().any(|access| access.storage == shared),
+        "undeclared read must still enter the hazard read-set: {:?}",
+        operations[1].reads
+    );
+    assert!(operations[1].reads.iter().all(|access| access.storage != plan.buffers()[out_idx].storage_id()));
+}
+
+/// ES1: native-replay endpoint validation walks the plan once per execute, with
+/// no per-buffer device resolution and no growth across repeated executes.
+#[test]
+fn native_replay_validation_cost_is_flat_across_executes() {
+    const ENDPOINTS: usize = 3; // one kernel argument + copy destination/source.
+    let spec_calls = Arc::new(AtomicUsize::new(0));
+    let (plan, _replays, _, _, _) = native_copy_plan_with_source(DeviceSpec::Cpu, false, Arc::clone(&spec_calls));
+
+    plan.execute().expect("first execute");
+    spec_calls.store(0, Ordering::SeqCst);
+    // Measure a warm execute: the first one also mints the plan context.
+    plan.execute().expect("warm execute");
+    let per_execute = spec_calls.swap(0, Ordering::SeqCst);
+    for _ in 0..100 {
+        plan.execute().expect("repeat execute");
+    }
+
+    assert_eq!(spec_calls.load(Ordering::SeqCst), per_execute * 100, "per-execute validation cost must not grow");
+    assert!(
+        per_execute <= 4 * ENDPOINTS,
+        "{per_execute} device_spec calls for {ENDPOINTS} endpoints: the walk was not merged"
+    );
 }

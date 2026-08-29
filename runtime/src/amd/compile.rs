@@ -27,8 +27,17 @@ pub fn compile_ir_to_amd_object(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8
     compile_ir_to_amd_object_with(&toolchain, ir, arch)
 }
 
-pub(crate) fn amd_object_flags(arch: AmdArch) -> Vec<String> {
-    vec![
+/// Clang driver flags for one kernel.
+///
+/// `-nogpulib` skips the ROCm device-library search entirely, the way tinygrad
+/// drives amdgcn straight through LLVM (`runtime/support/compiler_llvm.py:19-24`
+/// links no device libs). The renderer emits `@llvm.*` intrinsics for every
+/// float unary the AMDGPU backend can select, so the libraries are only needed
+/// when the IR still references the f64 `__ocml_*` entry points
+/// (`codegen/src/llvm/amd/ops.rs::render_float_unary`). The IR is part of the
+/// object-cache key, so keying a flag off it keeps the key sound.
+pub(crate) fn amd_object_flags(ir: &str, arch: AmdArch) -> Vec<String> {
+    let mut flags: Vec<String> = vec![
         "-x".into(),
         "ir".into(),
         "-c".into(),
@@ -39,10 +48,12 @@ pub(crate) fn amd_object_flags(arch: AmdArch) -> Vec<String> {
         "-nogpuinc".into(),
         "-Wno-override-module".into(),
         "-fno-math-errno".into(),
-        "-".into(),
-        "-o".into(),
-        "-".into(),
-    ]
+    ];
+    if !ir.contains("@__ocml_") {
+        flags.push("-nogpulib".into());
+    }
+    flags.extend(["-", "-o", "-"].map(str::to_string));
+    flags
 }
 
 pub(crate) fn compile_ir_to_amd_object_with(
@@ -81,7 +92,7 @@ pub(crate) fn compile_ir_to_amd_object_with(
 
     debug!(arch = arch.mcpu(), ir.length = ir.len(), "compiling amdgcn IR via clang");
 
-    let args = amd_object_flags(arch);
+    let args = amd_object_flags(ir, arch);
 
     let mut child = toolchain
         .command()
@@ -109,19 +120,6 @@ pub(crate) fn compile_ir_to_amd_object_with(
     }
 
     Ok(output.stdout)
-}
-
-pub(crate) fn spawn_ir_to_amd_object(
-    toolchain: &ClangToolchain,
-    ir: &str,
-    arch: AmdArch,
-) -> svod_device::Result<svod_device::device::CompilerProcess> {
-    if !has_amdgpu_target_with(toolchain) {
-        return Err(svod_device::Error::Runtime {
-            message: "AMD GPU support requires clang built with the AMDGPU target".into(),
-        });
-    }
-    crate::clang::spawn_compile_process(toolchain, ir, &amd_object_flags(arch))
 }
 
 /// Validate both the generic ELF contract and the architecture encoded in
@@ -169,13 +167,24 @@ fn amd_elf_machine(arch: AmdArch) -> u32 {
     }
 }
 
-fn has_amdgpu_target_with(toolchain: &ClangToolchain) -> bool {
-    let output = match toolchain.command().arg("--print-targets").output() {
-        Ok(output) => output,
-        Err(_) => return false,
-    };
+/// Does `executable` advertise the `amdgcn` target?
+fn probe_amdgcn(executable: &std::path::Path) -> bool {
+    let Ok(output) = Command::new(executable).arg("--print-targets").output() else { return false };
     output.status.success()
         && String::from_utf8_lossy(&output.stdout).lines().any(|line| line.split_whitespace().next() == Some("amdgcn"))
+}
+
+/// Cached per clang executable: an installation does not change during a run,
+/// and this forked a subprocess on *every* AMD compile.
+fn has_amdgpu_target_with(toolchain: &ClangToolchain) -> bool {
+    static CACHE: OnceLock<papaya::HashMap<std::path::PathBuf, bool>> = OnceLock::new();
+    let probed = CACHE.get_or_init(papaya::HashMap::new).pin();
+    if let Some(known) = probed.get(toolchain.executable()) {
+        return *known;
+    }
+    let result = probe_amdgcn(toolchain.executable());
+    probed.insert(toolchain.executable().to_path_buf(), result);
+    result
 }
 
 /// Does the host `clang` advertise the `amdgpu` target?
@@ -184,17 +193,7 @@ fn has_amdgpu_target_with(toolchain: &ClangToolchain) -> bool {
 /// during a run, and the subprocess is too slow to do per-call.
 pub fn has_amdgpu_target() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        let output = match Command::new("clang").arg("--print-targets").output() {
-            Ok(o) => o,
-            Err(_) => return false,
-        };
-        if !output.status.success() {
-            return false;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.lines().any(|line| line.split_whitespace().next().map(|t| t == "amdgcn").unwrap_or(false))
-    })
+    *CACHE.get_or_init(|| probe_amdgcn(std::path::Path::new("clang")))
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ tracing = "0.1"
 strum = { version = "0.28.0", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
+serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -39,11 +40,11 @@ tracing-verbose = []
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 test-case = "3.3.1"
-serde_json = "1"
 svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.3", features = [
   "testing",
 ] }
 proptest = "1.11.0"
+tempfile = "3.27.0"
 
 [[bench]]
 name = "optimization"

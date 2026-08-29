@@ -171,10 +171,14 @@ fn amd_emits_kernel_abi_and_target_triple() {
     assert!(result.code.contains("alwaysinline"), "missing alwaysinline attr:\n{}", result.code);
 }
 
-#[test]
-fn amd_uses_ocml_and_contract_only_float_flags() {
-    let input = UOp::param(0, 1, DType::Float32, None);
-    let output = UOp::param(1, 1, DType::Float32, None);
+/// The AMDGPU backend selects `@llvm.exp2` for f16/f32 but has no f64 lowering
+/// ("no libcall available for fexp2"), so only f64 stays on ROCm's `__ocml_*`.
+#[test_case::test_case(DType::Float16, "@llvm.exp2.f16", "half")]
+#[test_case::test_case(DType::Float32, "@llvm.exp2.f32", "float")]
+#[test_case::test_case(DType::Float64, "@__ocml_exp2_f64", "double")]
+fn amd_uses_llvm_intrinsics_and_contract_only_float_flags(dtype: DType, callee: &str, llvm_type: &str) {
+    let input = UOp::param(0, 1, dtype.clone(), None);
+    let output = UOp::param(1, 1, dtype, None);
     let idx = UOp::const_(DType::Int32, ConstValue::Int(0));
     let input_idx = UOp::index().buffer(input).indices(vec![idx.clone()]).call().unwrap();
     let output_idx = UOp::index().buffer(output).indices(vec![idx]).call().unwrap();
@@ -185,12 +189,16 @@ fn amd_uses_ocml_and_contract_only_float_flags() {
     let rendered = render_amd_linearized(&sink, AmdArch::Gfx1151, "amd_float_flags");
 
     assert!(
-        rendered.code.contains("declare float @__ocml_exp2_f32(float)"),
-        "missing OCML declaration:\n{}",
+        rendered.code.contains(&format!("declare {llvm_type} {callee}({llvm_type})")),
+        "missing declaration for {callee}:\n{}",
         rendered.code
     );
-    assert!(rendered.code.contains("call float @__ocml_exp2_f32"), "missing OCML call:\n{}", rendered.code);
-    assert!(rendered.code.contains("fdiv contract float"), "missing contract-only fdiv:\n{}", rendered.code);
+    assert!(rendered.code.contains(&format!("call {llvm_type} {callee}")), "missing {callee} call:\n{}", rendered.code);
+    assert!(
+        rendered.code.contains(&format!("fdiv contract {llvm_type}")),
+        "missing contract-only fdiv:\n{}",
+        rendered.code
+    );
     assert!(!rendered.code.contains(" arcp "), "AMD must not permit approximate reciprocal:\n{}", rendered.code);
 }
 

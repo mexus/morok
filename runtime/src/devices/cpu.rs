@@ -234,28 +234,6 @@ impl Compiler for ClangCompiler {
     fn cache_key(&self) -> &str {
         &self.cache_key
     }
-
-    fn start_compile_process(&self, spec: &ProgramSpec) -> Result<Option<svod_device::device::CompilerProcessTask>> {
-        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
-        if let Some(cache) = &self.cache
-            && let Some(bytes) =
-                cache.get_validated(&key, |bytes| validate_c_object(bytes, &spec.name)).map_err(runtime_as_device)?
-        {
-            return Ok(Some(svod_device::device::CompilerProcessTask::Ready(bytes)));
-        }
-        let process = crate::clang::spawn_compile_process(&self.toolchain, &spec.src, &self.flags)?;
-        Ok(Some(svod_device::device::CompilerProcessTask::Spawned(process)))
-    }
-
-    fn finish_compile_process(&self, spec: &ProgramSpec, bytes: Vec<u8>) -> Result<Vec<u8>> {
-        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
-        if let Some(cache) = &self.cache {
-            cache.publish_compiled(&key, bytes, |bytes| validate_c_object(bytes, &spec.name)).map_err(runtime_as_device)
-        } else {
-            validate_c_object(&bytes, &spec.name).map_err(runtime_as_device)?;
-            Ok(bytes)
-        }
-    }
 }
 
 /// Runtime factory for creating Clang programs.
@@ -334,34 +312,6 @@ impl Compiler for LlvmCompiler {
 
     fn cache_key(&self) -> &str {
         &self.cache_key
-    }
-
-    fn start_compile_process(
-        &self,
-        spec: &svod_device::device::ProgramSpec,
-    ) -> Result<Option<svod_device::device::CompilerProcessTask>> {
-        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
-        if let Some(cache) = &self.cache
-            && let Some(bytes) = cache
-                .get_validated(&key, |bytes| crate::clang::validate_relocatable_object(bytes, &spec.name))
-                .map_err(runtime_as_device)?
-        {
-            return Ok(Some(svod_device::device::CompilerProcessTask::Ready(bytes)));
-        }
-        let process = crate::clang::spawn_compile_process(&self.toolchain, &spec.src, &self.flags)?;
-        Ok(Some(svod_device::device::CompilerProcessTask::Spawned(process)))
-    }
-
-    fn finish_compile_process(&self, spec: &svod_device::device::ProgramSpec, bytes: Vec<u8>) -> Result<Vec<u8>> {
-        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
-        if let Some(cache) = &self.cache {
-            cache
-                .publish_compiled(&key, bytes, |bytes| crate::clang::validate_relocatable_object(bytes, &spec.name))
-                .map_err(runtime_as_device)
-        } else {
-            crate::clang::validate_relocatable_object(&bytes, &spec.name).map_err(runtime_as_device)?;
-            Ok(bytes)
-        }
     }
 }
 

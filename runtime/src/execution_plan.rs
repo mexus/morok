@@ -175,6 +175,26 @@ pub struct PreparedKernel {
     pub runtime_vars: Vec<RuntimeVar>,
 }
 
+impl PreparedKernel {
+    /// Hazard read-set positions: every buffer slot the kernel does not write.
+    ///
+    /// Tinygrad's `DepsTracker.access_resources` (`device.py:280-296`, called
+    /// from `graph/hcq.py:224` with `outs` as the write list) takes the whole
+    /// buffer list and treats every slot outside `write` as a read.
+    /// `input_indices` is only `ProgramSpec.ins` — the declared LOAD slots —
+    /// which misses buffers the kernel reads through an alias or an
+    /// undeclared global, so it must not drive dependency edges.
+    fn read_positions(&self) -> impl Iterator<Item = usize> + '_ {
+        debug_assert!(
+            self.input_indices.iter().all(|position| *position < self.buffer_indices.len()),
+            "kernel {} declares an input position outside its {} buffers",
+            self.id,
+            self.buffer_indices.len()
+        );
+        (0..self.buffer_indices.len()).filter(|position| !self.output_indices.contains(position))
+    }
+}
+
 /// Bound description for one `DefineVar` consumed by a kernel.
 #[derive(Clone, Debug)]
 pub struct RuntimeVar {
@@ -434,60 +454,65 @@ impl ExecutionPlan {
             return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::NoCompiledProgram));
         };
 
+        // One walk over the plan's endpoints. Native linked replay submits every
+        // kernel argument AND every copy endpoint through this context's
+        // queues; until peer mappings are explicit, all of them must belong to
+        // that exact physical device. Rechecked on every replay so a
+        // replacement buffer cannot patch a foreign VA into a cached plan —
+        // hence the single up-front `NativeDevice::resolve`, which keeps the
+        // process-global AMD device-cache lock out of the per-buffer path.
+        let native = svod_device::buffer::NativeDevice::resolve(owner);
         for op in &self.ops {
-            let PreparedOp::CompiledProgram(kernel) = op else { continue };
-            for (argument, &buffer_index) in kernel.buffer_indices.iter().enumerate() {
-                let actual = self.buffers[buffer_index].device_spec();
-                if &actual != owner {
-                    return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::ForeignProgramEndpoint {
-                        operation: kernel.id,
-                        argument,
-                        expected: owner.clone(),
-                        actual,
-                    }));
+            let (id, endpoints): (u64, Vec<(usize, Option<CopyEndpoint>)>) = match op {
+                PreparedOp::CompiledProgram(kernel) => {
+                    (kernel.id, kernel.buffer_indices.iter().map(|&index| (index, None)).collect())
                 }
-                if !self.buffers[buffer_index].matches_native_device(owner).context(ExecSnafu {
-                    context: format!("validate native kernel {} argument {argument}", kernel.id),
-                })? {
-                    return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::IncompatibleProgramAllocation {
-                        operation: kernel.id,
-                        argument,
-                        expected: owner.clone(),
-                    }));
-                }
-            }
-        }
-
-        // Native linked replay submits every copy through this context's copy
-        // queue. Until peer mappings are explicit, both current endpoints must
-        // belong to that exact physical device. Recheck on every replay so a
-        // replacement buffer cannot patch a foreign VA into a cached plan.
-        for op in &self.ops {
-            let PreparedOp::BufferCopy(copy) = op else { continue };
-            for (position, endpoint) in [(0, CopyEndpoint::Destination), (1, CopyEndpoint::Source)] {
-                let Some(&buffer_index) = copy.buffer_indices.get(position) else {
-                    continue;
-                };
-                let Some(buffer) = self.buffers.get(buffer_index) else {
-                    continue;
-                };
+                PreparedOp::BufferCopy(copy) => (
+                    copy.id,
+                    [CopyEndpoint::Destination, CopyEndpoint::Source]
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(position, endpoint)| {
+                            copy.buffer_indices.get(position).map(|&index| (index, Some(endpoint)))
+                        })
+                        .collect(),
+                ),
+                PreparedOp::CustomFunction(_) => continue,
+            };
+            for (argument, (buffer_index, endpoint)) in endpoints.into_iter().enumerate() {
+                let Some(buffer) = self.buffers.get(buffer_index) else { continue };
                 let actual = buffer.device_spec();
                 if &actual != owner {
-                    return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::ForeignCopyEndpoint {
-                        operation: copy.id,
-                        endpoint,
-                        expected: owner.clone(),
-                        actual,
+                    return Ok(NativeReplayOutcome::Declined(match endpoint {
+                        Some(endpoint) => NativeReplayDecline::ForeignCopyEndpoint {
+                            operation: id,
+                            endpoint,
+                            expected: owner.clone(),
+                            actual,
+                        },
+                        None => NativeReplayDecline::ForeignProgramEndpoint {
+                            operation: id,
+                            argument,
+                            expected: owner.clone(),
+                            actual,
+                        },
                     }));
                 }
                 if !buffer
-                    .matches_native_device(owner)
-                    .context(ExecSnafu { context: format!("validate native copy {} {endpoint:?}", copy.id) })?
+                    .matches_native(&native)
+                    .context(ExecSnafu { context: format!("validate native operation {id} endpoint {argument}") })?
                 {
-                    return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::IncompatibleCopyAllocation {
-                        operation: copy.id,
-                        endpoint,
-                        expected: owner.clone(),
+                    return Ok(NativeReplayOutcome::Declined(match endpoint {
+                        Some(endpoint) => NativeReplayDecline::IncompatibleCopyAllocation {
+                            operation: id,
+                            endpoint,
+                            expected: owner.clone(),
+                        },
+                        None => NativeReplayDecline::IncompatibleProgramAllocation {
+                            operation: id,
+                            argument,
+                            expected: owner.clone(),
+                        },
                     }));
                 }
             }
@@ -574,12 +599,19 @@ impl ExecutionPlan {
     }
 
     fn graph_endpoints_match_device(&self) -> Result<bool> {
+        // Resolve once per distinct kernel device instead of once per buffer:
+        // a captured chain is single-device, so this is one resolve per plan.
+        let mut resolved: Option<(DeviceSpec, svod_device::buffer::NativeDevice)> = None;
         for op in &self.ops {
             let PreparedOp::CompiledProgram(kernel) = op else { continue };
+            if resolved.as_ref().is_none_or(|(spec, _)| spec != &kernel.device) {
+                resolved = Some((kernel.device.clone(), svod_device::buffer::NativeDevice::resolve(&kernel.device)));
+            }
+            let native = &resolved.as_ref().expect("resolved above").1;
             for &index in &kernel.buffer_indices {
                 if self.buffers[index].device_spec() != kernel.device
                     || !self.buffers[index]
-                        .matches_native_device(&kernel.device)
+                        .matches_native(native)
                         .context(ExecSnafu { context: format!("validate graph kernel {} endpoint", kernel.id) })?
                 {
                     return Ok(false);
@@ -596,7 +628,7 @@ impl ExecutionPlan {
         for &operation in self.op_levels.iter().flatten() {
             let (device, queue, read_indices, write_indices, is_copy) = match &self.ops[operation] {
                 PreparedOp::CompiledProgram(kernel) => {
-                    let reads = kernel.input_indices.iter().map(|&position| kernel.buffer_indices[position]).collect();
+                    let reads = kernel.read_positions().map(|position| kernel.buffer_indices[position]).collect();
                     let writes =
                         kernel.output_indices.iter().map(|&position| kernel.buffer_indices[position]).collect();
                     (kernel.device.clone(), QueueKind::Compute(0), reads, writes, false)
@@ -761,8 +793,7 @@ impl ExecutionPlan {
                     .collect::<Result<Vec<_>>>()?;
                 let writes: Vec<usize> =
                     k.output_indices.iter().filter_map(|&j| current_addresses.get(j).copied()).collect();
-                let reads: Vec<usize> =
-                    k.input_indices.iter().filter_map(|&j| current_addresses.get(j).copied()).collect();
+                let reads: Vec<usize> = k.read_positions().filter_map(|j| current_addresses.get(j).copied()).collect();
 
                 let mut deps: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 for &b in &reads {
@@ -1195,14 +1226,17 @@ impl ExecutionPlan {
             .hcq_executor
             .lock()
             .map_err(|_| crate::error::Error::Execution { reason: "CPU HCQ executor lock poisoned".into() })?;
-        let graph = self.graph_endpoints_match_device()?.then(|| self.graph()).and_then(|graph| graph.as_deref());
-        if graph.is_none()
-            && matches!(self.replay_native_linked_plan()?, svod_device::device::NativeReplayOutcome::Executed)
-        {
-            return Ok(());
-        }
         let mut graph_replayed = false;
+        // Both pre-flight checks run inside the poisoning closure: a failed
+        // endpoint validation or native submit leaves the plan's timelines in
+        // an unknown state, so it must not stay retryable.
         let result = (|| {
+            let graph = self.graph_endpoints_match_device()?.then(|| self.graph()).and_then(|graph| graph.as_deref());
+            if graph.is_none()
+                && matches!(self.replay_native_linked_plan()?, svod_device::device::NativeReplayOutcome::Executed)
+            {
+                return Ok(());
+            }
             let linked = self.hcq_linked.get().expect("HCQ plan linked by builder");
             let mut staging = HashMap::new();
             // SAFETY: semantic plan submissions contain only waits, callback
@@ -1361,7 +1395,7 @@ impl ExecutionPlan {
                                     handle,
                                 );
                             }
-                            PreparedOp::BufferCopy(_) => unreachable!(),
+                            PreparedOp::BufferCopy(copy) => self.execute_copy(copy)?,
                             PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom)?,
                         }
                     }
@@ -1672,7 +1706,22 @@ impl ExecutionPlanBuilder {
     /// for zero-allocation execution.
     pub fn build(mut self) -> Result<ExecutionPlan> {
         for op in &mut self.ops {
-            let PreparedOp::CompiledProgram(kernel) = op else { continue };
+            let kernel = match op {
+                PreparedOp::CompiledProgram(kernel) => kernel,
+                // `execute_copy`, `copy_buffers` and `hcq_operations` all need
+                // the (dst, src) pair; a shorter copy degrades to a no-op edge
+                // in the hazard graph. Reject it here instead of at execute.
+                PreparedOp::BufferCopy(copy) if copy.buffer_indices.len() < 2 => {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!(
+                            "BufferCopy {} requires two buffer indices (dst, src), got {}",
+                            copy.id,
+                            copy.buffer_indices.len()
+                        ),
+                    });
+                }
+                PreparedOp::BufferCopy(_) | PreparedOp::CustomFunction(_) => continue,
+            };
 
             if kernel.output_indices.is_empty() {
                 return Err(crate::error::Error::Execution {

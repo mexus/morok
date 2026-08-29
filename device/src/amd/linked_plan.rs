@@ -12,9 +12,9 @@ use crate::amd::queue::{
 use crate::device::PlanCall;
 use crate::error::{Error, Result};
 use crate::hcq::{
-    AmdPm4Dispatch, Command, CommandBufferCache, CommandField, ComputeDispatch, LinkPatchValues, LinkedCommandBuffer,
+    AmdPm4Dispatch, Command, CommandField, ComputeDispatch, KERNARG_ALIGN, LinkPatchValues, LinkedCommandBuffer,
     PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, SemanticLinkedPlan, Submission,
-    SubmissionTimelines, SystemField, SystemPatchValues,
+    SubmissionTimelines, SystemField, SystemPatchValues, kernarg_offsets,
 };
 
 pub(crate) fn native_topology_decline(
@@ -147,15 +147,21 @@ impl AmdLinkedPlan {
         lane.ensure_has_local_memory(max_private)?;
         let pm4 = lane.queue().is_pm4();
         let allocator = owner.allocator();
+        let records: Vec<(usize, usize)> = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(operation, call)| match call {
+                PlanCall::Program { program, .. } => {
+                    let program = program.as_any().downcast_ref::<AmdProgram>().unwrap();
+                    Some((operation, program.kernarg_record_size()))
+                }
+                _ => None,
+            })
+            .collect();
+        let (packed, bytes) = kernarg_offsets(records.iter().map(|(_, size)| *size), KERNARG_ALIGN);
         let mut offsets = vec![None; calls.len()];
-        let mut bytes = 0usize;
-        for (operation, call) in calls.iter().enumerate() {
-            if let PlanCall::Program { program, .. } = call {
-                let program = program.as_any().downcast_ref::<AmdProgram>().unwrap();
-                bytes = bytes.next_multiple_of(128);
-                offsets[operation] = Some(bytes);
-                bytes += program.kernarg_record_size();
-            }
+        for (&(operation, _), offset) in records.iter().zip(packed) {
+            offsets[operation] = Some(offset);
         }
         let kernargs = AmdBufferGuard::new(
             allocator.alloc_host_visible_tagged(bytes.max(16), crate::amd::va_registry::AllocTag::Kernarg)?,
@@ -328,8 +334,7 @@ impl AmdLinkedPlan {
                         _ => return Err(Error::NotHostVisible { what: "AQL HCQ submission program" }),
                     };
                     links.push(gpu);
-                    let linked_control =
-                        CommandBufferCache::default().link(&program.control, &LinkPatchValues(links.clone()))?;
+                    let linked_control = lane.link(&program.control, &LinkPatchValues(links.clone()))?;
                     control = Some(NativeControlProgram {
                         replay: linked_control.replay_buffer(),
                         linked: linked_control,
@@ -352,7 +357,7 @@ impl AmdLinkedPlan {
                 }
                 QueueKind::Copy(_) => {}
             }
-            let linked = CommandBufferCache::default().link(&lowered, &LinkPatchValues(links.clone()))?;
+            let linked = lane.link(&lowered, &LinkPatchValues(links.clone()))?;
             native.push(NativeSubmission {
                 queue: submission.queue,
                 operation_slot,

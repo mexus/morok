@@ -3448,6 +3448,7 @@ dependencies = [
  "strum 0.27.2",
  "svod-dtype",
  "svod-ir",
+ "test-case",
  "tinyvec",
  "tracing",
 ]
@@ -3638,6 +3639,7 @@ dependencies = [
  "svod-ir",
  "svod-runtime",
  "svod-schedule",
+ "tempfile",
  "test-case",
  "tracing",
 ]

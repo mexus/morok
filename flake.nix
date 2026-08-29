@@ -120,6 +120,16 @@
             }
           );
 
+          # UC2: the JIT ELF loader path must keep working when the crate is
+          # built with `dlopen-fallback`; the default check never exercises it.
+          test-dlopen-fallback = crane'.cargoNextest (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              cargoNextestExtraArgs = "-p svod-runtime --features dlopen-fallback";
+            }
+          );
+
           # audit = crane'.cargoAudit {
           # inherit src advisory-db;
           # };

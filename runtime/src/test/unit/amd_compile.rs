@@ -1,5 +1,14 @@
 use super::*;
 
+/// The ROCm device libraries are only searched when the IR still calls an f64
+/// `__ocml_*` entry point; everything else is an `@llvm.*` intrinsic the
+/// AMDGPU backend selects on its own.
+#[test_case::test_case("  %r = call float @llvm.exp2.f32(float %v)" => true; "llvm intrinsics only")]
+#[test_case::test_case("  %r = call double @__ocml_exp2_f64(double %v)" => false; "f64 ocml transcendental")]
+fn nogpulib_tracks_device_library_use(body: &str) -> bool {
+    amd_object_flags(body, AmdArch::Gfx1100).iter().any(|flag| flag == "-nogpulib")
+}
+
 #[test]
 fn has_amdgpu_target_returns_consistent_bool() {
     // Behavior depends on local clang; we just check it doesn't panic and
@@ -33,13 +42,16 @@ source_filename = "amd_smoke"
 target triple = "amdgcn-amd-amdhsa"
 
 declare i32 @llvm.amdgcn.workitem.id.x()
+declare float @llvm.exp2.f32(float)
 
 define amdgpu_kernel void @amd_smoke(ptr noalias %buf0) #0 {
 entry:
   %tid = tail call i32 @llvm.amdgcn.workitem.id.x()
   %tid_ext = zext i32 %tid to i64
   %p = getelementptr inbounds float, ptr %buf0, i64 %tid_ext
-  store float 0.0, ptr %p
+  %v = load float, ptr %p
+  %e = call float @llvm.exp2.f32(float %v)
+  store float %e, ptr %p
   ret void
 }
 

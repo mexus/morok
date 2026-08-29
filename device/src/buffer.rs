@@ -130,6 +130,28 @@ pub struct Buffer {
     shape: SmallVec<[usize; 4]>,
 }
 
+/// A [`DeviceSpec`](svod_dtype::DeviceSpec) resolved to the backend identity
+/// that [`Buffer::matches_native`] compares against.
+///
+/// `AmdDevice::open` takes a process-global cache mutex, so a caller checking
+/// many buffers against one device resolves this once. The AMD core is opened
+/// lazily, on the first buffer that is actually AMD-backed: a host-backed
+/// buffer merely *tagged* AMD is a mismatch, not a reason to demand that the
+/// GPU be openable.
+pub enum NativeDevice {
+    Host(svod_dtype::DeviceSpec),
+    Amd { device_id: usize, core: OnceLock<Arc<crate::amd::AmdDeviceCore>> },
+}
+
+impl NativeDevice {
+    pub fn resolve(spec: &svod_dtype::DeviceSpec) -> Self {
+        match spec {
+            svod_dtype::DeviceSpec::Amd { device_id } => Self::Amd { device_id: *device_id, core: OnceLock::new() },
+            host => Self::Host(host.clone()),
+        }
+    }
+}
+
 impl Buffer {
     /// Device which owns the underlying allocation.
     pub fn device_spec(&self) -> svod_dtype::DeviceSpec {
@@ -138,16 +160,34 @@ impl Buffer {
 
     /// Verify that an AMD-tagged buffer is backed by the exact physical KFD
     /// device, not merely by an allocator reporting the same display spec.
+    ///
+    /// Resolving the spec costs a lock on the process-global AMD device cache,
+    /// so a caller validating many buffers against one device should resolve a
+    /// [`NativeDevice`] once and use [`Buffer::matches_native`].
     pub fn matches_native_device(&self, expected: &svod_dtype::DeviceSpec) -> Result<bool> {
-        let svod_dtype::DeviceSpec::Amd { device_id } = expected else {
-            return Ok(self.device_spec() == *expected);
-        };
-        self.data.ensure_allocated()?;
-        let RawBuffer::AmdDevice { device, .. } = self.data.raw() else {
-            return Ok(false);
-        };
-        let expected_device = crate::amd::AmdDevice::open(*device_id)?;
-        Ok(Arc::ptr_eq(device.core(), expected_device.core()))
+        self.matches_native(&NativeDevice::resolve(expected))
+    }
+
+    /// [`matches_native_device`](Self::matches_native_device) against an
+    /// already-resolved device.
+    pub fn matches_native(&self, expected: &NativeDevice) -> Result<bool> {
+        match expected {
+            NativeDevice::Host(spec) => Ok(self.device_spec() == *spec),
+            NativeDevice::Amd { device_id, core } => {
+                self.data.ensure_allocated()?;
+                let RawBuffer::AmdDevice { device, .. } = self.data.raw() else {
+                    return Ok(false);
+                };
+                let expected = match core.get() {
+                    Some(core) => core,
+                    None => {
+                        let opened = Arc::clone(crate::amd::AmdDevice::open(*device_id)?.core());
+                        core.get_or_init(|| opened)
+                    }
+                };
+                Ok(Arc::ptr_eq(device.core(), expected))
+            }
+        }
     }
 
     /// Create a new buffer with lazy allocation (not zero-initialized).

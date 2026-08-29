@@ -31,7 +31,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => render_define_reg(uop, ctx, kernel),
         Op::Wmma { a, b, c, metadata } => wmma::render_wmma_amd(uop, a, b, c, metadata, arch, ctx, kernel),
         Op::Unary(op @ (UnaryOp::Sqrt | UnaryOp::Log2 | UnaryOp::Exp2 | UnaryOp::Sin), src) => {
-            render_ocml_unary(uop, src, *op, ctx, kernel)
+            render_float_unary(uop, src, *op, ctx, kernel)
         }
         Op::Cast { src, .. } if is_fp8_cast(uop, src) => render_fp8_cast(uop, src, ctx, kernel),
         // ── Everything else: shared CPU path (ALU, INDEX, LOAD, STORE, …) ─
@@ -39,7 +39,18 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
     }
 }
 
-fn render_ocml_unary(
+/// Lower `sqrt`/`log2`/`exp2`/`sin` to the LLVM intrinsic the AMDGPU backend
+/// selects itself, so the object needs no ROCm device library.
+///
+/// Tinygrad renders these as `@llvm.{sqrt,log2,exp2}.<ty>`
+/// (`renderer/llvmir.py:226,236`) and drives amdgcn straight through LLVM with
+/// no device libs (`runtime/support/compiler_llvm.py:19-24`). The AMDGPU
+/// backend has no f64 lowering for `log2`/`exp2`/`sin` — it reports
+/// "no libcall available" / "cannot select f64 fsin", which is why tinygrad
+/// substitutes its `xlog2`/`xexp2` expansions there — so exactly those three
+/// keep the ROCm `__ocml_*` entry points. Their presence is what
+/// `amd_object_flags` keys `-nogpulib` off.
+fn render_float_unary(
     uop: &Arc<UOp>,
     src: &Arc<UOp>,
     op: UnaryOp,
@@ -59,10 +70,12 @@ fn render_ocml_unary(
         UnaryOp::Sin => "sin",
         _ => unreachable!(),
     };
+    let callee =
+        if bits == 64 && name != "sqrt" { format!("@__ocml_{name}_f64") } else { format!("@llvm.{name}.f{bits}") };
     let ty = ldt(&uop.dtype());
     let dst = ctx.name(uop);
     let value = ctx.get(src);
-    kernel.push(format!("  {dst} = call {ty} @__ocml_{name}_f{bits}({ty} {value})"));
+    kernel.push(format!("  {dst} = call {ty} {callee}({ty} {value})"));
     Some(())
 }
 

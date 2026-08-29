@@ -119,7 +119,10 @@ pub fn create_amd_codegen(device_id: usize, arch: AmdArch) -> Result<(Arc<dyn Re
     let renderer = Arc::new(AmdRendererWrapper { device: spec, arch });
     let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
     let toolchain = ClangToolchain::discover(cache.as_deref()).map_err(runtime_as_device)?;
-    let flags = crate::amd::compile::amd_object_flags(arch);
+    // The per-kernel `-nogpulib` decision comes from the IR, which is already
+    // part of every object-cache key; the persisted identity records the
+    // arch-stable, ocml-free flag set.
+    let flags = crate::amd::compile::amd_object_flags("", arch);
     let identity = CompilerIdentity {
         schema: OBJECT_CACHE_SCHEMA,
         backend: "amd-clang".into(),
@@ -220,33 +223,6 @@ impl Compiler for AmdCompiler {
 
     fn cache_key(&self) -> &str {
         &self.cache_key
-    }
-
-    fn start_compile_process(&self, spec: &ProgramSpec) -> Result<Option<svod_device::device::CompilerProcessTask>> {
-        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
-        if let Some(cache) = &self.cache
-            && let Some(bytes) = cache
-                .get_validated(&key, |bytes| crate::amd::compile::validate_amd_object(bytes, self.arch, &spec.name))
-                .map_err(runtime_as_device)?
-        {
-            return Ok(Some(svod_device::device::CompilerProcessTask::Ready(bytes)));
-        }
-        let process = crate::amd::compile::spawn_ir_to_amd_object(&self.toolchain, &spec.src, self.arch)?;
-        Ok(Some(svod_device::device::CompilerProcessTask::Spawned(process)))
-    }
-
-    fn finish_compile_process(&self, spec: &ProgramSpec, bytes: Vec<u8>) -> Result<Vec<u8>> {
-        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
-        if let Some(cache) = &self.cache {
-            cache
-                .publish_compiled(&key, bytes, |bytes| {
-                    crate::amd::compile::validate_amd_object(bytes, self.arch, &spec.name)
-                })
-                .map_err(runtime_as_device)
-        } else {
-            crate::amd::compile::validate_amd_object(&bytes, self.arch, &spec.name).map_err(runtime_as_device)?;
-            Ok(bytes)
-        }
     }
 }
 

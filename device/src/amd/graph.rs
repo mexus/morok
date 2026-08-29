@@ -19,8 +19,9 @@ use crate::amd::queue::{
 use crate::device::{Graph, GraphKernel};
 use crate::error::{Error, Result};
 use crate::hcq::{
-    AmdPm4Dispatch, Command, CommandBufferCache, CommandField, ComputeDispatch, LinkPatchValues, LinkedCommandBuffer,
+    AmdPm4Dispatch, Command, CommandField, ComputeDispatch, KERNARG_ALIGN, LinkPatchValues, LinkedCommandBuffer,
     PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, Submission, SystemField, SystemPatchValues,
+    kernarg_offsets,
 };
 
 struct KernargSlot {
@@ -93,6 +94,7 @@ unsafe impl Sync for AmdGraph {}
 
 fn lower_graph_submission(
     allocator: &AmdAllocator,
+    lane: &crate::amd::connector::PoolQueue,
     submission: &Submission,
     links: &[u64],
     state: Pm4LoweringState,
@@ -101,7 +103,7 @@ fn lower_graph_submission(
     if pm4 {
         let lowered = lower_hcq_pm4_command_buffer(submission, state)?;
         build_pm4_indirect_buffer(0, lowered.bytes.len() / 4)?;
-        let linked = CommandBufferCache::default().link(&lowered, &LinkPatchValues(links.to_vec()))?;
+        let linked = lane.link(&lowered, &LinkPatchValues(links.to_vec()))?;
         let buffer = AmdBufferGuard::new(
             allocator.alloc_host_visible_tagged(lowered.bytes.len().max(16), crate::amd::va_registry::AllocTag::Gtt)?,
         );
@@ -126,8 +128,8 @@ fn lower_graph_submission(
     let mut native_links = links.to_vec();
     native_links.push(gpu);
     let values = LinkPatchValues(native_links);
-    let control = CommandBufferCache::default().link(&program.control, &values)?;
-    let linked = CommandBufferCache::default().link(&program.aql, &values)?;
+    let control = lane.link(&program.control, &values)?;
+    let linked = lane.link(&program.aql, &values)?;
     Ok((linked, Some(GraphControl { linked: control, host, gpu, buffer: buffer.into_inner() })))
 }
 
@@ -182,8 +184,6 @@ impl AmdGraph {
         let max_private = programs.iter().map(|p| p.private_segment_size()).max().unwrap_or(128).max(128);
         lane.ensure_has_local_memory(max_private)?;
 
-        let mut offsets = Vec::with_capacity(kernels.len());
-        let mut bytes = 0usize;
         for (kernel, program) in kernels.iter().zip(&programs) {
             let (buffer_count, var_count) = program.arg_counts();
             if kernel.buffers.len() != buffer_count || kernel.vals.len() != var_count {
@@ -196,9 +196,9 @@ impl AmdGraph {
                     ),
                 });
             }
-            offsets.push(bytes);
-            bytes += program.kernarg_record_size().next_multiple_of(16);
         }
+        let (offsets, bytes) =
+            kernarg_offsets(programs.iter().map(|program| program.kernarg_record_size()), KERNARG_ALIGN);
         let kernargs_buf = AmdBufferGuard::new(
             allocator.alloc_host_visible_tagged(bytes.max(16), crate::amd::va_registry::AllocTag::Kernarg)?,
         );
@@ -325,7 +325,7 @@ impl AmdGraph {
                 // they never carry the KFD interrupt companion.
                 queue_event_mailbox: None,
             };
-            Some(lower_graph_submission(allocator, &profiled, &links, state, pm4)?)
+            Some(lower_graph_submission(allocator, &lane, &profiled, &links, state, pm4)?)
         };
 
         let state = Pm4LoweringState {
@@ -337,7 +337,7 @@ impl AmdGraph {
             // they never carry the KFD interrupt companion.
             queue_event_mailbox: None,
         };
-        let (linked, control) = lower_graph_submission(allocator, &submission, &links, state, pm4)?;
+        let (linked, control) = lower_graph_submission(allocator, &lane, &submission, &links, state, pm4)?;
         let command = linked.replay_buffer();
         let profile_command = profile_linked.as_ref().map(|(linked, _)| linked.replay_buffer());
         let control_command = control.as_ref().map(|control| control.linked.replay_buffer());

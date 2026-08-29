@@ -4,11 +4,11 @@
 //! migration inputs. The store owns no process-global state, so callers can
 //! disable it or drop it without affecting compiler/runtime lifetime.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -18,7 +18,11 @@ pub const OBJECT_CACHE_SCHEMA: u32 = 1;
 const MAGIC: &[u8; 16] = b"SVODOBJCACHE\0\0\0\0";
 const HEADER_LEN: usize = MAGIC.len() + 4 + 32 + 32 + 8;
 const DEFAULT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
-const STALE_LOCK_AGE: Duration = Duration::from_secs(120);
+/// Upper bound on waiting for another compiler to publish the same entry.
+/// Exceeding it is a cache miss, not an error: the caller compiles and skips
+/// publication.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCK_POLL: Duration = Duration::from_millis(10);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Every compiler property that can change emitted object bytes or their ABI.
@@ -112,7 +116,16 @@ impl ObjectCache {
             })?,
             Err(_) => DEFAULT_MAX_BYTES,
         };
-        Self::open(root, max_bytes).map(Some)
+        match Self::open(root, max_bytes) {
+            Ok(cache) => Ok(Some(cache)),
+            // A store we cannot even create is a missing store, not a broken
+            // compiler: tinygrad's `diskcache_get` (helpers.py:415-424)
+            // swallows the store's own errors and reports a miss.
+            Err(error) => {
+                warn_degraded("open object cache", &error);
+                Ok(None)
+            }
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -128,39 +141,40 @@ impl ObjectCache {
     {
         let digest = key.digest();
         let path = self.entry_path(&digest);
-        if let Some(bytes) = self.read_validated(&path, &digest, &validate)? {
+        if let Some(bytes) = self.read_validated(&path, &digest, &validate) {
             return Ok(bytes);
         }
 
-        let lock_path = path.with_extension("lock");
-        let _lock = LockFile::acquire(&lock_path)?;
-        if let Some(bytes) = self.read_validated(&path, &digest, &validate)? {
+        // The lock only deduplicates concurrent compilers. Losing it costs a
+        // duplicated compile, never a failed one.
+        let lock = self.publication_lock(&path.with_extension("lock"));
+        if lock.is_some()
+            && let Some(bytes) = self.read_validated(&path, &digest, &validate)
+        {
             return Ok(bytes);
         }
 
         let bytes = compile()?;
         validate(&bytes)?;
         let encoded = encode_entry(&digest, &bytes);
-        if self.max_bytes > 0 && encoded.len() as u64 <= self.max_bytes {
-            atomic_write(&path, &encoded)?;
+        if lock.is_some() && self.max_bytes > 0 && encoded.len() as u64 <= self.max_bytes {
+            if let Err(error) = atomic_write(&path, &encoded) {
+                warn_degraded("publish object cache entry", &error);
+            }
+            if let Err(error) = self.evict_to_budget(path.file_name()) {
+                warn_degraded("evict object cache entries", &error);
+            }
         }
-        self.evict_to_budget(path.file_name())?;
         Ok(bytes)
     }
 
-    pub(crate) fn get_validated<V>(&self, key: &ObjectCacheKey, validate: V) -> Result<Option<Vec<u8>>>
-    where
-        V: Fn(&[u8]) -> Result<()>,
-    {
-        let digest = key.digest();
-        self.read_validated(&self.entry_path(&digest), &digest, &validate)
-    }
-
-    pub(crate) fn publish_compiled<V>(&self, key: &ObjectCacheKey, bytes: Vec<u8>, validate: V) -> Result<Vec<u8>>
-    where
-        V: Fn(&[u8]) -> Result<()>,
-    {
-        self.get_or_compile(key, validate, || Ok(bytes))
+    /// Take the advisory publication lock, or `None` when it is contended or
+    /// unusable — the caller then compiles without publishing.
+    fn publication_lock(&self, path: &Path) -> Option<LockFile> {
+        LockFile::acquire(path, LOCK_TIMEOUT)
+            .inspect_err(|error| warn_degraded("acquire object cache lock", error))
+            .ok()
+            .flatten()
     }
 
     /// Persist deterministic compiler probes separately from evictable object
@@ -172,18 +186,30 @@ impl ObjectCache {
     {
         let digest = digest_fields([namespace.as_bytes(), input]);
         let path = self.root.join(format!("probe-{}-{}.data", sanitize(namespace), hex(&digest)));
-        if let Some(bytes) = read_entry(&path, &digest)? {
+        let cached = |path: &Path| {
+            read_entry(path, &digest).unwrap_or_else(|error| {
+                warn_degraded("read compiler probe", &error);
+                None
+            })
+        };
+        if let Some(bytes) = cached(&path) {
             return Ok(bytes);
         }
-        let _lock = LockFile::acquire(&path.with_extension("lock"))?;
-        if let Some(bytes) = read_entry(&path, &digest)? {
+        let lock = self.publication_lock(&path.with_extension("lock"));
+        if lock.is_some()
+            && let Some(bytes) = cached(&path)
+        {
             return Ok(bytes);
         }
         let bytes = create()?;
         if bytes.is_empty() {
             return Err(Error::JitCompilation { reason: format!("empty {namespace} compiler probe") });
         }
-        atomic_write(&path, &encode_entry(&digest, &bytes))?;
+        if lock.is_some()
+            && let Err(error) = atomic_write(&path, &encode_entry(&digest, &bytes))
+        {
+            warn_degraded("publish compiler probe", &error);
+        }
         Ok(bytes)
     }
 
@@ -191,28 +217,46 @@ impl ObjectCache {
         self.root.join(format!("{}.obj", hex(digest)))
     }
 
-    fn read_validated<V>(&self, path: &Path, digest: &[u8; 32], validate: &V) -> Result<Option<Vec<u8>>>
+    fn read_validated<V>(&self, path: &Path, digest: &[u8; 32], validate: &V) -> Option<Vec<u8>>
     where
         V: Fn(&[u8]) -> Result<()>,
     {
-        let Some(bytes) = read_entry(path, digest)? else { return Ok(None) };
+        let bytes = read_entry(path, digest).unwrap_or_else(|error| {
+            warn_degraded("read object cache entry", &error);
+            None
+        })?;
         if validate(&bytes).is_ok() {
-            return Ok(Some(bytes));
+            return Some(bytes);
         }
         let _ = fs::remove_file(path);
-        Ok(None)
+        None
     }
 
     fn evict_to_budget(&self, protected: Option<&std::ffi::OsStr>) -> Result<()> {
         if self.max_bytes == 0 {
             return Ok(());
         }
-        let _lock = LockFile::acquire(&self.root.join("eviction.lock"))?;
+        // Opportunistic: a concurrent sweep already bounds the store.
+        let Some(_lock) = LockFile::acquire(&self.root.join("eviction.lock"), Duration::ZERO)? else {
+            return Ok(());
+        };
         let mut entries = Vec::new();
         let mut total = 0u64;
         for item in fs::read_dir(&self.root).map_err(|e| cache_io("scan cache for eviction", e))? {
             let item = item.map_err(|e| cache_io("read cache directory entry", e))?;
             let path = item.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("lock") {
+                // Publication locks outlive their entry: `Drop` must not unlink
+                // one, or a second process would exclude on a different inode.
+                // Reap the orphans instead, and only while we hold them — an
+                // unheld lock has no waiter whose exclusion we could break.
+                if !path.with_extension("obj").exists()
+                    && matches!(LockFile::acquire(&path, Duration::ZERO), Ok(Some(_)))
+                {
+                    let _ = fs::remove_file(&path);
+                }
+                continue;
+            }
             if path.extension().and_then(|value| value.to_str()) != Some("obj") {
                 continue;
             }
@@ -241,32 +285,31 @@ impl ObjectCache {
     }
 }
 
+/// Advisory publication lock held through the file's `flock` state rather than
+/// its existence. A crashed owner releases it when the kernel closes its
+/// descriptor, so there is no stale-age heuristic, no PID to recycle, and no
+/// unlink of a lock another process is holding.
 struct LockFile {
-    path: PathBuf,
-    _file: File,
+    file: File,
 }
 
 impl LockFile {
-    fn acquire(path: &Path) -> Result<Self> {
+    /// `Ok(None)` = the lock is held elsewhere and `timeout` elapsed. Callers
+    /// treat that as a cache miss; the store is advisory.
+    fn acquire(path: &Path, timeout: Duration) -> Result<Option<Self>> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|error| cache_io("open cache lock", error))?;
+        let deadline = Instant::now() + timeout;
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(path) {
-                Ok(mut file) => {
-                    let _ = writeln!(file, "{}", std::process::id());
-                    return Ok(Self { path: path.to_path_buf(), _file: file });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = fs::metadata(path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > STALE_LOCK_AGE);
-                    if stale && !lock_owner_is_alive(path) {
-                        let _ = fs::remove_file(path);
-                    } else {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                }
-                Err(error) => return Err(cache_io("acquire cache lock", error)),
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self { file })),
+                Err(TryLockError::Error(error)) => return Err(cache_io("acquire cache lock", error)),
+                Err(TryLockError::WouldBlock) if Instant::now() >= deadline => return Ok(None),
+                Err(TryLockError::WouldBlock) => std::thread::sleep(LOCK_POLL),
             }
         }
     }
@@ -274,7 +317,7 @@ impl LockFile {
 
 impl Drop for LockFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self.file.unlock();
     }
 }
 
@@ -376,19 +419,12 @@ fn sanitize(value: &str) -> String {
     value.chars().map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' { ch } else { '_' }).collect()
 }
 
-#[cfg(unix)]
-fn lock_owner_is_alive(path: &Path) -> bool {
-    let Ok(contents) = fs::read_to_string(path) else { return false };
-    let Some(pid) = contents.trim().parse::<i32>().ok().filter(|pid| *pid > 0) else { return false };
-    // Signal 0 performs existence/permission checking without delivering a
-    // signal. EPERM still means the owner exists.
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn lock_owner_is_alive(_path: &Path) -> bool {
-    false
+/// The object cache is advisory storage: every failure to read, lock, publish
+/// or evict degrades to a miss instead of failing the caller's compile, the way
+/// tinygrad's `diskcache_get` (`helpers.py:415-424`) reports a miss when the
+/// store itself errors.
+fn warn_degraded(action: &str, error: &Error) {
+    tracing::warn!(target: "svod_runtime::object_cache", action, %error, "object cache degraded to a miss");
 }
 
 fn cache_io(action: &'static str, source: std::io::Error) -> Error {

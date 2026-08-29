@@ -733,7 +733,7 @@ impl AmdProgram {
         // The caller's non-clone QueueLease is the sole publication authority,
         // so kernarg reservation order is queue submission order.
         let arena = pool.arena();
-        let off = arena.bump(self.kernarg_size(), 16)?;
+        let off = arena.bump(self.kernarg_size(), crate::hcq::KERNARG_ALIGN)?;
         // SAFETY: arena returned a valid slot; the exclusive lane serializes
         // writers, so no concurrent writer holds the same offset.
         let host_base = unsafe { arena.host_at(off) };
