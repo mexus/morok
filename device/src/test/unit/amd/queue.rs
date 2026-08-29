@@ -424,6 +424,22 @@ fn mock_pool_failed_drain_and_panic_abandonment_quarantine_every_backing() {
 }
 
 #[test]
+fn mock_lane_acquisition_times_out_instead_of_parking_forever() {
+    let (_iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let core = Arc::clone(allocator.dev.core());
+    let held = core.lease_queue(&allocator).expect("first lane");
+
+    // The synthetic device has a single lane, so this cannot be satisfied: a
+    // lease leaked by a wedged publisher must surface as a typed timeout.
+    let error = core.lease_queue(&allocator).expect_err("a full pool must not park forever");
+    assert!(matches!(error, Error::TimelineTimeout { what: "AMD lane acquisition", .. }), "{error:?}");
+
+    drop(held);
+    core.lease_queue(&allocator).expect("a released lane is acquired again");
+}
+
+#[test]
 fn mock_quarantined_queue_leaks_its_backing_without_a_poisoned_device() {
     let (iface, allocator) = mock_allocator(1);
     let baseline = iface.allocation_count();

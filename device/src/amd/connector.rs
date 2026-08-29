@@ -108,6 +108,16 @@ impl LaneClaims {
     }
 }
 
+/// How long one lane-acquisition park may last before it counts as expired.
+/// Matches the device drain bound (tinygrad's `HCQDEV_WAIT_TIMEOUT_MS`).
+#[cfg(not(test))]
+const LANE_ACQUIRE_TIMEOUT_MS: u64 = 30_000;
+#[cfg(test)]
+const LANE_ACQUIRE_TIMEOUT_MS: u64 = 25;
+/// Consecutive expiries tolerated before acquisition fails. One expiry can be a
+/// legitimately long dispatch holding its lane; two in a row is a wedge.
+const LANE_ACQUIRE_MAX_EXPIRIES: u32 = 2;
+
 /// Bounded lazy pool of compute lanes. Queue creation is serialized and cold;
 /// acquisition of an initialized idle lane is lock-free.
 #[derive(Debug)]
@@ -133,7 +143,11 @@ impl QueuePool {
         }
     }
 
+    /// Claim an idle lane, creating one while the pool is below capacity.
+    /// Parking is bounded: a lease leaked by a wedged publisher must surface as
+    /// a typed timeout rather than hanging every subsequent dispatch.
     pub(crate) fn acquire(&self, core: &Arc<AmdDeviceCore>, allocator: &AmdAllocator) -> Result<QueueLease> {
+        let mut expiries = 0u32;
         loop {
             if let Some(error) = core.poison_error() {
                 return Err(error);
@@ -170,7 +184,20 @@ impl QueuePool {
                 let queue = Arc::clone(self.queues[slot].get().expect("initialized lane missing queue"));
                 return Ok(QueueLease { core: Arc::clone(core), slot, queue: Some(queue) });
             }
-            self.available.wait(&mut wait);
+            if self.available.wait_for(&mut wait, std::time::Duration::from_millis(LANE_ACQUIRE_TIMEOUT_MS)).timed_out()
+            {
+                expiries += 1;
+                if expiries >= LANE_ACQUIRE_MAX_EXPIRIES {
+                    return Err(Error::TimelineTimeout {
+                        what: "AMD lane acquisition",
+                        target: self.claims.capacity as u64,
+                        current: u64::from(self.claims.claimed.load(Ordering::Acquire).count_ones()),
+                        waited_ms: LANE_ACQUIRE_TIMEOUT_MS * u64::from(LANE_ACQUIRE_MAX_EXPIRIES),
+                    });
+                }
+            } else {
+                expiries = 0;
+            }
         }
     }
 
