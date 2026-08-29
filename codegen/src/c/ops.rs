@@ -10,8 +10,8 @@ use std::sync::Arc;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
-use super::types::{access_width, c_cast, c_dtype, c_math_fn, value_width};
-use crate::common::format_custom_template_strict;
+use super::types::{c_cast, c_dtype, c_math_fn};
+use crate::common::{access_width, format_custom_template_strict, shaped_dtype};
 
 /// Context for C code generation, tracking variable names and SSA inlining.
 pub struct CContext {
@@ -562,15 +562,6 @@ fn render_access(index: &Arc<UOp>, access_dtype: &DType, address: &str) -> Strin
         format!("*(({}*)({address}))", c_dtype(access_dtype))
     } else {
         format!("*({address})")
-    }
-}
-
-fn shaped_dtype(value: &Arc<UOp>) -> DType {
-    let count = value_width(value);
-    if count > 1 {
-        value.dtype().scalar_dtype().vec(count).expect("grouped value dtype must be vectorizable")
-    } else {
-        value.dtype()
     }
 }
 

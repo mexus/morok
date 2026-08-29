@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use svod_dtype::{DType, ScalarDType, cast::committed_float_bits};
-use svod_ir::{ConstValue, Op, UOp};
+
+use crate::common::value_width;
+use svod_ir::{ConstValue, UOp};
 
 /// Convert a DType to its C scalar type string.
 pub fn c_scalar(s: ScalarDType) -> &'static str {
@@ -195,40 +197,6 @@ pub fn collect_vector_typedefs(nodes: &[Arc<UOp>]) -> Vec<String> {
             )
         })
         .collect()
-}
-
-pub(super) fn access_width(index: &Arc<UOp>) -> usize {
-    match index.op() {
-        Op::Shrink { sizes, .. } => match sizes.op() {
-            Op::Const(value) => match value.0 {
-                ConstValue::Int(value) if value > 0 => value as usize,
-                ConstValue::UInt(value) if value > 0 => value as usize,
-                _ => 1,
-            },
-            _ => 1,
-        },
-        Op::Cast { src, .. } => access_width(src),
-        _ => index.dtype().vcount(),
-    }
-}
-
-pub(super) fn value_width(value: &Arc<UOp>) -> usize {
-    if value.dtype().vcount() > 1 {
-        return value.dtype().vcount();
-    }
-    match value.op() {
-        Op::Stack { sources } => sources.len(),
-        Op::Load { index, .. } => access_width(index),
-        Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. } | Op::Wmma { .. } => {
-            value
-                .shape()
-                .ok()
-                .flatten()
-                .and_then(|shape| shape.iter().try_fold(1usize, |count, dim| count.checked_mul(dim.as_const()?)))
-                .unwrap_or(1)
-        }
-        _ => 1,
-    }
 }
 
 fn collect_vec_dtype(dtype: &DType, seen: &mut BTreeSet<(ScalarDType, usize)>) {

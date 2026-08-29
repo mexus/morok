@@ -89,6 +89,7 @@ fn grouped_shrink_renders_single_vector_load_and_store() {
 
     let rendered = render_linearized(&sink, Some("grouped_memory")).expect("render grouped C memory");
     assert_eq!(rendered.code.matches("float4").count(), 4, "{}", rendered.code);
+    assert_c_compiles(&rendered.code);
 }
 
 #[test]
@@ -641,4 +642,30 @@ fn test_custom_template_rejects_mixed_auto_and_manual_placeholders() {
     let err = render_linearized(&sink, Some("test_custom_mixed_placeholders"))
         .expect_err("mixed placeholder modes must fail");
     assert!(format!("{err}").contains("mixes automatic"), "unexpected error: {err}");
+}
+
+/// Pipe `src` through `clang -fsyntax-only` and assert it parses. Skips when no
+/// clang is on PATH, so the test is a no-op on machines without a C compiler.
+/// Mirrors `assert_llvm_ir_assembles` in `llvm_text.rs`.
+fn assert_c_compiles(src: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let Ok(mut child) = Command::new("clang")
+        .args(["-fsyntax-only", "-Wno-unused-value", "-x", "c", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        eprintln!("skipping C compile check: no clang on PATH");
+        return;
+    };
+    child.stdin.take().unwrap().write_all(src.as_bytes()).expect("write C source to clang");
+    let output = child.wait_with_output().expect("wait for clang");
+    assert!(
+        output.status.success(),
+        "clang rejected the emitted C:\n{src}\n--- clang stderr ---\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use svod_ir::{Op, UOp};
+use svod_dtype::DType;
+use svod_ir::{ConstValue, Op, UOp};
 
 use crate::{Error, Result};
 
@@ -18,6 +19,56 @@ pub fn reject_unsupported_fnuz(nodes: &[Arc<UOp>], renderer: &str) -> Result<()>
         });
     }
     Ok(())
+}
+
+/// Lane count of a memory access, taken from the address expression. Grouped
+/// accesses keep a scalar dtype and carry their width in the SHRINK size (or,
+/// pre-shape-migration, in a vector dtype).
+pub fn access_width(index: &Arc<UOp>) -> usize {
+    match index.op() {
+        Op::Shrink { sizes, .. } => match sizes.op() {
+            Op::Const(value) => match value.0 {
+                ConstValue::Int(value) if value > 0 => value as usize,
+                ConstValue::UInt(value) if value > 0 => value as usize,
+                _ => 1,
+            },
+            _ => 1,
+        },
+        Op::Cast { src, .. } => access_width(src),
+        _ => index.dtype().vcount(),
+    }
+}
+
+/// Lane count of a value. This branch carries the count in the UOp shape rather
+/// than the dtype, so a shape-`[N]` scalar-dtype value renders as an `N`-lane
+/// vector.
+pub fn value_width(value: &Arc<UOp>) -> usize {
+    if value.dtype().vcount() > 1 {
+        return value.dtype().vcount();
+    }
+    match value.op() {
+        Op::Stack { sources } => sources.len(),
+        Op::Load { index, .. } => access_width(index),
+        Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. } | Op::Wmma { .. } => {
+            value
+                .shape()
+                .ok()
+                .flatten()
+                .and_then(|shape| shape.iter().try_fold(1usize, |count, dim| count.checked_mul(dim.as_const()?)))
+                .unwrap_or(1)
+        }
+        _ => 1,
+    }
+}
+
+/// The dtype a value renders as: its scalar dtype widened to [`value_width`].
+pub fn shaped_dtype(value: &Arc<UOp>) -> DType {
+    let count = value_width(value);
+    if count > 1 {
+        value.dtype().scalar_dtype().vec(count).expect("grouped value dtype must be vectorizable")
+    } else {
+        value.dtype()
+    }
 }
 
 /// Check whether a buffer (PARAM/DefineGlobal) is used as a STORE target in the graph.
