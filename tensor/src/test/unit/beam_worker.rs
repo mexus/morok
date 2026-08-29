@@ -42,24 +42,39 @@ fn a_closed_helper_fails_the_slot_regardless_of_the_deadline() {
     assert!(matches!(poll_slot(&responses, Some(&overdue(timeout)), timeout), SlotOutcome::Failed(None)));
 }
 
-/// TA5: a bad `SVOD_BEAM_WORKER` must not be latched — the next resolution with
-/// a valid helper has to succeed.
+/// TA5: a resolution failure must not be latched — the next attempt has to run
+/// the resolver again, and only a success is remembered.
 #[test]
 fn helper_resolution_failures_are_not_cached() {
+    let cache = std::sync::Mutex::new(None);
+    let attempts = std::cell::Cell::new(0usize);
+    let resolve = || {
+        attempts.set(attempts.get() + 1);
+        match attempts.get() {
+            1 => Err(BeamWorker::HelperUnavailable { reason: "not built yet".into() }),
+            _ => Ok(std::path::PathBuf::from("/helper/svod-beam-worker")),
+        }
+    };
+
+    assert!(cached_helper_path(&cache, resolve).is_err(), "first resolution must fail");
+    let resolved = cached_helper_path(&cache, resolve).expect("a failure must not be latched");
+    assert_eq!(resolved, std::path::PathBuf::from("/helper/svod-beam-worker"));
+    assert_eq!(cached_helper_path(&cache, resolve).unwrap(), resolved);
+    assert_eq!(attempts.get(), 2, "a cached success must not re-resolve");
+}
+
+/// A `SVOD_BEAM_WORKER` that is not a file is reported, not silently ignored.
+#[test]
+fn a_non_file_helper_override_is_rejected() {
     let helper = tempfile::NamedTempFile::new().expect("helper stand-in");
     let missing = helper.path().with_extension("absent");
-
     unsafe { std::env::set_var("SVOD_BEAM_WORKER", &missing) };
-    let failure = helper_path().expect_err("a missing helper must not resolve");
+    let failure = resolve_helper_path().expect_err("a missing helper must not resolve");
+    unsafe { std::env::remove_var("SVOD_BEAM_WORKER") };
     assert!(
         matches!(&failure, BeamWorker::HelperUnavailable { reason } if reason.contains("is not a file")),
         "{failure}"
     );
-
-    unsafe { std::env::set_var("SVOD_BEAM_WORKER", helper.path()) };
-    let resolved = helper_path().expect("a valid helper must resolve after a failure");
-    unsafe { std::env::remove_var("SVOD_BEAM_WORKER") };
-    assert_eq!(resolved, helper.path());
 }
 
 /// The helper path comes from cargo's own artifact report, not a guessed

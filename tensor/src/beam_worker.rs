@@ -374,11 +374,18 @@ impl Drop for SpawnedWorker {
 /// latched in a `OnceLock` and fail every later BEAM run in the process.
 fn helper_path() -> Result<PathBuf> {
     static HELPER: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
-    let mut cached = HELPER.lock().expect("BEAM helper path lock poisoned");
+    cached_helper_path(&HELPER, resolve_helper_path)
+}
+
+fn cached_helper_path(
+    cache: &std::sync::Mutex<Option<PathBuf>>,
+    resolve: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    let mut cached = cache.lock().expect("BEAM helper path lock poisoned");
     if let Some(path) = cached.as_ref() {
         return Ok(path.clone());
     }
-    let path = resolve_helper_path()?;
+    let path = resolve()?;
     *cached = Some(path.clone());
     Ok(path)
 }
