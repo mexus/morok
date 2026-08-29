@@ -212,6 +212,18 @@ pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContex
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
     let transformed_sink = crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&rangeify_matcher, sink, &mut ctx);
 
+    // Tinygrad has no recovery loop: neither PAD nor the tensor-form REDUCE survives
+    // pm_apply_rangeify. Fail loudly rather than leaking one into the kernel AST.
+    if transformed_sink
+        .toposort_call_aware(false)
+        .iter()
+        .any(|node| matches!(node.op(), Op::Pad { .. } | Op::ReduceAxis { .. }))
+    {
+        return Err(svod_ir::Error::SymbolicShapeUnsupported {
+            operation: "rangeify left a high-level PAD/ReduceAxis in the kernel graph",
+        });
+    }
+
     Ok((transformed_sink, ctx))
 }
 

@@ -15,6 +15,8 @@ use svod_device::DeviceSpec;
 use svod_dtype::DType;
 use svod_ir::{AxisId, AxisType, BufferizeOpts, CallInfo, ConstValue, Op, ReduceOp, UOp};
 
+use test_case::test_case;
+
 use crate::rangeify::{rangeify, run_rangeify, try_get_kernel_graph};
 
 struct NoRewrite;
@@ -76,6 +78,22 @@ fn test_run_rangeify_converts_tensor_reduce_to_loop_reduce() {
         reductions
             .iter()
             .all(|node| { matches!(node.op(), Op::Reduce { ranges, num_axes: 0, .. } if !ranges.is_empty()) })
+    );
+}
+
+#[test_case(&[(0, 0), (0, 0)]; "no padding")]
+#[test_case(&[(1, 1), (2, 2)]; "symmetric")]
+#[test_case(&[(3, 0), (0, 5)]; "one sided")]
+fn run_rangeify_lowers_every_pad(pads: &[(usize, usize)]) {
+    let dims: smallvec::SmallVec<[svod_ir::SInt; 4]> = smallvec![svod_ir::SInt::Const(4), svod_ir::SInt::Const(5)];
+    let source = UOp::new_buffer(DeviceSpec::Cpu, 20, DType::Float32).try_reshape(&dims).unwrap();
+    let padded = source.try_pad(&pads.iter().map(|&(lo, hi)| (lo.into(), hi.into())).collect::<Vec<_>>()).unwrap();
+
+    let (rangeified, _ctx) = run_rangeify(UOp::sink(vec![padded.contiguous()])).unwrap();
+    assert!(
+        !rangeified.toposort().iter().any(|node| matches!(node.op(), Op::Pad { .. } | Op::ReduceAxis { .. })),
+        "rangeify must lower every PAD:\n{}",
+        rangeified.tree()
     );
 }
 
