@@ -175,16 +175,21 @@ pub(crate) fn jit_load(obj: &[u8], name: &str) -> crate::Result<(*const (), memm
         return Err(crate::Error::JitCompilation { reason: "No loadable sections in ELF".to_string() });
     }
 
-    // Aarch64: reserve space for branch veneers (trampolines) after loadable
-    // sections. CALL26/JUMP26 only reach ±128 MiB; external symbols (libm etc.)
-    // are typically much farther on macOS/ARM.
-    let veneer_base = if arch == Architecture::Aarch64 {
-        let n = count_aarch64_external_calls(&elf, &section_offsets);
-        let base = (total_size + 3) & !3; // align to 4 bytes (instruction size)
-        total_size = base + n * VENEER_SIZE;
-        base
-    } else {
-        total_size
+    // Reserve space for branch veneers (trampolines) after the loadable
+    // sections. Direct branches are PC-relative with a limited reach —
+    // ±128 MiB for aarch64 CALL26/JUMP26, ±2 GiB for x86-64 call/jmp rel32 —
+    // while external symbols (libm etc.) sit wherever the loader put them. A
+    // long-lived process fills its mmap area top-down, so an anonymous JIT
+    // mapping eventually lands beyond that reach and every direct call must be
+    // routed through a trampoline instead.
+    let veneer_base = match arch {
+        Architecture::Aarch64 | Architecture::X86_64 => {
+            let n = count_external_branch_targets(&elf, &section_offsets, arch);
+            let base = total_size.next_multiple_of(VENEER_ALIGN);
+            total_size = base + n * VENEER_SIZE;
+            base
+        }
+        _ => total_size,
     };
 
     // Allocate and populate mmap.
@@ -307,21 +312,26 @@ struct RelocState {
     pcrel_hi: HashMap<u64, i64>,
     /// PPC64 ELFv2: TOC base address (.TOC. symbol), needed for TOC16 relocations.
     toc_base: Option<u64>,
-    /// Aarch64: veneer (branch trampoline) pool for CALL26/JUMP26 that exceed ±128 MiB.
+    /// Veneer (branch trampoline) pool for direct branches that exceed the
+    /// architecture's PC-relative reach.
     veneers: VeneerPool,
 }
 
-/// Pool of branch veneers (trampolines) for aarch64 CALL26/JUMP26 range overflow.
+/// Pool of branch veneers (trampolines) for direct-branch range overflow.
 ///
-/// When the target of a direct branch is more than ±128 MiB away, we emit a
-/// small trampoline that loads the full 64-bit address and does an indirect
-/// branch:
+/// When the target of a direct branch is out of reach, we emit a small
+/// trampoline inside the JIT mapping — always within reach of the call site —
+/// that materialises the full 64-bit address and branches indirectly:
 ///
 /// ```text
-///   LDR X16, [PC, #8]   // load 64-bit address from next 8 bytes
-///   BR  X16              // indirect branch
-///   .quad <target>       // 64-bit absolute address
+///   aarch64:            x86-64:
+///   LDR X16, [PC, #8]   MOVABS $target, %r11
+///   BR  X16             JMP    *%r11
+///   .quad <target>
 /// ```
+///
+/// Both scratch registers are call-clobbered and never carry arguments under
+/// their respective C ABIs, so the trampoline is transparent to the callee.
 #[derive(Default)]
 struct VeneerPool {
     /// Next available offset for a new veneer.
@@ -330,7 +340,8 @@ struct VeneerPool {
     map: HashMap<u64, usize>,
 }
 
-const VENEER_SIZE: usize = 16; // LDR X16 + BR X16 + .quad addr
+const VENEER_SIZE: usize = 16; // aarch64: LDR X16 + BR X16 + .quad; x86-64: MOVABS + JMP (13B, padded)
+const VENEER_ALIGN: usize = 16;
 const CALL26_MAX: i64 = (1 << 27) - 4; // ±128 MiB (signed 28-bit range, 4-byte aligned)
 
 impl VeneerPool {
@@ -338,23 +349,44 @@ impl VeneerPool {
         Self { next: base, map: HashMap::new() }
     }
 
-    /// Get or create a veneer for `target_addr`, returning its mmap offset.
-    fn get_or_create(&mut self, mmap: &mut [u8], target_addr: u64) -> usize {
+    /// Reserve the next veneer slot for `target_addr`, or return the offset of
+    /// an existing one. The flag is `true` when the slot is fresh and the
+    /// caller still has to write the trampoline into it.
+    fn reserve(&mut self, mmap_len: usize, target_addr: u64) -> (usize, bool) {
         if let Some(&off) = self.map.get(&target_addr) {
-            return off;
+            return (off, false);
         }
         let off = self.next;
         self.next += VENEER_SIZE;
-        debug_assert!(self.next <= mmap.len(), "veneer pool overflow");
-
-        // LDR X16, [PC, #8]  →  0x58000050
-        mmap[off..off + 4].copy_from_slice(&0x5800_0050u32.to_le_bytes());
-        // BR X16              →  0xD61F0200
-        mmap[off + 4..off + 8].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
-        // .quad target_addr
-        mmap[off + 8..off + 16].copy_from_slice(&target_addr.to_le_bytes());
-
+        debug_assert!(self.next <= mmap_len, "veneer pool overflow");
         self.map.insert(target_addr, off);
+        (off, true)
+    }
+
+    /// Get or create an aarch64 veneer for `target_addr`, returning its mmap offset.
+    fn get_or_create(&mut self, mmap: &mut [u8], target_addr: u64) -> usize {
+        let (off, fresh) = self.reserve(mmap.len(), target_addr);
+        if fresh {
+            // LDR X16, [PC, #8]  →  0x58000050
+            mmap[off..off + 4].copy_from_slice(&0x5800_0050u32.to_le_bytes());
+            // BR X16              →  0xD61F0200
+            mmap[off + 4..off + 8].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
+            // .quad target_addr
+            mmap[off + 8..off + 16].copy_from_slice(&target_addr.to_le_bytes());
+        }
+        off
+    }
+
+    /// Get or create an x86-64 veneer for `target_addr`, returning its mmap offset.
+    fn get_or_create_x86_64(&mut self, mmap: &mut [u8], target_addr: u64) -> usize {
+        let (off, fresh) = self.reserve(mmap.len(), target_addr);
+        if fresh {
+            // MOVABS $target_addr, %r11  →  49 BB <imm64>
+            mmap[off..off + 2].copy_from_slice(&[0x49, 0xBB]);
+            mmap[off + 2..off + 10].copy_from_slice(&target_addr.to_le_bytes());
+            // JMP *%r11                  →  41 FF E3
+            mmap[off + 10..off + 13].copy_from_slice(&[0x41, 0xFF, 0xE3]);
+        }
         off
     }
 }
@@ -371,7 +403,7 @@ fn apply_relocation(
     state: &mut RelocState,
 ) -> crate::Result<()> {
     match arch {
-        Architecture::X86_64 => reloc_x86_64(mmap, off, patch, target, addend, r_type),
+        Architecture::X86_64 => reloc_x86_64(mmap, off, patch, target, addend, r_type, state),
         Architecture::Aarch64 => reloc_aarch64(mmap, off, patch, target, addend, r_type, state),
         Architecture::Riscv64 => reloc_riscv64(mmap, off, patch, target, addend, r_type, state),
         Architecture::LoongArch64 => reloc_loongarch64(mmap, off, patch, target, addend, r_type),
@@ -382,22 +414,53 @@ fn apply_relocation(
 
 // ── x86_64 relocations ─────────────────────────────────────────────────────
 
-fn reloc_x86_64(mmap: &mut [u8], off: usize, patch: u64, target: u64, addend: i64, r_type: u32) -> crate::Result<()> {
+fn reloc_x86_64(
+    mmap: &mut [u8],
+    off: usize,
+    patch: u64,
+    target: u64,
+    addend: i64,
+    r_type: u32,
+    state: &mut RelocState,
+) -> crate::Result<()> {
     use object::elf::*;
     match r_type {
         // S + A - P, 32-bit PC-relative
         R_X86_64_PC32 | R_X86_64_PLT32 | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
-            let v = (target as i64 + addend - patch as i64) as i32;
+            let displacement = target as i64 + addend - patch as i64;
+            let v = match i32::try_from(displacement) {
+                Ok(v) => v,
+                // Beyond ±2 GiB. A direct `call`/`jmp rel32` can still reach the
+                // symbol through a veneer emitted inside this mapping; anything
+                // else (RIP-relative data, GOT loads) has no such escape and
+                // must fail loudly rather than branch into truncated garbage.
+                Err(_) => {
+                    let is_direct_branch = matches!(r_type, R_X86_64_PC32 | R_X86_64_PLT32)
+                        && matches!(off.checked_sub(1).map(|i| mmap[i]), Some(0xE8 | 0xE9));
+                    if !is_direct_branch {
+                        return Err(out_of_range_reloc("x86_64", r_type, displacement));
+                    }
+                    // `call`/`jmp rel32` resume at `patch + 4`, so the absolute
+                    // destination is `S + A + 4` and the veneer is reached with
+                    // the same +4 correction folded back in.
+                    let mmap_base = patch - off as u64;
+                    let veneer_off = state.veneers.get_or_create_x86_64(mmap, (target as i64 + addend + 4) as u64);
+                    let hop = mmap_base as i64 + veneer_off as i64 - 4 - patch as i64;
+                    i32::try_from(hop).map_err(|_| out_of_range_reloc("x86_64", r_type, hop))?
+                }
+            };
             mmap[off..off + 4].copy_from_slice(&v.to_le_bytes());
         }
         // S + A, signed 32-bit
         R_X86_64_32S => {
-            let v = (target as i64 + addend) as i32;
+            let value = target as i64 + addend;
+            let v = i32::try_from(value).map_err(|_| out_of_range_reloc("x86_64", r_type, value))?;
             mmap[off..off + 4].copy_from_slice(&v.to_le_bytes());
         }
         // S + A, unsigned 32-bit
         R_X86_64_32 => {
-            let v = (target as i64 + addend) as u32;
+            let value = target as i64 + addend;
+            let v = u32::try_from(value).map_err(|_| out_of_range_reloc("x86_64", r_type, value))?;
             mmap[off..off + 4].copy_from_slice(&v.to_le_bytes());
         }
         // S + A, 64-bit
@@ -702,6 +765,12 @@ fn unsupported_reloc(arch: &str, r_type: u32) -> crate::Error {
     crate::Error::JitCompilation { reason: format!("Unsupported {arch} relocation type: {r_type}") }
 }
 
+fn out_of_range_reloc(arch: &str, r_type: u32, value: i64) -> crate::Error {
+    crate::Error::JitCompilation {
+        reason: format!("{arch} relocation type {r_type} out of range: {value:#x} does not fit its field"),
+    }
+}
+
 fn unsupported_arch(arch: Architecture) -> crate::Error {
     crate::Error::JitCompilation { reason: format!("Unsupported ELF architecture: {arch:?}") }
 }
@@ -724,9 +793,14 @@ fn find_symbol_offset(
     Err(crate::Error::FunctionNotFound { name: name.to_string() })
 }
 
-/// Count unique external symbols referenced by CALL26/JUMP26 in an aarch64 ELF.
-/// Used to pre-allocate veneer space before mmap.
-fn count_aarch64_external_calls(elf: &object::File, section_offsets: &HashMap<object::SectionIndex, usize>) -> usize {
+/// Count unique external symbols reachable only through a direct branch.
+/// Used to pre-allocate veneer space before mmap: only symbols resolved outside
+/// the mapping can land beyond the branch's PC-relative reach.
+fn count_external_branch_targets(
+    elf: &object::File,
+    section_offsets: &HashMap<object::SectionIndex, usize>,
+    arch: Architecture,
+) -> usize {
     use std::collections::HashSet;
     let mut external = HashSet::new();
     for section in elf.sections() {
@@ -738,7 +812,14 @@ fn count_aarch64_external_calls(elf: &object::File, section_offsets: &HashMap<ob
                 RelocationFlags::Elf { r_type } => r_type,
                 _ => continue,
             };
-            if r_type != object::elf::R_AARCH64_CALL26 && r_type != object::elf::R_AARCH64_JUMP26 {
+            let branch = match arch {
+                Architecture::Aarch64 => {
+                    matches!(r_type, object::elf::R_AARCH64_CALL26 | object::elf::R_AARCH64_JUMP26)
+                }
+                Architecture::X86_64 => matches!(r_type, object::elf::R_X86_64_PC32 | object::elf::R_X86_64_PLT32),
+                _ => false,
+            };
+            if !branch {
                 continue;
             }
             if let object::RelocationTarget::Symbol(sym_idx) = reloc.target()
