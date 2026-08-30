@@ -206,10 +206,7 @@ where
     #[inline]
     fn record_replace(&mut self, original: &Arc<UOp>, result: Arc<UOp>) {
         if !Arc::ptr_eq(original, &result) {
-            use crate::provenance::{PROVENANCE_TRACKER, PassName};
-            PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().record_transform(result.id, original.id, PassName::RewritePattern);
-            });
+            crate::provenance::record_transformed(result.id, original.id, crate::provenance::PassName::RewritePattern);
         }
         self.replace.insert(UOpKey(original.clone()), result);
     }

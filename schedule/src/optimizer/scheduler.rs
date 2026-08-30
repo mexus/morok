@@ -771,10 +771,7 @@ impl Scheduler {
 
         // Record high-level transformation
         if old_ast_id != self.ast.id {
-            use svod_ir::provenance::{PROVENANCE_TRACKER, PassName};
-            PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ShiftTo);
-            });
+            svod_ir::provenance::record_transformed(self.ast.id, old_ast_id, svod_ir::provenance::PassName::ShiftTo);
         }
 
         // Clear caches (maxarg will be recomputed on next access)
@@ -902,10 +899,11 @@ impl Scheduler {
 
         // Record high-level transformation
         if old_ast_id != self.ast.id {
-            use svod_ir::provenance::{PROVENANCE_TRACKER, PassName};
-            PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ConvertLoopToGlobal);
-            });
+            svod_ir::provenance::record_transformed(
+                self.ast.id,
+                old_ast_id,
+                svod_ir::provenance::PassName::ConvertLoopToGlobal,
+            );
         }
 
         self.clear_caches();

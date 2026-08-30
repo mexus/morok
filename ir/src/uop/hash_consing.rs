@@ -363,13 +363,12 @@ impl UOp {
         let guard = uops().guard();
 
         // Fast path: check if valid entry exists
+        // No provenance capture here: an interning hit returns a node that already
+        // has its `Created` event, and this branch is the majority of the ~1M
+        // `UOp::new` calls in one resnet50 schedule.
         if let Some(weak) = uops().get(&key, &guard)
             && let Some(arc) = weak.upgrade()
         {
-            use crate::provenance::PROVENANCE_TRACKER;
-            PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().capture(arc.id, caller_location);
-            });
             return arc;
         }
 
@@ -426,10 +425,7 @@ impl UOp {
             _ => new_arc,
         };
 
-        use crate::provenance::PROVENANCE_TRACKER;
-        PROVENANCE_TRACKER.with(|tracker| {
-            tracker.borrow_mut().capture(final_arc.id, caller_location);
-        });
+        crate::provenance::record_created(final_arc.id, caller_location);
 
         final_arc
     }
