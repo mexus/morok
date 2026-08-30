@@ -468,6 +468,49 @@ fn compute_op_keys(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Vec<Tok
     }
 }
 
+/// Op kinds the root pattern demands of its direct children.
+///
+/// Tinygrad's `UPat.early_reject` (uop/ops.py:1349-1352): the union of the `op` sets of the
+/// fixed-position source patterns, taking only those constrained to exactly one op kind.
+/// Sources that are wildcards, bindings to wildcards, or alternatives over several kinds
+/// constrain nothing and contribute nothing.
+fn compute_early_reject_keys(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Vec<TokenStream2> {
+    match pattern {
+        Pattern::Binding { pattern, .. } => compute_early_reject_keys(pattern, iter_ctx),
+        // A top-level alternative matches if *any* branch does, so only kinds demanded by
+        // every branch are guaranteed present.
+        Pattern::Any(alternatives) => {
+            let mut branches = alternatives.iter().map(|alt| compute_early_reject_keys(alt, iter_ctx));
+            let first = branches.next().unwrap_or_default();
+            branches.fold(first, |acc, branch| {
+                let keep: std::collections::HashSet<String> = branch.iter().map(TokenStream2::to_string).collect();
+                acc.into_iter().filter(|key| keep.contains(&key.to_string())).collect()
+            })
+        }
+        _ => {
+            // Every source position below binds one of the root's direct children: tuple and
+            // op-variable args map onto child fields, struct fields that carry an op-shaped
+            // sub-pattern are child fields by construction.
+            let sources: Vec<&Pattern> = match pattern {
+                Pattern::OpTuple { args, .. } | Pattern::OpVar { args, .. } | Pattern::OpPermute { args, .. } => {
+                    args.iter().collect()
+                }
+                Pattern::OpStruct { fields, .. } => fields.iter().map(|field| &field.pattern).collect(),
+                _ => Vec::new(),
+            };
+            let mut seen = std::collections::HashSet::new();
+            sources
+                .into_iter()
+                .filter_map(|source| {
+                    let keys = compute_op_keys(source, iter_ctx);
+                    (keys.len() == 1).then(|| keys.into_iter().next().expect("one key"))
+                })
+                .filter(|key| seen.insert(key.to_string()))
+                .collect()
+        }
+    }
+}
+
 /// Get OpKey for a named operation.
 fn compute_op_key_for_op(op_name: &str) -> Vec<TokenStream2> {
     // Check if it's a binary op
@@ -1448,6 +1491,7 @@ fn generate_simplified_alternatives_rule(
 
     // Collect OpKeys from all alternatives
     let op_keys = compute_op_keys(&rule.lhs, iter_ctx);
+    let early_reject = compute_early_reject_keys(&rule.lhs, iter_ctx);
 
     // Generate attempt blocks for each alternative
     // Each alternative is wrapped in an inner closure so that `return NoMatch`
@@ -1520,8 +1564,9 @@ fn generate_simplified_alternatives_rule(
         })
     } else {
         Ok(quote! {
-            __matcher.add(
+            __matcher.add_rejecting(
                 &[#(#op_keys),*],
+                &[#(#early_reject),*],
                 |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
                     #(#alt_blocks)*
                     svod_ir::pattern::RewriteResult::NoMatch
@@ -1542,8 +1587,9 @@ fn generate_simplified_rule(
         return generate_simplified_alternatives_rule(alternatives, rule, iter_ctx, has_context);
     }
 
-    // Compute OpKeys for dispatch
+    // Compute OpKeys for dispatch and the child op kinds that gate the closure.
     let op_keys = compute_op_keys(&rule.lhs, iter_ctx);
+    let early_reject = compute_early_reject_keys(&rule.lhs, iter_ctx);
     let tree_var = format_ident!("__tree");
 
     // Generate inline match
@@ -1670,8 +1716,9 @@ fn generate_simplified_rule(
         })
     } else {
         Ok(quote! {
-            __matcher.add(
+            __matcher.add_rejecting(
                 &[#(#op_keys),*],
+                &[#(#early_reject),*],
                 move |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
                     #body
                 }

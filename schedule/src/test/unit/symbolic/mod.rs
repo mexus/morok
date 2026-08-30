@@ -1,4 +1,5 @@
 mod devectorize_pin;
+mod early_reject_pin;
 mod index_lowering;
 
 use crate::{

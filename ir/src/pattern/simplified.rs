@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::UOp;
+use crate::op::OpMask;
 use crate::op::pattern_derived::OpKey;
 
 use super::RewriteResult;
@@ -44,7 +45,28 @@ use super::RewriteResult;
 /// which is needed for caching combined matchers via `LazyLock`.
 pub type PatternClosure<C> = Arc<dyn Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync>;
 
-type PatternEntry<C> = (usize, PatternClosure<C>);
+/// One compiled pattern: its registration order, its early-reject mask and its closure.
+struct PatternEntry<C> {
+    /// Registration order, used to merge indexed and wildcard entries by source order.
+    sequence: usize,
+    /// Op kinds the pattern's fixed-position sources demand of the root's direct children.
+    /// Tinygrad equivalent: `UPat.early_reject` (uop/ops.py:1352).
+    early_reject: OpMask,
+    closure: PatternClosure<C>,
+}
+
+impl<C> Clone for PatternEntry<C> {
+    fn clone(&self) -> Self {
+        Self { sequence: self.sequence, early_reject: self.early_reject, closure: Arc::clone(&self.closure) }
+    }
+}
+
+impl<C> PatternEntry<C> {
+    /// Re-wrap this entry's closure, keeping order and early reject.
+    fn map<D>(&self, wrap: impl FnOnce(&PatternClosure<C>) -> PatternClosure<D>) -> PatternEntry<D> {
+        PatternEntry { sequence: self.sequence, early_reject: self.early_reject, closure: wrap(&self.closure) }
+    }
+}
 
 /// High-performance pattern matcher with O(1) OpKey-based dispatch.
 ///
@@ -115,19 +137,30 @@ impl<C> SimplifiedPatternMatcher<C> {
     where
         F: Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync + 'static,
     {
+        self.add_rejecting(keys, &[], closure);
+    }
+
+    /// Add a pattern that can only match when the root's direct children include every
+    /// op kind in `early_reject`; the closure is skipped otherwise.
+    ///
+    /// `early_reject` must be a *necessary* condition for the closure to match, i.e. the
+    /// union of the op kinds demanded by the pattern's fixed-position sources. Sources
+    /// that accept several kinds — or any kind — contribute nothing, exactly as in
+    /// Tinygrad's `UPat.early_reject` (uop/ops.py:1352).
+    pub fn add_rejecting<F>(&mut self, keys: &[OpKey], early_reject: &[OpKey], closure: F)
+    where
+        F: Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync + 'static,
+    {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
+        let entry =
+            PatternEntry { sequence, early_reject: early_reject.iter().cloned().collect(), closure: Arc::new(closure) };
         if keys.is_empty() {
             // No keys = wildcard pattern
-            self.wildcards.push((sequence, Arc::new(closure)));
-        } else if keys.len() == 1 {
-            // Single key - store directly
-            self.indexed.entry(keys[0].clone()).or_default().push((sequence, Arc::new(closure)));
+            self.wildcards.push(entry);
         } else {
-            // Multiple keys - share the closure via Arc clone
-            let shared: PatternClosure<C> = Arc::new(closure);
             for key in keys {
-                self.indexed.entry(key.clone()).or_default().push((sequence, Arc::clone(&shared)));
+                self.indexed.entry(key.clone()).or_default().push(entry.clone());
             }
         }
     }
@@ -141,7 +174,7 @@ impl<C> SimplifiedPatternMatcher<C> {
     {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        self.wildcards.push((sequence, Arc::new(closure)));
+        self.wildcards.push(PatternEntry { sequence, early_reject: OpMask::EMPTY, closure: Arc::new(closure) });
     }
 
     /// Return a matcher whose rewrites run only when `guard` accepts the root.
@@ -154,27 +187,36 @@ impl<C> SimplifiedPatternMatcher<C> {
         F: Fn(&Arc<UOp>) -> bool + Send + Sync + 'static,
     {
         let guard = Arc::new(guard);
+        let wrap = |entry: &PatternEntry<C>| {
+            entry.map(|closure| {
+                let (guard, closure) = (Arc::clone(&guard), Arc::clone(closure));
+                Arc::new(
+                    move |uop: &Arc<UOp>, ctx: &mut C| {
+                        if guard(uop) { closure(uop, ctx) } else { RewriteResult::NoMatch }
+                    },
+                ) as PatternClosure<C>
+            })
+        };
         let mut result = Self::new();
         for (key, entries) in &self.indexed {
-            for (sequence, closure) in entries {
-                let guard = Arc::clone(&guard);
-                let closure = Arc::clone(closure);
-                result.indexed.entry(key.clone()).or_default().push((
-                    *sequence,
-                    Arc::new(move |uop, ctx| if guard(uop) { closure(uop, ctx) } else { RewriteResult::NoMatch }),
-                ));
-            }
+            result.indexed.insert(key.clone(), entries.iter().map(&wrap).collect());
         }
-        for (sequence, closure) in &self.wildcards {
-            let guard = Arc::clone(&guard);
-            let closure = Arc::clone(closure);
-            result.wildcards.push((
-                *sequence,
-                Arc::new(move |uop, ctx| if guard(uop) { closure(uop, ctx) } else { RewriteResult::NoMatch }),
-            ));
-        }
+        result.wildcards = self.wildcards.iter().map(&wrap).collect();
         result.next_sequence = self.next_sequence;
         result
+    }
+
+    /// Copy of this matcher with every early reject cleared, so all entries are dispatched.
+    ///
+    /// Equivalence hook: rewriting with this must produce exactly the same graph as
+    /// rewriting with `self`, since an early reject only skips entries that cannot match.
+    pub fn without_early_reject(&self) -> Self {
+        let clear = |entry: &PatternEntry<C>| PatternEntry { early_reject: OpMask::EMPTY, ..entry.clone() };
+        Self {
+            indexed: self.indexed.iter().map(|(key, e)| (key.clone(), e.iter().map(clear).collect())).collect(),
+            wildcards: self.wildcards.iter().map(clear).collect(),
+            next_sequence: self.next_sequence,
+        }
     }
 
     /// Number of registered patterns.
@@ -190,6 +232,13 @@ impl<C> SimplifiedPatternMatcher<C> {
     /// Number of wildcard patterns (tried for every op).
     pub fn wildcard_count(&self) -> usize {
         self.wildcards.len()
+    }
+
+    /// Early-reject masks of the entries registered under `key`, in registration order.
+    ///
+    /// Diagnostic view of what each compiled pattern demands of a node's direct children.
+    pub fn early_rejects(&self, key: &OpKey) -> Vec<OpMask> {
+        self.indexed.get(key).into_iter().flatten().map(|entry| entry.early_reject).collect()
     }
 
     /// Number of indexed buckets (unique OpKeys with patterns).
@@ -212,23 +261,27 @@ impl<C> SimplifiedPatternMatcher<C> {
         let key = OpKey::from_op(uop.op());
 
         let indexed = self.indexed.get(&key).map(Vec::as_slice).unwrap_or_default();
+        let src_ops = uop.src_ops();
         let mut indexed_pos = 0;
         let mut wildcard_pos = 0;
         while indexed_pos < indexed.len() || wildcard_pos < self.wildcards.len() {
             let take_indexed = wildcard_pos == self.wildcards.len()
-                || (indexed_pos < indexed.len() && indexed[indexed_pos].0 < self.wildcards[wildcard_pos].0);
-            let (sequence, closure) = if take_indexed {
-                let entry = &indexed[indexed_pos];
+                || (indexed_pos < indexed.len()
+                    && indexed[indexed_pos].sequence < self.wildcards[wildcard_pos].sequence);
+            let entry = if take_indexed {
                 indexed_pos += 1;
-                entry
+                &indexed[indexed_pos - 1]
             } else {
-                let entry = &self.wildcards[wildcard_pos];
                 wildcard_pos += 1;
-                entry
+                &self.wildcards[wildcard_pos - 1]
             };
-            let result = closure(uop, ctx);
+            // Tinygrad: `if not early_reject.issubset(ler): continue` (uop/ops.py:1482).
+            if !entry.early_reject.is_subset_of(src_ops) {
+                continue;
+            }
+            let result = (entry.closure)(uop, ctx);
             if !matches!(result, RewriteResult::NoMatch) {
-                tracing::trace!(op_key = ?key, pattern_sequence = sequence, "pattern matched");
+                tracing::trace!(op_key = ?key, pattern_sequence = entry.sequence, "pattern matched");
                 return result;
             }
         }
@@ -262,21 +315,17 @@ impl SimplifiedPatternMatcher<()> {
     ///     + some_ctx_aware_pattern(); // TypedPatternMatcher<SomeCtx>
     /// ```
     pub fn with_context<D: 'static + Send + Sync>(&self) -> SimplifiedPatternMatcher<D> {
+        let lift = |entry: &PatternEntry<()>| {
+            entry.map(|closure| {
+                let closure = Arc::clone(closure);
+                Arc::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ())) as PatternClosure<D>
+            })
+        };
         let mut result = SimplifiedPatternMatcher::<D>::new();
         for (key, entries) in &self.indexed {
-            for (sequence, closure) in entries {
-                let closure = Arc::clone(closure);
-                result
-                    .indexed
-                    .entry(key.clone())
-                    .or_default()
-                    .push((*sequence, Arc::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ()))));
-            }
+            result.indexed.insert(key.clone(), entries.iter().map(&lift).collect());
         }
-        for (sequence, closure) in &self.wildcards {
-            let closure = Arc::clone(closure);
-            result.wildcards.push((*sequence, Arc::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ()))));
-        }
+        result.wildcards = self.wildcards.iter().map(&lift).collect();
         result.next_sequence = self.next_sequence;
         result
     }
@@ -298,14 +347,15 @@ impl<C> std::ops::Add for SimplifiedPatternMatcher<C> {
     fn add(mut self, rhs: Self) -> Self::Output {
         let offset = self.next_sequence;
         // Merge indexed patterns
+        let shift = move |mut entry: PatternEntry<C>| {
+            entry.sequence += offset;
+            entry
+        };
         for (key, patterns) in rhs.indexed {
-            self.indexed
-                .entry(key)
-                .or_default()
-                .extend(patterns.into_iter().map(|(sequence, closure)| (sequence + offset, closure)));
+            self.indexed.entry(key).or_default().extend(patterns.into_iter().map(shift));
         }
         // Merge wildcards
-        self.wildcards.extend(rhs.wildcards.into_iter().map(|(sequence, closure)| (sequence + offset, closure)));
+        self.wildcards.extend(rhs.wildcards.into_iter().map(shift));
         self.next_sequence += rhs.next_sequence;
         self
     }

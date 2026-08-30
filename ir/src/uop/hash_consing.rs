@@ -410,16 +410,19 @@ impl UOp {
             return arc;
         }
 
-        let content_hash = {
+        // One walk feeds both the structural hash and the early-reject mask of child op kinds.
+        let (content_hash, src_ops) = {
             use xxhash_rust::xxh64::Xxh64;
             let mut h = Xxh64::new(0);
+            let mut src_ops = crate::op::OpMask::EMPTY;
             std::mem::discriminant(&op).hash(&mut h);
             dtype.hash(&mut h);
             for child in op.children() {
                 h.write_u64(child.content_hash);
+                src_ops = src_ops.union(crate::op::OpMask::of_op(child.op()));
             }
             key.op_data.hash(&mut h);
-            h.finish()
+            (h.finish(), src_ops)
         };
 
         let new_arc = Arc::new(Self {
@@ -427,6 +430,7 @@ impl UOp {
             op,
             dtype,
             content_hash,
+            src_ops,
             tag,
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
@@ -515,6 +519,7 @@ impl UOp {
             op: self.op.clone(),
             dtype: self.dtype.clone(),
             content_hash: self.content_hash, // same structure, same content hash
+            src_ops: self.src_ops,
             tag: self.tag.clone(),
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
