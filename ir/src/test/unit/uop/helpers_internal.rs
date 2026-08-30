@@ -23,38 +23,20 @@ fn test_const_factor_addition() {
     assert_eq!(add.const_factor(), 3); // GCD(6, 9) = 3
 }
 
+/// `divides` folds only when the division is exact; the quotient keeps the sign of a
+/// negative divisor, and a zero divisor never divides.
 #[test]
-fn test_divides_constant_exact() {
-    let c = UOp::const_(DType::Int32, ConstValue::Int(12));
-    let result = c.divides(3);
-
-    assert!(result.is_some());
-    if let Some(r) = result {
-        if let Op::Const(cv) = r.op() {
-            assert_eq!(cv.0, ConstValue::Int(4));
-        } else {
-            panic!("Expected constant result");
+fn test_divides_constant() {
+    for (value, divisor, expected) in [(12i64, 3i64, Some(4i64)), (12, -3, Some(-4)), (10, 3, None), (12, 0, None)] {
+        let result = UOp::const_(DType::Int32, ConstValue::Int(value)).divides(divisor);
+        match expected {
+            Some(quotient) => assert!(
+                matches!(result.as_ref().map(|r| r.op()), Some(Op::Const(cv)) if cv.0 == ConstValue::Int(quotient)),
+                "{value} / {divisor}"
+            ),
+            None => assert!(result.is_none(), "{value} / {divisor}"),
         }
     }
-}
-
-#[test]
-fn test_divides_constant_not_exact() {
-    let c = UOp::const_(DType::Int32, ConstValue::Int(10));
-    assert!(c.divides(3).is_none());
-}
-
-#[test]
-fn test_divides_constant_negative_divisor_preserves_sign() {
-    let c = UOp::const_(DType::Int32, ConstValue::Int(12));
-    let result = c.divides(-3).expect("negative exact divisor");
-    assert!(matches!(result.op(), Op::Const(cv) if cv.0 == ConstValue::Int(-4)));
-}
-
-#[test]
-fn test_divides_constant_zero_is_not_divisible() {
-    let c = UOp::const_(DType::Int32, ConstValue::Int(12));
-    assert!(c.divides(0).is_none());
 }
 
 #[test]

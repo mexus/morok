@@ -206,18 +206,21 @@ fn test_shape_caching() {
 // =====================================================================
 
 #[test]
-fn test_shape_to_uop_non_empty() {
+fn test_shape_to_uop() {
     use crate::op::Op;
 
-    let shape = smallvec![SInt::from(3), SInt::from(4)];
-    let shape_uop = shape_to_uop(&shape);
+    // A rank-1 shape needs no STACK; higher ranks stack one lane per dim.
+    let single = shape_to_uop(&smallvec![SInt::from(7)]);
+    assert!(matches!(single.op(), Op::Const(_)));
+    assert_eq!(single.dtype(), DType::WeakInt);
 
-    if let Op::Stack { sources } = shape_uop.op() {
-        assert_eq!(sources.len(), 2, "shape [3, 4] should have two STACK sources");
-        assert_eq!(shape_uop.dtype(), DType::WeakInt);
-    } else {
-        panic!("expected STACK, got {:?}", shape_uop.op());
-    }
+    let empty = shape_to_uop(&smallvec![]);
+    assert!(matches!(empty.op(), Op::Stack { sources } if sources.is_empty()));
+    assert_eq!(empty.dtype(), DType::Void);
+
+    let pair = shape_to_uop(&smallvec![SInt::from(3), SInt::from(4)]);
+    assert!(matches!(pair.op(), Op::Stack { sources } if sources.len() == 2));
+    assert_eq!(pair.dtype(), DType::WeakInt);
 
     // Mixed const/symbolic lanes are materialised at the promoted dtype, so the
     // constant dim survives the round trip instead of hiding behind a CAST.
@@ -225,17 +228,4 @@ fn test_shape_to_uop_non_empty() {
     let Op::Stack { sources } = shape_to_uop(&mixed).op().clone() else { panic!("expected STACK") };
     assert_eq!(SInt::from(&sources[0]), SInt::Const(3));
     assert_eq!(SInt::from(&sources[1]).as_symbolic().map(|dim| dim.dtype()), Some(DType::Int32));
-}
-
-#[test]
-fn test_shape_to_uop_empty_and_single() {
-    use crate::op::Op;
-
-    let empty = shape_to_uop(&smallvec![]);
-    assert!(matches!(empty.op(), Op::Stack { sources } if sources.is_empty()));
-    assert_eq!(empty.dtype(), DType::Void);
-
-    let single = shape_to_uop(&smallvec![SInt::from(7)]);
-    assert!(matches!(single.op(), Op::Const(_)));
-    assert_eq!(single.dtype(), DType::WeakInt);
 }

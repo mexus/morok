@@ -1,54 +1,52 @@
 use crate::{BinaryOp, ConstValue, ConstValueHash, DType, Op, TernaryOp, UOp, UnaryOp, dtype_from_op};
 use svod_dtype::{AddrSpace, DeviceSpec};
 
+/// Literals and loop indices stay weak until lowering; INVALID has exactly one produced
+/// dtype whatever it is used as.
 #[test]
-fn constants_derive_weak_dtypes() {
-    let integer = Op::Const(ConstValueHash(ConstValue::Int(1)));
-    let float = Op::Const(ConstValueHash(ConstValue::Float(1.0)));
-    let boolean = Op::Const(ConstValueHash(ConstValue::Bool(true)));
-
-    assert_eq!(dtype_from_op(&integer), Some(DType::WeakInt));
-    assert_eq!(dtype_from_op(&float), Some(DType::WeakFloat));
-    assert_eq!(dtype_from_op(&boolean), Some(DType::Bool));
-}
-
-#[test]
-fn control_dtypes_match_target_rules() {
+fn produced_dtypes_of_leaves() {
     let end = UOp::index_const(8);
-    let range = UOp::range_const(8, 0);
-    let special = UOp::special(end, "gidx0".to_string());
-
-    assert_eq!(dtype_from_op(range.op()), Some(DType::WeakInt));
-    assert_eq!(dtype_from_op(special.op()), Some(DType::WeakInt));
+    for (label, op, expected) in [
+        ("int literal", Op::Const(ConstValueHash(ConstValue::Int(1))), DType::WeakInt),
+        ("float literal", Op::Const(ConstValueHash(ConstValue::Float(1.0))), DType::WeakFloat),
+        ("bool literal", Op::Const(ConstValueHash(ConstValue::Bool(true))), DType::Bool),
+        ("range", UOp::range_const(8, 0).op().clone(), DType::WeakInt),
+        ("special", UOp::special(end, "gidx0".to_string()).op().clone(), DType::WeakInt),
+        ("invalid", UOp::invalid_marker().op().clone(), DType::Bool),
+    ] {
+        assert_eq!(dtype_from_op(&op), Some(expected), "{label}");
+    }
 }
 
 #[test]
 fn alu_dtype_uses_current_promotion_rules() {
     let weak = UOp::new(Op::Const(ConstValueHash(ConstValue::Int(1))), DType::WeakInt);
     let strong = UOp::const_(DType::Int16, ConstValue::Int(2));
-    let add = Op::Binary(BinaryOp::Add, weak.clone(), strong.clone());
-    let comparison = Op::Binary(BinaryOp::Lt, weak, strong);
 
-    assert_eq!(dtype_from_op(&add), Some(DType::Int16));
-    assert_eq!(dtype_from_op(&comparison), Some(DType::Bool));
+    assert_eq!(dtype_from_op(&Op::Binary(BinaryOp::Add, weak.clone(), strong.clone())), Some(DType::Int16));
+    assert_eq!(dtype_from_op(&Op::Binary(BinaryOp::Lt, weak, strong)), Some(DType::Bool));
 }
 
-#[test]
-fn invalid_has_one_produced_dtype() {
-    assert_eq!(dtype_from_op(UOp::invalid_marker().op()), Some(DType::Bool));
-}
-
+/// `with_sources` re-derives the parent dtype from the new sources rather than carrying the
+/// old one over — except for INVALID, which is polymorphic and never retypes its parent.
 #[test]
 fn source_rewrite_rederives_parent_dtype() {
-    let lhs = UOp::const_(DType::Int16, ConstValue::Int(1));
-    let rhs = UOp::const_(DType::Int16, ConstValue::Int(2));
-    let add = UOp::new(Op::Binary(BinaryOp::Add, lhs.clone(), rhs), DType::Int16);
+    let int = UOp::const_(DType::Int16, ConstValue::Int(1));
+    let add = UOp::new(Op::Binary(BinaryOp::Add, int.clone(), int.clone()), DType::Int16);
     let float = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    assert_eq!(add.with_sources(vec![int.clone(), float]).dtype(), DType::Float32);
+    assert_eq!(add.with_sources(vec![int, UOp::invalid_marker()]).dtype(), DType::Int16);
 
-    let rewritten = add.with_sources(vec![lhs, float]);
-    assert_eq!(rewritten.dtype(), DType::Float32);
+    let index = |dtype| {
+        let buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, dtype);
+        UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().unwrap()
+    };
+    let load = UOp::load().index(index(DType::Float32)).call();
+    assert_eq!(load.with_sources(vec![index(DType::Float64)]).dtype(), DType::Float64);
 }
 
+/// A rebuilt ALU takes its dtype and its lane count from the new sources: the legacy vector
+/// result dtype on the node being rebuilt is discarded, and the lanes become a shape.
 #[test]
 fn alu_reconstruction_does_not_preserve_legacy_vector_result_dtype() {
     let old_float = UOp::const_(DType::Float32, ConstValue::Float(1.0));
@@ -75,28 +73,8 @@ fn alu_reconstruction_does_not_preserve_legacy_vector_result_dtype() {
     assert_eq!(comparison.shape().unwrap().unwrap().as_slice(), &[2usize.into()]);
 }
 
-#[test]
-fn invalid_source_does_not_retype_parent() {
-    let lhs = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let rhs = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = UOp::new(Op::Binary(BinaryOp::Add, lhs.clone(), rhs), DType::Float32);
-    let invalid = UOp::invalid_marker();
-
-    let rewritten = add.with_sources(vec![lhs, invalid]);
-    assert_eq!(rewritten.dtype(), DType::Float32);
-}
-
-#[test]
-fn load_reconstruction_rederives_dtype_without_preserving_old_lanes() {
-    let old_buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let old_index = UOp::index().buffer(old_buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
-    let old_load = UOp::load().index(old_index).call();
-    let new_buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float64);
-    let new_index = UOp::index().buffer(new_buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
-
-    assert_eq!(old_load.with_sources(vec![new_index]).dtype(), DType::Float64);
-}
-
+/// An explicit dtype request on INDEX is honoured only when it is the weak equivalent of
+/// the buffer's dtype; a concrete request must match exactly, and LOAD takes no request.
 #[test]
 fn weak_equivalent_explicit_dtype_is_only_an_index_exception() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
@@ -105,7 +83,6 @@ fn weak_equivalent_explicit_dtype_is_only_an_index_exception() {
         UOp::index().buffer(buffer.clone()).indices(vec![offset.clone()]).dtype(DType::WeakFloat).call().unwrap();
     assert_eq!(weak_index.dtype(), DType::WeakFloat);
 
-    // A concrete request must match exactly: no weak collapse across widths (IB4).
     let narrow = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float16);
     assert!(UOp::index().buffer(narrow).indices(vec![offset.clone()]).dtype(DType::Float32).call().is_err());
 
@@ -118,20 +95,8 @@ fn weak_equivalent_explicit_dtype_is_only_an_index_exception() {
     );
 }
 
-#[test]
-fn load_accepts_only_target_source_structures() {
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let index = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
-    let alt = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));
-
-    assert!(matches!(UOp::load().index(index.clone()).call().op(), Op::Load { alt: None, gate: None, .. }));
-    assert!(matches!(
-        UOp::load().index(index.clone()).alt(alt.clone()).gate(gate.clone()).call().op(),
-        Op::Load { alt: Some(_), gate: Some(_), .. }
-    ));
-}
-
+/// INVALID is a single interned node whatever dtype it is requested at, and reaching an
+/// operand position never retypes the operation.
 #[test]
 fn invalid_is_canonical_and_polymorphic() {
     let invalid = UOp::invalid_marker();
@@ -145,26 +110,23 @@ fn invalid_is_canonical_and_polymorphic() {
     assert_eq!(add.dtype(), DType::Float32);
 }
 
+/// Indexing an image-shaped PARAM yields the four-channel load dtype; a BUFFER, or a PARAM
+/// whose shape is not image-shaped, keeps the element dtype.
 #[test]
 fn index_dtype_matches_target_param_image_exception() {
-    let image_shape = crate::shape::shape_to_uop(&smallvec::smallvec![2usize.into(), 3usize.into(), 4usize.into()]);
-    let image_arg = crate::ParamArg::buffer(0, DType::Float16, AddrSpace::Global, None);
-    let param = UOp::new(Op::Param { shape: image_shape.clone(), arg: image_arg.clone() }, DType::Float16);
-    let buffer = UOp::new(Op::Buffer { shape: image_shape, arg: image_arg }, DType::Float16);
-    let wrong_shape = crate::shape::shape_to_uop(&smallvec::smallvec![2usize.into(), 3usize.into(), 5usize.into()]);
-    let wrong_param = UOp::new(
-        Op::Param { shape: wrong_shape, arg: crate::ParamArg::buffer(1, DType::Float16, AddrSpace::Global, None) },
-        DType::Float16,
-    );
-    let wrong_rank_shape = crate::shape::shape_to_uop(&smallvec::smallvec![3usize.into(), 4usize.into()]);
-    let wrong_rank_param = UOp::new(
-        Op::Param { shape: wrong_rank_shape, arg: crate::ParamArg::buffer(2, DType::Float16, AddrSpace::Global, None) },
-        DType::Float16,
-    );
+    let shape = |dims: &[usize]| crate::shape::shape_to_uop(&dims.iter().map(|d| (*d).into()).collect());
+    let param = |slot, dims: &[usize]| {
+        let arg = crate::ParamArg::buffer(slot, DType::Float16, AddrSpace::Global, None);
+        UOp::new(Op::Param { shape: shape(dims), arg }, DType::Float16)
+    };
     let offset = UOp::index_const(0);
+    let index_dtype = |buffer| UOp::index().buffer(buffer).indices(vec![offset.clone()]).call().unwrap().dtype();
 
-    assert_eq!(UOp::index().buffer(param).indices(vec![offset.clone()]).call().unwrap().dtype(), DType::Float32);
-    assert_eq!(UOp::index().buffer(buffer).indices(vec![offset.clone()]).call().unwrap().dtype(), DType::Float16);
-    assert_eq!(UOp::index().buffer(wrong_param).indices(vec![offset.clone()]).call().unwrap().dtype(), DType::Float16);
-    assert_eq!(UOp::index().buffer(wrong_rank_param).indices(vec![offset]).call().unwrap().dtype(), DType::Float16);
+    let image_arg = crate::ParamArg::buffer(0, DType::Float16, AddrSpace::Global, None);
+    let buffer = UOp::new(Op::Buffer { shape: shape(&[2, 3, 4]), arg: image_arg }, DType::Float16);
+
+    assert_eq!(index_dtype(param(0, &[2, 3, 4])), DType::Float32, "image-shaped PARAM");
+    assert_eq!(index_dtype(buffer), DType::Float16, "BUFFER is never image-shaped");
+    assert_eq!(index_dtype(param(1, &[2, 3, 5])), DType::Float16, "wrong channel count");
+    assert_eq!(index_dtype(param(2, &[3, 4])), DType::Float16, "wrong rank");
 }

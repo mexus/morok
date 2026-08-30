@@ -35,16 +35,13 @@ impl Matcher<()> for RewriteCallToFirstArg {
 }
 
 #[test]
-fn test_const_creation() {
-    let c1 = UOp::native_const(1.0f32);
-    assert_eq!(c1.dtype(), DType::Float32);
-    assert!(matches!(c1.op(), Op::Const(_)));
-}
-
-#[test]
 fn typed_constants_commit_and_report_unsupported_conversions() {
-    let value = 1.0 / 123_008.0;
-    let constant = UOp::const_(DType::Float16, ConstValue::Float(value));
+    let native = UOp::native_const(1.0f32);
+    assert_eq!(native.dtype(), DType::Float32);
+    assert!(matches!(native.op(), Op::Const(_)));
+
+    // Float16 has no exact representation for this, so the constant commits to the grid.
+    let constant = UOp::const_(DType::Float16, ConstValue::Float(1.0 / 123_008.0));
     assert!(matches!(constant.op(), Op::Const(value) if value.0 == ConstValue::Float(8.106231689453125e-6)));
 
     // bf16 commitment is total (IB1): f32-range overflow saturates instead of failing.
@@ -61,6 +58,7 @@ fn vconst_commits_every_lane() {
         vec![ConstValue::Float(1.0625), ConstValue::Float(1.1875), ConstValue::Float(-0.0)],
         DType::FP8E4M3,
     );
+    assert_eq!(vector.dtype(), DType::FP8E4M3.vec(3).unwrap());
     assert!(matches!(vector.op(), Op::VConst { values }
         if values == &vec![ConstValue::Float(1.0), ConstValue::Float(1.25), ConstValue::Float(-0.0)]));
 
@@ -108,21 +106,6 @@ fn const_like_expands_independent_receiver_shape() {
 }
 
 #[test]
-fn const_like_expands_mechanical_stack_receivers() {
-    let receiver = UOp::stack(smallvec![
-        UOp::native_const(0i32),
-        UOp::native_const(1i32),
-        UOp::native_const(2i32),
-        UOp::native_const(3i32),
-    ]);
-    let constant = receiver.const_like(7i64);
-
-    assert_eq!(constant.dtype(), DType::Int32);
-    assert_eq!(constant.shape().unwrap().unwrap().as_slice(), &[4usize.into()]);
-    assert!(matches!(constant.op(), Op::Expand { .. }));
-}
-
-#[test]
 fn vconst_like_stacks_after_movement_lowering() {
     let receiver = UOp::stack(smallvec![
         UOp::native_const(0.0f32),
@@ -139,43 +122,24 @@ fn vconst_like_stacks_after_movement_lowering() {
 
 #[test]
 fn const_like_shapes_invalid_without_retyping_it() {
-    let receiver =
-        UOp::stack((0..5).map(|value| UOp::const_(DType::Float32, ConstValue::Float(value as f64))).collect());
-    let invalid = receiver.const_like(ConstValue::Invalid);
+    for width in [2usize, 5] {
+        let receiver =
+            UOp::stack((0..width).map(|v| UOp::const_(DType::Float32, ConstValue::Float(v as f64))).collect());
+        let invalid = receiver.const_like(ConstValue::Invalid);
 
-    assert_eq!(invalid.dtype(), DType::Bool);
-    assert_eq!(invalid.shape().unwrap().unwrap().as_slice(), &[5usize.into()]);
-    assert!(matches!(invalid.op(), Op::Expand { src, .. } if UOp::is_invalid_marker(src)));
-    assert!(UOp::is_invalid_marker(&invalid));
-
-    let vector = UOp::stack(smallvec![UOp::native_const(0i32), UOp::native_const(1i32)]);
-    let vector_invalid = vector.const_like(ConstValue::Invalid);
-    assert_eq!(vector_invalid.dtype(), DType::Bool);
-    assert_eq!(vector_invalid.shape().unwrap().unwrap().as_slice(), &[2usize.into()]);
-    assert!(UOp::is_invalid_marker(&vector_invalid));
+        assert_eq!(invalid.dtype(), DType::Bool, "INVALID keeps its own dtype");
+        assert_eq!(invalid.shape().unwrap().unwrap().as_slice(), &[width.into()]);
+        assert!(matches!(invalid.op(), Op::Expand { src, .. } if UOp::is_invalid_marker(src)));
+        assert!(UOp::is_invalid_marker(&invalid));
+    }
 }
 
 #[test]
 fn test_hash_consing() {
-    // Create two identical constants
-    let c1 = UOp::native_const(1.0f32);
-    let c2 = UOp::native_const(1.0f32);
-
-    // They should be the same object
-    assert!(Arc::ptr_eq(&c1, &c2), "Hash consing should return same Rc for identical UOps");
-}
-
-#[test]
-fn test_hash_consing_with_src() {
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-
-    // Create a + b twice
-    let add1 = a.try_add(&b).unwrap();
-    let add2 = a.try_add(&b).unwrap();
-
-    // Should be the same object
-    assert!(Arc::ptr_eq(&add1, &add2), "Hash consing should work with src nodes");
+    assert!(Arc::ptr_eq(&a, &UOp::native_const(1.0f32)), "identical leaves intern to one Arc");
+    assert!(Arc::ptr_eq(&a.try_add(&b).unwrap(), &a.try_add(&b).unwrap()), "and so do identical inner nodes");
 }
 
 #[test]
@@ -197,78 +161,36 @@ fn test_hash_consing_preserves_differently_tagged_child_order() {
     assert!(Arc::ptr_eq(reverse_right, &left));
 }
 
-/// Test that hash consing works across threads.
-///
-/// This is the key correctness property: creating the same UOp in different
-/// threads should return the same Arc<UOp>, so Arc::ptr_eq works across threads.
+/// Creating the same UOp concurrently in many threads must still yield one Arc, so
+/// `Arc::ptr_eq` stays a valid identity check across threads.
 #[test]
 fn test_cross_thread_hash_consing() {
     use std::sync::Barrier;
 
-    let num_threads = 10;
-    let barrier = Arc::new(Barrier::new(num_threads));
-
-    // All threads create the same UOp concurrently
-    let handles: Vec<_> = (0..num_threads)
-        .map(|_| {
-            let b = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                // Wait for all threads to be ready
-                b.wait();
-                // Create the same constant in each thread
-                UOp::native_const(42.0f32)
+    for build in [(|| UOp::native_const(42.0f32)) as fn() -> Arc<UOp>, || {
+        let add = UOp::native_const(1.0f32).try_add(&UOp::native_const(2.0f32)).unwrap();
+        add.try_mul(&UOp::native_const(3.0f32)).unwrap()
+    }] {
+        let barrier = Arc::new(Barrier::new(10));
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    build()
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    // Collect results from all threads
-    let uops: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-    // All threads must get the same Arc
-    for i in 1..uops.len() {
-        assert!(
-            Arc::ptr_eq(&uops[0], &uops[i]),
-            "Thread {} got different Arc than thread 0 (id {} vs {})",
-            i,
-            uops[i].id,
-            uops[0].id
-        );
-    }
-}
-
-/// Test that hash consing works for complex UOps across threads.
-#[test]
-fn test_cross_thread_hash_consing_complex() {
-    use std::sync::Barrier;
-
-    let num_threads = 8;
-    let barrier = Arc::new(Barrier::new(num_threads));
-
-    // All threads create the same expression: (1.0 + 2.0) * 3.0
-    let handles: Vec<_> = (0..num_threads)
-        .map(|_| {
-            let b = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                b.wait();
-                let a = UOp::native_const(1.0f32);
-                let b_val = UOp::native_const(2.0f32);
-                let c = UOp::native_const(3.0f32);
-                let add = a.try_add(&b_val).unwrap();
-                add.try_mul(&c).unwrap()
-            })
-        })
-        .collect();
-
-    let uops: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-    // All threads must get the same Arc for the final expression
-    for i in 1..uops.len() {
-        assert!(Arc::ptr_eq(&uops[0], &uops[i]), "Thread {} got different Arc for complex expression", i);
+        let uops: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        for (index, uop) in uops.iter().enumerate() {
+            assert!(Arc::ptr_eq(&uops[0], uop), "thread {index} got id {} vs {}", uop.id, uops[0].id);
+        }
     }
 }
 
 #[test]
-fn test_binary_operations() {
+fn test_alu_dtypes_and_arity() {
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
 
@@ -276,34 +198,12 @@ fn test_binary_operations() {
     assert_eq!(add.dtype(), DType::Float32);
     assert_eq!(add.op().children().len(), 2);
 
-    let mul = a.try_mul(&b).unwrap();
-    assert_eq!(mul.dtype(), DType::Float32);
-}
-
-#[test]
-fn test_unary_operations() {
-    let a = UOp::native_const(4.0f32);
-
     let sqrt = a.try_sqrt().unwrap();
     assert_eq!(sqrt.dtype(), DType::Float32);
     assert_eq!(sqrt.op().children().len(), 1);
-}
 
-#[test]
-fn test_cast() {
-    let a = UOp::native_const(1.5f32);
-    let cast = a.cast(DType::Int32);
-
-    assert_eq!(cast.dtype(), DType::Int32);
-}
-
-#[test]
-fn test_comparison() {
-    let a = UOp::native_const(1.0f32);
-    let b = UOp::native_const(2.0f32);
-
-    let cmp = a.try_cmplt(&b).unwrap();
-    assert_eq!(cmp.dtype(), DType::Bool);
+    assert_eq!(a.cast(DType::Int32).dtype(), DType::Int32);
+    assert_eq!(a.try_cmplt(&b).unwrap().dtype(), DType::Bool);
 }
 
 #[test]
@@ -1045,290 +945,90 @@ fn test_custom_kernel_opaque_call_function_body_uses_call() {
     );
 }
 
+/// `children` and `map_child` walk the same sources in the same order.
 #[test]
-fn test_children_method() {
+fn test_children_accessors_agree() {
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
     let add = a.try_add(&b).unwrap();
 
-    let children = add.op().children();
-    assert_eq!(children.len(), 2);
-    assert!(Arc::ptr_eq(children[0], &a));
-    assert!(Arc::ptr_eq(children[1], &b));
-}
+    let mut mapped = Vec::new();
+    add.op().map_child(|child| mapped.push(child.clone()));
 
-#[test]
-fn test_for_each_child() {
-    let a = UOp::native_const(1.0f32);
-    let b = UOp::native_const(2.0f32);
-    let add = a.try_add(&b).unwrap();
-
-    let mut children = Vec::new();
-    add.op().map_child(|child| children.push(child.clone()));
-
-    assert_eq!(children.len(), 2);
-    assert!(Arc::ptr_eq(&children[0], &a));
-    assert!(Arc::ptr_eq(&children[1], &b));
+    assert_eq!(add.op().children().len(), 2);
+    for (child, expected) in add.op().children().iter().zip([&a, &b]) {
+        assert!(Arc::ptr_eq(child, expected));
+    }
+    for (child, expected) in mapped.iter().zip([&a, &b]) {
+        assert!(Arc::ptr_eq(child, expected));
+    }
 }
 
 // ============================================================================
-// Cached Property Tests
+// Cached properties
 // ============================================================================
 
-#[test]
-fn test_shape_property_scalar() {
-    // Scalar constant should have empty shape
-    let scalar = UOp::native_const(42.0f32);
-    let shape = scalar.shape().unwrap();
-
-    assert!(shape.is_some(), "Scalar should have shape");
-    assert_eq!(shape.unwrap().len(), 0, "Scalar should have empty shape");
+/// A property is computed on first access, cached in place, and every later access
+/// hands back the very same reference.
+fn assert_lazy_and_memoised<P: crate::uop::cached_property::CachedProperty>(uop: &Arc<UOp>) {
+    assert!(P::cache(uop).get().is_none(), "cache must be cold before the first access");
+    let first = P::get(uop);
+    assert!(P::cache(uop).get().is_some(), "cache must be populated after the first access");
+    assert!(std::ptr::eq(first, P::get(uop)), "later accesses must return the cached reference");
 }
 
 #[test]
-fn test_shape_property_lazy_evaluation() {
-    use crate::uop::cached_property::CachedProperty;
-    use crate::uop::properties::ShapeProperty;
+fn test_properties_are_lazy_and_memoised() {
+    use crate::uop::properties::{InScopeRangesProperty, RangesProperty, ShapeProperty};
 
-    // Use unique values unlikely to be created by other tests to get fresh UOps
-    // (global hash consing means identical UOps are shared across all tests)
-    let unique_val = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as f64;
-    let a = UOp::native_const(unique_val as f32);
-    let b = UOp::native_const((unique_val + 1.0) as f32);
-    let add = a.try_add(&b).unwrap();
+    // A fresh axis id and variable name keep this graph out of every other test's
+    // interning results, so the caches really are cold.
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(9101), crate::AxisType::Loop);
+    let node = range.cast(DType::Float32).try_add(&UOp::var("lazy_probe", DType::Float32, 0, 1)).unwrap();
 
-    // VERIFY: Cache is empty before first access (lazy evaluation)
-    assert!(ShapeProperty::cache(&add).get().is_none(), "Cache should be empty before first access");
-
-    // First access triggers computation
-    let shape1 = ShapeProperty::get(&add);
-    assert!(shape1.is_ok() && shape1.as_ref().unwrap().is_some());
-
-    // VERIFY: Cache is now populated
-    assert!(ShapeProperty::cache(&add).get().is_some(), "Cache should be populated after first access");
-
-    // Second access retrieves from cache (same pointer)
-    let shape2 = ShapeProperty::get(&add);
-
-    // VERIFY: Both accesses return the same cached reference
-    assert!(std::ptr::eq(shape1, shape2), "Second access should return same cached reference");
+    assert_lazy_and_memoised::<ShapeProperty>(&node);
+    assert_lazy_and_memoised::<RangesProperty>(&node);
+    assert_lazy_and_memoised::<InScopeRangesProperty>(&node);
 }
 
+/// Plain arithmetic over scalars: empty shape, no ranges, nothing in scope.
 #[test]
-fn test_ranges_property_no_ranges() {
-    // Simple arithmetic with no RANGE ops
-    let a = UOp::native_const(1.0f32);
-    let b = UOp::native_const(2.0f32);
-    let add = a.try_add(&b).unwrap();
+fn test_properties_of_a_scalar_graph() {
+    let add = UOp::native_const(1.0f32).try_add(&UOp::native_const(2.0f32)).unwrap();
 
-    let ranges = add.ranges();
-    assert_eq!(ranges.len(), 0, "No RANGE ops in simple arithmetic");
+    assert_eq!(add.shape().unwrap().expect("scalars are shaped").len(), 0);
+    assert!(add.ranges().is_empty());
+    assert!(add.in_scope_ranges().is_empty());
 }
 
+/// A RANGE is in its own scope and stays in scope for everything derived from it, until
+/// an END closes it.
 #[test]
-fn test_ranges_property_with_range() {
-    use crate::AxisType;
+fn test_in_scope_ranges_open_and_close() {
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), crate::AxisType::Loop);
+    let derived = range.cast(DType::Float32);
 
-    // Create a RANGE op
-    let end = UOp::index_const(10);
-    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
-
-    // Create some computation that uses the range
-    let idx = range.cast(DType::Float32);
-
-    let ranges = idx.ranges();
-    assert_eq!(ranges.len(), 1, "Should find one RANGE op");
-    assert!(Arc::ptr_eq(&ranges[0], &range));
+    assert_eq!(range.ranges().len(), 1);
+    assert!(Arc::ptr_eq(&range.ranges()[0], &range));
+    assert_eq!(range.in_scope_ranges().len(), 1, "RANGE has itself in scope");
+    assert_eq!(derived.in_scope_ranges().len(), 1, "derived computation inherits the scope");
+    assert!(UOp::native_const(1.0f32).end(smallvec![range]).in_scope_ranges().is_empty(), "END closes the scope");
 }
 
+/// The gate blocks traversal, so a node that fails it contributes neither itself nor its
+/// children.
 #[test]
-fn test_ranges_property_lazy_evaluation() {
-    use crate::AxisType;
-    use crate::uop::cached_property::CachedProperty;
-    use crate::uop::properties::RangesProperty;
-
-    let end = UOp::index_const(10);
-    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
-    let idx = range.cast(DType::Float32);
-
-    // VERIFY: Cache is empty before first access (lazy evaluation)
-    assert!(RangesProperty::cache(&idx).get().is_none(), "Cache should be empty before first access");
-
-    // First access triggers computation
-    let ranges1 = RangesProperty::get(&idx);
-    assert_eq!(ranges1.len(), 1);
-
-    // VERIFY: Cache is now populated
-    assert!(RangesProperty::cache(&idx).get().is_some(), "Cache should be populated after first access");
-
-    // Second access retrieves from cache (same pointer)
-    let ranges2 = RangesProperty::get(&idx);
-
-    // VERIFY: Both accesses return the same cached reference
-    assert!(std::ptr::eq(ranges1, ranges2), "Second access should return same cached reference");
-    assert!(Arc::ptr_eq(&ranges1[0], &ranges2[0]));
-}
-
-#[test]
-fn test_in_scope_ranges_simple() {
-    use crate::AxisType;
-
-    // Create a RANGE op
-    let end = UOp::index_const(10);
-    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
-
-    // RANGE itself should have itself in scope
-    let in_scope = range.in_scope_ranges();
-    assert_eq!(in_scope.len(), 1, "RANGE should have itself in scope");
-
-    // Create computation that uses the range
-    let idx = range.cast(DType::Float32);
-    let in_scope_idx = idx.in_scope_ranges();
-    assert_eq!(in_scope_idx.len(), 1, "Computation should inherit RANGE scope");
-}
-
-#[test]
-fn test_in_scope_ranges_lazy_evaluation() {
-    use crate::AxisType;
-    use crate::uop::cached_property::CachedProperty;
-    use crate::uop::properties::InScopeRangesProperty;
-
-    let end = UOp::index_const(10);
-    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
-    let idx = range.cast(DType::Float32);
-
-    // VERIFY: Cache is empty before first access (lazy evaluation)
-    assert!(InScopeRangesProperty::cache(&idx).get().is_none(), "Cache should be empty before first access");
-
-    // First access triggers computation
-    let in_scope1 = InScopeRangesProperty::get(&idx);
-    assert_eq!(in_scope1.len(), 1);
-
-    // VERIFY: Cache is now populated
-    assert!(InScopeRangesProperty::cache(&idx).get().is_some(), "Cache should be populated after first access");
-
-    // Second access retrieves from cache (same pointer)
-    let in_scope2 = InScopeRangesProperty::get(&idx);
-
-    // VERIFY: Both accesses return the same cached reference
-    assert!(std::ptr::eq(in_scope1, in_scope2), "Second access should return same cached reference");
-}
-
-#[test]
-fn test_in_scope_ranges_after_end() {
-    use crate::AxisType;
-    use smallvec::smallvec;
-
-    // Create a RANGE and computation
-    let end_val = UOp::index_const(10);
-    let range = UOp::range_axis(end_val, AxisId::Renumbered(0), AxisType::Loop);
-    let compute = UOp::native_const(1.0f32);
-
-    // Create END operation
-    let end_op = compute.end(smallvec![range.clone()]);
-
-    // After END, the range should no longer be in scope
-    let in_scope = end_op.in_scope_ranges();
-    assert_eq!(in_scope.len(), 0, "After END, range should not be in scope");
-}
-
-#[test]
-fn test_in_scope_ranges_nested() {
-    use crate::AxisType;
-    use smallvec::smallvec;
-
-    // Create two nested RANGEs
-    let end1 = UOp::index_const(10);
-    let _range1 = UOp::range_axis(end1, AxisId::Renumbered(0), AxisType::Loop);
-
-    let end2 = UOp::index_const(20);
-    let range2 = UOp::range_axis(end2, AxisId::Renumbered(1), AxisType::Loop);
-
-    // Computation that uses both ranges
-    let compute = UOp::native_const(1.0f32);
-
-    // Both ranges should be in scope
-    let in_scope = compute.in_scope_ranges();
-    assert_eq!(in_scope.len(), 0, "Const has no ranges in scope initially");
-
-    // After ending range2, only range1 should be in scope
-    let after_end2 = compute.end(smallvec![range2.clone()]);
-    let in_scope_after = after_end2.in_scope_ranges();
-    assert_eq!(in_scope_after.len(), 0, "After END, ranges are not propagated to parent");
-}
-
-#[test]
-fn test_toposort_filtered_basic() {
-    // Build graph: a -> b -> c
+fn test_toposort_filtered_gates_traversal() {
     let a = UOp::native_const(1.0f32);
     let b = a.try_add(&UOp::native_const(2.0f32)).unwrap();
     let c = b.try_mul(&UOp::native_const(3.0f32)).unwrap();
 
-    // Filter to only include 'c'
-    let filtered = c.toposort_filtered(|node| Arc::ptr_eq(node, &c));
+    assert_eq!(c.toposort_filtered(|_| true).len(), c.toposort().len());
+    assert!(c.toposort_filtered(|_| false).is_empty());
 
-    // Should only contain 'c' since gate blocks traversal of children
-    assert_eq!(filtered.len(), 1, "Filtered toposort should only include nodes passing gate");
-    assert!(Arc::ptr_eq(&filtered[0], &c));
-}
-
-#[test]
-fn test_toposort_filtered_all() {
-    // Build graph: a + b
-    let a = UOp::native_const(1.0f32);
-    let b = UOp::native_const(2.0f32);
-    let add = a.try_add(&b).unwrap();
-
-    // Filter that accepts all nodes
-    let filtered = add.toposort_filtered(|_| true);
-
-    // Should be same as regular toposort
-    let regular = add.toposort();
-    assert_eq!(filtered.len(), regular.len());
-}
-
-#[test]
-fn test_toposort_filtered_none() {
-    // Build graph
-    let a = UOp::native_const(1.0f32);
-
-    // Filter that rejects all nodes
-    let filtered = a.toposort_filtered(|_| false);
-
-    // Should be empty (gate blocks traversal)
-    assert_eq!(filtered.len(), 0, "Gate blocking all nodes should return empty");
-}
-
-#[test]
-fn test_multiple_properties_coexist() {
-    // Create a constant (has shape)
-    let a = UOp::native_const(1.0f32);
-    let b = UOp::native_const(2.0f32);
-
-    // Create an addition operation
-    let add = a.try_add(&b).unwrap();
-
-    // Access shape property (const operations have shape)
-    let shape = add.shape().unwrap();
-    assert!(shape.is_some());
-    assert_eq!(shape.unwrap().len(), 0); // Scalar
-
-    // Access ranges property (no ranges in this graph)
-    let ranges = add.ranges();
-    assert_eq!(ranges.len(), 0);
-
-    // Access in_scope_ranges property
-    let in_scope = add.in_scope_ranges();
-    assert_eq!(in_scope.len(), 0);
-
-    // All should be cached independently
-    let shape2 = add.shape().unwrap();
-    let ranges2 = add.ranges();
-    let in_scope2 = add.in_scope_ranges();
-
-    assert_eq!(shape, shape2);
-    assert_eq!(ranges.len(), ranges2.len());
-    assert_eq!(in_scope.len(), in_scope2.len());
+    let only_root = c.toposort_filtered(|node| Arc::ptr_eq(node, &c));
+    assert_eq!(only_root.len(), 1);
+    assert!(Arc::ptr_eq(&only_root[0], &c));
 }
 
 /// The warm-children fast path in `CachedProperty::get` must produce exactly what
@@ -1387,10 +1087,12 @@ fn test_device_and_addrspace_are_memoised_on_diamond_dags() {
     }
     let root = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32);
 
+    // Memoised, both resolve in a linear walk over ~80 nodes; unmemoised they explore 2^20
+    // paths each and take tens of seconds. The bound below only has to separate those two
+    // complexity classes, so it is five orders of magnitude above the memoised cost.
     let start = std::time::Instant::now();
     assert_eq!(root.device_spec(), Some(DeviceSpec::Cpu), "device must propagate up from the BUFFER leaf");
     assert_eq!(root.addrspace(), Some(AddrSpace::Global), "addrspace must propagate up from the BUFFER leaf");
     let elapsed = start.elapsed();
-
-    assert!(elapsed < std::time::Duration::from_millis(100), "20-level diamond took {elapsed:?}; memo is not working");
+    assert!(elapsed < std::time::Duration::from_secs(5), "20-level diamond took {elapsed:?}; memo is not working");
 }

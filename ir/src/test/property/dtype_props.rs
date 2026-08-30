@@ -1,8 +1,9 @@
 //! Property tests for DType operations and casting.
 
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 
-use svod_dtype::DType;
+use svod_dtype::{DType, ScalarDType};
 
 use crate::UOp;
 use crate::types::{BinaryOp, ConstValue};
@@ -12,7 +13,7 @@ use crate::uop::range_eval::compute_sound_vmin_vmax;
 use super::generators::*;
 
 // ============================================================================
-// Constant Casting Properties
+// Constant casting
 // ============================================================================
 
 proptest! {
@@ -21,172 +22,56 @@ proptest! {
     /// Casting to the same dtype should be identity.
     #[test]
     fn const_cast_identity((dtype, cv) in const_pair()) {
-        let casted = cv.cast(&dtype).expect("Cast to same dtype should succeed");
-        prop_assert_eq!(cv, casted, "Cast to same dtype should be identity");
+        prop_assert_eq!(cv, cv.cast(&dtype).expect("cast to same dtype should succeed"));
     }
 
-    /// Casting bool to int should give 0 or 1.
     #[test]
-    fn const_cast_bool_to_int(b: bool) {
-        let cv = ConstValue::Bool(b);
+    fn const_cast_bool_round_trips_through_zero_and_one(b: bool, i in -100i64..=100) {
         let expected = if b { 1i64 } else { 0i64 };
-
-        let casted = cv.cast(&DType::Int32).expect("Bool to int32 should succeed");
-        prop_assert_eq!(casted, ConstValue::Int(expected));
-
-        let casted64 = cv.cast(&DType::Int64).expect("Bool to int64 should succeed");
-        prop_assert_eq!(casted64, ConstValue::Int(expected));
+        prop_assert_eq!(ConstValue::Bool(b).cast(&DType::Int32), Some(ConstValue::Int(expected)));
+        prop_assert_eq!(ConstValue::Bool(b).cast(&DType::Int64), Some(ConstValue::Int(expected)));
+        prop_assert_eq!(ConstValue::Int(i).cast(&DType::Bool), Some(ConstValue::Bool(i != 0)));
     }
 
-    /// Casting int 0 to bool should give false, non-zero should give true.
+    /// Truncating to i8 then widening preserves the truncated value, and the widening path
+    /// taken (chained or direct) does not matter.
     #[test]
-    fn const_cast_int_to_bool(i in -100i64..=100) {
-        let cv = ConstValue::Int(i);
-        let expected = i != 0;
-
-        let casted = cv.cast(&DType::Bool).expect("Int to bool should succeed");
-        prop_assert_eq!(casted, ConstValue::Bool(expected));
+    fn const_cast_widening_preserves_the_narrowed_value(i in -100i64..=100) {
+        let narrow = ConstValue::Int(i).cast(&DType::Int8).unwrap();
+        let via_chain = narrow.cast(&DType::Int16).unwrap().cast(&DType::Int32).unwrap();
+        prop_assert_eq!(via_chain, narrow.cast(&DType::Int32).unwrap(), "chained must equal direct widening");
+        prop_assert_eq!(via_chain.cast(&DType::Int64).unwrap(), ConstValue::Int(i as i8 as i64));
     }
 
-    /// Widening integer casts preserve value.
-    #[test]
-    fn const_cast_int_widening_preserves_value(i in -100i64..=100) {
-        let cv8 = ConstValue::Int(i).cast(&DType::Int8).unwrap();
-
-        // Cast to wider types
-        let cv16 = cv8.cast(&DType::Int16).unwrap();
-        let cv32 = cv16.cast(&DType::Int32).unwrap();
-        let cv64 = cv32.cast(&DType::Int64).unwrap();
-
-        // Extract final value
-        if let ConstValue::Int(final_val) = cv64 {
-            // Should match the truncated i8 value
-            let expected = i as i8 as i64;
-            prop_assert_eq!(final_val, expected,
-                "Widening should preserve truncated value: {} -> i8 -> i16 -> i32 -> i64",
-                i);
-        } else {
-            panic!("Expected Int after widening chain");
-        }
-    }
-
-    /// Direct wide cast equals chained narrow casts (for in-range values).
-    #[test]
-    fn const_cast_widening_chain_equals_direct(i in -100i64..=100) {
-        // i is small enough to fit in i8
-        let cv_narrow = ConstValue::Int(i).cast(&DType::Int8).unwrap();
-
-        // Chain: i8 -> i16 -> i32
-        let via_chain = cv_narrow
-            .cast(&DType::Int16).unwrap()
-            .cast(&DType::Int32).unwrap();
-
-        // Direct: i8 -> i32
-        let direct = cv_narrow.cast(&DType::Int32).unwrap();
-
-        prop_assert_eq!(via_chain, direct,
-            "Chained widening should equal direct widening");
-    }
-
-    /// Float to int to float preserves integer part.
+    /// Float to int to float preserves the integer part.
     #[test]
     fn const_cast_float_to_int_to_float(f in -100.0..=100.0) {
-        let cv = ConstValue::Float(f);
-
-        // Float -> Int32 -> Float
-        let via_int = cv.cast(&DType::Int32).unwrap().cast(&DType::Float32).unwrap();
-
-        if let ConstValue::Float(result) = via_int {
-            // Should match truncated integer value
-            let expected = (f as i32) as f64;
-            prop_assert!((result - expected).abs() < 0.1,
-                "Float->Int->Float should preserve integer part: {} -> {} (expected {})",
-                f, result, expected);
-        } else {
-            panic!("Expected Float after cast chain");
-        }
+        let via_int = ConstValue::Float(f).cast(&DType::Int32).unwrap().cast(&DType::Float32).unwrap();
+        let ConstValue::Float(result) = via_int else { panic!("expected Float after cast chain") };
+        prop_assert!((result - (f as i32) as f64).abs() < 0.1, "{f} -> {result}");
     }
 
-    /// Zero casts to zero in any dtype.
+    /// Numeric zero and one survive a cast into any arithmetic dtype, whichever
+    /// representation they start from.
     #[test]
-    fn const_cast_zero_to_any_dtype(sdtype in arithmetic_sdtype()) {
+    fn const_cast_preserves_zero_and_one(sdtype in arithmetic_sdtype(), one: bool) {
         let dtype = DType::from(sdtype);
-        let zero_int = ConstValue::Int(0);
-        let zero_float = ConstValue::Float(0.0);
-        let zero_bool = ConstValue::Bool(false);
-
-        if let Some(casted_int) = zero_int.cast(&dtype) {
-            match casted_int {
-                ConstValue::Invalid => unreachable!(),
-                ConstValue::Int(v) => prop_assert_eq!(v, 0),
-                ConstValue::UInt(v) => prop_assert_eq!(v, 0),
-                ConstValue::Float(v) => prop_assert_eq!(v, 0.0),
-                ConstValue::Bool(v) => prop_assert!(!v),
-            }
-        }
-
-        if let Some(casted_float) = zero_float.cast(&dtype) {
-            match casted_float {
-                ConstValue::Invalid => unreachable!(),
-                ConstValue::Int(v) => prop_assert_eq!(v, 0),
-                ConstValue::UInt(v) => prop_assert_eq!(v, 0),
-                ConstValue::Float(v) => prop_assert_eq!(v, 0.0),
-                ConstValue::Bool(v) => prop_assert!(!v),
-            }
-        }
-
-        if let Some(casted_bool) = zero_bool.cast(&dtype) {
-            match casted_bool {
-                ConstValue::Invalid => unreachable!(),
-                ConstValue::Int(v) => prop_assert_eq!(v, 0),
-                ConstValue::UInt(v) => prop_assert_eq!(v, 0),
-                ConstValue::Float(v) => prop_assert_eq!(v, 0.0),
-                ConstValue::Bool(v) => prop_assert!(!v),
-            }
-        }
-    }
-
-    /// One casts to one in numeric dtypes.
-    #[test]
-    fn const_cast_one_to_numeric_dtype(dtype in arithmetic_sdtype()) {
-        let dtype = DType::from(dtype);
-        let one = ConstValue::Int(1);
-
-        if let Some(casted) = one.cast(&dtype) {
-            match casted {
-                ConstValue::Invalid => unreachable!(),
-                ConstValue::Int(v) => prop_assert_eq!(v, 1),
-                ConstValue::UInt(v) => prop_assert_eq!(v, 1),
-                ConstValue::Float(v) => prop_assert_eq!(v, 1.0),
-                ConstValue::Bool(v) => prop_assert!(v), // 1 -> true
+        let sources = if one {
+            [ConstValue::Int(1), ConstValue::Float(1.0), ConstValue::Bool(true)]
+        } else {
+            [ConstValue::Int(0), ConstValue::Float(0.0), ConstValue::Bool(false)]
+        };
+        for source in sources {
+            if let Some(casted) = source.cast(&dtype) {
+                prop_assert_eq!(const_value_to_f64(&casted), f64::from(u8::from(one)), "{:?} -> {:?}", source, dtype);
             }
         }
     }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1000))]
-
-    #[test]
-    fn exact_float_operation_sound_bounds_enclose_special_results(
-        a_bits in any::<u32>(),
-        b_bits in any::<u32>(),
-        op in prop_oneof![Just(BinaryOp::Add), Just(BinaryOp::Mul), Just(BinaryOp::Fdiv)],
-    ) {
-        let a = f32::from_bits(a_bits);
-        let b = f32::from_bits(b_bits);
-        let lhs = UOp::const_(DType::Float32, ConstValue::Float(a as f64));
-        let rhs = UOp::const_(DType::Float32, ConstValue::Float(b as f64));
-        let expr = UOp::new(crate::Op::Binary(op, lhs, rhs), DType::Float32);
-        let expected = eval_binary_op_typed(op, ConstValue::Float(a as f64), ConstValue::Float(b as f64), svod_dtype::ScalarDType::Float32);
-
-        match expected {
-            Some(ConstValue::Float(value)) if value.is_nan() => prop_assert!(compute_sound_vmin_vmax(&expr).is_none()),
-            Some(value) => prop_assert_eq!(compute_sound_vmin_vmax(&expr), Some((value, value))),
-            None => prop_assert!(compute_sound_vmin_vmax(&expr).is_none()),
-        }
-    }
-}
+// ============================================================================
+// Sound range analysis
+// ============================================================================
 
 fn value_is_enclosed(value: ConstValue, min: ConstValue, max: ConstValue) -> bool {
     match (value, min, max) {
@@ -197,8 +82,88 @@ fn value_is_enclosed(value: ConstValue, min: ConstValue, max: ConstValue) -> boo
     }
 }
 
+/// Endpoints and midpoint of an inclusive range; enough to catch a bound that excludes an
+/// achievable value without evaluating the whole domain.
+fn samples((min, max): (i64, i64)) -> [i64; 3] {
+    [min, max, min + (max - min) / 2]
+}
+
+fn ordered(pair: (i64, i64)) -> (i64, i64) {
+    if pair.0 <= pair.1 { pair } else { (pair.1, pair.0) }
+}
+
+/// Every value an operand range can actually take must fall inside the sound range the
+/// analysis reports for the operation — for both signedness families of a narrow dtype,
+/// where wrap-around is what makes the bound hard.
+fn sound_ranges_enclose_sampled_binary_values(
+    dtype: DType,
+    scalar: ScalarDType,
+    wrap: fn(i64) -> ConstValue,
+    lhs_bounds: (i64, i64),
+    rhs_bounds: (i64, i64),
+    shift: i64,
+) -> Result<(), TestCaseError> {
+    let lhs = UOp::var("prop_lhs", dtype.clone(), lhs_bounds.0, lhs_bounds.1);
+    let rhs = UOp::var("prop_rhs", dtype.clone(), rhs_bounds.0, rhs_bounds.1);
+    let shift_rhs = UOp::const_(dtype.clone(), wrap(shift));
+
+    let ops = [
+        BinaryOp::Add,
+        BinaryOp::Sub,
+        BinaryOp::Mul,
+        BinaryOp::Max,
+        BinaryOp::FloorDiv,
+        BinaryOp::CDiv,
+        BinaryOp::FloorMod,
+        BinaryOp::CMod,
+        BinaryOp::And,
+        BinaryOp::Or,
+        BinaryOp::Xor,
+    ];
+    let cases = ops
+        .iter()
+        .map(|op| (*op, rhs.clone(), samples(rhs_bounds).to_vec()))
+        .chain([BinaryOp::Shl, BinaryOp::Shr].iter().map(|op| (*op, shift_rhs.clone(), vec![shift])));
+
+    for (op, rhs, rhs_samples) in cases {
+        let expr = UOp::new(crate::Op::Binary(op, lhs.clone(), rhs), dtype.clone());
+        let Some((min, max)) = compute_sound_vmin_vmax(&expr) else { continue };
+        for a in samples(lhs_bounds) {
+            for b in &rhs_samples {
+                if let Some(value) = eval_binary_op_typed(op, wrap(a), wrap(*b), scalar) {
+                    prop_assert!(
+                        value_is_enclosed(value, min, max),
+                        "{op:?}: {a}, {b} -> {value:?} not in [{min:?}, {max:?}]"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    /// The sound range of a constant-folded float operation is that exact value, and is
+    /// withheld entirely when the result is NaN.
+    #[test]
+    fn exact_float_operation_sound_bounds_enclose_special_results(
+        a_bits in any::<u32>(),
+        b_bits in any::<u32>(),
+        op in prop_oneof![Just(BinaryOp::Add), Just(BinaryOp::Mul), Just(BinaryOp::Fdiv)],
+    ) {
+        let (a, b) = (f32::from_bits(a_bits) as f64, f32::from_bits(b_bits) as f64);
+        let lhs = UOp::const_(DType::Float32, ConstValue::Float(a));
+        let rhs = UOp::const_(DType::Float32, ConstValue::Float(b));
+        let expr = UOp::new(crate::Op::Binary(op, lhs, rhs), DType::Float32);
+
+        match eval_binary_op_typed(op, ConstValue::Float(a), ConstValue::Float(b), ScalarDType::Float32) {
+            Some(ConstValue::Float(value)) if value.is_nan() => prop_assert!(compute_sound_vmin_vmax(&expr).is_none()),
+            Some(value) => prop_assert_eq!(compute_sound_vmin_vmax(&expr), Some((value, value))),
+            None => prop_assert!(compute_sound_vmin_vmax(&expr).is_none()),
+        }
+    }
 
     #[test]
     fn sampled_int8_binary_values_are_enclosed_by_sound_ranges(
@@ -206,58 +171,14 @@ proptest! {
         b in any::<(i8, i8)>(),
         shift in 0i8..8,
     ) {
-        let (amin, amax) = if a.0 <= a.1 { (a.0, a.1) } else { (a.1, a.0) };
-        let (bmin, bmax) = if b.0 <= b.1 { (b.0, b.1) } else { (b.1, b.0) };
-        let lhs = UOp::var("prop_i8_lhs", DType::Int8, i64::from(amin), i64::from(amax));
-        let rhs = UOp::var("prop_i8_rhs", DType::Int8, i64::from(bmin), i64::from(bmax));
-        let samples_a = [amin, amax, ((i16::from(amin) + i16::from(amax)) / 2) as i8];
-        let samples_b = [bmin, bmax, ((i16::from(bmin) + i16::from(bmax)) / 2) as i8];
-
-        for op in [
-            BinaryOp::Add,
-            BinaryOp::Sub,
-            BinaryOp::Mul,
-            BinaryOp::Max,
-            BinaryOp::FloorDiv,
-            BinaryOp::CDiv,
-            BinaryOp::FloorMod,
-            BinaryOp::CMod,
-            BinaryOp::And,
-            BinaryOp::Or,
-            BinaryOp::Xor,
-        ] {
-            let expr = UOp::new(crate::Op::Binary(op, lhs.clone(), rhs.clone()), DType::Int8);
-            if let Some((min, max)) = compute_sound_vmin_vmax(&expr) {
-                for a in samples_a {
-                    for b in samples_b {
-                        if let Some(value) = eval_binary_op_typed(
-                            op,
-                            ConstValue::Int(i64::from(a)),
-                            ConstValue::Int(i64::from(b)),
-                            svod_dtype::ScalarDType::Int8,
-                        ) {
-                            prop_assert!(value_is_enclosed(value, min, max), "{op:?}: {a}, {b} -> {value:?} not in [{min:?}, {max:?}]");
-                        }
-                    }
-                }
-            }
-        }
-
-        let shift_rhs = UOp::const_(DType::Int8, ConstValue::Int(i64::from(shift)));
-        for op in [BinaryOp::Shl, BinaryOp::Shr] {
-            let expr = UOp::new(crate::Op::Binary(op, lhs.clone(), shift_rhs.clone()), DType::Int8);
-            if let Some((min, max)) = compute_sound_vmin_vmax(&expr) {
-                for a in samples_a {
-                    let value = eval_binary_op_typed(
-                        op,
-                        ConstValue::Int(i64::from(a)),
-                        ConstValue::Int(i64::from(shift)),
-                        svod_dtype::ScalarDType::Int8,
-                    ).unwrap();
-                    prop_assert!(value_is_enclosed(value, min, max), "{op:?}: {a}, {shift} -> {value:?} not in [{min:?}, {max:?}]");
-                }
-            }
-        }
+        sound_ranges_enclose_sampled_binary_values(
+            DType::Int8,
+            ScalarDType::Int8,
+            ConstValue::Int,
+            ordered((i64::from(a.0), i64::from(a.1))),
+            ordered((i64::from(b.0), i64::from(b.1))),
+            i64::from(shift),
+        )?;
     }
 
     #[test]
@@ -266,87 +187,35 @@ proptest! {
         b in any::<(u8, u8)>(),
         shift in 0u8..8,
     ) {
-        let (amin, amax) = if a.0 <= a.1 { (a.0, a.1) } else { (a.1, a.0) };
-        let (bmin, bmax) = if b.0 <= b.1 { (b.0, b.1) } else { (b.1, b.0) };
-        let lhs = UOp::var("prop_u8_lhs", DType::UInt8, i64::from(amin), i64::from(amax));
-        let rhs = UOp::var("prop_u8_rhs", DType::UInt8, i64::from(bmin), i64::from(bmax));
-        let samples_a = [amin, amax, amin + (amax - amin) / 2];
-        let samples_b = [bmin, bmax, bmin + (bmax - bmin) / 2];
-
-        for op in [
-            BinaryOp::Add,
-            BinaryOp::Sub,
-            BinaryOp::Mul,
-            BinaryOp::Max,
-            BinaryOp::FloorDiv,
-            BinaryOp::CDiv,
-            BinaryOp::FloorMod,
-            BinaryOp::CMod,
-            BinaryOp::And,
-            BinaryOp::Or,
-            BinaryOp::Xor,
-        ] {
-            let expr = UOp::new(crate::Op::Binary(op, lhs.clone(), rhs.clone()), DType::UInt8);
-            if let Some((min, max)) = compute_sound_vmin_vmax(&expr) {
-                for a in samples_a {
-                    for b in samples_b {
-                        if let Some(value) = eval_binary_op_typed(
-                            op,
-                            ConstValue::UInt(u64::from(a)),
-                            ConstValue::UInt(u64::from(b)),
-                            svod_dtype::ScalarDType::UInt8,
-                        ) {
-                            prop_assert!(value_is_enclosed(value, min, max), "{op:?}: {a}, {b} -> {value:?} not in [{min:?}, {max:?}]");
-                        }
-                    }
-                }
-            }
-        }
-
-        let shift_rhs = UOp::const_(DType::UInt8, ConstValue::UInt(u64::from(shift)));
-        for op in [BinaryOp::Shl, BinaryOp::Shr] {
-            let expr = UOp::new(crate::Op::Binary(op, lhs.clone(), shift_rhs.clone()), DType::UInt8);
-            if let Some((min, max)) = compute_sound_vmin_vmax(&expr) {
-                for a in samples_a {
-                    let value = eval_binary_op_typed(
-                        op,
-                        ConstValue::UInt(u64::from(a)),
-                        ConstValue::UInt(u64::from(shift)),
-                        svod_dtype::ScalarDType::UInt8,
-                    ).unwrap();
-                    prop_assert!(value_is_enclosed(value, min, max), "{op:?}: {a}, {shift} -> {value:?} not in [{min:?}, {max:?}]");
-                }
-            }
-        }
+        sound_ranges_enclose_sampled_binary_values(
+            DType::UInt8,
+            ScalarDType::UInt8,
+            |value| ConstValue::UInt(value as u64),
+            ordered((i64::from(a.0), i64::from(a.1))),
+            ordered((i64::from(b.0), i64::from(b.1))),
+            i64::from(shift),
+        )?;
     }
 
+    /// Narrowing casts wrap, so the reported range must still enclose every wrapped value.
     #[test]
     fn sampled_narrow_integer_cast_values_are_enclosed(
         pair in any::<(i16, i16)>(),
         upair in any::<(u16, u16)>(),
     ) {
-        let (min, max) = if pair.0 <= pair.1 { pair } else { (pair.1, pair.0) };
-        let src = UOp::var("prop_cast_i16", DType::Int16, i64::from(min), i64::from(max));
-        let samples = [min, max, ((i32::from(min) + i32::from(max)) / 2) as i16];
-        for target in [DType::Int8, DType::UInt8] {
-            let cast = src.cast(target.clone());
-            if let Some((range_min, range_max)) = compute_sound_vmin_vmax(&cast) {
-                for value in samples {
-                    let value = ConstValue::Int(i64::from(value)).cast(&target).unwrap();
-                    prop_assert!(value_is_enclosed(value, range_min, range_max));
-                }
-            }
-        }
+        let signed = ordered((i64::from(pair.0), i64::from(pair.1)));
+        let unsigned = ordered((i64::from(upair.0), i64::from(upair.1)));
+        let sources = [
+            (UOp::var("prop_cast_i16", DType::Int16, signed.0, signed.1), signed, ConstValue::Int as fn(i64) -> _),
+            (UOp::var("prop_cast_u16", DType::UInt16, unsigned.0, unsigned.1), unsigned, |v| ConstValue::UInt(v as u64)),
+        ];
 
-        let (min, max) = if upair.0 <= upair.1 { upair } else { (upair.1, upair.0) };
-        let src = UOp::var("prop_cast_u16", DType::UInt16, i64::from(min), i64::from(max));
-        let samples = [min, max, min + (max - min) / 2];
-        for target in [DType::Int8, DType::UInt8] {
-            let cast = src.cast(target.clone());
-            if let Some((range_min, range_max)) = compute_sound_vmin_vmax(&cast) {
-                for value in samples {
-                    let value = ConstValue::UInt(u64::from(value)).cast(&target).unwrap();
-                    prop_assert!(value_is_enclosed(value, range_min, range_max));
+        for (src, bounds, wrap) in sources {
+            for target in [DType::Int8, DType::UInt8] {
+                let cast = src.cast(target.clone());
+                let Some((min, max)) = compute_sound_vmin_vmax(&cast) else { continue };
+                for value in samples(bounds) {
+                    prop_assert!(value_is_enclosed(wrap(value).cast(&target).unwrap(), min, max));
                 }
             }
         }
@@ -354,7 +223,7 @@ proptest! {
 }
 
 // ============================================================================
-// DType Family Properties
+// DType families
 // ============================================================================
 
 proptest! {
@@ -362,97 +231,43 @@ proptest! {
 
     /// Within a dtype family, widening should preserve values for in-range constants.
     #[test]
-    fn dtype_family_widening_preserves_small_values(
-        family in arb_dtype_family(),
-        val in -10i64..=10,
-    ) {
+    fn dtype_family_widening_preserves_small_values(family in arb_dtype_family(), val in -10i64..=10) {
         let dtypes = family.widening_sequence();
-        let narrowest = &dtypes[0];
+        let Some(narrowest) = ConstValue::Int(val).cast(&dtypes[0]) else { return Ok(()) };
+        let expected = const_value_to_f64(&narrowest);
 
-        // Cast to narrowest type
-        let cv = ConstValue::Int(val).cast(narrowest);
-        if cv.is_none() {
-            // Skip if narrowest dtype can't represent this value
-            return Ok(());
-        }
-        let cv = cv.unwrap();
-
-        // Widen through the family
-        let mut current = cv;
+        let mut current = narrowest;
         for dtype in &dtypes[1..] {
-            let widened = current.cast(dtype).expect("Widening should succeed");
-
-            // Numeric value should be preserved
-            let original_numeric = const_value_to_f64(&cv);
-            let widened_numeric = const_value_to_f64(&widened);
-
-            prop_assert!((original_numeric - widened_numeric).abs() < 0.1,
-                "Widening from {:?} to {:?} should preserve value: {} -> {}",
-                narrowest, dtype, original_numeric, widened_numeric);
-
-            current = widened;
+            current = current.cast(dtype).expect("widening should succeed");
+            prop_assert!(
+                (expected - const_value_to_f64(&current)).abs() < 0.1,
+                "widening to {dtype:?} should preserve {expected}"
+            );
         }
     }
 
-    /// Widening then narrowing back may lose precision but shouldn't change sign for small values.
+    /// Widening then narrowing back may lose precision but must not change sign.
     #[test]
-    fn dtype_roundtrip_preserves_sign(
-        family in arb_dtype_family(),
-        val in -10i64..=10,
-    ) {
+    fn dtype_roundtrip_preserves_sign(family in arb_dtype_family(), val in -10i64..=10) {
         let dtypes = family.widening_sequence();
-        let narrowest = &dtypes[0];
-        let widest = &dtypes[dtypes.len() - 1];
+        let (narrowest, widest) = (&dtypes[0], &dtypes[dtypes.len() - 1]);
+        let Some(cv) = ConstValue::Int(val).cast(narrowest) else { return Ok(()) };
 
-        // Start with value in narrowest type
-        let cv = ConstValue::Int(val).cast(narrowest);
-        if cv.is_none() {
-            return Ok(());
-        }
-        let cv = cv.unwrap();
-        let original_sign = const_value_sign(&cv);
-
-        // Widen to widest, then narrow back
-        let widened = cv.cast(widest).expect("Widening should succeed");
-        let narrowed = widened.cast(narrowest).expect("Narrowing should succeed");
-
-        // Sign should be preserved for small values
-        let final_sign = const_value_sign(&narrowed);
-        prop_assert_eq!(original_sign, final_sign,
-            "Round-trip should preserve sign: {:?} -> {:?} -> {:?}",
-            narrowest, widest, narrowest);
+        let round_tripped = cv.cast(widest).expect("widening").cast(narrowest).expect("narrowing");
+        prop_assert_eq!(const_value_sign(&cv), const_value_sign(&round_tripped), "{:?} -> {:?} -> back", narrowest, widest);
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Convert ConstValue to f64 for numeric comparison.
 fn const_value_to_f64(cv: &ConstValue) -> f64 {
     match cv {
         ConstValue::Invalid => panic!("Invalid has no numeric value"),
         ConstValue::Int(v) => *v as f64,
         ConstValue::UInt(v) => *v as f64,
         ConstValue::Float(v) => *v,
-        ConstValue::Bool(v) => {
-            if *v {
-                1.0
-            } else {
-                0.0
-            }
-        }
+        ConstValue::Bool(v) => f64::from(u8::from(*v)),
     }
 }
 
-/// Get sign of ConstValue (-1, 0, or 1).
 fn const_value_sign(cv: &ConstValue) -> i8 {
-    let val = const_value_to_f64(cv);
-    if val < 0.0 {
-        -1
-    } else if val > 0.0 {
-        1
-    } else {
-        0
-    }
+    const_value_to_f64(cv).partial_cmp(&0.0).map_or(0, |ordering| ordering as i8)
 }

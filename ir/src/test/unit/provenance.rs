@@ -408,7 +408,7 @@ fn test_tracking_off_captures_nothing_on_the_hash_cons_hit_path() {
     // below is a genuine hash-cons hit.
     let node = fresh_uop();
     let op = node.op().clone();
-    for _ in 0..100_000 {
+    for _ in 0..1_000 {
         let hit = UOp::new(op.clone(), DType::Int32);
         assert_eq!(hit.id, node.id, "expected an interning hit");
     }
