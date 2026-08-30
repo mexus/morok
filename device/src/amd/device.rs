@@ -253,11 +253,6 @@ impl AmdDevice {
     /// This deliberately bypasses the device cache, KFD, and process-global
     /// event-page setup so lifecycle tests can exercise the core on any host.
     #[cfg(test)]
-    pub(crate) fn synthetic(iface: Arc<dyn crate::amd::iface::AmdIface>) -> Arc<Self> {
-        Self::synthetic_with_xcc(iface, 1)
-    }
-
-    #[cfg(test)]
     pub(crate) fn synthetic_with_xcc(iface: Arc<dyn crate::amd::iface::AmdIface>, num_xcc: u32) -> Arc<Self> {
         let node = AmdNode {
             node_id: 0,

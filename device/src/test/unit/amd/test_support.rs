@@ -1,9 +1,8 @@
-//! Shared gating helpers for the AMD hardware tests.
+//! Shared scaffolding for the AMD tests: the host-only [`MockAmdIface`] backend
+//! and the gating helpers that skip hardware probes on unsupported hosts.
 //!
 //! Sibling modules under `crate::test::unit::amd` reach these via
-//! `super::test_support`. Centralising the probe keeps the per-test boilerplate
-//! to a single `let … else { return }` and gives every hardware test identical
-//! skip semantics on hosts without a supported GPU.
+//! `super::test_support`.
 
 use crate::amd::AmdAllocator;
 
@@ -120,10 +119,6 @@ impl std::fmt::Debug for MockAmdIface {
 }
 
 impl MockAmdIface {
-    pub(crate) fn device(self: &Arc<Self>) -> Arc<AmdDevice> {
-        AmdDevice::synthetic(Arc::clone(self) as Arc<dyn AmdIface>)
-    }
-
     pub(crate) fn script_alloc(&self, outcome: Result<()>) {
         self.state.lock().alloc_script.push_back(outcome);
     }
@@ -184,6 +179,51 @@ impl MockAmdIface {
     pub(crate) fn free_issues(&self) -> Vec<MockFreeIssue> {
         self.state.lock().free_issues.clone()
     }
+
+    /// Publication checkpoints reached so far, in call order.
+    pub(crate) fn publication_stages(&self) -> Vec<PublicationStage> {
+        self.state
+            .lock()
+            .transcript
+            .iter()
+            .filter_map(|call| match call {
+                MockAmdCall::PublicationCheckpoint { stage } => Some(*stage),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn call_count(&self, matches: impl Fn(&MockAmdCall) -> bool) -> usize {
+        self.state.lock().transcript.iter().filter(|call| matches(call)).count()
+    }
+}
+
+/// A synthetic `xccs`-XCC device (1 selects the PM4 path, >1 the AQL path) over
+/// a fresh mock backend.
+pub(crate) fn mock_device(xccs: u32) -> (Arc<MockAmdIface>, AmdAllocator) {
+    let iface = Arc::new(MockAmdIface::default());
+    let dev = AmdDevice::synthetic_with_xcc(Arc::clone(&iface) as Arc<dyn AmdIface>, xccs);
+    (iface, AmdAllocator { dev, device_id: 0 })
+}
+
+/// [`mock_device`] with a signal pool installed — the precondition for every
+/// queue that owns a completion timeline.
+pub(crate) fn mock_device_with_signals(xccs: u32) -> (Arc<MockAmdIface>, AmdAllocator) {
+    let (iface, allocator) = mock_device(xccs);
+    install_signal_pool(&allocator);
+    (iface, allocator)
+}
+
+pub(crate) fn install_signal_pool(allocator: &AmdAllocator) {
+    allocator.dev.core().install_signal_pool(crate::amd::signal::SignalPool::new(allocator, 64).expect("signal pool"));
+}
+
+pub(crate) fn scripted_error(stage: &str) -> Error {
+    Error::Runtime { message: format!("scripted {stage} failure") }
+}
+
+pub(crate) fn replay_dwords(bytes: &[u8]) -> Vec<u32> {
+    bytes.as_chunks::<4>().0.iter().copied().map(u32::from_le_bytes).collect()
 }
 
 impl AmdIface for MockAmdIface {
@@ -312,41 +352,29 @@ impl AmdIface for MockAmdIface {
     }
 }
 
-/// Open the device-0 AMD allocator, or `None` (with a skip note) on any host
-/// that lacks a supported AMD GPU — no `/dev/kfd`, unsupported arch, or missing
-/// permissions. Hardware tests early-return on `None`:
-///
-/// ```ignore
-/// let Some(alloc) = amd_alloc_or_skip() else { return };
-/// ```
+/// Open the device-0 AMD allocator, or `None` on any host that lacks a supported
+/// AMD GPU — no `/dev/kfd`, unsupported arch, or missing permissions. Hardware
+/// tests early-return on `None`.
 pub(crate) fn amd_alloc_or_skip() -> Option<AmdAllocator> {
-    match AmdAllocator::new(0) {
-        Ok(alloc) => Some(alloc),
-        Err(_) => {
-            eprintln!("skipping: no supported AMD GPU on this host");
-            None
-        }
+    AmdAllocator::new(0).ok()
+}
+
+/// Install the signal pool a hardware probe needs, unless a device factory
+/// already did (both installers are idempotent).
+pub(crate) fn ensure_hw_signal_pool(alloc: &AmdAllocator) {
+    if alloc.dev.core().signal_pool().is_none() {
+        install_signal_pool(alloc);
     }
 }
 
-/// `true` if `alloc` drives a multi-XCC (CDNA SPX) device. The native-completion
-/// and AQL-scratch probes are meaningless on a single-XCC part, so they gate on
-/// this and skip (with a note) otherwise.
+/// `true` if `alloc` drives a multi-XCC (CDNA SPX) device. The AQL probes are
+/// meaningless on a single-XCC part, so they gate on this.
 pub(crate) fn require_multi_xcc(alloc: &AmdAllocator) -> bool {
-    if alloc.dev.node.num_xcc.max(1) > 1 {
-        return true;
-    }
-    eprintln!("PROBE skipped: single-XCC device (multi-XCC AQL only)");
-    false
+    alloc.dev.node.num_xcc.max(1) > 1
 }
 
 /// `true` if `alloc` drives a single-XCC (RDNA / gfx11/12) PM4 device. The PM4
-/// graph-capture probes only exercise the PM4 indirect-buffer path, so they gate
-/// on this and skip (with a note) on multi-XCC AQL parts.
+/// graph-capture probes only exercise the PM4 indirect-buffer path.
 pub(crate) fn require_single_xcc(alloc: &AmdAllocator) -> bool {
-    if alloc.dev.node.num_xcc.max(1) == 1 {
-        return true;
-    }
-    eprintln!("PROBE skipped: multi-XCC device (single-XCC PM4 only)");
-    false
+    alloc.dev.node.num_xcc.max(1) == 1
 }

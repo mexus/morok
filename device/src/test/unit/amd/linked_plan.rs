@@ -5,50 +5,34 @@ use crate::amd::linked_plan::native_topology_decline;
 use crate::device::NativeReplayDecline;
 use crate::hcq::{CopyLeg, DeviceQueue, LaneSubmission, QueueKind, SemanticLinkedPlan, TopologyCommand};
 use svod_dtype::DeviceSpec;
-fn plan(lanes: Vec<LaneSubmission>) -> SemanticLinkedPlan {
-    SemanticLinkedPlan::from_lane_submissions(lanes, |_| [0x1000, 0x1008]).unwrap()
+
+fn lane(device_id: usize, queue: QueueKind, operation: usize, copy_leg: Option<CopyLeg>) -> LaneSubmission {
+    LaneSubmission {
+        lane: DeviceQueue { device: DeviceSpec::Amd { device_id }, queue },
+        waits: vec![],
+        commands: vec![TopologyCommand { operation, copy_leg }],
+        signal_value: 1,
+    }
+}
+
+fn decline(lanes: Vec<LaneSubmission>, has_copy_queue: bool) -> Option<NativeReplayDecline> {
+    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, |_| [0x1000, 0x1008]).unwrap();
+    native_topology_decline(&plan, has_copy_queue)
 }
 
 #[test]
-fn native_topology_rejects_staged_copy() {
-    let semantic = plan(vec![LaneSubmission {
-        lane: DeviceQueue { device: DeviceSpec::Amd { device_id: 0 }, queue: QueueKind::Copy(0) },
-        waits: vec![],
-        commands: vec![TopologyCommand { operation: 4, copy_leg: Some(CopyLeg::ToHost) }],
-        signal_value: 1,
-    }]);
-    assert_eq!(native_topology_decline(&semantic, true), Some(NativeReplayDecline::StagedCopy { operation: 4 }));
-}
-
-#[test]
-fn native_topology_rejects_copy_without_hardware_queue() {
-    let semantic = plan(vec![LaneSubmission {
-        lane: DeviceQueue { device: DeviceSpec::Amd { device_id: 0 }, queue: QueueKind::Copy(0) },
-        waits: vec![],
-        commands: vec![TopologyCommand { operation: 4, copy_leg: None }],
-        signal_value: 1,
-    }]);
-    assert_eq!(native_topology_decline(&semantic, false), Some(NativeReplayDecline::BackendUnsupported));
+fn native_topology_rejects_staged_copies_and_copies_without_a_hardware_queue() {
+    let copy = |leg| vec![lane(0, QueueKind::Copy(0), 4, leg)];
+    assert_eq!(decline(copy(Some(CopyLeg::ToHost)), true), Some(NativeReplayDecline::StagedCopy { operation: 4 }));
+    assert_eq!(decline(copy(None), false), Some(NativeReplayDecline::BackendUnsupported));
+    assert_eq!(decline(copy(None), true), None, "a direct copy on a device with an SDMA queue replays natively");
 }
 
 #[test]
 fn native_topology_rejects_mixed_devices() {
-    let semantic = plan(vec![
-        LaneSubmission {
-            lane: DeviceQueue { device: DeviceSpec::Amd { device_id: 0 }, queue: QueueKind::Compute(0) },
-            waits: vec![],
-            commands: vec![TopologyCommand { operation: 0, copy_leg: None }],
-            signal_value: 1,
-        },
-        LaneSubmission {
-            lane: DeviceQueue { device: DeviceSpec::Amd { device_id: 1 }, queue: QueueKind::Compute(0) },
-            waits: vec![],
-            commands: vec![TopologyCommand { operation: 1, copy_leg: None }],
-            signal_value: 1,
-        },
-    ]);
+    let lanes = vec![lane(0, QueueKind::Compute(0), 0, None), lane(1, QueueKind::Compute(0), 1, None)];
     assert!(matches!(
-        native_topology_decline(&semantic, true),
+        decline(lanes, true),
         Some(NativeReplayDecline::MixedComputeDevices {
             expected: DeviceSpec::Amd { device_id: 0 },
             actual: DeviceSpec::Amd { device_id: 1 },

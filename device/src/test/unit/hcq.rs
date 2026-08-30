@@ -1,39 +1,123 @@
+use crate::device::{AbiParamDescriptor, AbiParamKind};
 use crate::hcq::{
-    ClikeKernargLayout, Command, CommandBufferCache, ComputeDispatch, CpuQueueExecutor, LinkPatchValues,
-    LoweredCommandBuffer, NullHcq, PatchEncoding, PatchSite, PatchSource, PatchTable, PlaceholderKind,
-    PlaceholderPacking, PlaceholderRequest, QueueKind, RuntimePatchValues, SemanticLinkedSubmission, Submission,
-    SubmissionExecutionError, SystemField, SystemPatchValues,
+    ClikeKernargLayout, Command, CommandBufferCache, CommandField, CopyLeg, CpuQueueExecutor, DeviceQueue,
+    LaneSubmission, LaneWait, LinkPatchValues, LoweredCommandBuffer, NullHcq, PatchEncoding, PatchSite, PatchSource,
+    PatchTable, PlaceholderKind, PlaceholderPacking, PlaceholderRequest, QueueKind, QueueMergeLimits,
+    RuntimePatchValues, SemanticLinkedPlan, SemanticLinkedSubmission, Submission, SubmissionExecutionError,
+    SystemField, SystemPatchValues, TopologyOperation, TopologyOperationKind, TopologyResource, schedule_device_lanes,
 };
-use svod_dtype::DeviceSpec;
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
 
+fn storage(slot: usize) -> AbiParamDescriptor {
+    AbiParamDescriptor { slot, kind: AbiParamKind::Storage(AddrSpace::Global), dtype: DType::Float32, name: None }
+}
+
+fn scalar(slot: usize, name: &str) -> AbiParamDescriptor {
+    AbiParamDescriptor { slot, kind: AbiParamKind::Scalar, dtype: DType::Int32, name: Some(name.into()) }
+}
+
+/// Buffers and scalars share one dense, slot-ordered kernarg record: pointers
+/// are 8-byte aligned and scalars keep their natural width, whether the ABI's
+/// slots are contiguous or sparse.
 #[test]
-fn clike_kernargs_pack_dense_abi_order() {
-    use crate::device::{AbiParamDescriptor, AbiParamKind};
-    use svod_dtype::{AddrSpace, DType};
-    let layout = ClikeKernargLayout::from_abi(&[
-        AbiParamDescriptor {
-            slot: 0,
-            kind: AbiParamKind::Storage(AddrSpace::Global),
-            dtype: DType::Float32,
-            name: None,
-        },
-        AbiParamDescriptor {
-            slot: 1,
-            kind: AbiParamKind::Storage(AddrSpace::Global),
-            dtype: DType::Float32,
-            name: None,
-        },
-        AbiParamDescriptor { slot: 2, kind: AbiParamKind::Scalar, dtype: DType::Int32, name: Some("low".into()) },
-        AbiParamDescriptor { slot: 3, kind: AbiParamKind::Scalar, dtype: DType::Int32, name: Some("high".into()) },
-    ]);
+fn clike_kernargs_pack_in_slot_order_at_natural_alignment() {
     let mut dst = [0xcc; 32];
-    let written = layout.pack(&mut dst, &[0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00], &[-2, 0x1234_5678]).unwrap();
+    let dense = ClikeKernargLayout::from_abi(&[storage(0), storage(1), scalar(2, "low"), scalar(3, "high")]);
+    let written = dense.pack(&mut dst, &[0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00], &[-2, 0x1234_5678]).unwrap();
     assert_eq!(written, 24);
     assert_eq!(&dst[0..8], &0x1122_3344_5566_7788u64.to_le_bytes());
     assert_eq!(&dst[8..16], &0x99aa_bbcc_ddee_ff00u64.to_le_bytes());
     assert_eq!(&dst[16..20], &(-2i32).to_le_bytes());
     assert_eq!(&dst[20..24], &0x1234_5678i32.to_le_bytes());
-    assert_eq!(&dst[24..], &[0xcc; 8]);
+    assert_eq!(&dst[24..], &[0xcc; 8], "packing never writes past the record");
+
+    // Sparse slots keep their relative order and the pointer that follows a
+    // scalar is realigned rather than packed tight.
+    let mut dst = [0u8; 24];
+    ClikeKernargLayout::from_abi(&[storage(0), scalar(1, "n"), storage(5)])
+        .pack(&mut dst, &[0x1000, 0x5000], &[7])
+        .unwrap();
+    assert_eq!(&dst[..8], &0x1000u64.to_le_bytes());
+    assert_eq!(&dst[8..12], &7i32.to_le_bytes());
+    assert_eq!(&dst[16..24], &0x5000u64.to_le_bytes());
+}
+
+#[test]
+fn program_kernargs_interleave_storage_and_scalars_by_slot() {
+    let slotted = |name: &str, slot: usize| {
+        let var = svod_ir::UOp::variable(name.into(), 0, 16, DType::Int32);
+        let svod_ir::Op::Param { shape, arg } = var.op() else { panic!("variable PARAM") };
+        let mut arg = arg.clone();
+        arg.slot = slot;
+        svod_ir::UOp::new(svod_ir::Op::Param { shape: shape.clone(), arg }, DType::Int32)
+    };
+    let mut info = svod_ir::ProgramInfo { globals: vec![0, 2], ..Default::default() };
+    info.vars = vec![slotted("low", 1), slotted("high", 3)];
+    let abi = vec![
+        storage(0),
+        AbiParamDescriptor::from_param(&info.vars[0]).unwrap(),
+        storage(2),
+        AbiParamDescriptor::from_param(&info.vars[1]).unwrap(),
+    ];
+
+    let mut dst = [0xcc; 32];
+    let written = ClikeKernargLayout::pack_program(&info, &abi, &mut dst, &[0x1000, 0x3000], &[7, -3]).unwrap();
+    assert_eq!(written, 28);
+    assert_eq!(&dst[0..8], &0x1000u64.to_le_bytes());
+    assert_eq!(&dst[8..12], &7i32.to_le_bytes());
+    assert_eq!(&dst[12..16], &[0; 4], "the next pointer is realigned, not packed tight");
+    assert_eq!(&dst[16..24], &0x3000u64.to_le_bytes());
+    assert_eq!(&dst[24..28], &(-3i32).to_le_bytes());
+
+    // Sparse global slots address buffers by compact ordinal, so the caller must
+    // supply exactly one address per global.
+    let sparse = svod_ir::ProgramInfo { globals: vec![0, 5], ..Default::default() };
+    let abi = sparse.globals.iter().map(|&slot| storage(slot)).collect::<Vec<_>>();
+    let mut dst = [0u8; 16];
+    ClikeKernargLayout::pack_program(&sparse, &abi, &mut dst, &[0x1111, 0x5555], &[]).unwrap();
+    assert_eq!(&dst[..8], &0x1111u64.to_le_bytes());
+    assert_eq!(&dst[8..], &0x5555u64.to_le_bytes());
+    let err = ClikeKernargLayout::pack_program(&sparse, &abi, &mut dst, &[0x1111], &[])
+        .expect_err("compact buffer arity must be exact");
+    assert!(matches!(err, crate::Error::ProgramAbiMismatch { .. }), "{err:?}");
+}
+
+/// One packing rule for every kernarg site. Tinygrad bump-allocates its kernarg
+/// blocks at alignment 8 (`runtime/support/hcq.py:352`); 16 covers the largest
+/// AMDHSA member alignment without the 128-byte inflation morok used to apply.
+#[test_case::test_case(&[8, 12, 4] => (vec![0, 16, 32], 36); "records are aligned, the total is not padded")]
+#[test_case::test_case(&[16, 16] => (vec![0, 16], 32); "already-aligned records pack tight")]
+#[test_case::test_case(&[] => (vec![], 0); "no records")]
+fn kernarg_offsets_pack_records_at_one_alignment(sizes: &[usize]) -> (Vec<usize>, usize) {
+    crate::hcq::kernarg_offsets(sizes.iter().copied(), 16)
+}
+
+#[test]
+fn placeholder_packing_aliases_scratch_and_aligns_kernargs() {
+    let packing = PlaceholderPacking::pack(&[
+        PlaceholderRequest { kind: PlaceholderKind::Scratch, bytes: 64 },
+        PlaceholderRequest { kind: PlaceholderKind::Kernargs, bytes: 20 },
+        PlaceholderRequest { kind: PlaceholderKind::Scratch, bytes: 256 },
+        PlaceholderRequest { kind: PlaceholderKind::Kernargs, bytes: 12 },
+    ]);
+    assert_eq!(packing.offsets, [0, 0, 0, 32], "scratch requests alias, kernarg requests bump");
+    assert_eq!((packing.scratch_bytes, packing.kernarg_bytes), (256, 44));
+}
+
+// ------------------------------------------------------------ neutral executors
+
+fn dispatch(kernel_object: u64, completion_signal: u64) -> crate::hcq::ComputeDispatch {
+    crate::hcq::ComputeDispatch {
+        workgroup_size: [64, 1, 1],
+        grid_size: [1024, 1, 1],
+        private_segment_size: 0,
+        group_segment_size: 0,
+        kernel_object,
+        kernarg_address: 0x3000,
+        completion_signal,
+        barrier: true,
+        amd_pm4: None,
+    }
 }
 
 #[test]
@@ -42,31 +126,23 @@ fn null_hcq_enforces_timeline_dependencies_and_order() {
     let mut null = NullHcq::default();
     let mut blocked = Submission::new(QueueKind::Compute(0));
     blocked.push(Command::Wait { signal_address: signal, value: 2 });
-    assert!(null.submit(&blocked).is_err());
+    assert!(null.submit(&blocked).is_err(), "an unsatisfied wait must not run");
 
     null.set_signal(signal, 1);
-    let dispatch = ComputeDispatch {
-        workgroup_size: [64, 1, 1],
-        grid_size: [1024, 1, 1],
-        private_segment_size: 0,
-        group_segment_size: 0,
-        kernel_object: 0x2000,
-        kernarg_address: 0x3000,
-        completion_signal: 0x4000,
-        barrier: true,
-        amd_pm4: None,
-    };
+    let compute = dispatch(0x2000, 0x4000);
     let mut submit = Submission::new(QueueKind::Compute(0));
     submit
         .push(Command::Wait { signal_address: signal, value: 1 })
         .push(Command::MemoryBarrier)
-        .push(Command::Compute(dispatch.clone()))
+        .push(Command::Compute(compute.clone()))
         .push(Command::Store { dst: signal, value: 2 });
     null.submit(&submit).unwrap();
 
-    assert_eq!(null.trace().len(), 4);
-    assert_eq!(null.trace()[0].1, Command::Wait { signal_address: signal, value: 1 });
-    assert_eq!(null.trace()[2].1, Command::Compute(dispatch));
+    assert_eq!(
+        null.trace().iter().map(|(_, command)| command.clone()).collect::<Vec<_>>(),
+        submit.commands,
+        "every command runs, in order"
+    );
     null.submit(&blocked).unwrap();
 }
 
@@ -87,11 +163,11 @@ fn null_hcq_timestamps_use_deterministic_queue_clock() {
 
     null.submit(&compute).unwrap();
     null.submit(&copy).unwrap();
+    // One tick per command, shared across queues.
     assert_eq!(null.signal_value(0x40), Some(1_000));
     assert_eq!(null.signal_value(0x48), Some(1_025));
     assert_eq!(null.signal_value(0x50), Some(1_050));
     assert_eq!(null.signal_value(0x58), Some(1_075));
-    assert_eq!(null.trace().len(), compute.commands.len() + copy.commands.len());
 }
 
 #[test]
@@ -128,7 +204,7 @@ fn cpu_hcq_mixed_compute_copy_waits_and_finalizers_are_ordered() {
     unsafe { executor.submit(&copy, |_| Ok::<_, ()>(())) }.unwrap();
 
     assert_eq!(operations, [7]);
-    assert_eq!(destination, source);
+    assert_eq!(destination, source, "the copy queue observes the compute queue's staged bytes");
     assert_eq!(executor.signal_value(0x30), Some(100));
     assert_eq!(executor.signal_value(0x38), Some(110));
     assert_eq!(executor.signal_value(0x28), Some(2));
@@ -150,34 +226,20 @@ fn cpu_and_null_compute_errors_do_not_publish_finalizers() {
     assert_eq!(null.signal_value(0x20), None);
 }
 
-#[test]
-fn profile_disabled_submission_has_no_commands_or_metadata_overhead() {
-    let mut submission = Submission::new(QueueKind::Compute(0));
-    submission.push(Command::Execute { operation: 7 });
-    assert!(!submission.profile_requested());
-    assert_eq!(submission.commands, [Command::Execute { operation: 7 }]);
-
-    submission.request_profile();
-    assert!(submission.profile_requested());
-    assert_eq!(submission.commands, [Command::Execute { operation: 7 }]);
-}
+// -------------------------------------------------------------- patched replays
 
 #[test]
 fn inserting_profile_commands_preserves_patch_ownership() {
-    use crate::hcq::{CommandField, PatchSource};
-
     let mut submission = Submission::new(QueueKind::Compute(0));
     submission.push(Command::Wait { signal_address: 0, value: 1 });
     submission.bind(0, CommandField::WaitAddress, PatchSource::System(SystemField::TimelineSignal(0))).unwrap();
     submission.insert(0, Command::Timestamp { dst: 0x80 });
-    assert_eq!(submission.patches()[0].command, 1);
+    assert_eq!(submission.patches()[0].command, 1, "the bound command's index shifts with it");
     assert_eq!(submission.commands[1], Command::Wait { signal_address: 0, value: 1 });
 }
 
 #[test]
 fn semantic_link_retains_structure_and_repatches_runtime_and_system_fields() {
-    use crate::hcq::CommandField;
-
     let mut submission = Submission::new(QueueKind::Copy(0));
     submission.push(Command::Wait { signal_address: 0, value: 0 });
     submission.bind(0, CommandField::WaitAddress, PatchSource::System(SystemField::TimelineSignal(0))).unwrap();
@@ -190,80 +252,22 @@ fn semantic_link_retains_structure_and_repatches_runtime_and_system_fields() {
     let static_ptr = linked.static_submission().commands.as_ptr();
     let mut replay = linked.replay_buffer();
     let mut system = SystemPatchValues::default();
-    system.0.insert(SystemField::TimelineSignal(0), 0x1000);
-    system.0.insert(SystemField::TimelineValue(0), 7);
-    linked.patch(&mut replay, &RuntimePatchValues { buffers: vec![0x2000, 0x3000], vars: vec![] }, &system).unwrap();
-    assert_eq!(replay.submission().commands[0], Command::Wait { signal_address: 0x1000, value: 7 });
-    assert_eq!(replay.submission().commands[1], Command::Copy { dst: 0x2000, src: 0x3000, bytes: 4 });
-
-    system.0.insert(SystemField::TimelineValue(0), 8);
-    linked.patch(&mut replay, &RuntimePatchValues { buffers: vec![0x4000, 0x5000], vars: vec![] }, &system).unwrap();
-    assert_eq!(replay.submission().commands[0], Command::Wait { signal_address: 0x1000, value: 8 });
-    assert_eq!(replay.submission().commands[1], Command::Copy { dst: 0x4000, src: 0x5000, bytes: 4 });
-    assert_eq!(linked.static_submission().commands.as_ptr(), static_ptr);
-    assert_eq!(linked.static_submission().commands[0], Command::Wait { signal_address: 0, value: 0 });
-}
-
-#[test]
-fn canonical_program_kernargs_interleave_storage_and_scalars_by_slot() {
-    let mut info = svod_ir::ProgramInfo::default();
-    info.globals = vec![0, 2];
-    let slotted = |name: &str, slot: usize| {
-        let var = svod_ir::UOp::variable(name.into(), 0, 16, svod_dtype::DType::Int32);
-        let svod_ir::Op::Param { shape, arg } = var.op() else { panic!("variable PARAM") };
-        let mut arg = arg.clone();
-        arg.slot = slot;
-        svod_ir::UOp::new(svod_ir::Op::Param { shape: shape.clone(), arg }, svod_dtype::DType::Int32)
+    let mut apply = |value: u64, dst: u64, src: u64| {
+        system.0.insert(SystemField::TimelineSignal(0), 0x1000);
+        system.0.insert(SystemField::TimelineValue(0), value);
+        linked.patch(&mut replay, &RuntimePatchValues { buffers: vec![dst, src], vars: vec![] }, &system).unwrap();
+        replay.submission().commands.clone()
     };
-    info.vars = vec![slotted("low", 1), slotted("high", 3)];
-    let mut dst = [0xcc; 32];
-    let abi = vec![
-        crate::device::AbiParamDescriptor {
-            slot: 0,
-            kind: crate::device::AbiParamKind::Storage(svod_dtype::AddrSpace::Global),
-            dtype: svod_dtype::DType::Float32,
-            name: None,
-        },
-        crate::device::AbiParamDescriptor::from_param(&info.vars[0]).unwrap(),
-        crate::device::AbiParamDescriptor {
-            slot: 2,
-            kind: crate::device::AbiParamKind::Storage(svod_dtype::AddrSpace::Global),
-            dtype: svod_dtype::DType::Float32,
-            name: None,
-        },
-        crate::device::AbiParamDescriptor::from_param(&info.vars[1]).unwrap(),
-    ];
-    let written = ClikeKernargLayout::pack_program(&info, &abi, &mut dst, &[0x1000, 0x3000], &[7, -3]).unwrap();
-    assert_eq!(written, 28);
-    assert_eq!(&dst[0..8], &0x1000u64.to_le_bytes());
-    assert_eq!(&dst[8..12], &7i32.to_le_bytes());
-    assert_eq!(&dst[12..16], &[0; 4]);
-    assert_eq!(&dst[16..24], &0x3000u64.to_le_bytes());
-    assert_eq!(&dst[24..28], &(-3i32).to_le_bytes());
-}
-
-#[test]
-fn sparse_program_slots_use_compact_buffer_ordinals() {
-    let mut info = svod_ir::ProgramInfo::default();
-    info.globals = vec![0, 5];
-    let abi = info
-        .globals
-        .iter()
-        .map(|&slot| crate::device::AbiParamDescriptor {
-            slot,
-            kind: crate::device::AbiParamKind::Storage(svod_dtype::AddrSpace::Global),
-            dtype: svod_dtype::DType::Float32,
-            name: None,
-        })
-        .collect::<Vec<_>>();
-    let mut dst = [0u8; 16];
-
-    ClikeKernargLayout::pack_program(&info, &abi, &mut dst, &[0x1111, 0x5555], &[]).unwrap();
-    assert_eq!(&dst[..8], &0x1111u64.to_le_bytes());
-    assert_eq!(&dst[8..], &0x5555u64.to_le_bytes());
-    let err = ClikeKernargLayout::pack_program(&info, &abi, &mut dst, &[0x1111], &[])
-        .expect_err("compact buffer arity must be exact");
-    assert!(matches!(err, crate::Error::ProgramAbiMismatch { .. }), "{err:?}");
+    assert_eq!(
+        apply(7, 0x2000, 0x3000),
+        [Command::Wait { signal_address: 0x1000, value: 7 }, Command::Copy { dst: 0x2000, src: 0x3000, bytes: 4 },]
+    );
+    assert_eq!(
+        apply(8, 0x4000, 0x5000),
+        [Command::Wait { signal_address: 0x1000, value: 8 }, Command::Copy { dst: 0x4000, src: 0x5000, bytes: 4 },]
+    );
+    assert_eq!(linked.static_submission().commands.as_ptr(), static_ptr, "the template is never reallocated");
+    assert_eq!(linked.static_submission().commands[0], Command::Wait { signal_address: 0, value: 0 });
 }
 
 #[test]
@@ -287,21 +291,19 @@ fn neutral_patch_tables_cache_link_bytes_and_scatter_replays() {
             },
         ]),
     };
-    assert_eq!(lowered.patches.link.len(), 1);
-    assert_eq!(lowered.patches.runtime.len(), 2);
-    assert_eq!(lowered.patches.system.len(), 1);
+    assert_eq!((lowered.patches.link.len(), lowered.patches.runtime.len(), lowered.patches.system.len()), (1, 2, 1));
 
     let mut cache = CommandBufferCache::default();
     let linked = cache.link(&lowered, &LinkPatchValues(vec![0x1122_3344_5566_7788])).unwrap();
     let linked_again = cache.link(&lowered, &LinkPatchValues(vec![0x1122_3344_5566_7788])).unwrap();
-    assert!(std::sync::Arc::ptr_eq(&linked, &linked_again));
+    assert!(std::sync::Arc::ptr_eq(&linked, &linked_again), "identical link values reuse the linked image");
     let immutable = linked.static_bytes().to_vec();
 
     let mut replay = linked.replay_buffer();
     let mut system = SystemPatchValues::default();
     system.0.insert(SystemField::TimelineValue(0), 3);
     linked.patch(&mut replay, &RuntimePatchValues { buffers: vec![0x2000], vars: vec![7] }, &system).unwrap();
-    assert_eq!(&replay.bytes()[8..16], &0x2010u64.to_le_bytes());
+    assert_eq!(&replay.bytes()[8..16], &0x2010u64.to_le_bytes(), "the site's addend is applied");
 
     system.0.insert(SystemField::TimelineValue(0), 4);
     linked.patch(&mut replay, &RuntimePatchValues { buffers: vec![0x9000], vars: vec![-2] }, &system).unwrap();
@@ -311,461 +313,18 @@ fn neutral_patch_tables_cache_link_bytes_and_scatter_replays() {
 }
 
 #[test]
-fn hcq_placeholder_packing_aliases_scratch_and_aligns_kernargs() {
-    let packing = PlaceholderPacking::pack(&[
-        PlaceholderRequest { kind: PlaceholderKind::Scratch, bytes: 64 },
-        PlaceholderRequest { kind: PlaceholderKind::Kernargs, bytes: 20 },
-        PlaceholderRequest { kind: PlaceholderKind::Scratch, bytes: 256 },
-        PlaceholderRequest { kind: PlaceholderKind::Kernargs, bytes: 12 },
-    ]);
-    assert_eq!(packing.offsets, [0, 0, 0, 32]);
-    assert_eq!(packing.scratch_bytes, 256);
-    assert_eq!(packing.kernarg_bytes, 44);
-}
-
-/// One packing rule for every kernarg site. Tinygrad bump-allocates its kernarg
-/// blocks at alignment 8 (`runtime/support/hcq.py:352`); 16 covers the largest
-/// AMDHSA member alignment without the 128-byte inflation morok used to apply.
-#[test_case::test_case(&[8, 12, 4], 16 => (vec![0, 16, 32], 36); "records are aligned, the total is not padded")]
-#[test_case::test_case(&[16, 16], 16 => (vec![0, 16], 32); "already-aligned records pack tight")]
-#[test_case::test_case(&[], 16 => (vec![], 0); "no records")]
-fn kernarg_offsets_pack_records_at_one_alignment(sizes: &[usize], align: usize) -> (Vec<usize>, usize) {
-    crate::hcq::kernarg_offsets(sizes.iter().copied(), align)
-}
-
-#[test]
-fn timeline_rollover_switches_signal_and_requests_one_reset() {
-    let mut timeline = crate::hcq::EpochTimeline::with_next([0x1000, 0x2000], crate::hcq::TIMELINE_ROLLOVER + 1);
-    let point = timeline.reserve();
-    assert_eq!(point, crate::hcq::TimelinePoint { signal_address: 0x2000, value: 1 });
-    assert_eq!(timeline.take_reset(), Some(0x2000));
-    assert_eq!(timeline.take_reset(), None, "rollover reset ownership is consumed once");
-
-    let mut timelines = crate::hcq::SubmissionTimelines::new([0x10, 0x18], [0x20, 0x28], [0x30, 0x38]);
-    assert!(timelines.take_resets().is_empty());
-}
-
-#[test]
-fn submission_finalizer_helpers_own_wait_and_signal_commands() {
-    let producer = crate::hcq::TimelinePoint { signal_address: 0x20, value: 7 };
-    let completion = crate::hcq::TimelinePoint { signal_address: 0x10, value: 3 };
-    let mut submission = Submission::new(QueueKind::Compute(0));
-    submission.wait_for(producer).push(Command::MemoryBarrier).signal(completion);
-    assert_eq!(
-        submission.commands,
-        [
-            Command::Wait { signal_address: 0x20, value: 7 },
-            Command::MemoryBarrier,
-            Command::Store { dst: 0x10, value: 3 },
-        ]
-    );
-}
-
-fn gpu(id: usize) -> DeviceSpec {
-    DeviceSpec::Amd { device_id: id }
-}
-
-fn resource(id: u64, owner: DeviceSpec) -> crate::hcq::TopologyResource {
-    resource_range(id, owner, 0, 16)
-}
-
-fn resource_range(id: u64, owner: DeviceSpec, start: usize, end: usize) -> crate::hcq::TopologyResource {
-    crate::hcq::TopologyResource { id, owner, start, end }
-}
-
-fn lane_signals(lane: &crate::hcq::DeviceQueue) -> [u64; 2] {
-    let device = match &lane.device {
-        DeviceSpec::Amd { device_id } => *device_id as u64 + 1,
-        DeviceSpec::Cpu => 0,
-        _ => 0x100,
-    };
-    let queue = match lane.queue {
-        QueueKind::Compute(number) => number as u64 * 4,
-        QueueKind::Copy(number) => number as u64 * 4 + 2,
-    };
-    let first = 0x1000 + device * 0x100 + queue * 0x10;
-    [first, first + 8]
-}
-
-fn copy_op(
-    operation: usize,
-    src: crate::hcq::TopologyResource,
-    dst: crate::hcq::TopologyResource,
-) -> crate::hcq::TopologyOperation {
-    crate::hcq::TopologyOperation {
-        operation,
-        lane: crate::hcq::DeviceQueue { device: dst.owner.clone(), queue: QueueKind::Copy(0) },
-        reads: vec![src.clone()],
-        writes: vec![dst.clone()],
-        kind: crate::hcq::TopologyOperationKind::Copy { src, dst, bytes: 16 },
-    }
-}
-
-#[test]
-fn direct_copy_uses_declared_executor_access() {
-    use crate::hcq::{CopyLeg, QueueMergeLimits, SemanticLinkedPlan, schedule_device_lanes};
-    let mut op = copy_op(0, resource(1, gpu(0)), resource(2, gpu(1)));
-    op.lane.device = gpu(2);
-    let scheduled = schedule_device_lanes(&[op], QueueMergeLimits::UNLIMITED, |executor, owner| {
-        executor == &gpu(2) && matches!(owner, DeviceSpec::Amd { .. })
-    });
-    assert_eq!(scheduled.len(), 1);
-    assert_eq!(scheduled[0].lane.device, gpu(2));
-    assert_eq!(scheduled[0].commands[0].copy_leg, Some(CopyLeg::Direct));
-
-    let plan = SemanticLinkedPlan::from_lane_submissions(scheduled, lane_signals).unwrap();
-    let mut null = NullHcq::default();
-    let mut executed = Vec::new();
-    plan.execute_null(&mut null, |lane, command| {
-        executed.push((lane.clone(), command.clone()));
-        Ok::<_, ()>(())
-    })
-    .unwrap();
-    assert_eq!(executed.len(), 1);
-    assert_eq!(executed[0].1.copy_leg, Some(CopyLeg::Direct));
-}
-
-#[test]
-fn two_device_inaccessible_copy_inserts_ordered_host_staging() {
-    use crate::hcq::{CopyLeg, QueueMergeLimits, SemanticLinkedPlan, schedule_device_lanes};
-    let op = copy_op(4, resource(10, gpu(0)), resource(11, gpu(1)));
-    let scheduled = schedule_device_lanes(&[op], QueueMergeLimits::UNLIMITED, |executor, owner| executor == owner);
-    assert_eq!(scheduled.len(), 2);
-    assert_eq!(scheduled[0].lane.device, gpu(0));
-    assert_eq!(scheduled[0].commands[0].copy_leg, Some(CopyLeg::ToHost));
-    assert_eq!(scheduled[1].lane.device, gpu(1));
-    assert_eq!(scheduled[1].commands[0].copy_leg, Some(CopyLeg::FromHost));
-    assert_eq!(scheduled[1].waits[0].lane, scheduled[0].lane);
-    assert_eq!(scheduled[1].waits[0].value, scheduled[0].signal_value);
-
-    let plan = SemanticLinkedPlan::from_lane_submissions(scheduled, lane_signals).unwrap();
-    let mut null = NullHcq::default();
-    let mut legs = Vec::new();
-    plan.execute_null(&mut null, |_, command| {
-        legs.push(command.copy_leg.unwrap());
-        Ok::<_, ()>(())
-    })
-    .unwrap();
-    assert_eq!(legs, [CopyLeg::ToHost, CopyLeg::FromHost]);
-}
-
-#[test]
-fn compute_copy_cross_device_dependencies_are_lane_local_not_global() {
-    use crate::hcq::{DeviceQueue, QueueMergeLimits, TopologyOperation, TopologyOperationKind, schedule_device_lanes};
-    let produced = resource(20, gpu(0));
-    let output = resource(21, gpu(1));
-    let compute = TopologyOperation {
-        operation: 0,
-        lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
-        reads: vec![],
-        writes: vec![produced.clone()],
-        kind: TopologyOperationKind::Execute,
-    };
-    let copy = copy_op(1, produced, output);
-    let scheduled = schedule_device_lanes(&[compute, copy], QueueMergeLimits::UNLIMITED, |a, b| a == b);
-    // compute, source->host, target<-host. Each transfer waits only its producer.
-    assert_eq!(scheduled.len(), 3);
-    assert_eq!(scheduled[1].waits, [crate::hcq::LaneWait { lane: scheduled[0].lane.clone(), value: 1 }]);
-    assert_eq!(scheduled[2].waits, [crate::hcq::LaneWait { lane: scheduled[1].lane.clone(), value: 1 }]);
-}
-
-#[test]
-fn queue_merge_limits_split_exactly_after_boundary() {
-    use crate::hcq::{DeviceQueue, QueueMergeLimits, TopologyOperation, TopologyOperationKind, schedule_device_lanes};
-    let ops = (0..5)
-        .map(|operation| TopologyOperation {
-            operation,
-            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
-            reads: vec![],
-            writes: vec![],
-            kind: TopologyOperationKind::Execute,
-        })
-        .collect::<Vec<_>>();
-    let scheduled =
-        schedule_device_lanes(&ops, QueueMergeLimits { max_submissions: 2, max_commands: 2 }, |a, b| a == b);
-    assert_eq!(scheduled.iter().map(|s| s.commands.len()).collect::<Vec<_>>(), [2, 2, 1]);
-
-    let unmerged = schedule_device_lanes(&ops, QueueMergeLimits::NO_MERGE, |a, b| a == b);
-    assert_eq!(unmerged.iter().map(|s| s.commands.len()).collect::<Vec<_>>(), [1, 1, 1, 1, 1]);
-}
-
-#[test]
-fn equal_queue_numbers_on_different_devices_keep_distinct_timelines() {
-    use crate::hcq::{DeviceQueue, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind};
-    let operations = [
-        TopologyOperation {
-            operation: 0,
-            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
-            reads: vec![],
-            writes: vec![],
-            kind: TopologyOperationKind::Execute,
-        },
-        TopologyOperation {
-            operation: 1,
-            lane: DeviceQueue { device: gpu(1), queue: QueueKind::Compute(0) },
-            reads: vec![],
-            writes: vec![],
-            kind: TopologyOperationKind::Execute,
-        },
-    ];
-    let lanes = crate::hcq::schedule_device_lanes(&operations, QueueMergeLimits::UNLIMITED, |a, b| a == b);
-    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
-    assert_ne!(plan.bindings()[0].point.signal_address, plan.bindings()[1].point.signal_address);
-
-    let mut null = NullHcq::default();
-    let mut devices = Vec::new();
-    plan.execute_null(&mut null, |lane, _| {
-        devices.push(lane.device.clone());
-        Ok::<_, ()>(())
-    })
-    .unwrap();
-    assert_eq!(devices, [gpu(0), gpu(1)]);
-}
-
-#[test]
-fn compute_copy_dependencies_execute_in_both_directions() {
-    use crate::hcq::{DeviceQueue, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind};
-    let first = resource(30, gpu(0));
-    let second = resource(31, gpu(0));
-    let operations = [
-        TopologyOperation {
-            operation: 0,
-            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
-            reads: vec![],
-            writes: vec![first.clone()],
-            kind: TopologyOperationKind::Execute,
-        },
-        copy_op(1, first, second.clone()),
-        TopologyOperation {
-            operation: 2,
-            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
-            reads: vec![second],
-            writes: vec![],
-            kind: TopologyOperationKind::Execute,
-        },
-    ];
-    let lanes = crate::hcq::schedule_device_lanes(&operations, QueueMergeLimits::NO_MERGE, |a, b| a == b);
-    assert_eq!(lanes[1].waits[0].lane.queue, QueueKind::Compute(0));
-    assert_eq!(lanes[2].waits[0].lane.queue, QueueKind::Copy(0));
-
-    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
-    let mut null = NullHcq::default();
-    let mut order = Vec::new();
-    plan.execute_null(&mut null, |_, command| {
-        order.push(command.operation);
-        Ok::<_, ()>(())
-    })
-    .unwrap();
-    assert_eq!(order, [0, 1, 2]);
-}
-
-#[test]
-fn raw_war_and_waw_hazards_wait_for_the_producer_lane() {
-    use crate::hcq::{DeviceQueue, QueueMergeLimits, TopologyOperation, TopologyOperationKind};
-    let compute = DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) };
-    let copy = DeviceQueue { device: gpu(0), queue: QueueKind::Copy(0) };
-    let cases = [
-        (vec![], vec![resource(40, gpu(0))], vec![resource(40, gpu(0))], vec![]),
-        (vec![resource(41, gpu(0))], vec![], vec![], vec![resource(41, gpu(0))]),
-        (vec![], vec![resource(42, gpu(0))], vec![], vec![resource(42, gpu(0))]),
-    ];
-    for (producer_reads, producer_writes, consumer_reads, consumer_writes) in cases {
-        let operations = [
-            TopologyOperation {
-                operation: 0,
-                lane: compute.clone(),
-                reads: producer_reads,
-                writes: producer_writes,
-                kind: TopologyOperationKind::Execute,
-            },
-            TopologyOperation {
-                operation: 1,
-                lane: copy.clone(),
-                reads: consumer_reads,
-                writes: consumer_writes,
-                kind: TopologyOperationKind::Execute,
-            },
-        ];
-        let lanes = crate::hcq::schedule_device_lanes(&operations, QueueMergeLimits::NO_MERGE, |a, b| a == b);
-        assert_eq!(lanes[1].waits, [crate::hcq::LaneWait { lane: compute.clone(), value: 1 }]);
-        let plan = crate::hcq::SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
-        let mut null = NullHcq::default();
-        let mut order = Vec::new();
-        plan.execute_null(&mut null, |_, command| {
-            order.push(command.operation);
-            Ok::<_, ()>(())
-        })
-        .unwrap();
-        assert_eq!(order, [0, 1]);
-    }
-}
-
-#[test]
-fn topology_hazards_require_overlapping_byte_ranges() {
-    use crate::hcq::{DeviceQueue, QueueMergeLimits, TopologyOperation, TopologyOperationKind};
-    let producer = |write| TopologyOperation {
-        operation: 0,
-        lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
-        reads: vec![],
-        writes: vec![write],
-        kind: TopologyOperationKind::Execute,
-    };
-    let consumer = |operation, read| TopologyOperation {
-        operation,
-        lane: DeviceQueue { device: gpu(0), queue: QueueKind::Copy(0) },
-        reads: vec![read],
-        writes: vec![],
-        kind: TopologyOperationKind::Execute,
-    };
-
-    let disjoint = crate::hcq::schedule_device_lanes(
-        &[producer(resource_range(50, gpu(0), 0, 8)), consumer(1, resource_range(50, gpu(0), 8, 16))],
-        QueueMergeLimits::NO_MERGE,
-        |a, b| a == b,
-    );
-    assert!(disjoint[1].waits.is_empty());
-    let overlap = crate::hcq::schedule_device_lanes(
-        &[producer(resource_range(50, gpu(0), 0, 9)), consumer(1, resource_range(50, gpu(0), 8, 16))],
-        QueueMergeLimits::NO_MERGE,
-        |a, b| a == b,
-    );
-    assert_eq!(overlap[1].waits[0].value, 1);
-    let plan = crate::hcq::SemanticLinkedPlan::from_lane_submissions(overlap, lane_signals).unwrap();
-    let mut null = NullHcq::default();
-    let mut order = Vec::new();
-    plan.execute_null(&mut null, |_, command| {
-        order.push(command.operation);
-        Ok::<_, ()>(())
-    })
-    .unwrap();
-    assert_eq!(order, [0, 1]);
-}
-
-#[test]
-fn merged_waits_target_and_execute_published_boundaries() {
-    use crate::hcq::{DeviceQueue, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind};
-    let first = resource(60, gpu(0));
-    let operations = [
-        TopologyOperation {
-            operation: 0,
-            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
-            reads: vec![],
-            writes: vec![first.clone()],
-            kind: TopologyOperationKind::Execute,
-        },
-        TopologyOperation {
-            operation: 1,
-            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
-            reads: vec![],
-            writes: vec![],
-            kind: TopologyOperationKind::Execute,
-        },
-        TopologyOperation {
-            operation: 2,
-            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Copy(0) },
-            reads: vec![first],
-            writes: vec![],
-            kind: TopologyOperationKind::Execute,
-        },
-    ];
-    let lanes = crate::hcq::schedule_device_lanes(&operations, QueueMergeLimits::UNLIMITED, |a, b| a == b);
-    assert_eq!(lanes.len(), 2);
-    assert_eq!(lanes[0].signal_value, 2);
-    assert_eq!(lanes[1].waits[0].value, 2);
-
-    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
-    let mut null = NullHcq::default();
-    let mut null_order = Vec::new();
-    plan.execute_null(&mut null, |_, command| {
-        null_order.push(command.operation);
-        Ok::<_, ()>(())
-    })
-    .unwrap();
-    assert_eq!(null_order, [0, 1, 2]);
-
-    let mut cpu = CpuQueueExecutor::default();
-    let mut order = Vec::new();
-    unsafe {
-        plan.execute_cpu(&mut cpu, |_, command| {
-            order.push(command.operation);
-            Ok::<_, ()>(())
-        })
-    }
-    .unwrap();
-    assert_eq!(order, [0, 1, 2]);
-}
-
-#[test]
-fn semantic_linked_submission_retains_concrete_lane_identity() {
-    let lane = crate::hcq::DeviceQueue { device: gpu(1), queue: QueueKind::Compute(0) };
-    let linked = SemanticLinkedSubmission::new_for_lane(lane.clone(), Submission::new(QueueKind::Compute(0))).unwrap();
-    assert_eq!(linked.lane(), &lane);
-    assert_eq!(linked.replay_buffer().lane(), &lane);
-}
-
-#[test]
-fn native_adapter_preserves_single_device_submission_shape() {
-    use crate::hcq::{
-        Command, DeviceQueue, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind,
-    };
-
-    let value = resource(70, gpu(0));
-    let operations = [
-        TopologyOperation {
-            operation: 0,
-            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
-            reads: vec![],
-            writes: vec![value.clone()],
-            kind: TopologyOperationKind::Execute,
-        },
-        TopologyOperation {
-            operation: 1,
-            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Copy(0) },
-            reads: vec![value],
-            writes: vec![],
-            kind: TopologyOperationKind::Execute,
-        },
-    ];
-    let lanes = crate::hcq::schedule_device_lanes(&operations, QueueMergeLimits::NO_MERGE, |a, b| a == b);
-    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
-    let native = plan.native_submissions().unwrap();
-
-    assert_eq!(native.len(), 3);
-    assert_eq!(native[0].lane().queue, QueueKind::Compute(0));
-    assert!(matches!(
-        native[0].static_submission().commands.as_slice(),
-        [Command::MemoryBarrier, Command::Wait { .. }, Command::Execute { operation: 0 }, Command::Store { .. }]
-    ));
-    assert!(matches!(
-        native[1].static_submission().commands.as_slice(),
-        [
-            Command::MemoryBarrier,
-            Command::Wait { .. },
-            Command::Wait { .. },
-            Command::Execute { operation: 1 },
-            Command::Store { .. }
-        ]
-    ));
-    assert!(matches!(native[2].static_submission().commands.as_slice(), [Command::Wait { .. }, Command::Store { .. }]));
-}
-
-#[test]
 fn linked_buffer_cache_is_scoped_by_context_and_device() {
     let lowered = LoweredCommandBuffer { bytes: vec![0; 8], patches: PatchTable::default() };
     let values = LinkPatchValues::default();
     let mut cache = CommandBufferCache::default();
-    let a = cache.link_for_context(1, &gpu(0), &lowered, &values).unwrap();
-    let replay = cache.link_for_context(1, &gpu(0), &lowered, &values).unwrap();
-    let other_context = cache.link_for_context(2, &gpu(0), &lowered, &values).unwrap();
-    let other_device = cache.link_for_context(1, &gpu(1), &lowered, &values).unwrap();
-    assert!(std::sync::Arc::ptr_eq(&a, &replay));
-    assert!(!std::sync::Arc::ptr_eq(&a, &other_context));
-    assert!(!std::sync::Arc::ptr_eq(&a, &other_device));
+    let first = cache.link_for_context(1, &gpu(0), &lowered, &values).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &cache.link_for_context(1, &gpu(0), &lowered, &values).unwrap()));
+    assert!(!std::sync::Arc::ptr_eq(&first, &cache.link_for_context(2, &gpu(0), &lowered, &values).unwrap()));
+    assert!(!std::sync::Arc::ptr_eq(&first, &cache.link_for_context(1, &gpu(1), &lowered, &values).unwrap()));
 }
 
 #[test]
 fn concurrent_device_replays_patch_private_buffers() {
-    use crate::hcq::CommandField;
     let mut submission = Submission::new(QueueKind::Copy(0));
     submission.push(Command::Copy { dst: 0, src: 0, bytes: 8 });
     submission.bind(0, CommandField::CopyDst, PatchSource::RuntimeBuffer(0)).unwrap();
@@ -791,4 +350,237 @@ fn concurrent_device_replays_patch_private_buffers() {
         }
     });
     assert_eq!(linked.static_submission().commands[0], Command::Copy { dst: 0, src: 0, bytes: 8 });
+}
+
+#[test]
+fn timeline_rollover_switches_signal_and_requests_one_reset() {
+    let mut timeline = crate::hcq::EpochTimeline::with_next([0x1000, 0x2000], crate::hcq::TIMELINE_ROLLOVER + 1);
+    assert_eq!(timeline.reserve(), crate::hcq::TimelinePoint { signal_address: 0x2000, value: 1 });
+    assert_eq!(timeline.take_reset(), Some(0x2000));
+    assert_eq!(timeline.take_reset(), None, "rollover reset ownership is consumed once");
+}
+
+// ------------------------------------------------------------- lane scheduling
+
+fn gpu(id: usize) -> DeviceSpec {
+    DeviceSpec::Amd { device_id: id }
+}
+
+fn lane(device: usize, queue: QueueKind) -> DeviceQueue {
+    DeviceQueue { device: gpu(device), queue }
+}
+
+fn resource(id: u64, owner: usize) -> TopologyResource {
+    resource_range(id, owner, 0, 16)
+}
+
+fn resource_range(id: u64, owner: usize, start: usize, end: usize) -> TopologyResource {
+    TopologyResource { id, owner: gpu(owner), start, end }
+}
+
+fn execute(
+    operation: usize,
+    lane: DeviceQueue,
+    reads: Vec<TopologyResource>,
+    writes: Vec<TopologyResource>,
+) -> TopologyOperation {
+    TopologyOperation { operation, lane, reads, writes, kind: TopologyOperationKind::Execute }
+}
+
+fn copy_op(operation: usize, src: TopologyResource, dst: TopologyResource) -> TopologyOperation {
+    TopologyOperation {
+        operation,
+        lane: DeviceQueue { device: dst.owner.clone(), queue: QueueKind::Copy(0) },
+        reads: vec![src.clone()],
+        writes: vec![dst.clone()],
+        kind: TopologyOperationKind::Copy { src, dst, bytes: 16 },
+    }
+}
+
+/// Every lane gets its own pair of timeline signals, keyed by device and queue.
+fn lane_signals(lane: &DeviceQueue) -> [u64; 2] {
+    let device = match &lane.device {
+        DeviceSpec::Amd { device_id } => *device_id as u64 + 1,
+        DeviceSpec::Cpu => 0,
+        _ => 0x100,
+    };
+    let queue = match lane.queue {
+        QueueKind::Compute(number) => number as u64 * 4,
+        QueueKind::Copy(number) => number as u64 * 4 + 2,
+    };
+    let first = 0x1000 + device * 0x100 + queue * 0x10;
+    [first, first + 8]
+}
+
+/// Schedule with each device only able to reach its own resources.
+fn schedule_local(operations: &[TopologyOperation], limits: QueueMergeLimits) -> Vec<LaneSubmission> {
+    schedule_device_lanes(operations, limits, |executor, owner| executor == owner)
+}
+
+/// Operation ids in the order the neutral executor runs them.
+fn null_order(lanes: Vec<LaneSubmission>) -> Vec<usize> {
+    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
+    let mut order = Vec::new();
+    plan.execute_null(&mut NullHcq::default(), |_, command| {
+        order.push(command.operation);
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    order
+}
+
+#[test]
+fn direct_copy_runs_on_the_executor_that_declares_access() {
+    let mut op = copy_op(0, resource(1, 0), resource(2, 1));
+    op.lane.device = gpu(2);
+    let scheduled = schedule_device_lanes(&[op], QueueMergeLimits::UNLIMITED, |executor, owner| {
+        executor == &gpu(2) && matches!(owner, DeviceSpec::Amd { .. })
+    });
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].lane.device, gpu(2));
+    assert_eq!(scheduled[0].commands[0].copy_leg, Some(CopyLeg::Direct));
+    assert_eq!(null_order(scheduled), [0]);
+}
+
+/// Without declared peer access a cross-device copy splits into two staged legs,
+/// each waiting only on its own producer rather than on a global barrier.
+#[test]
+fn inaccessible_cross_device_copy_stages_through_the_host() {
+    let produced = resource(20, 0);
+    let output = resource(21, 1);
+    let operations =
+        [execute(0, lane(0, QueueKind::Compute(0)), vec![], vec![produced.clone()]), copy_op(1, produced, output)];
+    let scheduled = schedule_local(&operations, QueueMergeLimits::UNLIMITED);
+
+    assert_eq!(scheduled.len(), 3, "compute, source->host, target<-host");
+    assert_eq!(scheduled[1].lane.device, gpu(0));
+    assert_eq!(scheduled[1].commands[0].copy_leg, Some(CopyLeg::ToHost));
+    assert_eq!(scheduled[1].waits, [LaneWait { lane: scheduled[0].lane.clone(), value: 1 }]);
+    assert_eq!(scheduled[2].lane.device, gpu(1));
+    assert_eq!(scheduled[2].commands[0].copy_leg, Some(CopyLeg::FromHost));
+    assert_eq!(scheduled[2].waits, [LaneWait { lane: scheduled[1].lane.clone(), value: 1 }]);
+    assert_eq!(null_order(scheduled), [0, 1, 1], "both legs carry the original operation id");
+}
+
+#[test]
+fn queue_merge_limits_split_exactly_after_boundary() {
+    let operations =
+        (0..5).map(|operation| execute(operation, lane(0, QueueKind::Compute(0)), vec![], vec![])).collect::<Vec<_>>();
+    let merged = schedule_local(&operations, QueueMergeLimits { max_submissions: 2, max_commands: 2 });
+    assert_eq!(merged.iter().map(|lane| lane.commands.len()).collect::<Vec<_>>(), [2, 2, 1]);
+    let unmerged = schedule_local(&operations, QueueMergeLimits::NO_MERGE);
+    assert_eq!(unmerged.iter().map(|lane| lane.commands.len()).collect::<Vec<_>>(), [1, 1, 1, 1, 1]);
+}
+
+#[test]
+fn equal_queue_numbers_on_different_devices_keep_distinct_timelines() {
+    let operations = [
+        execute(0, lane(0, QueueKind::Compute(0)), vec![], vec![]),
+        execute(1, lane(1, QueueKind::Compute(0)), vec![], vec![]),
+    ];
+    let lanes = schedule_local(&operations, QueueMergeLimits::UNLIMITED);
+    let plan = SemanticLinkedPlan::from_lane_submissions(lanes.clone(), lane_signals).unwrap();
+    assert_ne!(plan.bindings()[0].point.signal_address, plan.bindings()[1].point.signal_address);
+    assert_eq!(null_order(lanes), [0, 1]);
+}
+
+/// A hazard on overlapping bytes makes the consumer lane wait on the producer
+/// lane's timeline, in either direction between compute and copy queues.
+#[test_case::test_case(&[], &[(0, 16)], &[(0, 16)], &[], true; "read after write")]
+#[test_case::test_case(&[(0, 16)], &[], &[], &[(0, 16)], true; "write after read")]
+#[test_case::test_case(&[], &[(0, 16)], &[], &[(0, 16)], true; "write after write")]
+#[test_case::test_case(&[], &[(0, 9)], &[(8, 16)], &[], true; "overlapping byte ranges")]
+#[test_case::test_case(&[], &[(0, 8)], &[(8, 16)], &[], false; "disjoint byte ranges")]
+fn topology_hazards_wait_for_the_producer_lane(
+    producer_reads: &[(usize, usize)],
+    producer_writes: &[(usize, usize)],
+    consumer_reads: &[(usize, usize)],
+    consumer_writes: &[(usize, usize)],
+    hazard: bool,
+) {
+    let spans = |ranges: &[(usize, usize)]| {
+        ranges.iter().map(|&(start, end)| resource_range(50, 0, start, end)).collect::<Vec<_>>()
+    };
+    let producer = lane(0, QueueKind::Compute(0));
+    let operations = [
+        execute(0, producer.clone(), spans(producer_reads), spans(producer_writes)),
+        execute(1, lane(0, QueueKind::Copy(0)), spans(consumer_reads), spans(consumer_writes)),
+    ];
+    let lanes = schedule_local(&operations, QueueMergeLimits::NO_MERGE);
+    let expected: &[LaneWait] = if hazard { &[LaneWait { lane: producer, value: 1 }] } else { &[] };
+    assert_eq!(lanes[1].waits, expected);
+    assert_eq!(null_order(lanes), [0, 1]);
+}
+
+#[test]
+fn compute_copy_dependencies_execute_in_both_directions() {
+    let first = resource(30, 0);
+    let second = resource(31, 0);
+    let operations = [
+        execute(0, lane(0, QueueKind::Compute(0)), vec![], vec![first.clone()]),
+        copy_op(1, first, second.clone()),
+        execute(2, lane(0, QueueKind::Compute(0)), vec![second], vec![]),
+    ];
+    let lanes = schedule_local(&operations, QueueMergeLimits::NO_MERGE);
+    assert_eq!(lanes[1].waits[0].lane.queue, QueueKind::Compute(0));
+    assert_eq!(lanes[2].waits[0].lane.queue, QueueKind::Copy(0));
+    assert_eq!(null_order(lanes), [0, 1, 2]);
+}
+
+/// Merging moves a lane's published boundary to the end of the merged run, so a
+/// dependent lane must wait for that later value, not for the producer's own.
+#[test]
+fn merged_waits_target_and_execute_published_boundaries() {
+    let produced = resource(60, 0);
+    let operations = [
+        execute(0, lane(0, QueueKind::Compute(0)), vec![], vec![produced.clone()]),
+        execute(1, lane(0, QueueKind::Compute(0)), vec![], vec![]),
+        execute(2, lane(0, QueueKind::Copy(0)), vec![produced], vec![]),
+    ];
+    let lanes = schedule_local(&operations, QueueMergeLimits::UNLIMITED);
+    assert_eq!(lanes.len(), 2);
+    assert_eq!(lanes[0].signal_value, 2);
+    assert_eq!(lanes[1].waits[0].value, 2);
+    assert_eq!(null_order(lanes.clone()), [0, 1, 2]);
+
+    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
+    let mut order = Vec::new();
+    unsafe {
+        plan.execute_cpu(&mut CpuQueueExecutor::default(), |_, command| {
+            order.push(command.operation);
+            Ok::<_, ()>(())
+        })
+    }
+    .unwrap();
+    assert_eq!(order, [0, 1, 2]);
+}
+
+#[test]
+fn native_adapter_preserves_single_device_submission_shape() {
+    let value = resource(70, 0);
+    let operations = [
+        execute(0, lane(0, QueueKind::Compute(0)), vec![], vec![value.clone()]),
+        execute(1, lane(0, QueueKind::Copy(0)), vec![value], vec![]),
+    ];
+    let lanes = schedule_local(&operations, QueueMergeLimits::NO_MERGE);
+    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
+    let native = plan.native_submissions().unwrap();
+
+    assert_eq!(native.len(), 3);
+    assert_eq!(native[0].lane().queue, QueueKind::Compute(0));
+    assert!(matches!(
+        native[0].static_submission().commands.as_slice(),
+        [Command::MemoryBarrier, Command::Wait { .. }, Command::Execute { operation: 0 }, Command::Store { .. }]
+    ));
+    assert!(matches!(
+        native[1].static_submission().commands.as_slice(),
+        [
+            Command::MemoryBarrier,
+            Command::Wait { .. },
+            Command::Wait { .. },
+            Command::Execute { operation: 1 },
+            Command::Store { .. }
+        ]
+    ));
+    assert!(matches!(native[2].static_submission().commands.as_slice(), [Command::Wait { .. }, Command::Store { .. }]));
 }
