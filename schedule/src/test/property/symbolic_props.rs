@@ -1,616 +1,260 @@
-//! Property tests for symbolic optimizer algebraic rules.
-//!
-//! Tests that pattern rewrites preserve semantics and follow algebraic laws.
+//! Property tests for the symbolic optimizer's algebraic rules: rewrites must preserve
+//! semantics and obey the laws they claim.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use svod_dtype::DType;
+use svod_dtype::{DType, ScalarDType};
 use svod_ir::types::{BinaryOp, ConstValue};
 use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::eval::{eval_binary_op, eval_binary_op_typed, eval_unary_op_typed};
 use svod_ir::uop::properties::VminVmaxProperty;
 use svod_ir::{Op, UOp};
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::{symbolic, symbolic_simple};
 
-// Import generators from ir crate
 use svod_ir::test::property::generators::*;
 
-// ============================================================================
-// Identity Elimination Properties
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1000))]
-
-    /// x + 0 should simplify to x
-    #[test]
-    fn identity_add_zero_right(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::native_const(0i32);
-        let expr = x.try_add(&zero).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &x),
-            "x + 0 should simplify to x");
+fn apply(op: BinaryOp, lhs: &Arc<UOp>, rhs: &Arc<UOp>) -> Arc<UOp> {
+    match op {
+        BinaryOp::Add => lhs.try_add(rhs),
+        BinaryOp::Sub => lhs.try_sub(rhs),
+        BinaryOp::Mul => lhs.try_mul(rhs),
+        BinaryOp::FloorDiv => lhs.try_div(rhs),
+        BinaryOp::And => lhs.try_and_op(rhs),
+        BinaryOp::Or => lhs.try_or_op(rhs),
+        BinaryOp::Xor => lhs.try_xor_op(rhs),
+        other => panic!("{other:?} has no constructor here"),
     }
-
-    /// 0 + x should simplify to x (commutativity)
-    #[test]
-    fn identity_add_zero_left(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::native_const(0i32);
-        let expr = zero.try_add(&x).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &x),
-            "0 + x should simplify to x");
-    }
-
-    /// x - 0 should simplify to x
-    #[test]
-    fn identity_sub_zero(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::native_const(0i32);
-        let expr = x.try_sub(&zero).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &x),
-            "x - 0 should simplify to x");
-    }
-
-    /// x * 1 should simplify to x
-    #[test]
-    fn identity_mul_one_right(x in arb_simple_uop(DType::Int32)) {
-        let one = UOp::native_const(1i32);
-        let expr = x.try_mul(&one).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &x),
-            "x * 1 should simplify to x");
-    }
-
-    /// 1 * x should simplify to x (commutativity)
-    #[test]
-    fn identity_mul_one_left(x in arb_simple_uop(DType::Int32)) {
-        let one = UOp::native_const(1i32);
-        let expr = one.try_mul(&x).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &x),
-            "1 * x should simplify to x");
-    }
-
-    /// x / 1 should simplify to x (integer division)
-    #[test]
-    fn identity_idiv_one(x in arb_simple_uop(DType::Int32)) {
-        let one = UOp::native_const(1i32);
-        let expr = x.try_div(&one).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &x),
-            "x / 1 should simplify to x");
-    }
-
-    /// x | 0 should simplify to x
-    #[test]
-    fn identity_or_zero_right(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::native_const(0i32);
-        let expr = x.try_or_op(&zero).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &x),
-            "x | 0 should simplify to x");
-    }
-
-    /// x ^ 0 should simplify to x
-    #[test]
-    fn identity_xor_zero_right(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::native_const(0i32);
-        let expr = x.try_xor_op(&zero).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &x),
-            "x ^ 0 should simplify to x");
-    }
+    .unwrap()
 }
 
-// ============================================================================
-// Zero Propagation Properties
-// ============================================================================
+/// `(op, identity, also_folds_on_the_left)`: `x op identity == x`.
+const IDENTITIES: &[(BinaryOp, i32, bool)] = &[
+    (BinaryOp::Add, 0, true),
+    (BinaryOp::Sub, 0, false),
+    (BinaryOp::Mul, 1, true),
+    (BinaryOp::FloorDiv, 1, false),
+    (BinaryOp::Or, 0, false),
+    (BinaryOp::Xor, 0, false),
+];
+
+/// `(op, absorbing element)`: `x op absorbing == absorbing`, either way round.
+const ABSORBING: &[(BinaryOp, i32)] = &[(BinaryOp::Mul, 0), (BinaryOp::And, 0)];
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
 
-    /// x * 0 should simplify to 0
     #[test]
-    fn zero_mul_right(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::native_const(0i32);
-        let expr = x.try_mul(&zero).unwrap();
+    fn identity_operand_folds_away(x in arb_simple_uop(DType::Int32)) {
+        for &(op, identity, folds_on_the_left) in IDENTITIES {
+            let identity = UOp::native_const(identity);
+            let right = graph_rewrite(symbolic_simple(), apply(op, &x, &identity), &mut ());
+            prop_assert!(Arc::ptr_eq(&right, &x), "x {op:?} identity should be x, got {:?}", right.op());
 
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &zero),
-            "x * 0 should simplify to 0");
-    }
-
-    /// 0 * x should simplify to 0
-    #[test]
-    fn zero_mul_left(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::native_const(0i32);
-        let expr = zero.try_mul(&x).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &zero),
-            "0 * x should simplify to 0");
-    }
-
-    /// x & 0 should simplify to 0
-    #[test]
-    fn zero_and_right(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::native_const(0i32);
-        let expr = x.try_and_op(&zero).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &zero),
-            "x & 0 should simplify to 0");
-    }
-
-    /// 0 & x should simplify to 0
-    #[test]
-    fn zero_and_left(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::native_const(0i32);
-        let expr = zero.try_and_op(&x).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &zero),
-            "0 & x should simplify to 0");
-    }
-}
-
-// ============================================================================
-// Self-Folding Properties
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1000))]
-
-    /// x / x simplifies only when the declared range excludes zero.
-    #[test]
-    fn self_idiv_one(x in arb_var_uop(DType::Int32)) {
-        let expr = x.try_div(&x).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        if x.vmin().try_int().is_some_and(|min| min > 0) || x.vmax().try_int().is_some_and(|max| max < 0) {
-            match simplified.op() {
-                Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Int(1), "nonzero x / x should be 1"),
-                _ => prop_assert!(false, "nonzero x / x should simplify to Const(1), got {:?}", simplified.op()),
+            if folds_on_the_left {
+                let left = graph_rewrite(symbolic_simple(), apply(op, &identity, &x), &mut ());
+                prop_assert!(Arc::ptr_eq(&left, &x), "identity {op:?} x should be x, got {:?}", left.op());
             }
+        }
+    }
+
+    #[test]
+    fn absorbing_operand_swallows_the_expression(x in arb_simple_uop(DType::Int32)) {
+        for &(op, value) in ABSORBING {
+            let absorbing = UOp::native_const(value);
+            for expr in [apply(op, &x, &absorbing), apply(op, &absorbing, &x)] {
+                let simplified = graph_rewrite(symbolic_simple(), expr, &mut ());
+                prop_assert!(Arc::ptr_eq(&simplified, &absorbing), "{op:?} should fold to {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn bitwise_self_operation_is_idempotent(x in arb_simple_uop(DType::Int32)) {
+        for op in [BinaryOp::And, BinaryOp::Or] {
+            let simplified = graph_rewrite(symbolic_simple(), apply(op, &x, &x), &mut ());
+            prop_assert!(Arc::ptr_eq(&simplified, &x), "x {op:?} x should be x, got {:?}", simplified.op());
+        }
+    }
+
+    /// Integer self comparisons are decided without looking at the value.
+    #[test]
+    fn self_comparison_folds_to_a_constant(x in arb_var_uop(DType::Int32)) {
+        for (expr, expected) in [
+            (x.try_cmplt(&x).unwrap(), false),
+            (x.try_cmpne(&x).unwrap(), false),
+            (x.try_cmpeq(&x).unwrap(), true),
+        ] {
+            let simplified = graph_rewrite(symbolic(), expr, &mut ());
+            prop_assert!(
+                matches!(simplified.op(), Op::Const(value) if value.0 == ConstValue::Bool(expected)),
+                "expected Const({expected}), got {:?}", simplified.op()
+            );
+        }
+    }
+
+    /// `x / x` folds to 1 only when the declared range excludes zero.
+    #[test]
+    fn self_division_folds_only_away_from_zero(min in 0i64..20, span in 0i64..20) {
+        let x = UOp::var("x", DType::Int32, min, min + span);
+        let simplified = graph_rewrite(symbolic_simple(), x.try_div(&x).unwrap(), &mut ());
+
+        if min > 0 {
+            prop_assert!(
+                matches!(simplified.op(), Op::Const(value) if value.0 == ConstValue::Int(1)),
+                "nonzero x / x should be 1, got {:?}", simplified.op()
+            );
         } else {
-            prop_assert!(matches!(simplified.op(), Op::Binary(BinaryOp::FloorDiv, ..)));
+            prop_assert!(matches!(simplified.op(), Op::Binary(BinaryOp::FloorDiv, ..)), "got {:?}", simplified.op());
         }
     }
 
-    /// x & x should simplify to x (idempotent)
+    /// A binary op over two constants folds to the value the evaluator computes.
     #[test]
-    fn self_and_identity(x in arb_simple_uop(DType::Int32)) {
-        let expr = x.try_and_op(&x).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &x),
-            "x & x should simplify to x");
-    }
-
-    /// x | x should simplify to x (idempotent)
-    #[test]
-    fn self_or_identity(x in arb_simple_uop(DType::Int32)) {
-        let expr = x.try_or_op(&x).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        prop_assert!(Arc::ptr_eq(&simplified, &x),
-            "x | x should simplify to x");
-    }
-
-    /// x < x should simplify to false (for non-float types)
-    #[test]
-    fn self_lt_false(x in arb_var_uop(DType::Int32)) {
-        let expr = x.try_cmplt(&x).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        match simplified.op() {
-            Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Bool(false),
-                "x < x should be false"),
-            _ => prop_assert!(false, "x < x should simplify to Const(false), got {:?}", simplified.op()),
-        }
-    }
-
-    /// x == x should simplify to true (for non-float types)
-    #[test]
-    fn self_eq_true(x in arb_var_uop(DType::Int32)) {
-        let expr = x.try_cmpeq(&x).unwrap();
-
-        let matcher = symbolic();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        match simplified.op() {
-            Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Bool(true),
-                "x == x should be true"),
-            _ => prop_assert!(false, "x == x should simplify to Const(true), got {:?}", simplified.op()),
-        }
-    }
-
-    /// x != x should simplify to false (for non-float types)
-    #[test]
-    fn self_ne_false(x in arb_var_uop(DType::Int32)) {
-        let expr = x.try_cmpne(&x).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        match simplified.op() {
-            Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Bool(false),
-                "x != x should be false"),
-            _ => prop_assert!(false, "x != x should simplify to Const(false), got {:?}", simplified.op()),
-        }
-    }
-}
-
-// ============================================================================
-// Constant Folding Properties
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(2000))]
-
-    /// Binary operations on two constants should fold
-    #[test]
-    fn const_fold_add(a in arb_small_int(), b in arb_small_int()) {
-        let a_uop = UOp::const_(DType::Int32, a);
-        let b_uop = UOp::const_(DType::Int32, b);
-        let expr = a_uop.try_add(&b_uop).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        // Should be a constant
-        match simplified.op() {
-            Op::Const(cv) => {
-                // Compute expected result
-                if let (ConstValue::Int(av), ConstValue::Int(bv)) = (a, b) {
-                    let expected = av.wrapping_add(bv);
-                    if let ConstValue::Int(result) = cv.0 {
-                        prop_assert_eq!(result as i32, expected as i32,
-                            "{} + {} should equal {}", av, bv, expected);
+    fn constant_operands_fold_to_the_evaluated_value(
+        a in arb_small_int(),
+        b in arb_small_int(),
+        divisor in nonzero_int(),
+    ) {
+        let konst = |value| UOp::const_(DType::Int32, value);
+        for (op, rhs) in [(BinaryOp::Add, b), (BinaryOp::Mul, b), (BinaryOp::FloorDiv, divisor)] {
+            let simplified = graph_rewrite(symbolic_simple(), apply(op, &konst(a), &konst(rhs)), &mut ());
+            match simplified.op() {
+                Op::Const(folded) => {
+                    // The value is only comparable when both operands are really Int32:
+                    // `nonzero_int` also produces divisors that overflow the dtype.
+                    let in_range = |v| matches!(v, ConstValue::Int(value) if i32::try_from(value).is_ok());
+                    if in_range(a) && in_range(rhs) {
+                        let expected = eval_binary_op_typed(op, a, rhs, ScalarDType::Int32);
+                        prop_assert_eq!(Some(folded.0), expected, "{:?} {:?} {:?}", a, op, rhs);
                     }
                 }
+                other => prop_assert!(false, "{op:?} over constants did not fold: {other:?}"),
             }
-            _ => prop_assert!(false, "Constant addition should fold to constant"),
         }
     }
-
-    /// Binary operations on two constants should fold (multiplication)
-    #[test]
-    fn const_fold_mul(a in arb_small_int(), b in arb_small_int()) {
-        let a_uop = UOp::const_(DType::Int32, a);
-        let b_uop = UOp::const_(DType::Int32, b);
-        let expr = a_uop.try_mul(&b_uop).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        // Should be a constant
-        prop_assert!(matches!(simplified.op(), Op::Const(_)),
-            "Constant multiplication should fold to constant");
-    }
-
-    /// Division by non-zero constant should fold
-    #[test]
-    fn const_fold_idiv(a in arb_small_int(), b in nonzero_int()) {
-        let a_uop = UOp::const_(DType::Int32, a);
-        let b_uop = UOp::const_(DType::Int32, b);
-        let expr = a_uop.try_div(&b_uop).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr, &mut ());
-
-        // Should be a constant
-        prop_assert!(matches!(simplified.op(), Op::Const(_)),
-            "Constant division should fold to constant");
-    }
 }
-
-// ============================================================================
-// Algebraic Law Properties
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1000))]
-
-    /// Commutativity: x + y = y + x after optimization
-    #[test]
-    fn commutativity_add(
-        x in arb_simple_uop(DType::Int32),
-        y in arb_simple_uop(DType::Int32),
-    ) {
-        let xy = x.try_add(&y).unwrap();
-        let yx = y.try_add(&x).unwrap();
-
-        let matcher = symbolic_simple();
-        let opt_xy = graph_rewrite(&matcher, xy, &mut ());
-        let opt_yx = graph_rewrite(&matcher, yx, &mut ());
-
-        // Both should optimize to same structure (either both to x+y or both simplified)
-        // We verify this by checking if optimization preserves commutativity
-        // by ensuring symmetric simplification
-        prop_assert!(
-            (Arc::ptr_eq(&opt_xy, &opt_yx)) ||
-            (matches!((opt_xy.op(), opt_yx.op()),
-                (Op::Binary(BinaryOp::Add, _, _), Op::Binary(BinaryOp::Add, _, _)))),
-            "Addition should commute after optimization"
-        );
-    }
-
-    /// Idempotent operations: applying twice gives same result
-    #[test]
-    fn idempotent_and(x in arb_simple_uop(DType::Int32)) {
-        // x & x & x = x & x = x
-        let x_and_x = x.try_and_op(&x).unwrap();
-        let x_and_x_and_x = x_and_x.try_and_op(&x).unwrap();
-
-        let matcher = symbolic_simple();
-        let opt1 = graph_rewrite(&matcher, x_and_x, &mut ());
-        let opt2 = graph_rewrite(&matcher, x_and_x_and_x, &mut ());
-
-        // Both should simplify to the same form (ideally to x, but constants may fold differently)
-        // The key property is idempotence: applying & with self gives same result
-        prop_assert!(Arc::ptr_eq(&opt1, &opt2) || Arc::ptr_eq(&opt1, &x),
-            "x & x should be idempotent: either both simplify to same form or to x");
-    }
-}
-
-// ============================================================================
-// Nested Operation Properties (Phase 1.3)
-// ============================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
-    /// Nested division: (a // b) // c = a // (b * c) for positive constants
-    ///
-    /// Note: When a's max < b*c, range optimization may simplify divisions to 0.
-    /// We use small divisors (b, c in 2..8) to ensure a.max >= b*c is often satisfied.
+    /// `(a // b) // c` collapses to `a // (b * c)`. Divisors stay small so that `a`'s range
+    /// does not let range analysis fold the intermediate division to zero first.
     #[test]
-    fn nested_div_collapse(
-        a in arb_var_uop(DType::Int32),
-        b in 2..8i32,
-        c in 2..8i32,
-    ) {
-        // Skip when range optimization would apply:
-        // Need: a.max >= b * c to avoid intermediate divisions becoming 0
+    fn nested_div_collapse(a in arb_var_uop(DType::Int32), b in 2..8i32, c in 2..8i32) {
         let (_, vmax) = VminVmaxProperty::get(&a);
         if let ConstValue::Int(max) = vmax {
             prop_assume!(*max >= (b as i64) * (c as i64));
         }
 
-        // (a // b) // c
-        let b_uop = UOp::native_const(b);
-        let c_uop = UOp::native_const(c);
-        let div1 = a.try_div(&b_uop).unwrap();
-        let div2 = div1.try_div(&c_uop).unwrap();
+        let div = a.try_div(&UOp::native_const(b)).unwrap().try_div(&UOp::native_const(c)).unwrap();
+        let simplified = graph_rewrite(symbolic(), div, &mut ());
 
-        let matcher = symbolic();
-        let simplified = graph_rewrite(&matcher, div2, &mut ());
-
-        // Should simplify to a // (b * c)
-        if let Op::Binary(BinaryOp::FloorDiv, var, divisor) = simplified.op() {
-            prop_assert!(Arc::ptr_eq(var, &a), "Variable should be preserved");
-            if let Op::Const(cv) = divisor.op() {
-                let expected = (b as i64) * (c as i64);
-                prop_assert_eq!(cv.0, ConstValue::Int(expected),
-                    "(a // {}) // {} should simplify to a // {}", b, c, expected);
-            } else {
-                prop_assert!(false, "Divisor should be constant");
+        match simplified.op() {
+            Op::Binary(BinaryOp::FloorDiv, var, divisor) => {
+                prop_assert!(Arc::ptr_eq(var, &a));
+                prop_assert!(matches!(divisor.op(), Op::Const(v) if v.0 == ConstValue::Int((b as i64) * (c as i64))));
             }
-        } else {
-            prop_assert!(false, "Should simplify to FloorDiv");
+            other => prop_assert!(false, "expected a single FloorDiv, got {other:?}"),
         }
     }
 
-    /// Nested multiplication: (a * b) * c = a * (b * c) for constants
+    /// `(a * b) * c` collapses to `a * (b * c)`.
     #[test]
-    fn nested_mul_collapse(
-        a in arb_var_uop(DType::Int32),
-        b in 2..20i32,
-        c in 2..20i32,
-    ) {
-        // (a * b) * c
-        let b_uop = UOp::native_const(b);
-        let c_uop = UOp::native_const(c);
-        let mul1 = a.try_mul(&b_uop).unwrap();
-        let mul2 = mul1.try_mul(&c_uop).unwrap();
+    fn nested_mul_collapse(a in arb_var_uop(DType::Int32), b in 2..20i32, c in 2..20i32) {
+        let mul = a.try_mul(&UOp::native_const(b)).unwrap().try_mul(&UOp::native_const(c)).unwrap();
+        let simplified = graph_rewrite(symbolic(), mul, &mut ());
 
-        let matcher = symbolic();
-        let simplified = graph_rewrite(&matcher, mul2, &mut ());
-
-        // Should simplify to a * (b * c)
-        if let Op::Binary(BinaryOp::Mul, var, multiplier) = simplified.op() {
-            prop_assert!(Arc::ptr_eq(var, &a), "Variable should be preserved");
-            if let Op::Const(cv) = multiplier.op() {
-                let expected = (b as i64) * (c as i64);
-                prop_assert_eq!(cv.0, ConstValue::Int(expected),
-                    "(a * {}) * {} should simplify to a * {}", b, c, expected);
-            } else {
-                prop_assert!(false, "Multiplier should be constant");
+        match simplified.op() {
+            Op::Binary(BinaryOp::Mul, var, factor) => {
+                prop_assert!(Arc::ptr_eq(var, &a));
+                prop_assert!(matches!(factor.op(), Op::Const(v) if v.0 == ConstValue::Int((b as i64) * (c as i64))));
             }
-        } else {
-            prop_assert!(false, "Should simplify to Mul");
+            other => prop_assert!(false, "expected a single Mul, got {other:?}"),
         }
     }
 
-    /// Modulo idempotence: (a % b) % b = a % b
-    ///
-    /// Note: When a's max < b, the modulo simplifies to a via range analysis.
-    /// We skip such cases to test the algebraic idempotence pattern.
+    /// `(a % b) % b` collapses to `a % b`. Skipped when `a.max < b`, where range analysis
+    /// folds the modulo to `a` before the idempotence rule can fire.
     #[test]
-    fn mod_idempotence(
-        a in arb_var_uop(DType::Int32),
-        b in 2..100i32,
-    ) {
-        // Skip when range optimization would apply (a.max < b means a % b = a)
+    fn mod_idempotence(a in arb_var_uop(DType::Int32), b in 2..100i32) {
         let (_, vmax) = VminVmaxProperty::get(&a);
         if let ConstValue::Int(max) = vmax {
             prop_assume!(*max >= b as i64);
         }
 
-        let b_uop = UOp::native_const(b);
-        let mod1 = a.try_mod(&b_uop).unwrap();
-        let mod2 = mod1.try_mod(&b_uop).unwrap();
+        let divisor = UOp::native_const(b);
+        let nested = a.try_mod(&divisor).unwrap().try_mod(&divisor).unwrap();
+        let simplified = graph_rewrite(symbolic_simple(), nested, &mut ());
 
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, mod2, &mut ());
-
-        // Should simplify to a % b
-        if let Op::Binary(BinaryOp::FloorMod, var, divisor) = simplified.op() {
-            prop_assert!(Arc::ptr_eq(var, &a), "Variable should be preserved");
-            prop_assert!(Arc::ptr_eq(divisor, &b_uop), "Divisor should be preserved");
-        } else {
-            prop_assert!(false, "Should simplify to FloorMod(a, b)");
+        match simplified.op() {
+            Op::Binary(BinaryOp::FloorMod, var, actual) => {
+                prop_assert!(Arc::ptr_eq(var, &a));
+                prop_assert!(Arc::ptr_eq(actual, &divisor));
+            }
+            other => prop_assert!(false, "expected FloorMod(a, b), got {other:?}"),
         }
     }
 
-    /// Addition chain: (a + b) + c = a + (b + c) for constants
+    /// `(a + b) + c` collapses to `a + (b + c)`, or to `a` alone when the sum cancels.
     #[test]
-    fn nested_add_collapse(
-        a in arb_var_uop(DType::Int32),
-        b in -100..100i32,
-        c in -100..100i32,
-    ) {
-        let b_uop = UOp::native_const(b);
-        let c_uop = UOp::native_const(c);
-        let add1 = a.try_add(&b_uop).unwrap();
-        let add2 = add1.try_add(&c_uop).unwrap();
+    fn nested_add_collapse(a in arb_var_uop(DType::Int32), b in -100..100i32, c in -100..100i32) {
+        let add = a.try_add(&UOp::native_const(b)).unwrap().try_add(&UOp::native_const(c)).unwrap();
+        let simplified = graph_rewrite(symbolic(), add, &mut ());
 
-        let matcher = symbolic();
-        let simplified = graph_rewrite(&matcher, add2, &mut ());
-
-        // Should simplify to a + (b + c), a - |b+c|, or just a when b+c=0
-        let expected_sum = (b as i64) + (c as i64);
+        let sum = (b as i64) + (c as i64);
         match simplified.op() {
             Op::Binary(BinaryOp::Add, var, addend) => {
-                prop_assert!(Arc::ptr_eq(var, &a), "Variable should be preserved");
-                if let Op::Const(cv) = addend.op() {
-                    prop_assert_eq!(cv.0, ConstValue::Int(expected_sum),
-                        "(a + {}) + {} should simplify to a + {}", b, c, expected_sum);
-                }
+                prop_assert!(Arc::ptr_eq(var, &a));
+                prop_assert!(matches!(addend.op(), Op::Const(v) if v.0 == ConstValue::Int(sum)));
             }
             Op::Binary(BinaryOp::Sub, var, subtrahend) => {
-                prop_assert!(Arc::ptr_eq(var, &a), "Variable should be preserved");
-                if let Op::Const(cv) = subtrahend.op() {
-                    prop_assert_eq!(cv.0, ConstValue::Int(-expected_sum),
-                        "(a + {}) + {} should simplify to a - {}", b, c, -expected_sum);
-                }
+                prop_assert!(Arc::ptr_eq(var, &a));
+                prop_assert!(matches!(subtrahend.op(), Op::Const(v) if v.0 == ConstValue::Int(-sum)));
             }
             Op::DefineVar { .. } => {
-                // When b + c = 0, simplifies to just a (identity)
-                prop_assert!(Arc::ptr_eq(&simplified, &a),
-                    "(a + {}) + {} = a + 0 should simplify to a", b, c);
-                prop_assert_eq!(expected_sum, 0,
-                    "DefineVar result should only happen when sum is 0");
+                prop_assert!(Arc::ptr_eq(&simplified, &a));
+                prop_assert_eq!(sum, 0, "a bare variable may only come out when the constants cancel");
             }
-            _ => prop_assert!(false, "Should simplify to Add, Sub, or identity (when sum is 0)"),
+            other => prop_assert!(false, "expected Add, Sub or the bare variable, got {other:?}"),
         }
     }
 
-    /// Subtraction chain: (a - b) - c = a - (b + c) for constants
+    /// `(a - b) - c` collapses to tinygrad's subtraction form, `a + -(b + c)`.
     #[test]
-    fn nested_sub_collapse(
-        a in arb_var_uop(DType::Int32),
-        b in 1..100i32,
-        c in 1..100i32,
-    ) {
-        let b_uop = UOp::native_const(b);
-        let c_uop = UOp::native_const(c);
-        let sub1 = a.try_sub(&b_uop).unwrap();
-        let sub2 = sub1.try_sub(&c_uop).unwrap();
+    fn nested_sub_collapse(a in arb_var_uop(DType::Int32), b in 1..100i32, c in 1..100i32) {
+        let sub = a.try_sub(&UOp::native_const(b)).unwrap().try_sub(&UOp::native_const(c)).unwrap();
+        let simplified = graph_rewrite(symbolic(), sub, &mut ());
 
-        let matcher = symbolic();
-        let simplified = graph_rewrite(&matcher, sub2, &mut ());
-
-        // Should simplify to a + (-(b + c)) in Tinygrad-style subtraction form.
-        if let Op::Binary(BinaryOp::Add, var, subtrahend) = simplified.op() {
-            prop_assert!(Arc::ptr_eq(var, &a), "Variable should be preserved");
-            if let Op::Const(cv) = subtrahend.op() {
+        match simplified.op() {
+            Op::Binary(BinaryOp::Add, var, addend) => {
+                prop_assert!(Arc::ptr_eq(var, &a));
                 let expected = -((b as i64) + (c as i64));
-                prop_assert_eq!(cv.0, ConstValue::Int(expected),
-                    "(a - {}) - {} should simplify to a + ({})", b, c, expected);
-            } else {
-                prop_assert!(false, "Subtrahend should be constant");
+                prop_assert!(matches!(addend.op(), Op::Const(v) if v.0 == ConstValue::Int(expected)));
             }
-        } else {
-            prop_assert!(false, "Should simplify to Add");
+            other => prop_assert!(false, "expected Add with a negative constant, got {other:?}"),
         }
     }
 
-    /// Mul-Div inverse: (a * b) // b = a for variables
+    /// `(a * b) // b` cancels back to `a`.
     #[test]
-    fn mul_div_inverse(
-        a in arb_var_uop(DType::Int32),
-        b in 1..100i32,
-    ) {
-        let b_uop = UOp::native_const(b);
-        let mul = a.try_mul(&b_uop).unwrap();
-        let div = mul.try_div(&b_uop).unwrap();
+    fn mul_div_inverse(a in arb_var_uop(DType::Int32), b in 1..100i32) {
+        let b = UOp::native_const(b);
+        let simplified = graph_rewrite(symbolic_simple(), a.try_mul(&b).unwrap().try_div(&b).unwrap(), &mut ());
 
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, div, &mut ());
-
-        // Should simplify back to a
-        prop_assert!(Arc::ptr_eq(&simplified, &a),
-            "(a * {}) // {} should simplify to a", b, b);
+        prop_assert!(Arc::ptr_eq(&simplified, &a), "got {}", simplified.tree());
     }
 }
 
-// ============================================================================
-// Div/FloorMod Soundness: simplified expression must evaluate identically to original
-// for ALL variable assignments within declared ranges.
-// ============================================================================
-
-/// Evaluate a UOp expression tree by substituting variables with concrete values.
-/// Returns None if the expression can't be evaluated (e.g., contains unsupported ops).
-fn eval_uop(expr: &Arc<UOp>, vars: &std::collections::HashMap<String, i64>) -> Option<i64> {
-    use svod_ir::uop::eval::eval_binary_op;
+/// Evaluate an expression tree with variables bound to concrete values. Returns `None` for
+/// ops the evaluator does not cover.
+fn eval_uop(expr: &Arc<UOp>, vars: &HashMap<String, i64>) -> Option<i64> {
     match expr.op() {
-        Op::Const(cv) => match cv.0 {
+        Op::Const(value) => match value.0 {
             ConstValue::Invalid => Some(i64::MIN),
             ConstValue::Int(v) => Some(v),
             _ => None,
@@ -618,29 +262,27 @@ fn eval_uop(expr: &Arc<UOp>, vars: &std::collections::HashMap<String, i64>) -> O
         Op::DefineVar { name, .. } => vars.get(name.as_str()).copied(),
         Op::Bind { var, .. } => eval_uop(var, vars),
         Op::Binary(op, a, b) => {
-            let av = eval_uop(a, vars)?;
-            let bv = eval_uop(b, vars)?;
-            match eval_binary_op(*op, ConstValue::Int(av), ConstValue::Int(bv))? {
+            let (a, b) = (eval_uop(a, vars)?, eval_uop(b, vars)?);
+            match eval_binary_op(*op, ConstValue::Int(a), ConstValue::Int(b))? {
                 ConstValue::Int(v) => Some(v),
-                ConstValue::Bool(b) => Some(b as i64),
+                ConstValue::Bool(v) => Some(v as i64),
                 _ => None,
             }
         }
         Op::Ternary(svod_ir::TernaryOp::Where, cond, t, f) => {
-            let cv = eval_uop(cond, vars)?;
-            if cv != 0 { eval_uop(t, vars) } else { eval_uop(f, vars) }
+            if eval_uop(cond, vars)? != 0 {
+                eval_uop(t, vars)
+            } else {
+                eval_uop(f, vars)
+            }
         }
-        Op::Unary(svod_ir::UnaryOp::Not, x) => {
-            let v = eval_uop(x, vars)?;
-            Some(if v == 0 { 1 } else { 0 })
-        }
+        Op::Unary(svod_ir::UnaryOp::Not, x) => Some((eval_uop(x, vars)? == 0) as i64),
         _ => None,
     }
 }
 
+/// Evaluate at the dtype's own width, so wrapping and narrowing are observable.
 fn eval_typed_uop(expr: &Arc<UOp>, variable: &str, value: ConstValue) -> Option<ConstValue> {
-    use svod_ir::uop::eval::{eval_binary_op_typed, eval_unary_op_typed};
-
     match expr.op() {
         Op::Const(constant) => Some(constant.0),
         Op::DefineVar { name, .. } if name == variable => Some(value),
@@ -656,89 +298,73 @@ fn eval_typed_uop(expr: &Arc<UOp>, variable: &str, value: ConstValue) -> Option<
     }
 }
 
-/// Generate (a*f + b*g + const) expressions for divmod testing.
-/// Variables have range [0, max_val), constants in [-20, 20], divisor in [2, 16].
+/// `(a*f + b*g + const)` expressions, with the divisor to apply and the variable ranges.
 fn arb_divmod_expr() -> impl Strategy<Value = (Arc<UOp>, i64, Vec<(String, i64, i64)>)> {
-    // (factor_a, factor_b, const_offset, divisor, var_a_max, var_b_max)
-    (
-        -20i64..20, // factor_a
-        -20i64..20, // factor_b
-        -20i64..20, // const_offset
-        2i64..16,   // divisor
-        1i64..8,    // var_a_max
-        1i64..8,    // var_b_max
-    )
-        .prop_map(|(fa, fb, k, div, a_max, b_max)| {
+    (-20i64..20, -20i64..20, -20i64..20, 2i64..16, 1i64..8, 1i64..8).prop_map(
+        |(factor_a, factor_b, offset, divisor, a_max, b_max)| {
             let a = UOp::variable("a".into(), 0, a_max, DType::Int32);
             let b = UOp::variable("b".into(), 0, b_max, DType::Int32);
-            let mut expr = UOp::index_const(k);
-            if fa != 0 {
-                expr = expr.try_add(&UOp::index_const(fa).try_mul(&a).unwrap()).unwrap();
+            let mut expr = UOp::index_const(offset);
+            if factor_a != 0 {
+                expr = expr.try_add(&UOp::index_const(factor_a).try_mul(&a).unwrap()).unwrap();
             }
-            if fb != 0 {
-                expr = expr.try_add(&UOp::index_const(fb).try_mul(&b).unwrap()).unwrap();
+            if factor_b != 0 {
+                expr = expr.try_add(&UOp::index_const(factor_b).try_mul(&b).unwrap()).unwrap();
             }
-            let vars = vec![("a".into(), 0, a_max), ("b".into(), 0, b_max)];
-            (expr, div, vars)
-        })
+            (expr, divisor, vec![("a".into(), 0, a_max), ("b".into(), 0, b_max)])
+        },
+    )
+}
+
+/// The simplification must evaluate identically to the original at every point of the
+/// declared variable ranges.
+fn prop_assert_same_over_ranges(
+    original: &Arc<UOp>,
+    simplified: &Arc<UOp>,
+    var_ranges: &[(String, i64, i64)],
+) -> Result<(), TestCaseError> {
+    for a in var_ranges[0].1..=var_ranges[0].2 {
+        for b in var_ranges[1].1..=var_ranges[1].2 {
+            let vars = HashMap::from([("a".to_string(), a), ("b".to_string(), b)]);
+            if let (Some(before), Some(after)) = (eval_uop(original, &vars), eval_uop(simplified, &vars)) {
+                prop_assert_eq!(
+                    before,
+                    after,
+                    "mismatch at a={}, b={}.\n  original: {}\n  simplified: {}",
+                    a,
+                    b,
+                    original.tree(),
+                    simplified.tree()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2000))]
 
-    /// FloorMod simplification must preserve semantics for ALL variable values in range.
     #[test]
-    fn divmod_mod_soundness((expr, div, var_ranges) in arb_divmod_expr()) {
-        let c = UOp::index_const(div);
-        let modded = expr.try_mod(&c).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, modded.clone(), &mut ());
-
-        // Evaluate at all combinations of variable values
-        for a_val in var_ranges[0].1..=var_ranges[0].2 {
-            for b_val in var_ranges[1].1..=var_ranges[1].2 {
-                let mut vars = std::collections::HashMap::new();
-                vars.insert("a".into(), a_val);
-                vars.insert("b".into(), b_val);
-
-                if let (Some(orig), Some(simp)) = (eval_uop(&modded, &vars), eval_uop(&simplified, &vars)) {
-                    prop_assert_eq!(orig, simp,
-                        "FloorMod mismatch at a={}, b={}, div={}.\n  Original: {}\n  Simplified: {}",
-                        a_val, b_val, div, modded.tree(), simplified.tree());
-                }
-            }
-        }
+    fn divmod_mod_soundness((expr, divisor, var_ranges) in arb_divmod_expr()) {
+        let modded = expr.try_mod(&UOp::index_const(divisor)).unwrap();
+        let simplified = graph_rewrite(symbolic_simple(), modded.clone(), &mut ());
+        prop_assert_same_over_ranges(&modded, &simplified, &var_ranges)?;
     }
 
-    /// FloorDiv simplification must preserve semantics for ALL variable values in range.
     #[test]
-    fn divmod_idiv_soundness((expr, div, var_ranges) in arb_divmod_expr()) {
-        let c = UOp::index_const(div);
-        let divided = expr.try_div(&c).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, divided.clone(), &mut ());
-
-        for a_val in var_ranges[0].1..=var_ranges[0].2 {
-            for b_val in var_ranges[1].1..=var_ranges[1].2 {
-                let mut vars = std::collections::HashMap::new();
-                vars.insert("a".into(), a_val);
-                vars.insert("b".into(), b_val);
-
-                if let (Some(orig), Some(simp)) = (eval_uop(&divided, &vars), eval_uop(&simplified, &vars)) {
-                    prop_assert_eq!(orig, simp,
-                        "FloorDiv mismatch at a={}, b={}, div={}.\n  Original: {}\n  Simplified: {}",
-                        a_val, b_val, div, divided.tree(), simplified.tree());
-                }
-            }
-        }
+    fn divmod_idiv_soundness((expr, divisor, var_ranges) in arb_divmod_expr()) {
+        let divided = expr.try_div(&UOp::index_const(divisor)).unwrap();
+        let simplified = graph_rewrite(symbolic_simple(), divided.clone(), &mut ());
+        prop_assert_same_over_ranges(&divided, &simplified, &var_ranges)?;
     }
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
 
+    /// The affine congruence rules must fire and must not change the value at the narrow
+    /// dtype they were derived at.
     #[test]
     fn affine_congruence_rewrites_preserve_exact_typed_runtime(
         divisor in 8i64..=16,
@@ -767,6 +393,7 @@ proptest! {
         }
     }
 
+    /// 8-bit divmod rewrites must reproduce the wrapping runtime result, signed or not.
     #[test]
     fn typed_int8_divmod_rewrites_preserve_wrapping_runtime(
         unsigned in any::<bool>(),

@@ -136,12 +136,8 @@ pub fn assert_long_arithmetic(a: u64, b: u64, from: ScalarDType) {
     let neg = Op::Unary(svod_ir::UnaryOp::Neg, long_const(from, a));
     assert_words(from, UOp::new(neg, DType::Scalar(from)), a.wrapping_neg(), "neg");
     // A cast away from a long is not itself split, so only the stall is observable.
-    let c = long_const(from, a).cast(DType::Float32);
-    eprintln!("INPUT: {}", c.tree());
-    eprintln!("OUT: {}", graph_rewrite_bottom_up(&pm_long_decomp(), c.clone(), &mut ()).tree());
-    let i32c = long_const(from, a).cast(DType::Int32);
-    eprintln!("OUTI32: {}", graph_rewrite_bottom_up(&pm_long_decomp(), i32c, &mut ()).tree());
-    assert_fully_split(&graph_rewrite_bottom_up(&pm_long_decomp(), c, &mut ()));
+    let cast = long_const(from, a).cast(DType::Float32);
+    assert_fully_split(&graph_rewrite_bottom_up(&pm_long_decomp(), cast, &mut ()));
 }
 
 proptest! {

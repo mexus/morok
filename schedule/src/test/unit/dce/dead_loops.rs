@@ -1,93 +1,53 @@
-//! Tests for dead loop / trivial range symbolic simplifications.
+//! Dead loop elimination: `Range(end)` folds to `Const(0)` when `vmax(end) <= 0`.
 //!
-//! - `Range(Const)` with `vmin == vmax` folds to `Const(vmin)`.
-//! - `Range(_)` with `vmax < 0` folds to `Const(0)` (dead loop).
-//!
-//! END/REDUCE empty-ranges folds were removed: they conflated trivial-Range
-//! Const(0,Index) with dead-Range markers, breaking `Range(Unroll, end=1)`
-//! inside REDUCE/END. Downstream `reduce_to_acc` handles dead/empty ranges.
+//! END/REDUCE empty-range folds were removed: they conflated the trivial-Range
+//! `Const(0, Index)` with dead-Range markers, breaking `Range(Unroll, end=1)` inside
+//! REDUCE/END. Downstream `reduce_to_acc` handles dead and empty ranges instead.
 
 use smallvec::smallvec;
 use std::sync::Arc;
 use svod_dtype::DType;
 use svod_ir::types::ConstValue;
 use svod_ir::{AxisId, AxisType, Op, UOp};
+use test_case::test_case;
 
 use crate::rewrite::graph_rewrite;
 
 use super::helpers::{assert_const_value, get_matcher};
 
-// ----------------------------------------------------------------------------
-// RANGE Elimination Tests
-// ----------------------------------------------------------------------------
-
-#[test]
-fn test_range_zero_to_const() {
-    // RANGE(0) → Const(0)
-    let zero = UOp::native_const(0i32);
-    let range = UOp::range(zero, 0);
-
-    let matcher = get_matcher();
-    let result = graph_rewrite(&matcher, range, &mut ());
-
-    assert_const_value(&result, ConstValue::Int(0));
+fn zero_trip() -> Arc<UOp> {
+    UOp::native_const(0i32)
 }
 
-#[test]
-fn test_range_negative_to_const() {
-    // RANGE(-5) → Const(0)
-    let neg_five = UOp::native_const(-5i32);
-    let range = UOp::range(neg_five, 0);
-
-    let matcher = get_matcher();
-    let result = graph_rewrite(&matcher, range, &mut ());
-
-    assert_const_value(&result, ConstValue::Int(0));
+fn negative_trip() -> Arc<UOp> {
+    UOp::native_const(-5i32)
 }
 
-#[test]
-fn test_range_symbolic_dead() {
-    // size ∈ [0,5], RANGE(size - 10) → Const(0)
-    // vmax(size - 10) = 5 - 10 = -5 ≤ 0, so dead
-    let size = UOp::variable("size".into(), 0, 5, DType::Int32);
-    let ten = UOp::native_const(10i32);
-    let count = size.try_sub(&ten).expect("SUB should succeed");
+fn clamped_to_zero() -> Arc<UOp> {
+    UOp::native_const(-10i32).try_max(&UOp::native_const(0i32)).unwrap()
+}
+
+/// `size` is in [0, 5], so `size - 10` has `vmax == -5`.
+fn symbolically_empty() -> Arc<UOp> {
+    UOp::variable("size".into(), 0, 5, DType::Int32).try_sub(&UOp::native_const(10i32)).unwrap()
+}
+
+#[test_case(zero_trip(); "zero trip count")]
+#[test_case(negative_trip(); "negative trip count")]
+#[test_case(clamped_to_zero(); "vmax exactly zero")]
+#[test_case(symbolically_empty(); "symbolic vmax below zero")]
+fn dead_range_folds_to_zero(end: Arc<UOp>) {
+    let dtype = end.dtype();
     let range = UOp::new(
-        Op::Range { end: count.clone(), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop, deps: smallvec![] },
-        count.dtype(),
+        Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop, deps: smallvec![] },
+        dtype,
     );
 
-    let matcher = get_matcher();
-    let result = graph_rewrite(&matcher, range, &mut ());
-
-    assert_const_value(&result, ConstValue::Int(0));
+    assert_const_value(&graph_rewrite(get_matcher(), range, &mut ()), ConstValue::Int(0));
 }
 
 #[test]
-fn test_range_boundary_vmax_zero() {
-    // max(-10, 0) = 0, so RANGE has vmax = 0 (boundary)
-    // RANGE(max(-10, 0)) → Const(0)
-    let neg_ten = UOp::native_const(-10i32);
-    let zero = UOp::native_const(0i32);
-    let max_val = neg_ten.try_max(&zero).unwrap();
-    let range = UOp::range(max_val, 0);
-
-    let matcher = get_matcher();
-    let result = graph_rewrite(&matcher, range, &mut ());
-
-    assert_const_value(&result, ConstValue::Int(0));
-}
-
-// ----------------------------------------------------------------------------
-// END constructor
-// ----------------------------------------------------------------------------
-
-#[test]
-fn test_end_empty_ranges_returns_self() {
-    // UOp::end(empty) returns self.
+fn end_without_ranges_returns_the_computation() {
     let store = UOp::noop();
-    let end = Arc::clone(&store).end(smallvec![]);
-
-    // Empty ranges: end() should return the computation directly
-    assert!(Arc::ptr_eq(&end, &store), "end(empty) should return self");
+    assert!(Arc::ptr_eq(&Arc::clone(&store).end(smallvec![]), &store));
 }
