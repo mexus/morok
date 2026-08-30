@@ -3532,3 +3532,22 @@ fn weak_int_constants_cancel_across_an_index_sum() {
 
     assert!(Arc::ptr_eq(&folded, &scaled), "the constants must cancel, got {}", folded.tree());
 }
+
+/// `if any(X not in uop.backward_slice_with_self for X,_ in candidate): continue`
+/// (tinygrad/uop/symbolic.py:341) — a candidate the uop never mentions is skipped
+/// before any substitution, and the uop comes back untouched.
+#[test_case::test_case(true ; "candidate in the slice rewrites")]
+#[test_case::test_case(false ; "candidate outside the slice is skipped")]
+fn uop_given_valid_only_substitutes_candidates_in_the_slice(in_slice: bool) {
+    use crate::symbolic::valid_simplification::uop_given_valid;
+
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let y = UOp::var("y", DType::Int32, 0, 100);
+    let valid = x.lt(&UOp::native_const(10i32));
+    // `x < 10` makes `x < 50` true; `y < 50` is not decided by it.
+    let expression = if in_slice { &x } else { &y }.lt(&UOp::native_const(50i32));
+
+    let result = uop_given_valid(&valid, &expression, true);
+
+    assert_eq!(!Arc::ptr_eq(&result, &expression), in_slice, "got {}", result.tree());
+}
