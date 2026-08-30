@@ -8,7 +8,8 @@
 use std::{f32::consts::PI, sync::Arc};
 
 use svod_dtype::DType;
-use svod_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, UOp, pattern::RewriteResult};
+use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp, pattern::RewriteResult};
+use test_case::test_case;
 
 use crate::rangeify::transforms::reduce_collapse as reduce_collapse_inner;
 
@@ -499,4 +500,26 @@ fn test_reduce_mul_chain_single_factor_no_op() {
     // This might succeed via reduce_collapse, but not via mul_chain
     // (mul_chain requires the src to be a MUL op)
     let _result = reduce_unparented(&reduce);
+}
+
+/// The arange fold: `sum(r in [0, 32) of (r + v < 31 ? 0 : 1))` must collapse to
+/// bound arithmetic with no RANGE left. ADD is commutative and morok's canonical
+/// ordering puts the substituted scalar first whenever it sorts below the RANGE,
+/// so the Lt lift has to fire for either operand order — tinygrad's UPat matches
+/// commutative sources in both positions (`codegen/simplify.py:101`).
+#[test_case(true ; "range on the left")]
+#[test_case(false ; "range on the right")]
+fn reduce_collapse_lifts_a_commutative_add_in_either_order(range_first: bool) {
+    let range = UOp::range_axis(UOp::index_const(32), AxisId::Renumbered(0), AxisType::Reduce);
+    let scalar = UOp::variable("in0".into(), 0, 31, range.dtype());
+    let sum = if range_first { range.try_add(&scalar) } else { scalar.try_add(&range) }
+        .expect("range and scalar share a dtype");
+    let bound = UOp::const_(sum.dtype(), ConstValue::Int(31));
+    let gate = sum.try_cmplt(&bound).expect("comparison against a same-dtype bound");
+    let body = UOp::try_where(gate, UOp::native_const(0i32), UOp::native_const(1i32)).expect("both branches are Int32");
+    let reduce = body.reduce(vec![range].into(), ReduceOp::Add);
+
+    let result = reduce_collapse(&reduce).expect("the arange fold must collapse this reduce");
+    assert!(!has_ranges_in_graph(&result), "reduce_collapse left a RANGE behind: {:?}", result.op());
+    assert!(!has_reduce_op(&result), "reduce_collapse left a REDUCE behind: {:?}", result.op());
 }
