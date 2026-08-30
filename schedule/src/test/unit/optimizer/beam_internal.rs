@@ -10,7 +10,11 @@ fn weak_axis_scheduler(constant: i32) -> Scheduler {
     use svod_ir::{AxisId, AxisType};
 
     let range = UOp::range_axis(UOp::index_const(64), AxisId::Renumbered(0), AxisType::Weak);
-    Scheduler::new(UOp::sink(vec![UOp::native_const(constant), range]), crate::optimizer::Renderer::cpu())
+    // Pin the thread budget: `Renderer::cpu()` reads the host core count, and the
+    // weak axis only offers THREAD splits up to that budget.
+    let mut renderer = crate::optimizer::Renderer::cpu();
+    renderer.global_max = Some(vec![32]);
+    Scheduler::new(UOp::sink(vec![UOp::native_const(constant), range]), renderer)
 }
 
 /// `BEAM_ACTIONS` is tinygrad's `actions` grid: every opt kind is offered, and the
