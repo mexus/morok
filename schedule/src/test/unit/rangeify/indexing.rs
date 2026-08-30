@@ -300,3 +300,25 @@ fn test_multiple_contexts_independent() {
     let r = ctx2.new_range(&SInt::Const(30), AxisType::Loop);
     assert!(matches!(r.op(), Op::Range { axis_id: AxisId::Unrenumbered(0), .. }));
 }
+
+/// `apply_movement_op` and `_apply_reshape` are `@functools.cache` upstream
+/// (tinygrad/schedule/indexing.py:158,171): process-global and keyed on the inputs, so
+/// a second call with the same op, input shape and range tuple never rebuilds the
+/// index chain — it hands back the very nodes the first call produced.
+#[test]
+fn equal_movement_inputs_reuse_the_cached_index_chain() {
+    // Prime extents so no other test shares these inputs in the process-global cache.
+    let rngs = vec![UOp::range_const(13, 0), UOp::range_const(11, 1)];
+    let in_shape = [SInt::Const(11), SInt::Const(13)];
+    let out_shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![SInt::Const(13), SInt::Const(11)]);
+    let reshape = UOp::new(Op::Reshape { src: UOp::index_const(0), new_shape: out_shape }, DType::Float32);
+    let holds = || crate::rangeify::indexing::movement_cache_holds(reshape.op(), &in_shape, &rngs);
+
+    assert!(!holds(), "these inputs must be new");
+    let first = crate::rangeify::apply_movement_op(reshape.op(), &in_shape, &rngs);
+    assert!(holds(), "the first call memoises the inputs");
+    let second = crate::rangeify::apply_movement_op(reshape.op(), &in_shape, &rngs);
+
+    assert_eq!(first.len(), in_shape.len());
+    assert!(first.iter().zip(&second).all(|(a, b)| Arc::ptr_eq(a, b)), "a hit returns the cached nodes");
+}

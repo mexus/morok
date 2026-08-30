@@ -749,15 +749,14 @@ pub(crate) fn transform_movement_through_index(
     indices: &SmallVec<[Arc<UOp>; 4]>,
     index: &Arc<UOp>,
 ) -> Option<Arc<UOp>> {
-    use super::indexing::{SimplifyCache, apply_movement_op, apply_reshape_ranges};
+    use super::indexing::{apply_movement_op, apply_reshape_ranges};
 
     let src = &mop.op().sources()[0];
     let src_shape = src.shape().ok()??;
     let mop_shape = mop.shape().ok()??;
 
     if indices.len() == mop_shape.len() {
-        let mut cache = SimplifyCache::default();
-        let transformed = apply_movement_op(mop.op(), src_shape, indices.as_slice(), &mut cache);
+        let transformed = apply_movement_op(mop.op(), src_shape, indices.as_slice());
         return UOp::index().buffer(src.clone()).indices(transformed).dtype(index.dtype()).call().ok();
     }
 
