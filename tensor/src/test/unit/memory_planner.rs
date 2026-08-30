@@ -619,9 +619,7 @@ fn test_real_numeric_result_matches_with_planner_disabled_and_arena() {
         let first = &a + &b;
         let second = &first * &a;
         let mut output = &second + &b;
-        let mut config = crate::PrepareConfig::default();
-        config.planner_mode = mode;
-        config.disable_schedule_cache = true;
+        let config = crate::PrepareConfig { planner_mode: mode, disable_schedule_cache: true, ..Default::default() };
         output.realize_with(&config).expect("realize numeric planner differential");
         output.as_vec::<f32>().expect("numeric output")
     }
