@@ -2095,16 +2095,17 @@ pub fn pm_threefry_decomp() -> &'static TypedPatternMatcher<()> {
 
 /// Threefry2x32 mixing algorithm (Random123 library).
 fn threefry2x32(x: &Arc<UOp>, key: &Arc<UOp>) -> Arc<UOp> {
-    let u32_dt = DType::Scalar(svod_dtype::ScalarDType::UInt32);
-    let u64_dt = DType::Scalar(svod_dtype::ScalarDType::UInt64);
-    let mask32 = UOp::const_(u64_dt.clone(), ConstValue::UInt(0xFFFFFFFF));
-    let pow32 = UOp::const_(u64_dt.clone(), ConstValue::UInt(1u64 << 32));
+    let u32_dt = DType::UInt32;
+    let u64_dt = DType::UInt64;
+    let shift32 = UOp::const_(u64_dt.clone(), ConstValue::Int(32));
 
-    // Split x and key from uint64 to two uint32
-    let x0 = x.and_(&mask32).cast(u32_dt.clone());
-    let x1 = x.floor_div(&pow32).and_(&mask32).cast(u32_dt.clone());
-    let key0 = key.and_(&mask32).cast(u32_dt.clone());
-    let key1 = key.floor_div(&pow32).and_(&mask32).cast(u32_dt.clone());
+    // Split x and key from uint64 to two uint32. Narrowing casts truncate, so
+    // `.cast(u32)` / `>> 32` need no mask; this is also the form the uint64
+    // pack-cancellation rules in `symbolic_simple` invert.
+    let x0 = x.cast(u32_dt.clone());
+    let x1 = x.shr(&shift32).cast(u32_dt.clone());
+    let key0 = key.cast(u32_dt.clone());
+    let key1 = key.shr(&shift32).cast(u32_dt.clone());
 
     // Key schedule: ks = [key1, key0 ^ key1 ^ 0x1BD11BDA, key0]
     let skein_const = UOp::const_(u32_dt.clone(), ConstValue::UInt(0x1BD11BDA));
@@ -2120,9 +2121,9 @@ fn threefry2x32(x: &Arc<UOp>, key: &Arc<UOp>) -> Arc<UOp> {
     for i in 0..5u32 {
         for &r in &rotations[i as usize % 2] {
             let new_x0 = xr0.add(&xr1);
-            // Rotation: (xr1 * 2^r) + (xr1 // 2^(32-r))  (barrel rotate via mul+div)
-            let rot_left = xr1.mul(&UOp::const_(u32_dt.clone(), ConstValue::UInt(1u64 << r)));
-            let rot_right = xr1.floor_div(&UOp::const_(u32_dt.clone(), ConstValue::UInt(1u64 << (32 - r))));
+            // Barrel rotate: (xr1 << r) + (xr1 >> (32-r)).
+            let rot_left = xr1.shl(&UOp::const_(u32_dt.clone(), ConstValue::Int(r as i64)));
+            let rot_right = xr1.shr(&UOp::const_(u32_dt.clone(), ConstValue::Int(32 - r as i64)));
             let rotated = rot_left.add(&rot_right);
             xr1 = new_x0.xor(&rotated);
             xr0 = new_x0;
@@ -2133,8 +2134,8 @@ fn threefry2x32(x: &Arc<UOp>, key: &Arc<UOp>) -> Arc<UOp> {
         xr1 = xr1.add(&ks[(i as usize + 1) % 3]).add(&round_const);
     }
 
-    // Recombine: xr1.cast(u64) * 2^32 | xr0.cast(u64)
-    xr1.cast(u64_dt.clone()).mul(&pow32).or_(&xr0.cast(u64_dt))
+    // Recombine: (xr1.cast(u64) << 32) | xr0.cast(u64)
+    xr1.cast(u64_dt.clone()).shl(&shift32).or_(&xr0.cast(u64_dt))
 }
 
 /// DeMorgan's law: NOT(x) & NOT(y) → NOT(x | y).

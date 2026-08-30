@@ -587,6 +587,7 @@ fn symbolic_simple_base() -> TypedPatternMatcher {
         + zero_folding_dsl_patterns()
         + division_dsl_patterns()
         + cast_dsl_patterns()
+        + uint_pack_dsl_patterns()
         + div_mod_recombine_dsl_patterns()
         + power_dsl_patterns()
         + boolean_dsl_simple_patterns()
@@ -1092,6 +1093,57 @@ pub fn cast_dsl_patterns() -> &'static TypedPatternMatcher {
             if can_safe_cast(&x.dtype(), intermediate)
             ~> |x, outer| x.cast(outer.clone()),
     }
+}
+
+/// Unpack a uint64 packed from two uint32 (Tinygrad `uop/symbolic.py:170-173`).
+///
+/// THREEFRY packs its operands as `(hi.cast(u64) << 32) | lo.cast(u64)` and its
+/// callers immediately take one half back out. Cancelling the pair keeps the
+/// whole PRNG in 32-bit ALU.
+pub fn uint_pack_dsl_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
+        // ((_:u64 << 32) | y.cast(u64)).cast(u32) → y.cast(u32)
+        Cast { src: Or[shifted @ Shl(_, _s @const(s)), lo], dtype: narrowed }
+            if *narrowed == DType::UInt32 && shifted.dtype() == DType::UInt64 && is_shift_32(s)
+            => |lo| Some(low_half_payload(lo)?.cast(DType::UInt32)),
+        // ((x.cast(u64) << 32) | _.cast(u64)) >> 32 → x.cast(u64)
+        Shr(Or[Shl(high, _s @const(s)), lo], _t @const(t))
+            if is_shift_32(s) && is_shift_32(t)
+            => |high, lo| {
+                let payload = low_half_payload(high)?;
+                low_half_payload(lo)?;
+                Some(payload.cast(DType::UInt64))
+            },
+    }
+}
+
+/// A shift amount of exactly 32, whatever integer flavour the constant carries.
+fn is_shift_32(value: ConstValue) -> bool {
+    matches!(value, ConstValue::Int(32) | ConstValue::UInt(32))
+}
+
+/// The 32-bit payload behind a widening cast into uint64, when the source
+/// provably holds in the low 32 bits — so the high half of the widened value is
+/// zero. Tinygrad spells this as a literal `uint32 → uint64` cast; morok's
+/// earlier cast folding can leave a signed-but-non-negative source instead.
+fn low_half_payload(value: &Arc<UOp>) -> Option<&Arc<UOp>> {
+    let Op::Cast { src, dtype } = value.op() else { return None };
+    (*dtype == DType::UInt64 && (src.dtype() == DType::UInt32 || fits_in_u32(src))).then_some(src)
+}
+
+/// Provable `0 ..= u32::MAX` bounds — the range-analysis stand-in for a literal
+/// uint32 source.
+fn fits_in_u32(value: &Arc<UOp>) -> bool {
+    fn bound(value: &ConstValue) -> Option<i128> {
+        match value {
+            ConstValue::Int(v) => Some(i128::from(*v)),
+            ConstValue::UInt(v) => Some(i128::from(*v)),
+            _ => None,
+        }
+    }
+    let bounds = SoundVminVmaxProperty::get(value);
+    let Some((low, high)) = bounds.as_ref() else { return false };
+    matches!((bound(low), bound(high)), (Some(low), Some(high)) if low >= 0 && high <= i128::from(u32::MAX))
 }
 
 /// Range-based double-cast collapse.
