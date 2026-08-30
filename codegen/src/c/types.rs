@@ -242,7 +242,7 @@ pub fn c_reduce_identity(op: svod_ir::ReduceOp, dtype: &DType) -> String {
         }
         ReduceOp::Max => {
             if dtype.is_float() {
-                format!("-{}", c_math_fn("__builtin_inf", dtype))
+                format!("-{}()", c_math_fn("__builtin_inf", dtype))
             } else if dtype.is_signed() {
                 match dtype.base() {
                     ScalarDType::Int64 | ScalarDType::Index => format!("{}LL", i64::MIN),
@@ -257,7 +257,7 @@ pub fn c_reduce_identity(op: svod_ir::ReduceOp, dtype: &DType) -> String {
         }
         ReduceOp::Min => {
             if dtype.is_float() {
-                c_math_fn("__builtin_inf", dtype)
+                format!("{}()", c_math_fn("__builtin_inf", dtype))
             } else if dtype.is_signed() {
                 match dtype.base() {
                     ScalarDType::Int64 | ScalarDType::Index => format!("{}LL", i64::MAX),

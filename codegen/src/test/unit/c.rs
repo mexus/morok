@@ -270,25 +270,16 @@ fn reduce_sink(value: f64, extent: i64, op: ReduceOp) -> std::sync::Arc<UOp> {
     UOp::sink(vec![reduce.end(smallvec::smallvec![range])])
 }
 
-#[test_case::test_case(empty_loop_sink(), &["for", "ridx0", "< 10"], true; "loop over a concrete range")]
-#[test_case::test_case(reduce_sink(5.0, 10, ReduceOp::Add), &["acc", "for", "+=", "0.0f"], true; "sum accumulates from the identity")]
-// `compiles: false` — KNOWN BUG, not a property of MAX. `c_reduce_identity`
-// (codegen/src/c/types.rs:245) builds the MAX identity as
-// `format!("-{}", c_math_fn("__builtin_inf", dtype))`, but `c_math_fn` only
-// mangles the *name* by dtype; every one of its other call sites appends the
-// argument list. So the emitted `float accN = -__builtin_inff;` names a builtin
-// without calling it, and clang rejects it ("builtin functions must be directly
-// called"). `ReduceOp::Min` at types.rs:260 has the same defect. Flip this row
-// to `true` once the identity is emitted as `-__builtin_inff()`.
-#[test_case::test_case(reduce_sink(3.0, 5, ReduceOp::Max), &["acc", "fmaxf"], false; "max uses fmaxf")]
-fn c_renders_range_and_reduce_structure(sink: std::sync::Arc<UOp>, needles: &[&str], compiles: bool) {
+#[test_case::test_case(empty_loop_sink(), &["for", "ridx0", "< 10"]; "loop over a concrete range")]
+#[test_case::test_case(reduce_sink(5.0, 10, ReduceOp::Add), &["acc", "for", "+=", "0.0f"]; "sum accumulates from the identity")]
+#[test_case::test_case(reduce_sink(3.0, 5, ReduceOp::Max), &["acc", "fmaxf", "-__builtin_inff()"]; "max starts from -inf and uses fmaxf")]
+#[test_case::test_case(reduce_sink(3.0, 5, ReduceOp::Min), &["acc", "fminf", "__builtin_inff()"]; "min starts from +inf and uses fminf")]
+fn c_renders_range_and_reduce_structure(sink: std::sync::Arc<UOp>, needles: &[&str]) {
     let result = render_linearized(&sink, Some("range_or_reduce")).expect("C codegen failed");
     for needle in needles {
         assert!(result.code.contains(needle), "missing {needle}:\n{}", result.code);
     }
-    if compiles {
-        assert_c_compiles(&result.code);
-    }
+    assert_c_compiles(&result.code);
 }
 
 #[test]
