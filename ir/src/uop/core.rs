@@ -59,16 +59,17 @@ enum TraversalMode {
     PreserveCalls,
 }
 
-fn traversal_sources(node: &Arc<UOp>, mode: TraversalMode) -> SmallVec<[Arc<UOp>; 4]> {
+/// Borrowed children — `Op::sources()` would clone every `Arc` just to read it.
+fn traversal_sources<'a>(node: &'a Arc<UOp>, mode: TraversalMode) -> SmallVec<[&'a Arc<UOp>; 4]> {
     if mode == TraversalMode::Full {
-        return node.op().sources();
+        return node.op().children();
     }
 
     match node.op() {
-        Op::Call { args, .. } | Op::Function { args, .. } => args.clone(),
+        Op::Call { args, .. } | Op::Function { args, .. } => args.iter().collect(),
         // PROGRAM is opaque when preserving call bodies.
         Op::Program { .. } => SmallVec::new(),
-        _ => node.op().sources(),
+        _ => node.op().children(),
     }
 }
 
@@ -705,14 +706,10 @@ impl UOp {
                 result.push(node);
             } else {
                 stack.push((node.clone(), true));
-                let mut children = Vec::new();
-                for child in traversal_sources(&node, mode) {
-                    if !visited.contains(&Arc::as_ptr(&child)) {
-                        children.push(child);
+                for child in traversal_sources(&node, mode).into_iter().rev() {
+                    if !visited.contains(&Arc::as_ptr(child)) {
+                        stack.push((child.clone(), false));
                     }
-                }
-                for child in children.into_iter().rev() {
-                    stack.push((child, false));
                 }
             }
         }
@@ -743,14 +740,10 @@ impl UOp {
                 result.push(node);
             } else if gate(&node) {
                 stack.push((node.clone(), true));
-                let mut children = Vec::new();
-                for child in traversal_sources(&node, mode) {
-                    if !visited.contains(&Arc::as_ptr(&child)) {
-                        children.push(child);
+                for child in traversal_sources(&node, mode).into_iter().rev() {
+                    if !visited.contains(&Arc::as_ptr(child)) {
+                        stack.push((child.clone(), false));
                     }
-                }
-                for child in children.into_iter().rev() {
-                    stack.push((child, false));
                 }
             }
         }

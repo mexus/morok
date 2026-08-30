@@ -53,6 +53,7 @@
 //! ```
 
 use crate::{Op, UOp, UOpKey};
+use smallvec::{SmallVec, smallvec};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -64,33 +65,25 @@ enum TraversalMode {
     PreserveCallBodies,
 }
 
-fn traversal_children(node: &Arc<UOp>, mode: TraversalMode) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
+/// Borrowed children, split into traversed sources and skipped-but-preserved ones.
+/// Borrowing (rather than `Op::sources()`) keeps the per-visit cost at zero
+/// allocations and zero refcount traffic — tinygrad reads `n.src` directly.
+type Children<'a> = SmallVec<[&'a Arc<UOp>; 4]>;
+
+fn traversal_children<'a>(node: &'a Arc<UOp>, mode: TraversalMode) -> (Children<'a>, Children<'a>) {
     if mode == TraversalMode::Full {
-        return (node.op().sources().into_iter().collect(), Vec::new());
+        return (node.op().children(), SmallVec::new());
     }
 
     match node.op() {
-        Op::Call { body, args, .. } | Op::Function { body, args, .. } => {
-            (args.iter().cloned().collect(), vec![body.clone()])
-        }
+        Op::Call { body, args, .. } | Op::Function { body, args, .. } => (args.iter().collect(), smallvec![body]),
         // PROGRAM is opaque when preserving call bodies.
         Op::Program { sink, linear, source, binary, .. } => {
-            let mut skipped = Vec::with_capacity(
-                1 + usize::from(linear.is_some()) + usize::from(source.is_some()) + usize::from(binary.is_some()),
-            );
-            skipped.push(sink.clone());
-            if let Some(linear) = linear {
-                skipped.push(linear.clone());
-            }
-            if let Some(source) = source {
-                skipped.push(source.clone());
-            }
-            if let Some(binary) = binary {
-                skipped.push(binary.clone());
-            }
-            (Vec::new(), skipped)
+            let mut skipped: Children<'a> = smallvec![sink];
+            skipped.extend(linear.iter().chain(source.iter()).chain(binary.iter()));
+            (SmallVec::new(), skipped)
         }
-        _ => (node.op().sources().into_iter().collect(), Vec::new()),
+        _ => (node.op().children(), SmallVec::new()),
     }
 }
 
@@ -281,7 +274,7 @@ where
 
                 let (sources, skipped) = traversal_children(&working, self.traversal_mode);
                 for skipped_child in skipped {
-                    self.replace.entry(UOpKey(skipped_child.clone())).or_insert(skipped_child);
+                    self.replace.entry(UOpKey(skipped_child.clone())).or_insert_with(|| skipped_child.clone());
                 }
 
                 for child in sources.into_iter().rev() {
@@ -289,38 +282,40 @@ where
                     if on_stack.contains(&child_key) {
                         continue;
                     }
-                    stack.push(Entry { n: child.clone(), stage: 0, new_n: child });
+                    stack.push(Entry { n: child.clone(), stage: 0, new_n: child.clone() });
                     on_stack.insert(child_key);
                 }
             } else if stage == 1 {
                 // Stage 1: ApplyPatterns
-                let sources = new_n.op().sources();
+                // Scoped so the borrow of `new_n`'s children ends before `new_n` is consumed.
+                let (tmp, waiting, sources_changed) = {
+                    let sources = new_n.op().children();
+                    let mut tmp: Vec<Arc<UOp>> = Vec::with_capacity(sources.len());
+                    let mut waiting = false;
+                    let mut changed = false;
 
-                let mut tmp: Vec<Arc<UOp>> = Vec::with_capacity(sources.len());
-                let mut waiting = false;
-
-                for src in &sources {
-                    let src_key = UOpKey(src.clone());
-                    if let Some(rx) = self.replace.get(&src_key) {
-                        tmp.push(rx.clone());
-                    } else {
-                        // Source not ready: register in waitlist
-                        waitlist.entry(src_key).or_default().push(Entry {
-                            n: n.clone(),
-                            stage: 1,
-                            new_n: new_n.clone(),
-                        });
-                        waiting = true;
-                        break;
+                    for src in sources {
+                        let src_key = UOpKey(src.clone());
+                        if let Some(rx) = self.replace.get(&src_key) {
+                            changed |= !Arc::ptr_eq(rx, src);
+                            tmp.push(rx.clone());
+                        } else {
+                            // Source not ready: register in waitlist
+                            waitlist.entry(src_key).or_default().push(Entry {
+                                n: n.clone(),
+                                stage: 1,
+                                new_n: new_n.clone(),
+                            });
+                            waiting = true;
+                            break;
+                        }
                     }
-                }
+                    (tmp, waiting, changed)
+                };
 
                 if waiting {
                     continue;
                 }
-
-                // All sources ready — reconstruct if any changed
-                let sources_changed = tmp.iter().zip(sources.iter()).any(|(a, b)| !Arc::ptr_eq(a, b));
 
                 // Hash consing may collapse reconstruction to same node even when
                 // sources logically changed. Detect this and treat as unchanged.
@@ -417,20 +412,20 @@ where
 
                 let (sources, skipped) = traversal_children(&n, self.traversal_mode);
                 for skipped_child in skipped {
-                    self.replace.entry(UOpKey(skipped_child.clone())).or_insert(skipped_child);
+                    self.replace.entry(UOpKey(skipped_child.clone())).or_insert_with(|| skipped_child.clone());
                 }
                 for child in sources.into_iter().rev() {
                     let child_key = UOpKey(child.clone());
                     if !self.replace.contains_key(&child_key) {
-                        stack.push((child, false));
+                        stack.push((child.clone(), false));
                     }
                 }
             } else {
                 // Rebuild with rewritten sources.
-                let sources = n.op().sources();
+                let sources = n.op().children();
                 let new_src: Vec<Arc<UOp>> = sources
                     .iter()
-                    .map(|s| self.replace.get(&UOpKey(s.clone())).cloned().unwrap_or_else(|| s.clone()))
+                    .map(|s| self.replace.get(&UOpKey((*s).clone())).cloned().unwrap_or_else(|| (*s).clone()))
                     .collect();
                 let any_changed = new_src.iter().zip(sources.iter()).any(|(a, b)| !Arc::ptr_eq(a, b));
                 let rebuilt = if any_changed { n.with_sources(new_src) } else { n.clone() };
