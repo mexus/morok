@@ -88,7 +88,6 @@ fn test_substitute_transformation() {
     let replacement = UOp::native_const(20i32);
 
     // Build substitution map
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(original.clone()), replacement.clone());
 
@@ -121,14 +120,12 @@ fn test_provenance_chain() {
 
     // Transform it multiple times
     let uop2 = UOp::native_const(2i32);
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(uop1.clone()), uop2.clone());
     let result1 = uop1.substitute(&subst_map);
 
     // Another transformation
     let uop3 = UOp::native_const(3i32);
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map2 = HashMap::new();
     subst_map2.insert(UOpKey(result1.clone()), uop3.clone());
     let result2 = result1.substitute(&subst_map2);
@@ -280,7 +277,6 @@ fn test_multiple_parents() {
 
     // Now substitute 'a' in 'c'
     let a_new = UOp::native_const(10i32);
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(a.clone()), a_new.clone());
     let c_new = c.substitute(&subst_map);

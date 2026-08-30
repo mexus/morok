@@ -108,7 +108,10 @@ pub enum Error {
     Rangeify { source: svod_ir::Error },
 
     #[snafu(display("Kernel graph failed: {source}"))]
-    KernelGraph { source: svod_schedule::KernelGraphError },
+    KernelGraph {
+        #[snafu(source(from(svod_schedule::KernelGraphError, Box::new)))]
+        source: Box<svod_schedule::KernelGraphError>,
+    },
 
     #[snafu(display("Optimization error: {source}"))]
     Optimize { source: svod_schedule::OptError },

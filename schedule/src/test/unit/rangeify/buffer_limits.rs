@@ -31,7 +31,6 @@ fn add_chain(count: usize, range: &Arc<UOp>) -> Arc<UOp> {
     (1..count).fold(read(0, range), |acc, slot| acc.try_add(&read(slot, range)).expect("add"))
 }
 
-#[allow(clippy::mutable_key_type)]
 fn count_stages(uop: &Arc<UOp>) -> usize {
     let (mut stack, mut visited, mut count) = (vec![uop.clone()], HashSet::new(), 0);
     while let Some(current) = stack.pop() {

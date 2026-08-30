@@ -1122,14 +1122,12 @@ fn substitute_gated_replaces_only_the_mapped_nodes() {
     let r1 = UOp::range_const(20, 1);
     let replacement = UOp::index_const(42);
 
-    #[allow(clippy::mutable_key_type)]
     let map = HashMap::from([(UOpKey(r0.clone()), replacement.clone())]);
     let result = r0.add(&r1).substitute_gated(&map);
     let Op::Binary(BinaryOp::Add, lhs, rhs) = result.op() else { panic!("expected Add, got {}", result.tree()) };
     assert!(Arc::ptr_eq(lhs, &replacement) || Arc::ptr_eq(rhs, &replacement));
     assert!(Arc::ptr_eq(lhs, &r1) || Arc::ptr_eq(rhs, &r1));
 
-    #[allow(clippy::mutable_key_type)]
     let empty: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     assert!(Arc::ptr_eq(&r0.substitute_gated(&empty), &r0));
 }

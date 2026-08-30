@@ -482,10 +482,8 @@ pub(crate) fn retain_program_abi(
     let abi = abi.to_vec();
     let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
     let var_count = abi.len() - buf_count;
-    let var_names = abi
-        .iter()
-        .filter_map(|arg| (!arg.is_storage()).then(|| arg.name.clone().unwrap_or_default()))
-        .collect::<Vec<_>>();
+    let var_names =
+        abi.iter().filter(|arg| !arg.is_storage()).map(|arg| arg.name.clone().unwrap_or_default()).collect::<Vec<_>>();
     crate::device::validate_abi_descriptors(&abi, buf_count, &var_names)?;
     Ok((abi, buf_count, var_count))
 }

@@ -5,6 +5,9 @@
 //! 2. Heap toposort respecting data dependencies
 
 use std::cmp::Ordering;
+
+/// WMMA `(upcast, reduce, hidden)` axis lists, `None` when the sort key carries no WMMA.
+type WmmaAxes = Option<(Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>)>;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -566,13 +569,7 @@ enum ArgKey {
     Call(Option<String>, Vec<String>, Option<String>, bool, bool),
     Hints(Vec<(String, Option<usize>, Option<i64>)>),
     Bytes(Vec<u8>),
-    Wmma(
-        (usize, usize, usize),
-        DTypeKey,
-        String,
-        usize,
-        Option<(Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>)>,
-    ),
+    Wmma((usize, usize, usize), DTypeKey, String, usize, WmmaAxes),
 }
 
 fn reduce_value(op: svod_ir::ReduceOp) -> u16 {
@@ -605,10 +602,7 @@ fn axis_pairs(values: &[(svod_ir::AxisId, usize)]) -> Vec<(usize, usize)> {
     values.iter().map(|(axis, amount)| (axis.path()[0], *amount)).collect()
 }
 
-fn partial_wmma_axes_cmp(
-    left: &Option<(Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>)>,
-    right: &Option<(Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>)>,
-) -> Option<Ordering> {
+fn partial_wmma_axes_cmp(left: &WmmaAxes, right: &WmmaAxes) -> Option<Ordering> {
     let (left, right) = match (left, right) {
         (None, None) => return Some(Ordering::Equal),
         (Some(left), Some(right)) => (left, right),
@@ -836,7 +830,6 @@ fn run_count(uop: &Arc<UOp>) -> u64 {
     use svod_ir::uop::cached_property::CachedProperty;
     use svod_ir::uop::properties::InScopeRangesProperty;
 
-    #[allow(clippy::mutable_key_type)]
     let in_scope = InScopeRangesProperty::get(uop);
 
     in_scope

@@ -96,7 +96,6 @@ cached_property! {
     InScopeRangesProperty: HashSet<UOpKey> {
         cache_field: in_scope_ranges_cache,
         compute: |uop| {
-            #[allow(clippy::mutable_key_type)]
             let mut result: HashSet<UOpKey> = HashSet::new();
 
             // Step 1: Merge from all sources' cached in_scope_ranges

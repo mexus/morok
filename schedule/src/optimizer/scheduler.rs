@@ -762,7 +762,6 @@ impl Scheduler {
         };
 
         // 5. Perform substitution
-        #[allow(clippy::mutable_key_type)] // UOpKey uses stable ID for Hash/Eq (safe)
         let mut subst_map = HashMap::new();
         subst_map.insert(UOpKey(rng), sub_axis);
 
@@ -877,7 +876,6 @@ impl Scheduler {
         }
 
         // Build substitution map: WEAK -> GLOBAL
-        #[allow(clippy::mutable_key_type)]
         let mut subst_map = std::collections::HashMap::new();
         for rng in globalizable {
             let new_rng = rng.with_axis_type(AxisType::Global);

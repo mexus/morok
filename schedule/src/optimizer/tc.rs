@@ -429,7 +429,6 @@ fn apply_axis_choice_impl(
             .collect();
 
         // Substitute ne → placeholders in REDUCE subtree
-        #[allow(clippy::mutable_key_type)]
         let subst_to_ph: HashMap<UOpKey, Arc<UOp>> =
             ne.iter().zip(&placeholders).map(|(n, ph)| (UOpKey(n.clone()), ph.clone())).collect();
         let ret = updated_reduce.substitute(&subst_to_ph);
@@ -449,10 +448,8 @@ fn apply_axis_choice_impl(
         };
 
         // Substitute placeholders → permuted ne for each source
-        #[allow(clippy::mutable_key_type)]
         let subst_a: HashMap<UOpKey, Arc<UOp>> =
             placeholders.iter().enumerate().map(|(i, ph)| (UOpKey(ph.clone()), ne[inv_a[i]].clone())).collect();
-        #[allow(clippy::mutable_key_type)]
         let subst_b: HashMap<UOpKey, Arc<UOp>> =
             placeholders.iter().enumerate().map(|(i, ph)| (UOpKey(ph.clone()), ne[inv_b[i]].clone())).collect();
 
@@ -558,7 +555,6 @@ fn apply_axis_choice_impl(
         }
 
         // Substitute REDUCE → WMMA chain in the AST
-        #[allow(clippy::mutable_key_type)]
         let mut subst_map = HashMap::new();
         subst_map.insert(UOpKey(updated_reduce), tc_uop);
         let new_ast = scheduler.ast().substitute(&subst_map);

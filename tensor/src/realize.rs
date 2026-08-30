@@ -128,7 +128,6 @@ impl Tensor {
 
         let realized_uop = self.uop();
         if !Arc::ptr_eq(&old_uop, &realized_uop) {
-            #[allow(clippy::mutable_key_type)]
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
             crate::tensor_registry::apply_map_to_tensors(&becomes_map);
         }
@@ -190,7 +189,6 @@ impl Tensor {
 
         let realized_uop = self.uop();
         if !Arc::ptr_eq(&old_uop, &realized_uop) {
-            #[allow(clippy::mutable_key_type)]
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
             crate::tensor_registry::apply_map_to_tensors(&becomes_map);
         }
@@ -234,7 +232,6 @@ impl Tensor {
         self.finalize_realize(&plan, &old_uop)?;
         let realized_uop = self.uop();
         if !Arc::ptr_eq(&old_uop, &realized_uop) {
-            #[allow(clippy::mutable_key_type)]
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
             crate::tensor_registry::apply_map_to_tensors(&becomes_map);
         }
@@ -466,7 +463,6 @@ impl Tensor {
         debug!(prep_ms, exec_ms, num_outputs = pending_indices.len(), "realize_batch complete");
 
         // Finalize each pending tensor in-place + build batched becomes_map
-        #[allow(clippy::mutable_key_type)]
         let mut becomes_map = HashMap::new();
         for (buf_idx, &orig_idx) in pending_indices.iter().enumerate() {
             let output_buf = plan.output_buffer_at(buf_idx).expect("buf_idx in range").clone();
@@ -865,7 +861,6 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
 ///
 /// BIND runtime values are carried separately through `var_vals` and applied
 /// at execution-time via fixedvars, preserving `execute_with_vars` behavior.
-#[allow(clippy::mutable_key_type)]
 pub(crate) fn restore_post_schedule_cache(root: &Arc<UOp>, normalization: &ScheduleCacheNormalization) -> Arc<UOp> {
     let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     let mut lunique_buffers: HashMap<usize, Arc<UOp>> = HashMap::new();
@@ -1742,8 +1737,7 @@ fn beam_search_optimize(
 
     // Clone buffers for the closure (Buffer is Clone + Send + Sync)
     let buffers: Vec<Buffer> = buffers.to_vec();
-    let mut bench_config = svod_runtime::BenchmarkConfig::default();
-    bench_config.timing_runs = beam_config.num_runs;
+    let bench_config = svod_runtime::BenchmarkConfig { timing_runs: beam_config.num_runs, ..Default::default() };
 
     // Clone device components for the closure
     let dev_compiler = device.compiler.clone();
@@ -1788,8 +1782,8 @@ fn beam_search_optimize(
         worker_pool.run(candidates, |response| {
             let index = response.index;
             let Some(artifact) = response.result else {
-                if (log_surpass || beam_debug > 1) && response.error.is_some() {
-                    eprintln!("[BEAM drop] worker candidate={index}: {}", response.error.unwrap());
+                if let Some(error) = response.error.filter(|_| log_surpass || beam_debug > 1) {
+                    eprintln!("[BEAM drop] worker candidate={index}: {error}");
                 }
                 return;
             };

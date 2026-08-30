@@ -26,7 +26,6 @@ fn gated(idx: &Arc<UOp>, bound: i64) -> (Arc<UOp>, Arc<UOp>) {
     (wrapped, valid)
 }
 
-#[allow(clippy::mutable_key_type)]
 fn realize_axes(ctx: &IndexingContext, uop: &Arc<UOp>) -> Option<Option<Vec<usize>>> {
     ctx.realize_map.get(&UOpKey(uop.clone())).cloned()
 }

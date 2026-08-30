@@ -169,7 +169,6 @@ struct ReshapeKey {
 /// Both caches are process-global, exactly as upstream's `@functools.cache`: a hit
 /// skips building the index chain and its `graph_rewrite` entirely, across every
 /// `run_rangeify`.
-#[allow(clippy::mutable_key_type)]
 type Memo<K> = std::sync::LazyLock<std::sync::Mutex<rustc_hash::FxHashMap<K, Vec<Arc<UOp>>>>>;
 static MOVEMENT_CACHE: Memo<MovementKey> = std::sync::LazyLock::new(Default::default);
 static RESHAPE_CACHE: Memo<ReshapeKey> = std::sync::LazyLock::new(Default::default);
@@ -201,7 +200,6 @@ fn cached<K: Eq + std::hash::Hash>(memo: &Memo<K>, key: K, f: impl FnOnce() -> V
 }
 
 /// Run range assignment on a UOp graph. Returns (transformed_sink, context).
-#[allow(clippy::mutable_key_type)]
 #[instrument(skip(sink), fields(sink_id = sink.id))]
 pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContext)> {
     let mut ctx = IndexingContext::new();
@@ -246,7 +244,6 @@ pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContex
 /// `consumer_map[x][c] = None` dict insert (indexing.py:202-205).
 type ConsumerMap = HashMap<UOpKey, IndexSet<UOpKey>>;
 
-#[allow(clippy::mutable_key_type)]
 fn consumer_map_for_data_sources(sink: &Arc<UOp>) -> ConsumerMap {
     let topo = sink.toposort_call_aware(false);
     let mut consumer_map: ConsumerMap = topo.iter().map(|u| (UOpKey(u.clone()), IndexSet::new())).collect();
@@ -547,7 +544,6 @@ pub(crate) fn merge_consumer_ranges(
 }
 
 /// Assign input/output ranges for each UOp via reverse toposort traversal.
-#[allow(clippy::mutable_key_type)]
 #[instrument(skip_all)]
 fn assign_ranges(
     reverse_topo: &[Arc<UOp>],
@@ -1056,14 +1052,11 @@ pub fn apply_reshape_ranges(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<U
 fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp>]) -> Vec<Arc<UOp>>) -> Vec<Arc<UOp>> {
     let sink = UOp::sink(rngs.to_vec());
     // Canonicalize only live/in-scope ranges.
-    #[allow(clippy::mutable_key_type)]
     let in_scope = sink.in_scope_ranges();
     let ranges_in_expr: Vec<Arc<UOp>> =
         sink.ranges().iter().filter(|r| in_scope.contains(&UOpKey((*r).clone()))).cloned().collect();
 
-    #[allow(clippy::mutable_key_type)]
     let mut sub_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
-    #[allow(clippy::mutable_key_type)]
     let mut reverse_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     let mut reverse_axis_map: HashMap<usize, Arc<UOp>> = HashMap::new();
     for (i, r) in ranges_in_expr.iter().enumerate() {
@@ -1095,7 +1088,6 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
 
     // If rewrite changed placeholder internals (e.g., `end` expr), structural
     // reverse_map can miss restoration. Recover by axis id.
-    #[allow(clippy::mutable_key_type)]
     let mut axis_restore_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     for r in UOp::sink(output.clone()).ranges().iter() {
         if let Op::Range { axis_id: AxisId::Renumbered(i), axis_type: AxisType::Placeholder, .. } = r.op()
@@ -1287,7 +1279,6 @@ pub fn is_const(uop: &Arc<UOp>, value: &ConstValue) -> bool {
 // ============================================================================
 
 /// Collect all RANGE UOps from an expression tree.
-#[allow(clippy::mutable_key_type)]
 fn collect_ranges_from_uop(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     use std::collections::HashSet;
     let mut ranges = Vec::new();

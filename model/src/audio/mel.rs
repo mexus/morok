@@ -82,16 +82,8 @@ impl MelSpectrogram {
 
     pub fn forward_into(&self, waveform: &[f32], out: &mut ArrayViewMutD<'_, f32>) {
         let n_fft = self.n_fft;
-        let signal: &[f32];
-        let signal_owned: Vec<f32>;
-
-        if self.center {
-            let pad = n_fft / 2;
-            signal_owned = reflect_pad(waveform, pad);
-            signal = &signal_owned;
-        } else {
-            signal = waveform;
-        }
+        let signal_owned = self.center.then(|| reflect_pad(waveform, n_fft / 2));
+        let signal: &[f32] = signal_owned.as_deref().unwrap_or(waveform);
 
         let n_frames = if signal.len() >= n_fft { (signal.len() - n_fft) / self.hop_length + 1 } else { 0 };
         let n_bins = n_fft / 2 + 1;
@@ -143,16 +135,8 @@ impl MelSpectrogram {
     /// its own `log10` + clamp + normalize.
     pub fn forward_power(&self, waveform: &[f32]) -> Vec<f32> {
         let n_fft = self.n_fft;
-        let signal: &[f32];
-        let signal_owned: Vec<f32>;
-
-        if self.center {
-            let pad = n_fft / 2;
-            signal_owned = reflect_pad(waveform, pad);
-            signal = &signal_owned;
-        } else {
-            signal = waveform;
-        }
+        let signal_owned = self.center.then(|| reflect_pad(waveform, n_fft / 2));
+        let signal: &[f32] = signal_owned.as_deref().unwrap_or(waveform);
 
         let n_frames_raw = if signal.len() >= n_fft { (signal.len() - n_fft) / self.hop_length + 1 } else { 0 };
         // Match torch.stft(...)[..., :-1]: drop the last frame.

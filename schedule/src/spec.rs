@@ -802,7 +802,7 @@ fn rule_tensor_copy_multi_contiguous() -> SpecRule {
     fn mstack_len(source: &Arc<UOp>) -> Option<usize> {
         match source.op() {
             Op::MStack { buffers } => Some(buffers.len()),
-            op if op.is_movement() => op.sources().first().and_then(|source| mstack_len(source)),
+            op if op.is_movement() => op.sources().first().and_then(mstack_len),
             _ => None,
         }
     }

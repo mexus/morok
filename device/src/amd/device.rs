@@ -443,7 +443,7 @@ impl AmdDeviceCore {
     pub(crate) fn publication_checkpoint(&self, stage: crate::amd::iface::PublicationStage) -> Result<()> {
         #[cfg(test)]
         {
-            return self.iface.publication_checkpoint(stage);
+            self.iface.publication_checkpoint(stage)
         }
         #[cfg(not(test))]
         {

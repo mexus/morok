@@ -356,7 +356,7 @@ fn display_slot(slot: usize) -> isize {
     if slot == usize::MAX { -1 } else { slot as isize }
 }
 
-fn actual_for_formal<'a>(slot: usize, args: &'a [Arc<UOp>]) -> crate::Result<&'a Arc<UOp>> {
+fn actual_for_formal(slot: usize, args: &[Arc<UOp>]) -> crate::Result<&Arc<UOp>> {
     let actual = if slot == usize::MAX { args.last() } else { args.get(slot) };
     actual.ok_or(crate::Error::CallFormalSlotMissing { slot: display_slot(slot), arg_count: args.len() })
 }
@@ -366,7 +366,6 @@ fn actual_for_formal<'a>(slot: usize, args: &'a [Arc<UOp>]) -> crate::Result<&'a
 /// PARAM slots are positional and may be sparse; unused actual arguments are
 /// valid. Tinygrad's scalar slot `-1` is represented by `usize::MAX` and is a
 /// free body variable during execution, so it is excluded here.
-#[allow(clippy::mutable_key_type)]
 pub fn function_param_substitutions(body: &Arc<UOp>, args: &[Arc<UOp>]) -> crate::Result<HashMap<UOpKey, Arc<UOp>>> {
     let mut substitutions = HashMap::new();
     for formal in body.toposort_call_aware(false) {
@@ -415,7 +414,6 @@ pub fn function_param_substitutions(body: &Arc<UOp>, args: &[Arc<UOp>]) -> crate
 /// This intentionally does not inspect or validate the rest of the FUNCTION
 /// body. Tinygrad rewrites each selected `inner_shape` independently, including
 /// Python slot `-1` selecting the last call argument.
-#[allow(clippy::mutable_key_type)]
 pub fn substitute_selected_shape(shape: &Shape, _function: &Arc<UOp>, args: &[Arc<UOp>]) -> crate::Result<Shape> {
     let mut substitutions = HashMap::new();
     for dim in shape {

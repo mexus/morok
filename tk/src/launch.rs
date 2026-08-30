@@ -34,7 +34,7 @@ pub(crate) fn plan_compact_buffers(globals: &[usize], supplied: usize) -> Result
     if supplied != globals.len() {
         return BufferCountSnafu { expected: globals.len(), supplied, slots: globals.to_vec() }.fail();
     }
-    Ok(globals.iter().copied().enumerate().map(|(ordinal, slot)| (ordinal, slot)).collect())
+    Ok(globals.iter().copied().enumerate().collect())
 }
 
 /// Errors raised while compiling or dispatching a hand-built kernel.

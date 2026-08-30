@@ -445,7 +445,6 @@ pub fn pm_remove_bufferize() -> TypedPatternMatcher {
 ///
 /// CONST range keys are skipped during substitution — they're broadcast slots,
 /// not real loop variables.
-#[allow(clippy::mutable_key_type)]
 fn remove_bufferize(
     src: &Arc<UOp>,
     buf_ranges: &SmallVec<[Arc<UOp>; 4]>,
@@ -578,7 +577,6 @@ pub(crate) fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
                 "reduce_unparented: all reduce ranges must be RANGE ops, got: {:?}",
                 ranges.iter().map(|r| r.op().as_ref().to_string()).collect::<Vec<_>>()
             );
-            #[allow(clippy::mutable_key_type)]
             let src_ranges = src.in_scope_ranges();
             let (parented, unparented) = partition_reduce_ranges(ranges, src_ranges);
 
@@ -620,7 +618,6 @@ pub(crate) fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
 ///
 /// Uses `in_scope_ranges` (cached property) to check if any of the given ranges
 /// appear in the UOp's dependency graph.
-#[allow(clippy::mutable_key_type)]
 fn references_any_reduce_range(uop: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> bool {
     let in_scope = uop.in_scope_ranges();
     ranges.iter().any(|r| in_scope.contains(&UOpKey(r.clone())))
@@ -1044,7 +1041,6 @@ pub fn split_kernels_pattern() -> TypedPatternMatcher<Vec<Arc<UOp>>> {
 // ============================================================================
 
 /// Extract device specification from a UOp graph (first device found).
-#[allow(clippy::mutable_key_type)]
 pub fn extract_device_from_graph(root: &Arc<UOp>) -> Option<DeviceSpec> {
     let mut visited = HashSet::new();
 
@@ -1136,10 +1132,8 @@ fn check_buffer_limit(
 /// Collect all accessed buffers from sources.
 fn collect_accessed_buffers(sources: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     let mut all_buffers = Vec::new();
-    #[allow(clippy::mutable_key_type)]
     let mut visited = HashSet::new();
 
-    #[allow(clippy::mutable_key_type)]
     fn collect_recursive(uop: &Arc<UOp>, buffers: &mut Vec<Arc<UOp>>, visited: &mut HashSet<UOpKey>) {
         let key = UOpKey(Arc::clone(uop));
         if !visited.insert(key) {
@@ -1165,7 +1159,6 @@ fn collect_accessed_buffers(sources: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     }
 
     // Deduplicate
-    #[allow(clippy::mutable_key_type)]
     let mut seen = HashSet::new();
     all_buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
     all_buffers
@@ -1185,7 +1178,6 @@ fn force_bufferize(src: &Arc<UOp>, ctx: &mut IndexingContext) -> Arc<UOp> {
             _ => range.clone(),
         })
         .collect();
-    #[allow(clippy::mutable_key_type)]
     let substitutions: HashMap<_, _> = original_ranges
         .iter()
         .zip(&end_ranges)
@@ -1502,7 +1494,6 @@ fn gated_collapse_core(idx: &Arc<UOp>, range: &Arc<UOp>, end: &Arc<UOp>, expr: &
     let zero = UOp::index_const(0);
     let in_bounds = idx_casted.try_cmpge(&zero).ok()?.try_and_op(&idx_casted.try_cmplt(end).ok()?).ok()?;
     let valid_idx = idx_casted.valid(in_bounds.clone());
-    #[allow(clippy::mutable_key_type)]
     let subs: std::collections::HashMap<UOpKey, Arc<UOp>> = [(UOpKey(range.clone()), valid_idx)].into_iter().collect();
     let substituted = expr.substitute(&subs);
     let zero_like = UOp::const_(expr.dtype(), ConstValue::zero(expr.dtype().base()));

@@ -85,7 +85,7 @@ fn fast_idiv(x: &Arc<UOp>, divisor: i64, dont_cast: bool, supported_dtypes: &Has
         let result = multiply_shift(x)?;
         return if is_unsigned { Some(result) } else { result.try_add(&signed_adjustment()?).ok() };
     }
-    let factor = divisor & -divisor;
+    let factor = divisor.isolate_lowest_one();
     if factor > 1 {
         let reduced = x.cdiv(&x.const_like(factor));
         if let Some(result) = fast_idiv(&reduced, divisor / factor, true, supported_dtypes) {

@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\nLoading GigaAM from {}{}...",
         args.repo,
-        (!local_repo.is_dir()).then(|| format!(" ({revision})")).unwrap_or_default()
+        if local_repo.is_dir() { String::new() } else { format!(" ({revision})") }
     );
     let model = if local_repo.is_dir() {
         GigaAm::from_dir_with_weights_and_encoder_dtype(&local_repo, weights, encoder_dtype)?

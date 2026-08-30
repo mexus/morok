@@ -177,10 +177,12 @@ fn try_compile(
         return Ok(None);
     };
     let raw_ast = candidate.get_optimized_ast(None);
-    let mut post = svod_schedule::OptimizerConfig::default();
-    post.beam = init.beam.clone();
-    post.transcendental = init.transcendental;
-    post.disable_fast_idiv = init.disable_fast_idiv;
+    let post = svod_schedule::OptimizerConfig {
+        beam: init.beam.clone(),
+        transcendental: init.transcendental,
+        disable_fast_idiv: init.disable_fast_idiv,
+        ..Default::default()
+    };
     let optimized = svod_schedule::apply_post_optimization_with_config(raw_ast, &codegen.optimizer_renderer, &post)
         .map_err(BeamWorker::at("post optimization"))?;
     let compute_ops = svod_schedule::compute_ops_estimate(&optimized);
@@ -571,7 +573,7 @@ impl WorkerPool {
                         }
                         finished += 1;
                         progress = true;
-                        completed(response);
+                        completed(*response);
                         if self.workers[slot].tasks >= self.max_tasks_per_child {
                             self.replace(slot)?;
                             continue;
@@ -615,7 +617,7 @@ impl WorkerPool {
 
 /// What one poll of a worker slot found.
 enum SlotOutcome {
-    Response(WorkerResponse),
+    Response(Box<WorkerResponse>),
     /// The helper's stdout errored or closed; `None` for a disconnected channel.
     Failed(Option<std::io::Error>),
     TimedOut,
@@ -635,7 +637,7 @@ fn poll_slot(
     timeout: Duration,
 ) -> SlotOutcome {
     match responses.try_recv() {
-        Ok(Ok(response)) => SlotOutcome::Response(response),
+        Ok(Ok(response)) => SlotOutcome::Response(Box::new(response)),
         Ok(Err(error)) => SlotOutcome::Failed(Some(error)),
         Err(mpsc::TryRecvError::Disconnected) => SlotOutcome::Failed(None),
         Err(mpsc::TryRecvError::Empty) => match busy {

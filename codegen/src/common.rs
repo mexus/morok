@@ -102,6 +102,9 @@ pub fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
     false
 }
 
+/// `(buffers, variables)` in canonical ABI order.
+pub type BuffersAndVars = (Vec<Arc<UOp>>, Vec<Arc<UOp>>);
+
 /// Collect buffer and variable parameters from a UOp graph.
 ///
 /// Collects:
@@ -109,7 +112,7 @@ pub fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
 /// - Variables: DEFINE_VAR and scalar PARAM operations
 ///
 /// Returns (buffers, variables) sorted for deterministic function signatures.
-pub fn collect_buffers_and_vars(root: &Arc<UOp>) -> Result<(Vec<Arc<UOp>>, Vec<Arc<UOp>>)> {
+pub fn collect_buffers_and_vars(root: &Arc<UOp>) -> Result<BuffersAndVars> {
     let nodes = root.toposort();
     let params = collect_abi_params(&nodes)?;
     Ok(params.into_iter().partition(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_some())))

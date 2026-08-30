@@ -290,7 +290,6 @@ fn apply_swap(scheduler: &mut Scheduler, axis: usize, other_axis: usize) -> Resu
     let new_rng = UOp::range_axis(end1, axis_id2, axis_type1);
     let new_altrng = UOp::range_axis(end2, axis_id1, axis_type2);
 
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(rng), new_rng);
     subst_map.insert(UOpKey(altrng), new_altrng);
@@ -393,7 +392,6 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
         .map_err(|_| ValidationFailedSnafu { op: "PADTO", reason: "failed to create validity condition" }.build())?;
 
     // Build substitution map
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(rng.clone()), new_rng.clone());
 
@@ -412,7 +410,6 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
     // The replacement INDEX must use the new padded range in its indices
     // (not the original range), since substitute replaces the INDEX node
     // directly without recursing into its children.
-    #[allow(clippy::mutable_key_type)]
     let range_subst: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(rng.clone()), new_rng.clone())].into_iter().collect();
 
     for buf_op in scheduler.bufs() {

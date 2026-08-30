@@ -46,7 +46,6 @@ pub struct CFGContext {
     ///
     /// The predecessor is the operation that must complete before
     /// this RANGE can begin execution.
-    #[allow(clippy::mutable_key_type)]
     pub edges: HashMap<UOpKey, Arc<UOp>>,
 }
 
@@ -72,12 +71,10 @@ impl CFGContext {
         // Step 1: Build dependency sets for each node
         // RANGE and END add themselves to deps
         // deps[u] = set of RANGE/END UOps that u transitively depends on
-        #[allow(clippy::mutable_key_type)]
         let mut deps: HashMap<UOpKey, HashMap<UOpKey, ()>> = HashMap::new();
 
         for node in &nodes {
             // Get deps from sources
-            #[allow(clippy::mutable_key_type)]
             let mut node_deps: HashMap<UOpKey, ()> = HashMap::new();
             node.op().map_child(|src| {
                 if let Some(src_deps) = deps.get(&UOpKey(src.clone())) {
@@ -99,7 +96,6 @@ impl CFGContext {
         //   - u depends on x (x is in deps[u])
         //   - u is SINK, OR u's RANGE (u.src[1]) is in deps[x]
         //   - x hasn't been assigned a nesting parent yet
-        #[allow(clippy::mutable_key_type)]
         let mut nesting: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
         for node in &nodes {
@@ -150,7 +146,6 @@ impl CFGContext {
         }
 
         // Step 3: Group siblings by parent
-        #[allow(clippy::mutable_key_type)]
         let mut siblings: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
         for node in &nodes {
             if let Some(parent) = nesting.get(&UOpKey(node.clone())) {

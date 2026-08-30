@@ -133,7 +133,6 @@ fn check_tree_scope(root: &Arc<UOp>) -> Result<(), String> {
 
     let topo = root.toposort();
     for u in &topo {
-        #[allow(clippy::mutable_key_type)] // HashSet<UOpKey>: key hash is by id, not interior mutability
         let u_scope = InScopeRangesProperty::get(u);
         if u_scope.is_empty() {
             continue;
@@ -142,7 +141,6 @@ fn check_tree_scope(root: &Arc<UOp>) -> Result<(), String> {
             if !v.op().sources().iter().any(|s| s.id == u.id) || matches!(v.op(), Op::After { .. }) {
                 continue;
             }
-            #[allow(clippy::mutable_key_type)] // HashSet<UOpKey>: key hash is by id, not interior mutability
             let v_scope = InScopeRangesProperty::get(v);
             let v_ended: HashSet<u64> = v.op().ended_ranges().iter().map(|r| r.id).collect();
             for r in u_scope.iter() {

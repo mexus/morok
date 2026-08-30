@@ -217,7 +217,7 @@ pub fn entry_valid(entry: u64) -> bool {
 /// of va, lowest set bit of sz)) - 12` (fragment 0 = 4 KiB), covering the whole
 /// range (`must_cover`). Saturates at 0.
 pub fn frag_size(va: u64, sz: u64) -> u32 {
-    let va_pwr2 = if va > 0 { va & va.wrapping_neg() } else { 1u64 << 63 };
-    let sz_pwr2 = sz & sz.wrapping_neg();
+    let va_pwr2 = if va > 0 { va.isolate_lowest_one() } else { 1u64 << 63 };
+    let sz_pwr2 = sz.isolate_lowest_one();
     bit_length(va_pwr2.min(sz_pwr2)).saturating_sub(13)
 }

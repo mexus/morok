@@ -109,7 +109,6 @@ impl ReduceContext {
     pub fn merge_reduce_ends(&mut self, sources: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
         let temp_sink = UOp::sink(sources.to_vec());
         let mut next_axis = next_axis_after(&temp_sink);
-        #[allow(clippy::mutable_key_type)]
         let subs = build_end_merge_subs(&self.range_to_ends, &mut next_axis);
         self.range_to_ends.clear();
         if subs.is_empty() {
@@ -125,7 +124,6 @@ impl ReduceContext {
 /// each such outer group, sub-groups beyond the first get cloned RANGEs
 /// (`AxisId::Renumbered(*next_axis + j)`) so each RANGE is associated with
 /// at most one merged END.
-#[allow(clippy::mutable_key_type)]
 fn build_end_merge_subs(
     range_to_ends: &HashMap<SmallVec<[u64; 4]>, Vec<Arc<UOp>>>,
     next_axis: &mut usize,
@@ -177,7 +175,6 @@ fn build_end_merge_subs(
             let mapped: Vec<Arc<UOp>> = if i == 0 {
                 group.clone()
             } else {
-                #[allow(clippy::mutable_key_type)]
                 let mut sub_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
                 for (old, new) in original_ranges.iter().zip(target_ranges.iter()) {
                     sub_map.insert(UOpKey(old.clone()), new.clone());
@@ -230,7 +227,6 @@ pub(crate) fn merge_register_read_ends(root: Arc<UOp>) -> Arc<UOp> {
         }
     }
     let mut next_axis = next_axis_after(&root);
-    #[allow(clippy::mutable_key_type)]
     let substitutions = build_end_merge_subs(&range_to_ends, &mut next_axis);
     if substitutions.is_empty() { root } else { root.substitute(&substitutions) }
 }
@@ -559,7 +555,7 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
 
         x @ Const(_) if x.dtype().base() == ctx.from => {
             let Op::Const(value) = x.op() else { unreachable!() };
-            Some(UOp::const_(DType::Scalar(ctx.to), value.0.clone()))
+            Some(UOp::const_(DType::Scalar(ctx.to), value.0))
         },
 
         // Pattern 6: Any op with FP8 output dtype → promote to target float, cast FP8 sources
@@ -1204,7 +1200,6 @@ pub fn pm_long_decomp() -> crate::TypedPatternMatcher {
 ///
 /// Broadcasting must already be unpacked: every source has the result shape,
 /// except Invalid, whose scalar base is polymorphic.
-
 fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
     let shape = alu.shape().ok().flatten()?.clone();
     if shape.is_empty() {

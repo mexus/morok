@@ -88,7 +88,6 @@ fn cleanup_device_end(end: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// 3. Categorize ranges by axis type (GLOBAL/THREAD vs LOCAL/WARP/GROUP_REDUCE)
 /// 4. Create SPECIAL indices with dimension limiting
 /// 5. Substitute RANGE ops with computed indices
-#[allow(clippy::mutable_key_type)]
 fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Sink { .. } = sink.op() else {
         return None;
@@ -295,7 +294,6 @@ fn thread_core_bound(
 /// Based on Tinygrad's gpudims.py:86-96.
 /// When a STORE to global memory doesn't use all local indices,
 /// we add a mask so the store only executes when missing locals are 0.
-#[allow(clippy::mutable_key_type)]
 fn compute_store_masks(
     topo: &[Arc<UOp>],
     all_ranges: &HashMap<(svod_ir::AxisId, AxisType), Arc<UOp>>,

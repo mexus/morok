@@ -50,7 +50,7 @@ const MIN_BLOCK_SIZE: usize = 256;
 ///   share an underlying allocation.
 /// - `Arena` packs all plannable buffers into one per-device arena using a TLSF
 ///   allocator and rewrites each logical buffer as a `Buffer::view` into it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlannerMode {
     /// Skip the planner entirely. Each `Buffer` keeps its original allocation
     /// and is freed by lazy `Drop`. Useful for memory-debugging baselines.
@@ -62,13 +62,8 @@ pub enum PlannerMode {
     /// Arena packing: pack every plannable buffer into a per-device arena using
     /// a TLSF allocator and rewrite each logical buffer as a fresh
     /// `Buffer::view` into it.
+    #[default]
     Arena,
-}
-
-impl Default for PlannerMode {
-    fn default() -> Self {
-        Self::Arena
-    }
 }
 
 /// Pure parser for the `SVOD_MEMORY_PLANNER` env var, exposed for testing.
@@ -252,6 +247,7 @@ pub struct MemoryPlannerMetrics {
 /// - Already allocated buffers (inputs)
 /// - Output buffers
 /// - Transfer operations
+///
 /// Buffer ids excluded from reuse, grouped by the reason that first applies.
 #[derive(Default)]
 struct ExcludedBufferIds {

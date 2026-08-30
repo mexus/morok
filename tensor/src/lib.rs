@@ -808,7 +808,6 @@ impl Tensor {
         {
             let identity = find_assign_identity(&target_uop, &base);
             let assigned_identity = identity.after(smallvec![assign_effect]);
-            #[allow(clippy::mutable_key_type)]
             let mut becomes_map = HashMap::new();
             becomes_map.insert(UOpKey(identity), assigned_identity);
             // Walk semantics required: replacement contains the original key

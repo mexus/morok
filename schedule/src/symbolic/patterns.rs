@@ -541,7 +541,7 @@ fn const_like_shape(u: &Arc<UOp>, value: ConstValue) -> Arc<UOp> {
 
     let scalar = UOp::const_(u.dtype().scalar_dtype(), value);
     let Ok(Some(shape)) = u.shape() else { return scalar };
-    if shape.is_empty() { scalar } else { fill(&scalar, &shape).unwrap_or(scalar) }
+    if shape.is_empty() { scalar } else { fill(&scalar, shape).unwrap_or(scalar) }
 }
 
 /// Fold LOAD/STORE with fully-Invalid INDEX.
@@ -628,7 +628,7 @@ fn symbolic_simple_base() -> TypedPatternMatcher {
 /// constants.
 pub fn pm_fold_cast_const() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        root @ Cast { src: _c @const(c_val), dtype: _ } ~> root.const_like(c_val.clone()),
+        root @ Cast { src: _c @const(c_val), dtype: _ } ~> root.const_like(c_val),
     }
 }
 

@@ -558,6 +558,7 @@ impl CompiledSpec {
     /// does not rebuild the candidate LINEAR graph. `launch_placeholder` is
     /// shared by private benchmark artifacts; dispatch uses the worker-returned
     /// concrete launch dimensions rather than these symbolic fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_beam_worker(
         name: String,
         source: String,
@@ -572,7 +573,8 @@ impl CompiledSpec {
         let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
         let var_names = abi
             .iter()
-            .filter_map(|arg| (!arg.is_storage()).then(|| arg.name.clone().unwrap_or_default()))
+            .filter(|arg| !arg.is_storage())
+            .map(|arg| arg.name.clone().unwrap_or_default())
             .collect::<Vec<_>>();
         validate_abi_descriptors(&abi, buf_count, &var_names)?;
         let spec = Self {
@@ -597,7 +599,8 @@ impl CompiledSpec {
         let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
         let var_names = abi
             .iter()
-            .filter_map(|arg| (!arg.is_storage()).then(|| arg.name.clone().unwrap_or_default()))
+            .filter(|arg| !arg.is_storage())
+            .map(|arg| arg.name.clone().unwrap_or_default())
             .collect::<Vec<_>>();
         validate_abi_descriptors(&abi, buf_count, &var_names)?;
         Ok(Self {
@@ -620,7 +623,8 @@ impl CompiledSpec {
         let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
         let var_names = abi
             .iter()
-            .filter_map(|arg| (!arg.is_storage()).then(|| arg.name.clone().unwrap_or_default()))
+            .filter(|arg| !arg.is_storage())
+            .map(|arg| arg.name.clone().unwrap_or_default())
             .collect::<Vec<_>>();
         validate_abi_descriptors(&abi, buf_count, &var_names)?;
         Ok(Self {
@@ -650,7 +654,8 @@ impl CompiledSpec {
         let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
         let var_names = abi
             .iter()
-            .filter_map(|arg| (!arg.is_storage()).then(|| arg.name.clone().unwrap_or_default()))
+            .filter(|arg| !arg.is_storage())
+            .map(|arg| arg.name.clone().unwrap_or_default())
             .collect::<Vec<_>>();
         validate_abi_descriptors(&abi, buf_count, &var_names)?;
         Ok(Self {

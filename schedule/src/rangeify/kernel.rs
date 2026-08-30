@@ -375,7 +375,6 @@ fn validate_normal_kernel_devices(root: &Arc<UOp>) -> svod_ir::Result<()> {
 fn fix_assign(root: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
     // Map buf_uop().id -> AFTER node that produces it
     let mut kernel_assign: HashMap<u64, Arc<UOp>> = HashMap::new();
-    #[allow(clippy::mutable_key_type)]
     let mut assign_rep: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
     let afters: Vec<Arc<UOp>> = root.toposort().into_iter().filter(|u| matches!(u.op(), Op::After { .. })).collect();
@@ -604,7 +603,6 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
 
     let base = source.base();
     let noop = UOp::noop();
-    #[allow(clippy::mutable_key_type)]
     let mut substitutions = HashMap::new();
     substitutions.insert(UOpKey(base), noop);
 

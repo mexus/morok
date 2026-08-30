@@ -1215,8 +1215,8 @@ impl QueueInner {
     fn push_pm4_bytes(&mut self, bytes: &[u8]) {
         let ring_dwords = self.ring_size / 4;
         let mut idx = (self.write_idx as usize) % ring_dwords;
-        for word in bytes.chunks_exact(4) {
-            let value = u32::from_le_bytes(word.try_into().unwrap());
+        for word in bytes.as_chunks::<4>().0 {
+            let value = u32::from_le_bytes(*word);
             // SAFETY: ring_host spans ring_size bytes; idx < ring_dwords.
             unsafe { std::ptr::write_volatile((self.ring_host.as_ptr() as *mut u32).add(idx), value) };
             idx = (idx + 1) % ring_dwords;
@@ -1279,7 +1279,7 @@ impl LinkedComputePublication<'_> {
         if self.is_pm4 {
             self.inner.push_pm4_bytes(replay.bytes());
         } else {
-            for packet in replay.bytes().chunks_exact(AQL_PACKET_BYTES) {
+            for packet in replay.bytes().as_chunks::<AQL_PACKET_BYTES>().0 {
                 self.inner.push_aql(packet);
             }
         }
@@ -1682,6 +1682,7 @@ impl AmdComputeQueue {
     /// Patch and publish a linked PM4 graph through the same counter discipline
     /// as ordinary PM4 dispatch. The native command stream was lowered once at
     /// capture; replay only updates invocation and queue-owned fields.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn replay_linked_pm4(
         &self,
         pool: &PoolQueue,
@@ -1793,16 +1794,18 @@ impl AmdComputeQueue {
     }
 
     pub fn submit_linked_aql(&self, replay: &crate::hcq::ReplayCommandBuffer) -> Result<()> {
-        if replay.bytes().len() % AQL_PACKET_BYTES != 0 {
+        if !replay.bytes().len().is_multiple_of(AQL_PACKET_BYTES) {
             return Err(Error::Runtime { message: "linked AQL stream is not packet aligned".into() });
         }
         let packets = replay
             .bytes()
-            .chunks_exact(AQL_PACKET_BYTES)
+            .as_chunks::<AQL_PACKET_BYTES>()
+            .0
+            .iter()
             .map(|bytes| {
                 let mut packet = [0u32; 16];
-                for (word, bytes) in packet.iter_mut().zip(bytes.chunks_exact(4)) {
-                    *word = u32::from_le_bytes(bytes.try_into().unwrap());
+                for (word, bytes) in packet.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                    *word = u32::from_le_bytes(*bytes);
                 }
                 packet
             })
@@ -1816,7 +1819,7 @@ impl AmdComputeQueue {
         replay: &crate::hcq::ReplayCommandBuffer,
         next: u64,
     ) -> Result<()> {
-        if replay.bytes().len() % AQL_PACKET_BYTES != 0 {
+        if !replay.bytes().len().is_multiple_of(AQL_PACKET_BYTES) {
             return Err(Error::Runtime { message: "linked AQL stream is not packet aligned".into() });
         }
         let packets = replay.bytes().len() / AQL_PACKET_BYTES;
@@ -1828,7 +1831,7 @@ impl AmdComputeQueue {
         debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
         let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
-        for packet in replay.bytes().chunks_exact(AQL_PACKET_BYTES) {
+        for packet in replay.bytes().as_chunks::<AQL_PACKET_BYTES>().0 {
             ring.push_aql(packet);
         }
         self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;

@@ -717,7 +717,7 @@ impl ProgramInfo {
         }
 
         let sources = uop.op().sources();
-        let rewritten_sources: Vec<_> = sources.iter().map(|src| Self::ssimplify(src)).collect();
+        let rewritten_sources: Vec<_> = sources.iter().map(Self::ssimplify).collect();
         let rewritten = if sources.iter().zip(&rewritten_sources).all(|(old, new)| Arc::ptr_eq(old, new)) {
             uop.clone()
         } else {

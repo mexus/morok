@@ -228,10 +228,8 @@ pub(crate) fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: boo
                 let simplified: Vec<Arc<UOp>> = candidates
                     .iter()
                     .map(|(x, new_x)| {
-                        #[allow(clippy::mutable_key_type)]
                         let map: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(x.clone()), new_x.clone())].into();
                         let s = simplify(uop.substitute(&map));
-                        #[allow(clippy::mutable_key_type)]
                         let rev: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(new_x.clone()), x.clone())].into();
                         simplify(s.substitute(&rev))
                     })
@@ -269,7 +267,6 @@ pub(crate) fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: boo
     }
 
     // Combined all-candidates substitution
-    #[allow(clippy::mutable_key_type)]
     let sub_map: HashMap<UOpKey, Arc<UOp>> =
         all_candidates.iter().map(|(x, f)| (UOpKey(x.clone()), f.clone())).collect();
     let substituted = uop.substitute(&sub_map);
@@ -281,7 +278,6 @@ pub(crate) fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: boo
     let simplified = simplify(substituted);
 
     // Substitute back and simplify again
-    #[allow(clippy::mutable_key_type)]
     let reverse_map: HashMap<UOpKey, Arc<UOp>> =
         all_candidates.iter().map(|(x, f)| (UOpKey(f.clone()), x.clone())).collect();
     simplify(simplified.substitute(&reverse_map))

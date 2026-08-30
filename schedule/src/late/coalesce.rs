@@ -12,6 +12,9 @@ use svod_ir::uop::properties::VminVmaxProperty;
 use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UOpKey};
 
 use crate::TypedPatternMatcher;
+
+/// Loads/stores of one buffer grouped by constant byte offset.
+type OffsetGroups = BTreeMap<i64, Vec<Arc<UOp>>>;
 use crate::optimizer::Renderer;
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::patterns::{sym, symbolic};
@@ -65,7 +68,6 @@ fn coordinates(idx: &Arc<UOp>) -> Option<Vec<Arc<UOp>>> {
 }
 
 fn substitute(idx: &Arc<UOp>, from: &Arc<UOp>, to: Arc<UOp>) -> Arc<UOp> {
-    #[allow(clippy::mutable_key_type)]
     let substitutions: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(from.clone()), to)].into();
     idx.substitute(&substitutions)
 }
@@ -307,8 +309,7 @@ pub fn memory_coalescing(sink: Arc<UOp>, ctx: &Renderer) -> Arc<UOp> {
         return sink;
     }
 
-    #[allow(clippy::mutable_key_type)]
-    let mut memory: HashMap<MemoryKey, (Arc<UOp>, BTreeMap<i64, Vec<Arc<UOp>>>)> = HashMap::new();
+    let mut memory: HashMap<MemoryKey, (Arc<UOp>, OffsetGroups)> = HashMap::new();
     for uop in sink.toposort() {
         // Tinygrad asserts the same shape (`coalesce.py:111`), but a Python
         // assert only guards development; ours would abort a release build over
@@ -354,15 +355,12 @@ pub fn memory_coalescing(sink: Arc<UOp>, ctx: &Renderer) -> Arc<UOp> {
             .push(uop.clone());
     }
 
-    #[allow(clippy::mutable_key_type)]
     let mut replacements: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     for (key, (buffer, offsets)) in memory {
         // Tinygrad's `must_divide=False` DSP arm (`coalesce.py:130`) has no
         // counterpart here: there is no DSP renderer to reach it.
         let mut lengths: Vec<usize> = Vec::new();
-        if !foldable_buffer(&buffer) {
-            // Scalar only.
-        } else if buffer.addrspace() == Some(AddrSpace::Reg) {
+        if !foldable_buffer(&buffer) || buffer.addrspace() == Some(AddrSpace::Reg) {
             // Scalar only.
         } else if image_shape(&buffer).is_some() {
             lengths.push(4usize);

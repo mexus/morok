@@ -178,11 +178,11 @@ impl AmdLinkedPlan {
         let mut operation_count = 0usize;
         for linked_semantic in &semantic_submissions {
             let original = linked_semantic.static_submission();
-            let operation_slot =
-                original.commands.iter().any(|command| matches!(command, Command::Execute { .. })).then(|| {
-                    let slot = operation_count as u32 + 1;
-                    slot
-                });
+            let operation_slot = original
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Execute { .. }))
+                .then(|| operation_count as u32 + 1);
             let mut submission = Submission::new(original.queue);
             for (command_index, command) in original.commands.iter().enumerate() {
                 match command {

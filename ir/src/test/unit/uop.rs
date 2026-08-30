@@ -1,6 +1,3 @@
-// UOpKey uses immutable id field for hashing/equality, so interior mutability is safe
-#![allow(clippy::mutable_key_type)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 

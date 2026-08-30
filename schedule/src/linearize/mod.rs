@@ -87,9 +87,9 @@ pub(crate) fn split_end_with_tag(
     sources: &SmallVec<[Arc<UOp>; 4]>,
     tag: Option<smallvec::SmallVec<[usize; 2]>>,
 ) -> Option<Arc<UOp>> {
-    let (backedges, targets): (SmallVec<[Arc<UOp>; 4]>, SmallVec<[Arc<UOp>; 4]>) =
+    let (backedges, targets): (Vec<Arc<UOp>>, Vec<Arc<UOp>>) =
         sources.iter().cloned().partition(|source| source.dtype() == DType::Void || source.dtype() == DType::Bool);
-    let mut sorted_ranges = UOp::sink(targets.into_vec()).ranges().clone();
+    let mut sorted_ranges = UOp::sink(targets).ranges().clone();
 
     // Matches Tinygrad's `sorted(..., key=lambda x: x.arg, reverse=True)` where
     // x.arg = (axis_id, axis_type, ...) -- tuple comparison gives lex ordering.
@@ -109,7 +109,7 @@ pub(crate) fn split_end_with_tag(
     for range in sorted_ranges {
         result = result.end(SmallVec::from_elem(range, 1));
     }
-    result = result.end(backedges).rtag(tag);
+    result = result.end(backedges.into()).rtag(tag);
 
     (!Arc::ptr_eq(&result, original)).then_some(result)
 }

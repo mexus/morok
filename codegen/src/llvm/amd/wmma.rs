@@ -152,6 +152,7 @@ fn wmma_wire_type_with_scaled_fp8(
 /// and return the `"<wire-ty> <value>"` fragment for the call's argument list.
 /// The temp name is derived from the unique `dst` (`%vN.a` …) so no fresh-name
 /// counter is needed.
+#[allow(clippy::too_many_arguments)]
 fn bitcast_operand(
     kernel: &mut Vec<String>,
     dst: &str,

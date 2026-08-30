@@ -154,7 +154,6 @@ fn resolve_toposort(root: &Arc<UOp>) -> Vec<Arc<UOp>> {
 ///
 /// Preserves callable/boundary FUNCTION bodies as opaque CALLs and keeps
 /// precompile functions intact.
-#[allow(clippy::mutable_key_type)]
 pub(crate) fn resolve_calls(root: Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
     let topo = resolve_toposort(&root);
     let mut rewritten: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
@@ -230,7 +229,6 @@ pub struct RangeifyResult {
 /// **Stage 4**: sym + pm_flatten_range - Initial symbolic (TOP_DOWN)
 /// **Stage 5**: pm_simplify_ranges - Simplify/merge ranges
 /// **Stage 6**: apply_opts - Post-range optimization (happens in optimizer)
-#[allow(clippy::mutable_key_type)]
 #[tracing::instrument(skip_all)]
 pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
     // Resolve the exact hardware-independent multi subset before tags capture
@@ -1069,7 +1067,6 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut RangeifyBufferConte
 // ============================================================================
 
 /// Partition ranges into parented and unparented.
-#[allow(clippy::mutable_key_type)]
 pub(crate) fn partition_reduce_ranges(
     ranges: &SmallVec<[Arc<UOp>; 4]>,
     src_ranges: &HashSet<UOpKey>,
@@ -1101,7 +1098,6 @@ pub(crate) fn get_range_size(range: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// 3. Wrap substituted body in a synthetic REDUCE
 /// 4. Run algebraic patterns (bound-from-below/above, distributive, etc.)
 /// 5. If REDUCE is eliminated (no_range), reverse-substitute back
-#[allow(clippy::mutable_key_type)]
 fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPatternMatcher<()>) -> Option<Arc<UOp>> {
     use svod_ir::ReduceOp;
 
@@ -1323,7 +1319,6 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
         let new_r0 = merged_range.floor_div(r1_end);
         let new_r1 = merged_range.mod_(r1_end);
 
-        #[allow(clippy::mutable_key_type)]
         let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
         subs.insert(UOpKey(r0.clone()), new_r0);
         subs.insert(UOpKey(r1.clone()), new_r1);
@@ -1440,7 +1435,6 @@ fn protect_reduce_ranges(ctx: &mut SimplifyRangesContext, ranges: &[Arc<UOp>]) {
     }
 }
 
-#[allow(clippy::mutable_key_type)]
 fn substitute_simplified_ranges(ctx: &mut SimplifyRangesContext, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     let substitutions = ctx
         .bounds
@@ -1522,7 +1516,6 @@ pub fn flatten_range_impl(r: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 /// Apply range flattening to a computation graph.
-#[allow(clippy::mutable_key_type)]
 pub fn flatten_ranges(root: &Arc<UOp>) -> Arc<UOp> {
     let mut replacements: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
@@ -1540,7 +1533,6 @@ pub fn flatten_ranges(root: &Arc<UOp>) -> Arc<UOp> {
 // ============================================================================
 
 /// Detect conflicting buffer identities reached through different INDEX source ops.
-#[allow(clippy::mutable_key_type)]
 pub fn find_bufs(store: &Arc<UOp>) {
     let indices = store
         .toposort_filtered(|uop| !matches!(uop.op(), Op::After { .. }))

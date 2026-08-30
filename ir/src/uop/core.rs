@@ -60,7 +60,7 @@ enum TraversalMode {
 }
 
 /// Borrowed children — `Op::sources()` would clone every `Arc` just to read it.
-fn traversal_sources<'a>(node: &'a Arc<UOp>, mode: TraversalMode) -> SmallVec<[&'a Arc<UOp>; 4]> {
+fn traversal_sources(node: &Arc<UOp>, mode: TraversalMode) -> SmallVec<[&Arc<UOp>; 4]> {
     if mode == TraversalMode::Full {
         return node.op().children();
     }
@@ -80,7 +80,6 @@ fn traversal_sources<'a>(node: &'a Arc<UOp>, mode: TraversalMode) -> SmallVec<[&
 ///
 /// Note: While UOp contains OnceCell fields, Hash/Eq are based solely on the
 /// immutable `id` field, making this safe to use as a HashMap key.
-#[allow(clippy::mutable_key_type)]
 #[derive(Clone)]
 pub struct UOpKey(pub Arc<UOp>);
 
@@ -923,7 +922,6 @@ impl UOp {
     /// // After END, range is no longer in scope
     /// assert!(!end_op.in_scope_ranges().contains(&range));
     /// ```
-    #[allow(clippy::mutable_key_type)]
     pub fn in_scope_ranges(self: &Arc<Self>) -> &HashSet<UOpKey> {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::InScopeRangesProperty;
@@ -934,7 +932,6 @@ impl UOp {
     ///
     /// Returns a HashMap where each UOp maps to the list of UOps that consume it.
     /// Useful for reverse traversal and dependency analysis.
-    #[allow(clippy::mutable_key_type)]
     pub fn get_consumer_map(self: &Arc<Self>) -> HashMap<UOpKey, Vec<Arc<Self>>> {
         self.get_consumer_map_call_aware(true)
     }
@@ -944,7 +941,6 @@ impl UOp {
     /// When `include_call_bodies` is false, traversal does not descend into
     /// CALL/FUNCTION bodies or PROGRAM internals. Call/function arguments and
     /// program device are still traversed.
-    #[allow(clippy::mutable_key_type)]
     pub fn get_consumer_map_call_aware(self: &Arc<Self>, include_call_bodies: bool) -> HashMap<UOpKey, Vec<Arc<Self>>> {
         let mut consumer_map: HashMap<UOpKey, Vec<Arc<Self>>> = HashMap::new();
         let mode = if include_call_bodies { TraversalMode::Full } else { TraversalMode::PreserveCalls };
@@ -962,7 +958,6 @@ impl UOp {
     ///
     /// Returns nodes in bottom-up order (leaves first, root last).
     /// Requires a consumer map to traverse from leaves to roots.
-    #[allow(clippy::mutable_key_type)]
     pub fn reverse_toposort(self: &Arc<Self>, consumer_map: &HashMap<UOpKey, Vec<Arc<Self>>>) -> Vec<Arc<Self>> {
         let mut visited = HashMap::new(); // Use HashMap to track visited by ID
         let mut result = Vec::new();
@@ -999,7 +994,6 @@ impl UOp {
     /// each node in the map. The rewrite engine provides O(n) memoization via its
     /// result cache and an explicit work-stack (no Rust recursion, so deep graphs
     /// do not exhaust the thread stack).
-    #[allow(clippy::mutable_key_type)]
     pub fn substitute(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
             return self.clone();
@@ -1015,7 +1009,6 @@ impl UOp {
     /// `Buffer → After(Buffer, [Store(...)])` for view-assign). The default
     /// [`Self::substitute`] would re-traverse replacements and loop or wrap
     /// the key multiple times.
-    #[allow(clippy::mutable_key_type)]
     pub fn substitute_walk(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
             return self.clone();
@@ -1025,7 +1018,6 @@ impl UOp {
     }
 
     /// Single-pass substitution that also preserves opaque callable bodies.
-    #[allow(clippy::mutable_key_type)]
     pub fn substitute_walk_preserve_calls(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
             return self.clone();
@@ -1039,7 +1031,6 @@ impl UOp {
     /// Direct substitutions still apply to CALL/FUNCTION/PROGRAM nodes themselves.
     /// Traversal skips CALL/FUNCTION bodies and PROGRAM internals by default,
     /// while still rewriting CALL/FUNCTION arguments.
-    #[allow(clippy::mutable_key_type)]
     pub fn substitute_preserve_calls(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
             return self.clone();
@@ -1053,7 +1044,6 @@ impl UOp {
     /// Like `substitute`, but skips subtrees whose `in_scope_ranges()` don't contain
     /// any of the substitution keys. Prevents substituting ranges in subexpressions
     /// that don't reference them.
-    #[allow(clippy::mutable_key_type)]
     pub fn substitute_gated(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
             return self.clone();
@@ -1064,7 +1054,6 @@ impl UOp {
     }
 
     /// Range-gated substitute that also preserves CALL/FUNCTION/PROGRAM boundaries.
-    #[allow(clippy::mutable_key_type)]
     pub fn substitute_gated_preserve_calls(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
             return self.clone();

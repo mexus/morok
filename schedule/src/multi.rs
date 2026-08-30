@@ -117,7 +117,6 @@ fn reduce_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     let mut local_reductions = SmallVec::with_capacity(buffers.len());
     for shard in buffers {
-        #[allow(clippy::mutable_key_type)]
         let substitutions = HashMap::from([(UOpKey(mstack.clone()), shard.clone())]);
         let local_shard = local.substitute(&substitutions);
         let reduced = local_shard.reduce_with_num_axes(ranges.clone(), *reduce_op, *num_axes);
