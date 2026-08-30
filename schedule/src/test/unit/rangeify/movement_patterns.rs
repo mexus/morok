@@ -1,385 +1,174 @@
-//! Tests for movement operation pattern matching.
-//!
-//! Verifies that movement ops (RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP)
-//! are correctly pushed through INDEX operations.
+//! Movement ops (RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP) folded into the
+//! INDEX that reads them.
 
 use std::sync::Arc;
 
+use smallvec::smallvec;
 use svod_device::DeviceSpec;
 use svod_dtype::DType;
 use svod_ir::{AxisId, AxisType, Op, SInt, UOp};
+use test_case::test_case;
 
 use crate::rangeify::patterns::movement_op_patterns;
+
+/// A movement chain and the ranges an INDEX reads it with.
+type Access = (Arc<UOp>, Vec<Arc<UOp>>);
 use crate::rewrite::{graph_rewrite, graph_rewrite_bottom_up};
 
-// ===== Helper Functions =====
-
-/// Create a test buffer with given size.
-fn create_buffer(size: usize) -> Arc<UOp> {
+fn buffer(size: usize) -> Arc<UOp> {
     UOp::new_buffer(DeviceSpec::Cpu, size, DType::Float32)
 }
 
-/// Create a RANGE for testing.
-fn create_range(size: usize, axis_id: usize) -> Arc<UOp> {
-    let end = UOp::index_const(size as i64);
-    UOp::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
+fn range(size: i64, axis_id: usize) -> Arc<UOp> {
+    UOp::range_axis(UOp::index_const(size), AxisId::Renumbered(axis_id), AxisType::Loop)
 }
 
-#[test]
-fn test_movement_index_preserves_dtype_and_source_order() {
-    let buffer = create_buffer(6);
-    let reshaped = buffer.try_reshape(&smallvec::smallvec![SInt::Const(2), SInt::Const(3)]).unwrap();
-    let r0 = create_range(2, 0);
-    let r1 = create_range(3, 1);
-    let indexed = UOp::index().buffer(reshaped).indices(vec![r0, r1]).call().unwrap();
+fn reshaped(buffer: Arc<UOp>, dims: &[i64]) -> Arc<UOp> {
+    buffer.try_reshape(&dims.iter().map(|&d| SInt::Const(d as usize)).collect()).expect("reshape")
+}
+
+/// `[200] -> [10, 20]`, read with one range per dim.
+fn reshape() -> Access {
+    (reshaped(buffer(200), &[10, 20]), vec![range(10, 0), range(20, 1)])
+}
+
+/// `[10, 1, 20] -> expand -> [10, 5, 20]`; the broadcast index becomes 0.
+fn expand() -> Access {
+    let src = reshaped(buffer(200), &[10, 1, 20]);
+    let new_shape = UOp::stack(smallvec![UOp::index_const(10), UOp::index_const(5), UOp::index_const(20)]);
+    (UOp::new(Op::Expand { src, new_shape }, DType::Float32), vec![range(10, 0), range(5, 1), range(20, 2)])
+}
+
+/// `[10, 20, 30]` permuted to `[20, 30, 10]`; the indices are reordered.
+fn permute() -> Access {
+    let src = reshaped(buffer(6000), &[10, 20, 30]);
+    (src.try_permute(vec![1, 2, 0]).expect("permute"), vec![range(20, 0), range(30, 1), range(10, 2)])
+}
+
+/// `[10, 40]` shrunk to `[0:5, 10:30]`; the indices are offset.
+fn shrink() -> Access {
+    let src = reshaped(buffer(400), &[10, 40]);
+    let offsets = UOp::stack(smallvec![UOp::index_const(0), UOp::index_const(10)]);
+    let sizes = UOp::stack(smallvec![UOp::index_const(5), UOp::index_const(20)]);
+    (UOp::new(Op::Shrink { src, offsets, sizes }, DType::Float32), vec![range(5, 0), range(20, 1)])
+}
+
+/// `[10, 20]` with the second axis reversed; index 1 becomes `19 - r1`.
+fn flip() -> Access {
+    let src = reshaped(buffer(200), &[10, 20]);
+    (UOp::new(Op::Flip { src, axes: vec![false, true] }, DType::Float32), vec![range(10, 0), range(20, 1)])
+}
+
+/// `[10, 20]` padded by `(1,1)` and `(2,2)`; the indices are offset and gated.
+fn pad() -> Access {
+    let src = reshaped(buffer(200), &[10, 20]);
+    let begin_pads = UOp::stack(smallvec![UOp::index_const(1), UOp::index_const(2)]);
+    let end_pads = UOp::stack(smallvec![UOp::index_const(1), UOp::index_const(2)]);
+    (UOp::new(Op::Pad { src, begin_pads, end_pads }, DType::Float32), vec![range(12, 0), range(24, 1)])
+}
+
+/// `RESHAPE(EXPAND(RESHAPE(buffer)))` read with one flat range — the rewrite has
+/// to reach a fixed point across all three.
+fn nested() -> Access {
+    let src = reshaped(buffer(10), &[10, 1]);
+    let new_shape = UOp::stack(smallvec![UOp::index_const(10), UOp::index_const(5)]);
+    let expanded = UOp::new(Op::Expand { src, new_shape }, DType::Float32);
+    (expanded.try_reshape(&smallvec![SInt::Const(50)]).expect("reshape"), vec![range(50, 0)])
+}
+
+/// Every movement chain collapses to a single flat index straight off the
+/// original BUFFER, whatever gating or offsetting the op contributes.
+#[test_case(super::reshape ; "reshape")]
+#[test_case(super::expand ; "expand")]
+#[test_case(super::permute ; "permute")]
+#[test_case(super::shrink ; "shrink")]
+#[test_case(super::flip ; "flip")]
+#[test_case(super::pad ; "pad")]
+#[test_case(super::nested ; "reshape of expand of reshape")]
+fn movement_chains_flatten_into_the_buffer_index(build: fn() -> Access) {
+    let (movement, ranges) = build();
+    let indexed = UOp::index().buffer(movement).indices(ranges).call().expect("index");
 
     let result = graph_rewrite(&movement_op_patterns(), indexed, &mut ());
+
     assert_eq!(result.dtype(), DType::Float32);
-    let Op::Index { buffer: result_buffer, indices, .. } = result.op() else { panic!("expected INDEX") };
-    assert!(Arc::ptr_eq(result_buffer, &buffer), "rewritten INDEX source zero must be the original buffer");
-    assert_eq!(indices.len(), 1, "rewritten indices must follow the buffer source");
+    let Op::Index { buffer, indices, .. } = result.op() else { panic!("expected INDEX, got {}", result.tree()) };
+    assert_eq!(indices.len(), 1, "movement ops flatten to one index: {}", result.tree());
+    assert!(matches!(buffer.op(), Op::Buffer { .. }), "no movement op may survive: {}", result.tree());
 }
 
 #[test]
-fn test_after_index_preserves_boundary_dtype_and_source_order() {
-    let buffer = create_buffer(8);
-    let range = create_range(8, 0);
-    let indexed = UOp::index().buffer(buffer.clone()).indices(vec![range.clone()]).call().unwrap();
-    let dep = UOp::noop();
-    let after = indexed.after(smallvec::smallvec![dep.clone()]);
+fn a_non_movement_source_is_left_under_the_index() {
+    let sqrt = buffer(100).try_sqrt().expect("sqrt");
+    let indexed = UOp::index().buffer(Arc::clone(&sqrt)).indices(vec![range(100, 0)]).call().expect("index");
 
-    let result = graph_rewrite(&movement_op_patterns(), after, &mut ());
-    assert_eq!(result.dtype(), DType::Float32);
+    let result = graph_rewrite(&movement_op_patterns(), indexed, &mut ());
+
+    let Op::Index { buffer, .. } = result.op() else { panic!("expected INDEX") };
+    assert!(Arc::ptr_eq(buffer, &sqrt));
+}
+
+/// A movement op with no INDEX/AFTER/END consumer has nothing to fold into.
+#[test]
+fn a_bare_movement_chain_is_untouched() {
+    let expanded = reshaped(buffer(10), &[10, 1])
+        .try_expand(&smallvec![SInt::Const(10), SInt::Const(4)])
+        .expect("expand")
+        .try_permute(vec![1, 0])
+        .expect("permute");
+
+    assert!(Arc::ptr_eq(&graph_rewrite_bottom_up(&movement_op_patterns(), expanded.clone(), &mut ()), &expanded));
+}
+
+/// A partial index — fewer indices than dims — only folds when the movement is a
+/// RESHAPE whose trailing dims line up; PERMUTE and EXPAND never do.
+#[test]
+fn a_partial_index_is_left_alone() {
+    let mismatched_reshape = reshaped(reshaped(buffer(12), &[2, 6]), &[2, 3, 2]);
+    let permuted = reshaped(buffer(6), &[2, 3]).try_permute(vec![1, 0]).expect("permute");
+    let expanded = reshaped(buffer(2), &[2, 1]).try_expand(&smallvec![SInt::Const(2), SInt::Const(3)]).expect("expand");
+
+    for movement in [mismatched_reshape, permuted, expanded] {
+        let indexed = UOp::index().buffer(Arc::clone(&movement)).indices(vec![range(2, 0)]).call().expect("index");
+        let result = graph_rewrite_bottom_up(&movement_op_patterns(), indexed.clone(), &mut ());
+
+        assert!(Arc::ptr_eq(&result, &indexed), "{}", result.tree());
+    }
+}
+
+// ===== AFTER boundaries =====
+
+/// AFTER is an ordering edge, not data: INDEX pushes through it and keeps both
+/// the passthrough buffer and the dep.
+#[test]
+fn index_pushes_through_an_after_without_losing_its_dep() {
+    let buffer = buffer(8);
+    let range = range(8, 0);
+    let indexed = UOp::index().buffer(Arc::clone(&buffer)).indices(vec![Arc::clone(&range)]).call().expect("index");
+    let dep = UOp::noop();
+
+    let result = graph_rewrite(&movement_op_patterns(), indexed.after(smallvec![Arc::clone(&dep)]), &mut ());
+
     let Op::Index { buffer: result_buffer, indices, .. } = result.op() else { panic!("expected INDEX") };
-    let Op::After { passthrough, deps } = result_buffer.op() else { panic!("expected INDEX(AFTER(...))") };
+    let Op::After { passthrough, deps } = result_buffer.op() else { panic!("expected INDEX(AFTER(..))") };
     assert!(Arc::ptr_eq(passthrough, &buffer));
-    assert_eq!(deps.len(), 1);
+    assert_eq!(deps.as_slice().len(), 1);
     assert!(Arc::ptr_eq(&deps[0], &dep));
-    assert_eq!(indices.len(), 1);
     assert!(Arc::ptr_eq(&indices[0], &range));
 }
 
-// ===== EXPAND Tests =====
-
+/// Moving a movement op outside an AFTER leaves the tag on the AFTER; the
+/// rebuilt movement node is fresh and untagged.
 #[test]
-fn test_expand_index_transformation() {
-    // Test: EXPAND([10, 1, 20] → [10, 5, 20]).INDEX([r0, r1, r2])
-    // Since the source is RESHAPE(buffer), graph_rewrite transforms both:
-    // 1. EXPAND transformation: INDEX(RESHAPE(buf), [r0, 0, r2]) - r1 becomes 0
-    // 2. RESHAPE transformation: INDEX(buf, [flattened]) - combines to 1D index
-
-    #[allow(clippy::identity_op)]
-    let buffer = create_buffer(10 * 1 * 20);
-
-    // Reshape to [10, 1, 20]
-    let reshaped =
-        buffer.try_reshape(&vec![SInt::Const(10), SInt::Const(1), SInt::Const(20)].into_iter().collect()).unwrap();
-
-    // Expand to [10, 5, 20]
-    let shape2 = UOp::stack(vec![UOp::index_const(10), UOp::index_const(5), UOp::index_const(20)].into());
-    let expanded = UOp::new(Op::Expand { src: reshaped, new_shape: shape2 }, DType::Float32);
-
-    // Create INDEX with ranges [r0, r1, r2]
-    let r0 = create_range(10, 0);
-    let r1 = create_range(5, 1);
-    let r2 = create_range(20, 2);
-    let indexed = UOp::index().buffer(expanded).indices(vec![r0.clone(), r1.clone(), r2.clone()]).call().unwrap();
-
-    // Apply pattern
-    let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
-
-    // Verify: should transform all movement ops through INDEX
-    // Final result: buffer.INDEX([flattened_index])
-    assert!(matches!(result.op(), Op::Index { .. }), "Result should be INDEX");
-
-    let Op::Index { buffer: res_buf, indices: res_idx, .. } = result.op() else {
-        panic!("Expected INDEX");
-    };
-
-    // After both EXPAND and RESHAPE are transformed, we get 1 flattened index
-    assert_eq!(res_idx.len(), 1, "Should have 1 index after all movement ops transformed");
-
-    // The buffer should be the original buffer (no movement ops remaining)
-    assert!(matches!(res_buf.op(), Op::Buffer { .. }), "Buffer should be the original buffer");
-}
-
-// ===== PERMUTE Tests =====
-
-#[test]
-fn test_permute_index_transformation() {
-    // Test: PERMUTE([10, 20, 30], axes=[1, 2, 0]).INDEX([r0, r1, r2])
-    // Since the source is RESHAPE(buffer), graph_rewrite transforms both:
-    // 1. PERMUTE transformation: INDEX(RESHAPE(buf), [r2, r0, r1]) - indices reordered
-    // 2. RESHAPE transformation: INDEX(buf, [flattened]) - combines to 1D index
-
-    let buffer = create_buffer(10 * 20 * 30);
-    let reshaped =
-        buffer.try_reshape(&vec![SInt::Const(10), SInt::Const(20), SInt::Const(30)].into_iter().collect()).unwrap();
-
-    // Permute: axes [1, 2, 0]
-    let permuted = reshaped.try_permute(vec![1, 2, 0]).unwrap();
-
-    // Create INDEX
-    let r0 = create_range(20, 0); // Now indexing dimension 1 of original
-    let r1 = create_range(30, 1); // Now indexing dimension 2 of original
-    let r2 = create_range(10, 2); // Now indexing dimension 0 of original
-    let indexed = UOp::index().buffer(permuted).indices(vec![r0.clone(), r1.clone(), r2.clone()]).call().unwrap();
-
-    // Apply pattern
-    let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
-
-    // Verify transformation
-    assert!(matches!(result.op(), Op::Index { .. }));
-
-    let Op::Index { buffer: res_buf, indices: res_idx, .. } = result.op() else {
-        panic!("Expected INDEX");
-    };
-
-    // After both PERMUTE and RESHAPE are transformed, we get 1 flattened index
-    assert_eq!(res_idx.len(), 1, "Should have 1 index after all movement ops transformed");
-
-    // The buffer should be the original buffer (no movement ops remaining)
-    assert!(matches!(res_buf.op(), Op::Buffer { .. }), "Buffer should be the original buffer");
-}
-
-// ===== RESHAPE Tests =====
-
-#[test]
-fn test_reshape_index_transformation() {
-    // Test: RESHAPE([200] → [10, 20]).INDEX([r0, r1])
-    // Expected: buffer.INDEX([r0 * 20 + r1]) - combined index
-
-    let buffer = create_buffer(200);
-
-    // Reshape to [10, 20]
-    let reshaped = buffer.try_reshape(&vec![SInt::Const(10), SInt::Const(20)].into_iter().collect()).unwrap();
-
-    // Create INDEX
-    let r0 = create_range(10, 0);
-    let r1 = create_range(20, 1);
-    let indexed = UOp::index().buffer(reshaped).indices(vec![r0, r1]).call().unwrap();
-
-    // Apply pattern
-    let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
-
-    // Verify: should have INDEX with combined indices
-    assert!(matches!(result.op(), Op::Index { .. }));
-
-    let Op::Index { indices: res_idx, .. } = result.op() else {
-        panic!("Expected INDEX");
-    };
-
-    // Should have single index (flattened)
-    assert_eq!(res_idx.len(), 1, "Should flatten to 1D index");
-}
-
-// ===== SHRINK Tests =====
-
-#[test]
-fn test_shrink_index_transformation() {
-    // Test: SHRINK([0:5, 10:30] from [10, 40]).INDEX([r0, r1])
-    // Expected: buffer.INDEX([r0 + 0, r1 + 10]) - offset indices
-
-    let buffer = create_buffer(10 * 40);
-    let reshaped = buffer.try_reshape(&vec![SInt::Const(10), SInt::Const(40)].into_iter().collect()).unwrap();
-
-    // SHRINK: offset=[0, 10], size=[5, 20]
-    let offsets = UOp::stack(vec![UOp::index_const(0), UOp::index_const(10)].into());
-    let sizes = UOp::stack(vec![UOp::index_const(5), UOp::index_const(20)].into());
-    let shrunk = UOp::new(Op::Shrink { src: reshaped, offsets, sizes }, DType::Float32);
-
-    // Create INDEX
-    let r0 = create_range(5, 0);
-    let r1 = create_range(20, 1);
-    let indexed = UOp::index().buffer(shrunk).indices(vec![r0, r1]).call().unwrap();
-
-    // Apply pattern
-    let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
-
-    // Verify transformation
-    assert!(matches!(result.op(), Op::Index { .. }));
-}
-
-// ===== FLIP Tests =====
-
-#[test]
-fn test_flip_index_transformation() {
-    // Test: FLIP([10, 20], axes=[false, true]).INDEX([r0, r1])
-    // Expected: buffer.INDEX([r0, (20-1) - r1]) - reversed second axis
-
-    let buffer = create_buffer(10 * 20);
-    let reshaped = buffer.try_reshape(&vec![SInt::Const(10), SInt::Const(20)].into_iter().collect()).unwrap();
-
-    // FLIP second axis
-    let flipped = UOp::new(Op::Flip { src: reshaped, axes: vec![false, true] }, DType::Float32);
-
-    // Create INDEX
-    let r0 = create_range(10, 0);
-    let r1 = create_range(20, 1);
-    let indexed = UOp::index().buffer(flipped).indices(vec![r0, r1]).call().unwrap();
-
-    // Apply pattern
-    let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
-
-    // Verify transformation
-    assert!(matches!(result.op(), Op::Index { .. }));
-}
-
-// ===== PAD Tests =====
-
-#[test]
-fn test_pad_index_transformation() {
-    // Test: PAD([10, 20], begin=[1, 2], end=[1, 2]).INDEX([r0, r1])
-    // Expected: buffer.INDEX with validity checks and adjusted indices
-
-    let buffer = create_buffer(10 * 20);
-    let reshaped = buffer.try_reshape(&vec![SInt::Const(10), SInt::Const(20)].into_iter().collect()).unwrap();
-
-    // PAD: add 1 padding on each side of first dim, 2 on each side of second dim
-    let begin_pads = UOp::stack(vec![UOp::index_const(1), UOp::index_const(2)].into());
-    let end_pads = UOp::stack(vec![UOp::index_const(1), UOp::index_const(2)].into());
-    let padded = UOp::new(Op::Pad { src: reshaped, begin_pads, end_pads }, DType::Float32);
-
-    // Create INDEX
-    let r0 = create_range(12, 0); // 10 + 1 + 1
-    let r1 = create_range(24, 1); // 20 + 2 + 2
-    let indexed = UOp::index().buffer(padded).indices(vec![r0, r1]).call().unwrap();
-
-    // Apply pattern
-    let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
-
-    // Verify transformation
-    assert!(matches!(result.op(), Op::Index { .. }));
-}
-
-// ===== AFTER Tests =====
-
-#[test]
-fn test_movement_through_after_keeps_the_tag_on_the_after() {
-    let buffer = create_buffer(20);
-    let reshaped = buffer.try_reshape(&vec![SInt::Const(4), SInt::Const(5)].into_iter().collect()).unwrap();
+fn movement_through_after_keeps_the_tag_on_the_after() {
+    let buffer = buffer(20);
     let store = buffer.store(UOp::native_const(1.0f32));
-    let after = reshaped.after(smallvec::smallvec![store]).rtag(Some(smallvec::smallvec![7]));
+    let after = reshaped(Arc::clone(&buffer), &[4, 5]).after(smallvec![store]).rtag(Some(smallvec![7]));
 
     let result = graph_rewrite(&movement_op_patterns(), after, &mut ());
 
     let Op::Reshape { src: inner, .. } = result.op() else { panic!("expected RESHAPE outside, got {}", result.tree()) };
     assert!(matches!(inner.op(), Op::After { .. }));
     assert_eq!(inner.tag().as_deref(), Some([7usize].as_slice()));
-    assert!(result.tag().is_none(), "the rebuilt movement node is fresh and untagged");
-}
-
-// ===== Non-Movement Op Tests =====
-
-#[test]
-fn test_non_movement_op_no_match() {
-    // Test that non-movement operations are not transformed
-
-    let buffer = create_buffer(100);
-
-    // Create a non-movement op (SQRT) - using unary op to avoid shape issues
-    // neg() now produces MUL(x, -1) which is binary, use sqrt instead.
-    let negated = buffer.try_sqrt().unwrap();
-
-    // Create INDEX
-    let r0 = create_range(100, 0);
-    let indexed = UOp::index().buffer(negated).indices(vec![r0]).call().unwrap();
-
-    // Apply pattern
-    let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
-
-    // Should NOT transform (no movement op)
-    // The result should still have the SQRT operation somewhere in the tree
-    assert!(matches!(result.op(), Op::Index { .. }));
-
-    // The buffer should still be the SQRT node
-    let Op::Index { buffer: res_buf, .. } = result.op() else {
-        panic!("Expected INDEX");
-    };
-
-    assert!(matches!(res_buf.op(), Op::Unary(..)), "Buffer should still be the SQRT");
-}
-
-// ===== Nested Movement Ops Test =====
-
-#[test]
-fn test_nested_movement_ops() {
-    // Test: RESHAPE(EXPAND(buffer)).INDEX(ranges)
-    // Should iterate to fixed point, transforming both operations
-
-    #[allow(clippy::identity_op)]
-    let buffer = create_buffer(10 * 1);
-    let reshaped1 = buffer.try_reshape(&vec![SInt::Const(10), SInt::Const(1)].into_iter().collect()).unwrap();
-
-    // Expand to [10, 5]
-    let shape = UOp::stack(vec![UOp::index_const(10), UOp::index_const(5)].into());
-    let expanded = UOp::new(Op::Expand { src: reshaped1, new_shape: shape }, DType::Float32);
-
-    // Reshape to [50]
-    let reshaped2 = expanded.try_reshape(&vec![SInt::Const(50)].into_iter().collect()).unwrap();
-
-    // Create INDEX
-    let r0 = create_range(50, 0);
-    let indexed = UOp::index().buffer(reshaped2).indices(vec![r0]).call().unwrap();
-
-    // Apply pattern (should iterate multiple times)
-    let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
-
-    // Verify: should have transformed through all movement ops
-    assert!(matches!(result.op(), Op::Index { .. }));
-
-    // The final buffer should be close to the original buffer
-    // (may have intermediate operations, but movement ops should be gone)
-}
-
-#[test]
-fn test_partial_reshape_index_suffix_mismatch_is_unchanged() {
-    let buffer = create_buffer(12);
-    let source = buffer.try_reshape(&smallvec::smallvec![SInt::Const(2), SInt::Const(6)]).unwrap();
-    let reshaped = source.try_reshape(&smallvec::smallvec![SInt::Const(2), SInt::Const(3), SInt::Const(2)]).unwrap();
-    let indexed = UOp::index().buffer(reshaped.clone()).indices(vec![create_range(2, 0)]).call().unwrap();
-
-    let result = graph_rewrite_bottom_up(&movement_op_patterns(), indexed.clone(), &mut ());
-
-    assert!(Arc::ptr_eq(&result, &indexed));
-    let Op::Index { buffer: result_buffer, .. } = result.op() else { panic!("expected INDEX") };
-    assert!(Arc::ptr_eq(result_buffer, &reshaped));
-}
-
-#[test]
-fn test_partial_nonreshape_movement_indices_are_unchanged() {
-    let buffer = create_buffer(6);
-    let reshaped = buffer.try_reshape(&smallvec::smallvec![SInt::Const(2), SInt::Const(3)]).unwrap();
-    let permuted = reshaped.try_permute(vec![1, 0]).unwrap();
-    let broadcast = create_buffer(2).try_reshape(&smallvec::smallvec![SInt::Const(2), SInt::Const(1)]).unwrap();
-    let expanded = broadcast.try_expand(&smallvec::smallvec![SInt::Const(2), SInt::Const(3)]).unwrap();
-
-    for movement in [permuted, expanded] {
-        let indexed = UOp::index().buffer(movement.clone()).indices(vec![create_range(2, 0)]).call().unwrap();
-        let result = graph_rewrite_bottom_up(&movement_op_patterns(), indexed.clone(), &mut ());
-
-        assert!(Arc::ptr_eq(&result, &indexed));
-        let Op::Index { buffer: result_buffer, .. } = result.op() else { panic!("expected INDEX") };
-        assert!(Arc::ptr_eq(result_buffer, &movement));
-    }
-}
-
-#[test]
-fn test_movement_without_index_after_or_end_is_unchanged() {
-    let buffer = create_buffer(10);
-    let reshaped = buffer.try_reshape(&smallvec::smallvec![SInt::Const(10), SInt::Const(1)]).unwrap();
-    let expanded = reshaped.try_expand(&smallvec::smallvec![SInt::Const(10), SInt::Const(4)]).unwrap();
-    let permuted = expanded.try_permute(vec![1, 0]).unwrap();
-
-    let result = graph_rewrite_bottom_up(&movement_op_patterns(), permuted.clone(), &mut ());
-
-    assert!(Arc::ptr_eq(&result, &permuted));
+    assert!(result.tag().is_none());
 }

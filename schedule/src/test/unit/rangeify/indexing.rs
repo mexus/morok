@@ -1,37 +1,138 @@
-//! Tests for IndexingContext and range assignment.
-//!
-//! Validates:
-//! - Range creation and ID assignment
-//! - Realize map tracking
-//! - Range map operations
-//! - Symbolic size handling
-//! - Axis types (Loop vs Reduce)
+//! `IndexingContext`: range allocation, the realize map, and the helpers
+//! `transform_single_source` uses to line consumer ranges up with a source.
 
 use std::sync::Arc;
 
-use svod_ir::{AxisId, AxisType, DType, Op, SInt, UOp};
+use smallvec::smallvec;
+use svod_ir::{AxisId, AxisType, ConstValue, DType, Op, SInt, UOp};
 
 use crate::rangeify::{
     IndexingContext,
     indexing::{broadcast_ranges, data_sources},
 };
 
-// ===== Index Linearization =====
+fn var() -> Arc<UOp> {
+    UOp::var("x", DType::Float32, 0, i64::MAX)
+}
+
+/// Ranges are numbered sequentially as `AxisId::Unrenumbered`, keep their extent
+/// (constant or symbolic), and a size-1 axis short-circuits to CONST 0 without
+/// consuming an id.
+#[test]
+fn ranges_are_numbered_sequentially_and_size_one_axes_are_free() {
+    let mut ctx = IndexingContext::new();
+    assert_eq!(ctx.range_counter(), 0);
+
+    for (i, extent) in [10i64, 20, 0, 1 << 30].into_iter().enumerate() {
+        let range = ctx.new_range(&SInt::Const(extent as usize), AxisType::Loop);
+        assert!(matches!(range.op(), Op::Range { axis_id, .. } if *axis_id == AxisId::Unrenumbered(i)));
+        assert!(
+            matches!(range.op(), Op::Range { end, .. } if matches!(end.op(), Op::Const(c) if c.0 == ConstValue::Int(extent)))
+        );
+        assert_eq!(ctx.range_counter(), i + 1);
+    }
+
+    let collapsed = ctx.new_range(&SInt::Const(1), AxisType::Loop);
+    assert!(matches!(collapsed.op(), Op::Const(_)), "a singleton axis is index 0, not a loop");
+    assert_eq!(ctx.range_counter(), 4, "and it consumes no axis id");
+
+    let n = UOp::define_var("n".to_string(), 0, i64::MAX);
+    let symbolic = ctx.new_range(&SInt::Symbolic(n.clone()), AxisType::Loop);
+    assert!(matches!(symbolic.op(), Op::Range { end, .. } if Arc::ptr_eq(end, &n)));
+
+    let reduce = ctx.new_range(&SInt::Const(10), AxisType::Reduce);
+    assert!(matches!(reduce.op(), Op::Range { axis_type: AxisType::Reduce, .. }));
+}
 
 #[test]
-fn test_image_buffers_keep_two_index_addresses() {
-    use svod_ir::ParamArg;
+fn separate_contexts_number_their_ranges_independently() {
+    let (mut first, mut second) = (IndexingContext::new(), IndexingContext::new());
+    first.new_range(&SInt::Const(10), AxisType::Loop);
+    first.new_range(&SInt::Const(20), AxisType::Loop);
 
+    let range = second.new_range(&SInt::Const(30), AxisType::Loop);
+    assert!(matches!(range.op(), Op::Range { axis_id: AxisId::Unrenumbered(0), .. }));
+}
+
+#[test]
+fn input_and_output_ranges_are_stored_and_read_back_per_uop() {
+    let mut ctx = IndexingContext::new();
+    let x = var();
+    let r0 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
+    let r1 = ctx.new_range(&SInt::Const(20), AxisType::Loop);
+
+    assert!(ctx.get_ranges(&x).is_none());
+    ctx.set_ranges(&x, vec![r0.clone(), r1.clone()], vec![r0.clone()]);
+
+    let (inputs, outputs) = ctx.get_ranges(&x).expect("ranges were set");
+    assert!(inputs.iter().zip([&r0, &r1]).all(|(a, b)| Arc::ptr_eq(a, b)));
+    assert!(outputs.len() == 1 && Arc::ptr_eq(&outputs[0], &r0));
+}
+
+/// `mark_realize_all` realizes every axis (no axis list); `mark_realize` records
+/// exactly the axes given.
+#[test]
+fn the_realize_map_distinguishes_all_axes_from_named_axes() {
+    let mut ctx = IndexingContext::new();
+    let x = var();
+
+    assert!(!ctx.should_realize(&x));
+    assert!(ctx.get_realize_axes(&x).is_none());
+
+    ctx.mark_realize_all(&x).expect("mark all");
+    assert!(ctx.should_realize(&x));
+
+    ctx.mark_realize(&x, vec![0, 2]);
+    assert_eq!(ctx.get_realize_axes(&x).expect("axes"), &[0, 2]);
+}
+
+/// Index coordinates and AFTER ordering deps are not data — only the buffer is.
+#[test]
+fn data_sources_skips_index_coordinates_and_after_deps() {
+    let buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 8, DType::Float32);
+    let range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Loop);
+    let index = UOp::index().buffer(buffer.clone()).indices(vec![range]).call().expect("index");
+    let after = buffer.after(smallvec![UOp::noop()]);
+
+    for node in [index, after] {
+        let sources = data_sources(&node);
+        assert_eq!(sources.len(), 1);
+        assert!(Arc::ptr_eq(&sources[0], &buffer));
+    }
+}
+
+/// A rank-0 source keeps the consumer's range verbatim; an expanded singleton
+/// axis is pinned to index 0 instead.
+#[test]
+fn broadcast_ranges_zeroes_only_the_expanded_axes() {
+    let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Loop);
+
+    let scalar = var();
+    let consumer = scalar.try_add(&UOp::var("other", DType::Float32, 0, 4)).expect("add");
+    let mapped = broadcast_ranges(&consumer, &scalar, std::slice::from_ref(&range));
+    assert!(mapped.len() == 1 && Arc::ptr_eq(&mapped[0], &range));
+
+    let source = UOp::const_(DType::Float32, 1.0f32.into()).try_reshape(&smallvec![SInt::Const(1)]).expect("reshape");
+    let expanded = source.try_expand(&smallvec![SInt::Const(4)]).expect("expand");
+    let consumer = expanded.try_add(&expanded).expect("add");
+    let mapped = broadcast_ranges(&consumer, &source, &[range]);
+    assert!(mapped.len() == 1 && matches!(mapped[0].op(), Op::Const(_)));
+}
+
+/// An image buffer addresses two coordinates; every other dtype linearises to
+/// one. `transform_single_source` has to pick per dtype.
+#[test]
+fn image_buffers_keep_two_index_addresses() {
     let ranges = [
         UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(0), AxisType::Loop),
         UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), AxisType::Loop),
     ];
-    let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![2usize.into(), 8usize.into()]);
+    let shape = svod_ir::shape::shape_to_uop(&smallvec![2usize.into(), 8usize.into()]);
+    let image = DType::Image { kind: svod_dtype::ImageKind::Float, shape: vec![2, 8, 4] };
 
-    for (dtype, expected_indices) in
-        [(DType::Image { kind: svod_dtype::ImageKind::Float, shape: vec![2, 8, 4] }, 2), (DType::Float32, 1)]
-    {
-        let arg = ParamArg::buffer(0, dtype.clone(), svod_dtype::AddrSpace::Global, Some(svod_ir::DeviceSpec::Cpu));
+    for (dtype, expected_indices) in [(image, 2), (DType::Float32, 1)] {
+        let arg =
+            svod_ir::ParamArg::buffer(0, dtype.clone(), svod_dtype::AddrSpace::Global, Some(svod_ir::DeviceSpec::Cpu));
         let buffer = UOp::new(Op::Buffer { shape: shape.clone(), arg }, dtype);
         let indexed = crate::rangeify::transforms::transform_single_source(
             &UOp::sink(vec![]),
@@ -43,264 +144,6 @@ fn test_image_buffers_keep_two_index_addresses() {
     }
 }
 
-// ===== Basic Range Creation =====
-
-#[test]
-fn test_indexing_context_new_range() {
-    let mut ctx = IndexingContext::new();
-
-    // Test constant size - ranges are created with AxisId::Unrenumbered
-    let r1 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    assert!(matches!(r1.op(), Op::Range { axis_id, .. } if *axis_id == AxisId::Unrenumbered(0)));
-
-    let r2 = ctx.new_range(&SInt::Const(20), AxisType::Loop);
-    assert!(matches!(r2.op(), Op::Range { axis_id, .. } if *axis_id == AxisId::Unrenumbered(1)));
-
-    // Test size 1 optimization (returns const 0)
-    let r3 = ctx.new_range(&SInt::Const(1), AxisType::Loop);
-    assert!(matches!(r3.op(), Op::Const(_)));
-}
-
-#[test]
-fn test_indexing_context_realize_map() {
-    let mut ctx = IndexingContext::new();
-    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
-
-    assert!(!ctx.should_realize(&x));
-
-    ctx.mark_realize_all(&x).unwrap();
-    assert!(ctx.should_realize(&x));
-}
-
-#[test]
-fn test_data_sources_exclude_index_metadata_and_after_dependencies() {
-    let buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 8, DType::Float32);
-    let range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Loop);
-    let index = UOp::index().buffer(buffer.clone()).indices(vec![range]).call().unwrap();
-    let dep = UOp::noop();
-    let after = buffer.after(smallvec::smallvec![dep]);
-
-    let index_sources = data_sources(&index);
-    assert_eq!(index_sources.len(), 1);
-    assert!(Arc::ptr_eq(&index_sources[0], &buffer));
-
-    let after_sources = data_sources(&after);
-    assert_eq!(after_sources.len(), 1);
-    assert!(Arc::ptr_eq(&after_sources[0], &buffer));
-}
-
-#[test]
-fn test_broadcast_ranges_preserves_extra_range_for_zero_rank_shapes() {
-    let source = UOp::var("source", DType::Float32, 0, 4);
-    let consumer = source.try_add(&UOp::var("other", DType::Float32, 0, 4)).unwrap();
-    let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Loop);
-
-    let mapped = broadcast_ranges(&consumer, &source, std::slice::from_ref(&range));
-
-    assert_eq!(mapped.len(), 1);
-    assert!(Arc::ptr_eq(&mapped[0], &range));
-}
-
-#[test]
-fn test_broadcast_ranges_zeroes_expanded_singleton_axis() {
-    let source = UOp::const_(DType::Float32, 1.0f32.into()).try_reshape(&smallvec::smallvec![SInt::Const(1)]).unwrap();
-    let expanded = source.try_expand(&smallvec::smallvec![SInt::Const(4)]).unwrap();
-    let consumer = expanded.try_add(&expanded).unwrap();
-    let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Loop);
-
-    let mapped = broadcast_ranges(&consumer, &source, &[range]);
-
-    assert_eq!(mapped.len(), 1);
-    assert!(matches!(mapped[0].op(), Op::Const(_)));
-}
-
-// ===== Range Counter =====
-
-#[test]
-fn test_range_counter_increments() {
-    let mut ctx = IndexingContext::new();
-
-    assert_eq!(ctx.range_counter(), 0);
-
-    ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    assert_eq!(ctx.range_counter(), 1);
-
-    ctx.new_range(&SInt::Const(20), AxisType::Loop);
-    assert_eq!(ctx.range_counter(), 2);
-
-    // Size 1 should NOT increment counter (returns const 0)
-    ctx.new_range(&SInt::Const(1), AxisType::Loop);
-    assert_eq!(ctx.range_counter(), 2);
-}
-
-// ===== Axis Types =====
-
-#[test]
-fn test_range_axis_types() {
-    let mut ctx = IndexingContext::new();
-
-    // Loop axis
-    let loop_range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    if let Op::Range { axis_type, .. } = loop_range.op() {
-        assert_eq!(*axis_type, AxisType::Loop);
-    } else {
-        panic!("Expected Range op");
-    }
-
-    // Reduce axis
-    let reduce_range = ctx.new_range(&SInt::Const(10), AxisType::Reduce);
-    if let Op::Range { axis_type, .. } = reduce_range.op() {
-        assert_eq!(*axis_type, AxisType::Reduce);
-    } else {
-        panic!("Expected Range op");
-    }
-}
-
-// ===== Symbolic Sizes =====
-
-#[test]
-fn test_symbolic_size_range() {
-    let mut ctx = IndexingContext::new();
-
-    // Create symbolic size
-    let n = UOp::define_var("n".to_string(), 0, i64::MAX);
-    let symbolic_size = SInt::Symbolic(n.clone());
-
-    let range = ctx.new_range(&symbolic_size, AxisType::Loop);
-
-    // Should create range with symbolic end
-    if let Op::Range { end, .. } = range.op() {
-        assert!(Arc::ptr_eq(end, &n));
-    } else {
-        panic!("Expected Range op");
-    }
-}
-
-// ===== Range Map Operations =====
-
-#[test]
-fn test_set_get_ranges() {
-    let mut ctx = IndexingContext::new();
-    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
-
-    let r0 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let r1 = ctx.new_range(&SInt::Const(20), AxisType::Loop);
-
-    // Initially no ranges
-    assert!(ctx.get_ranges(&x).is_none());
-
-    // Set ranges
-    let input_ranges = vec![r0.clone(), r1.clone()];
-    let output_ranges = vec![r0.clone()];
-    ctx.set_ranges(&x, input_ranges.clone(), output_ranges.clone());
-
-    // Get ranges
-    let ranges = ctx.get_ranges(&x);
-    assert!(ranges.is_some());
-
-    let (inp, out) = ranges.unwrap();
-    assert_eq!(inp.len(), 2);
-    assert_eq!(out.len(), 1);
-    assert!(Arc::ptr_eq(&inp[0], &r0));
-    assert!(Arc::ptr_eq(&inp[1], &r1));
-    assert!(Arc::ptr_eq(&out[0], &r0));
-}
-
-// ===== Realize Axes =====
-
-#[test]
-fn test_mark_realize_specific_axes() {
-    let mut ctx = IndexingContext::new();
-    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
-
-    // Mark specific axes
-    ctx.mark_realize(&x, vec![0, 2]);
-
-    assert!(ctx.should_realize(&x));
-
-    let axes = ctx.get_realize_axes(&x);
-    assert!(axes.is_some());
-    assert_eq!(axes.unwrap(), &[0, 2]);
-}
-
-#[test]
-fn test_get_realize_axes_none() {
-    let ctx = IndexingContext::new();
-    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
-
-    // Not in realize map
-    assert!(ctx.get_realize_axes(&x).is_none());
-}
-
-// ===== Multi-Dimensional =====
-
-#[test]
-fn test_multi_dimensional_ranges() {
-    let mut ctx = IndexingContext::new();
-
-    // Create 3D ranges
-    let r0 = ctx.new_range(&SInt::Const(32), AxisType::Loop);
-    let r1 = ctx.new_range(&SInt::Const(64), AxisType::Loop);
-    let r2 = ctx.new_range(&SInt::Const(128), AxisType::Loop);
-
-    // Verify sequential IDs
-    assert!(matches!(r0.op(), Op::Range { axis_id: AxisId::Unrenumbered(0), .. }));
-    assert!(matches!(r1.op(), Op::Range { axis_id: AxisId::Unrenumbered(1), .. }));
-    assert!(matches!(r2.op(), Op::Range { axis_id: AxisId::Unrenumbered(2), .. }));
-
-    // Verify sizes (ConstValueHash is a tuple struct wrapping ConstValue)
-    use svod_ir::ConstValue;
-    if let Op::Range { end, .. } = r0.op() {
-        assert!(matches!(end.op(), Op::Const(c) if matches!(c.0, ConstValue::Int(32))));
-    }
-    if let Op::Range { end, .. } = r1.op() {
-        assert!(matches!(end.op(), Op::Const(c) if matches!(c.0, ConstValue::Int(64))));
-    }
-    if let Op::Range { end, .. } = r2.op() {
-        assert!(matches!(end.op(), Op::Const(c) if matches!(c.0, ConstValue::Int(128))));
-    }
-}
-
-// ===== Edge Cases =====
-
-#[test]
-fn test_zero_size_range() {
-    let mut ctx = IndexingContext::new();
-
-    // Size 0 should still create a range (not optimized like size 1)
-    let range = ctx.new_range(&SInt::Const(0), AxisType::Loop);
-    assert!(matches!(range.op(), Op::Range { .. }));
-}
-
-#[test]
-fn test_large_size_range() {
-    let mut ctx = IndexingContext::new();
-
-    // Very large size
-    let range = ctx.new_range(&SInt::Const(1 << 30), AxisType::Loop);
-
-    use svod_ir::ConstValue;
-    if let Op::Range { end, .. } = range.op() {
-        assert!(matches!(end.op(), Op::Const(c) if matches!(c.0, ConstValue::Int(v) if v == 1 << 30)));
-    }
-}
-
-#[test]
-fn test_multiple_contexts_independent() {
-    // Two separate contexts should be independent
-    let mut ctx1 = IndexingContext::new();
-    let mut ctx2 = IndexingContext::new();
-
-    ctx1.new_range(&SInt::Const(10), AxisType::Loop);
-    ctx1.new_range(&SInt::Const(20), AxisType::Loop);
-
-    // ctx2 starts fresh
-    assert_eq!(ctx2.range_counter(), 0);
-
-    let r = ctx2.new_range(&SInt::Const(30), AxisType::Loop);
-    assert!(matches!(r.op(), Op::Range { axis_id: AxisId::Unrenumbered(0), .. }));
-}
-
 /// `apply_movement_op` and `_apply_reshape` are `@functools.cache` upstream
 /// (tinygrad/schedule/indexing.py:158,171): process-global and keyed on the inputs, so
 /// a second call with the same op, input shape and range tuple never rebuilds the
@@ -310,7 +153,7 @@ fn equal_movement_inputs_reuse_the_cached_index_chain() {
     // Prime extents so no other test shares these inputs in the process-global cache.
     let rngs = vec![UOp::range_const(13, 0), UOp::range_const(11, 1)];
     let in_shape = [SInt::Const(11), SInt::Const(13)];
-    let out_shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![SInt::Const(13), SInt::Const(11)]);
+    let out_shape = svod_ir::shape::shape_to_uop(&smallvec![SInt::Const(13), SInt::Const(11)]);
     let reshape = UOp::new(Op::Reshape { src: UOp::index_const(0), new_shape: out_shape }, DType::Float32);
     let holds = || crate::rangeify::indexing::movement_cache_holds(reshape.op(), &in_shape, &rngs);
 

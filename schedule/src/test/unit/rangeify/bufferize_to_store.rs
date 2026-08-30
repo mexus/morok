@@ -1,257 +1,55 @@
+//! `bufferize_to_store`: `STAGE(compute, ranges)` becomes
+//! `AFTER(BUFFER, [END(STORE(INDEX(BUFFER, ..), compute), ranges)])`.
+//!
+//! The BUFFER → PARAM conversion happens later, in `split_store`.
+
 use std::sync::Arc;
 
 use svod_ir::{Op, UOp};
 
-use crate::rangeify::kernel::split_store;
 use crate::rangeify::{RangeifyBufferContext, bufferize_to_store};
-#[allow(unused_imports)]
-use crate::test::unit::rangeify::helpers::extract_kernel;
-
-/// Helper to call split_store with the new signature
-fn call_split_store(x: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let mut uop_list = Vec::new();
-    split_store(&mut uop_list, x)
-}
 
 #[test]
-fn test_bufferize_to_store_global() {
+fn a_staged_compute_becomes_a_buffer_backed_store() {
     let mut ctx = RangeifyBufferContext::new();
-
-    // Create a simple STAGE with one range
     let compute = UOp::native_const(42.0f32);
     let range = UOp::range_const(10, 0);
+    let stage = UOp::stage_global(Arc::clone(&compute), vec![Arc::clone(&range)]);
 
-    let stage = UOp::stage_global(compute.clone(), vec![range.clone()]);
+    let result = bufferize_to_store(&stage, &mut ctx).expect("a global STAGE converts");
 
-    // Convert to STORE
-    let result = bufferize_to_store(&stage, &mut ctx);
+    let Op::After { passthrough, deps } = result.op() else { panic!("expected AFTER, got {}", result.tree()) };
+    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "the passthrough is the allocated BUFFER");
+    let [dep] = deps.as_slice() else { panic!("expected exactly one dep") };
 
-    assert!(result.is_some());
-    let result = result.unwrap();
+    let Op::End { computation, ranges } = dep.op() else { panic!("expected END, got {}", dep.tree()) };
+    assert_eq!(ranges.as_slice().len(), 1);
+    assert!(Arc::ptr_eq(&ranges[0], &range), "END closes the STAGE's own range");
 
-    // bufferize_to_store returns AFTER(passthrough=BUFFER, deps=[END(STORE)])
-    // Following Tinygrad's architecture: .store().end(*rngs)
-    // BUFFER → DEFINE_GLOBAL conversion happens later in split_store
-    let Op::After { passthrough, deps } = result.op() else {
-        panic!("Expected AFTER operation, got {:?}", result.op());
-    };
-
-    // Passthrough should be BUFFER (not DEFINE_GLOBAL - that conversion happens in split_store)
-    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", passthrough.op());
-    assert_eq!(deps.len(), 1);
-
-    // Deps should contain END wrapping STORE
-    let Op::End { computation, ranges: end_ranges } = deps[0].op() else {
-        panic!("Expected END operation in deps, got {:?}", deps[0].op());
-    };
-
-    // END should have 1 range
-    assert_eq!(end_ranges.len(), 1);
-    assert!(std::sync::Arc::ptr_eq(&end_ranges[0], &range));
-
-    // Unwrap END to get STORE
-    let Op::Store { index, value, gate } = computation.op() else {
-        panic!("Expected STORE operation inside END, got {:?}", computation.op());
-    };
+    let Op::Store { index, value, gate } = computation.op() else { panic!("expected STORE inside the END") };
     assert!(gate.is_none());
+    assert!(Arc::ptr_eq(value, &compute));
+    let Op::Index { buffer, .. } = index.op() else { panic!("expected INDEX, got {}", index.tree()) };
+    assert!(Arc::ptr_eq(buffer, passthrough), "the STORE writes the buffer the AFTER passes through");
 
-    // Index should contain the buffer reference
-    let Op::Index { buffer, .. } = index.op() else {
-        panic!("Expected INDEX operation, got {:?}", index.op());
-    };
-    assert!(matches!(buffer.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", buffer.op());
-    assert!(std::sync::Arc::ptr_eq(buffer, passthrough));
-
-    // Value should be the compute
-    assert!(std::sync::Arc::ptr_eq(value, &compute));
-
-    // Index should be INDEX operation with the range
-    assert!(matches!(index.op(), Op::Index { .. }));
-
-    // Verify context state - global_counter is NOT incremented for BUFFER ops
-    // (it's only used for DEFINE_GLOBAL/DEFINE_LOCAL counters)
-    assert_eq!(ctx.local_counter, 0);
-    assert!(ctx.has_buffer(&stage));
+    let tracked = ctx.get_buffer(&stage).expect("the STAGE is tracked");
+    assert!(Arc::ptr_eq(tracked, &result), "the context maps the STAGE to the whole AFTER");
+    assert_eq!(ctx.local_counter, 0, "a global BUFFER does not consume a local slot");
 }
 
+/// Multi-range STAGEs are lowered upstream; reaching one here is a bug, not a
+/// case to linearise.
 #[test]
 #[should_panic(expected = "unexpected multi-range")]
-fn test_bufferize_to_store_multiple_ranges() {
-    let mut ctx = RangeifyBufferContext::new();
+fn a_multi_range_stage_is_rejected() {
+    let ranges = vec![UOp::range_const(4, 0), UOp::range_const(8, 1)];
+    let stage = UOp::stage_global(UOp::native_const(100i32), ranges);
 
-    // Create STAGE with multiple ranges
-    let compute = UOp::native_const(100i32);
-    let range1 = UOp::range_const(4, 0);
-    let range2 = UOp::range_const(8, 1);
-
-    let stage = UOp::stage_global(compute.clone(), vec![range1.clone(), range2.clone()]);
-
-    // Convert to STORE
-    let result = bufferize_to_store(&stage, &mut ctx);
-
-    assert!(result.is_some());
-    let result = result.unwrap();
-
-    // bufferize_to_store returns AFTER(passthrough=BUFFER, deps=[END(STORE)])
-    // BUFFER → DEFINE_GLOBAL conversion happens later in split_store
-    let Op::After { passthrough, deps } = result.op() else {
-        panic!("Expected AFTER operation, got {:?}", result.op());
-    };
-
-    // Passthrough should be BUFFER (not DEFINE_GLOBAL)
-    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", passthrough.op());
-    assert_eq!(deps.len(), 1);
-
-    // Deps should contain END wrapping STORE
-    let Op::End { computation, ranges: end_ranges } = deps[0].op() else {
-        panic!("Expected END operation in deps, got {:?}", deps[0].op());
-    };
-
-    // END should have 2 ranges in the same order
-    assert_eq!(end_ranges.len(), 2);
-    assert!(std::sync::Arc::ptr_eq(&end_ranges[0], &range1));
-    assert!(std::sync::Arc::ptr_eq(&end_ranges[1], &range2));
-
-    // Unwrap END to get STORE
-    let Op::Store { index, value, gate } = computation.op() else {
-        panic!("Expected STORE operation inside END, got {:?}", computation.op());
-    };
-    assert!(gate.is_none());
-
-    // Value should be the compute
-    assert!(std::sync::Arc::ptr_eq(value, &compute));
-
-    // Index should be INDEX with linearized index (2 ranges → 1 linear index)
-    // For dims [4, 8], strides are [8, 1], so linear = range1 * 8 + range2
-    let Op::Index { buffer: idx_buffer, indices, .. } = index.op() else {
-        panic!("Expected INDEX operation");
-    };
-
-    // Buffer should be BUFFER (same as passthrough)
-    assert!(matches!(idx_buffer.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", idx_buffer.op());
-    assert!(std::sync::Arc::ptr_eq(idx_buffer, passthrough));
-
-    // Should have 1 linearized index (not 2 separate ranges)
-    assert_eq!(indices.len(), 1, "Multi-index should be linearized to single index");
-
-    // Verify context
-    assert!(ctx.has_buffer(&stage));
+    bufferize_to_store(&stage, &mut RangeifyBufferContext::new());
 }
 
 #[test]
-fn test_non_bufferize_returns_none() {
+fn only_a_stage_converts() {
     let mut ctx = RangeifyBufferContext::new();
-
-    // Create a non-STAGE operation
-    let const_op = UOp::native_const(1.0f32);
-
-    // Should return None
-    let result = bufferize_to_store(&const_op, &mut ctx);
-    assert!(result.is_none());
-}
-
-#[test]
-fn test_buffer_tracked_in_context() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    let compute = UOp::native_const(1.0f32);
-    let stage = UOp::stage_global(compute, vec![]);
-
-    // Before conversion, buffer should not be tracked
-    assert!(!ctx.has_buffer(&stage));
-
-    // Convert to STORE
-    bufferize_to_store(&stage, &mut ctx);
-
-    // After conversion, buffer should be tracked
-    assert!(ctx.has_buffer(&stage));
-
-    // Should be able to get the AFTER wrapping BUFFER
-    // bufferize_to_store stores AFTER(buffer, [STORE]) in context
-    let replacement = ctx.get_buffer(&stage).unwrap();
-
-    // Unwrap AFTER to get the actual BUFFER (not DEFINE_GLOBAL)
-    let Op::After { passthrough, .. } = replacement.op() else {
-        panic!("Expected AFTER operation, got {:?}", replacement.op());
-    };
-    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", passthrough.op());
-}
-
-#[test]
-fn test_bufferize_to_store_sequential_global_ids() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create three STAGE operations
-    for i in 0..3 {
-        let compute = UOp::native_const((i as f64) as f32);
-        let stage = UOp::stage_global(compute, vec![]);
-
-        let result = bufferize_to_store(&stage, &mut ctx);
-        assert!(result.is_some());
-
-        // For BUFFER ops, global_counter is NOT incremented (it's only for DEFINE_GLOBAL)
-        // But each STAGE should be tracked
-        assert!(ctx.has_buffer(&stage));
-        assert_eq!(ctx.local_counter, 0);
-    }
-}
-
-#[test]
-fn test_bufferize_to_store_integration_with_split_kernel() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a STAGE operation with non-OUTER range
-    // split_store skips END operations with OUTER ranges (control flow markers)
-    // so we use range_const which creates a non-OUTER range
-    let compute = UOp::native_const(42.0f32);
-    let range = UOp::range_const(10, 0);
-
-    let stage = UOp::stage_global(compute.clone(), vec![range]);
-
-    // Stage 1: STAGE → AFTER(BUFFER, [END(STORE)])
-    let store_result = bufferize_to_store(&stage, &mut ctx).unwrap();
-
-    // Verify buffer was tracked
-    assert!(ctx.has_buffer(&stage));
-
-    // Extract structure: AFTER(passthrough=BUFFER, deps=[END(STORE)])
-    let Op::After { passthrough: buffer_node, deps } = store_result.op() else {
-        panic!("Expected AFTER operation, got {:?}", store_result.op());
-    };
-    assert!(matches!(buffer_node.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", buffer_node.op());
-    assert_eq!(deps.len(), 1);
-
-    // deps[0] should be END wrapping STORE
-    let end_op = &deps[0];
-    let Op::End { computation, ranges: end_ranges } = end_op.op() else {
-        panic!("Expected END in AFTER deps, got {:?}", end_op.op());
-    };
-    assert_eq!(end_ranges.len(), 1);
-    assert!(matches!(computation.op(), Op::Store { .. }), "Expected STORE inside END");
-
-    // Stage 2: split_store transforms END(STORE) to END(CALL)
-    // The BUFFER node will be converted to DEFINE_GLOBAL inside the CALL body
-    let kernel = call_split_store(end_op).expect("split_store should create a CALL");
-    let kernel = extract_kernel(&kernel).expect("split_store should return CALL or END(CALL)");
-
-    // Verify CALL structure
-    let Op::Call { args: sources, body: ast, .. } = kernel.op() else {
-        panic!("Expected CALL operation, got {:?}", kernel.op());
-    };
-
-    // CALL sources should contain the BUFFER (mapped to itself by local_to_param_patterns)
-    assert!(!sources.is_empty(), "CALL should have at least one source");
-
-    // AST should be SINK wrapping the transformed computation
-    let Op::Sink { sources: sink_sources, .. } = ast.op() else {
-        panic!("Expected SINK operation in kernel AST, got {:?}", ast.op());
-    };
-    assert_eq!(sink_sources.len(), 1, "SINK should have 1 source");
-
-    // Verify the context stores AFTER with BUFFER passthrough
-    let ctx_buffer = ctx.get_buffer(&stage).unwrap();
-    let Op::After { passthrough, .. } = ctx_buffer.op() else {
-        panic!("Expected AFTER in context buffer mapping");
-    };
-    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", passthrough.op());
+    assert!(bufferize_to_store(&UOp::native_const(1.0f32), &mut ctx).is_none());
 }
