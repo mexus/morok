@@ -1103,6 +1103,74 @@ fn divmod_guards_do_not_overflow_host_arithmetic() {
     let _ = crate::symbolic::patterns::div_mod_recombine_dsl_patterns().rewrite(&expression, &mut ());
 }
 
+/// Variables for the recombine cases ported from tinygrad's
+/// `test/null/test_uop_symbolic.py` (`test_div_mod_recombine*`,
+/// `test_mod_recombine_with_outer_mul`, `test_reshape_index_roundtrip`).
+struct RecombineVars {
+    x: Arc<UOp>,
+    y: Arc<UOp>,
+}
+
+impl RecombineVars {
+    /// `None` builds the ranged variables the rule rewrites; `Some(point)` pins
+    /// them so [`eval_closed_typed`] can check the identity at that point.
+    fn new(point: Option<(i64, i64)>) -> Self {
+        let ((x_lo, x_hi), (y_lo, y_hi)) = match point {
+            Some((x, y)) => ((x, x), (y, y)),
+            None => ((0, 150_527), (0, 124)),
+        };
+        Self { x: UOp::var("x", DType::WeakInt, x_lo, x_hi), y: UOp::var("y", DType::WeakInt, y_lo, y_hi) }
+    }
+
+    fn c(&self, value: i64) -> Arc<UOp> {
+        self.x.const_like(value)
+    }
+}
+
+type RecombineTerm = fn(&RecombineVars) -> Arc<UOp>;
+
+// full recombine: q == b//div  ->  b*mul
+#[test_case::test_case(|v| v.x.mod_(&v.c(4)).add(&v.x.floor_div(&v.c(4)).mul(&v.c(4))), |v| v.x.clone() ; "mod plus scaled quotient")]
+#[test_case::test_case(|v| v.x.floor_div(&v.c(4)).mul(&v.c(4)).add(&v.x.mod_(&v.c(4))), |v| v.x.clone() ; "scaled quotient plus mod")]
+#[test_case::test_case(|v| v.y.add(&v.x.mod_(&v.c(4))).add(&v.x.floor_div(&v.c(4)).mul(&v.c(4))), |v| v.x.add(&v.y) ; "trailing quotient after an unrelated term")]
+#[test_case::test_case(|v| v.y.add(&v.x.floor_div(&v.c(4)).mul(&v.c(4))).add(&v.x.mod_(&v.c(4))), |v| v.x.add(&v.y) ; "trailing mod after an unrelated term")]
+#[test_case::test_case(|v| v.y.add(&v.x.floor_div(&v.c(4)).mul(&v.c(8))).add(&v.x.mod_(&v.c(4)).mul(&v.c(2))), |v| v.x.mul(&v.c(2)).add(&v.y) ; "scaled pair after an unrelated term")]
+#[test_case::test_case(|v| v.y.add(&v.x.mod_(&v.c(4)).mul(&v.c(2))).add(&v.x.floor_div(&v.c(4)).mul(&v.c(8))), |v| v.x.mul(&v.c(2)).add(&v.y) ; "scaled mod then quotient after an unrelated term")]
+#[test_case::test_case(|v| v.x.floor_div(&v.c(2)).mod_(&v.c(4)).add(&v.x.floor_div(&v.c(8)).mul(&v.c(4))), |v| v.x.floor_div(&v.c(2)) ; "merged quotient of a divided base")]
+#[test_case::test_case(|v| v.x.mul(&v.c(19)).add(&v.c(3)).mod_(&v.c(7)).add(&v.x.mul(&v.c(19)).add(&v.c(3)).floor_div(&v.c(7)).mul(&v.c(7))), |v| v.x.mul(&v.c(19)).add(&v.c(3)) ; "coefficient larger than the divisor")]
+#[test_case::test_case(|v| v.x.floor_div(&v.c(3)).mod_(&v.c(224)).mul(&v.c(3)).add(&v.x.mod_(&v.c(3))).add(&v.x.floor_div(&v.c(672)).mul(&v.c(672))), |v| v.x.clone() ; "three level ladder")]
+#[test_case::test_case(|v| v.x.floor_div(&v.c(11)).mod_(&v.c(7)).mul(&v.c(11)).add(&v.x.mod_(&v.c(11))).add(&v.x.floor_div(&v.c(77)).mul(&v.c(77))), |v| v.x.clone() ; "three level ladder other shape")]
+#[test_case::test_case(|v| v.x.floor_div(&v.c(7)).mod_(&v.c(6)).mul(&v.c(14)).add(&v.x.floor_div(&v.c(42)).mul(&v.c(84))), |v| v.x.floor_div(&v.c(7)).mul(&v.c(14)) ; "three level ladder keeping the outer scale")]
+#[test_case::test_case(|v| v.x.floor_div(&v.c(3)).add(&v.c(1)).mod_(&v.c(4)).add(&v.x.add(&v.c(3)).floor_div(&v.c(12)).mul(&v.c(4))), |v| v.x.floor_div(&v.c(3)).add(&v.c(1)) ; "offset merged quotient")]
+#[test_case::test_case(|v| v.x.add(&v.c(1)).mod_(&v.c(3)).add(&v.x.add(&v.c(1)).floor_div(&v.c(3)).add(&v.c(-17)).mul(&v.c(3))), |v| v.x.add(&v.c(1)).add(&v.c(-51)) ; "shifted quotient folds the shift into the result")]
+#[test_case::test_case(|v| v.x.floor_div(&v.c(8)).mul(&v.c(4)).add(&v.y).add(&v.x.floor_div(&v.c(2)).mod_(&v.c(4))), |v| v.x.floor_div(&v.c(2)).add(&v.y) ; "partners separated inside an additive sum")]
+#[test_case::test_case(|v| v.x.mul(&v.c(8)).add(&v.y).floor_div(&v.c(4)).mul(&v.c(4)).add(&v.x.mul(&v.c(8)).add(&v.y).mod_(&v.c(4))), |v| v.x.mul(&v.c(8)).add(&v.y) ; "reshape index roundtrip")]
+// partial recombine: q == (b//div)%d  ->  (b%(div*d))*mul
+#[test_case::test_case(|v| v.x.mod_(&v.c(4)).mul(&v.c(3)).add(&v.x.floor_div(&v.c(4)).mod_(&v.c(2)).mul(&v.c(12))), |v| v.x.mod_(&v.c(8)).mul(&v.c(3)) ; "partial widening with an outer mul")]
+#[test_case::test_case(|v| v.x.mod_(&v.c(4)).mul(&v.c(-2)).add(&v.x.floor_div(&v.c(4)).mod_(&v.c(2)).mul(&v.c(-8))), |v| v.x.mod_(&v.c(8)).mul(&v.c(-2)) ; "partial widening with a negative outer mul")]
+#[test_case::test_case(|v| v.x.mod_(&v.c(-3)).add(&v.x.floor_div(&v.c(-3)).mod_(&v.c(5)).mul(&v.c(-3))), |v| v.x.mod_(&v.c(-15)) ; "partial widening with a negative divisor")]
+#[test_case::test_case(|v| v.x.floor_div(&v.c(3)).mod_(&v.c(4)).mul(&v.c(2)).add(&v.x.floor_div(&v.c(12)).mod_(&v.c(5)).mul(&v.c(8))), |v| v.x.floor_div(&v.c(3)).mod_(&v.c(20)).mul(&v.c(2)) ; "partial widening through a merged quotient")]
+#[test_case::test_case(|v| v.x.floor_div(&v.c(2)).mod_(&v.c(4)).mul(&v.c(2)).add(&v.x.mod_(&v.c(2))), |v| v.x.mod_(&v.c(8)) ; "partial widening recomposing a low order remainder")]
+// the padded-conv ladder: the `x//c*c` and `x%c` partners separated by a third term
+#[test_case::test_case(|v| v.x.floor_div(&v.c(14)).mod_(&v.c(14)).mul(&v.c(14)).add(&v.y).add(&v.x.floor_div(&v.c(196)).mod_(&v.c(512)).mul(&v.c(196))), |v| v.x.floor_div(&v.c(14)).mod_(&v.c(7168)).mul(&v.c(14)).add(&v.y) ; "padded conv ladder with a separating term")]
+// declines
+#[test_case::test_case(|v| v.x.floor_div(&v.c(3)).mod_(&v.c(224)).mul(&v.c(3)).add(&v.x.floor_div(&v.c(600)).mul(&v.c(600))), |v| v.x.floor_div(&v.c(3)).mod_(&v.c(224)).mul(&v.c(3)).add(&v.x.floor_div(&v.c(600)).mul(&v.c(600))) ; "declines when the merged divisor mismatches")]
+#[test_case::test_case(|v| v.x.floor_div(&v.c(3)).mod_(&v.c(224)).mul(&v.c(3)).add(&v.x.floor_div(&v.c(672)).mul(&v.c(700))), |v| v.x.floor_div(&v.c(3)).mod_(&v.c(224)).mul(&v.c(3)).add(&v.x.floor_div(&v.c(672)).mul(&v.c(700))) ; "declines when the partner scale mismatches")]
+#[test_case::test_case(|v| v.x.floor_div(&v.c(-3)).mod_(&v.c(-2)).add(&v.x.floor_div(&v.c(6)).mul(&v.c(-2))), |v| v.x.floor_div(&v.c(-3)).mod_(&v.c(-2)).add(&v.x.floor_div(&v.c(6)).mul(&v.c(-2))) ; "declines the unsound negative merged quotient")]
+fn div_mod_recombine_matches_tinygrad(input: RecombineTerm, expected: RecombineTerm) {
+    let ranged = RecombineVars::new(None);
+    let rewritten = graph_rewrite(crate::symbolic::patterns::div_mod_recombine_dsl_patterns(), input(&ranged), &mut ());
+    let expected_uop = expected(&ranged);
+    assert!(Arc::ptr_eq(&rewritten, &expected_uop), "got {:?}, want {:?}", rewritten.op(), expected_uop.op());
+
+    for point in [(0, 0), (1, 3), (7, 5), (223, 17), (4095, 124), (150_527, 61)] {
+        let pinned = RecombineVars::new(Some(point));
+        let (lhs, rhs) = (eval_closed_typed(&input(&pinned)), eval_closed_typed(&expected(&pinned)));
+        assert!(lhs.is_some(), "input did not evaluate at {point:?}");
+        assert_eq!(lhs, rhs, "identity broken at {point:?}");
+    }
+}
+
 #[test]
 fn signed_floor_division_rewrites_keep_negative_cases_exact() {
     let i8_const = |value| UOp::const_(DType::Int8, ConstValue::Int(value));

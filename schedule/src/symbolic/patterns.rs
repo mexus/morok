@@ -2443,66 +2443,146 @@ pub fn where_alu_combining_patterns() -> &'static TypedPatternMatcher {
 }
 
 // INDEX cleanup is handled by movement_cleanup_patterns in the canonical shaped IR.
+
+/// The `B` with `q == B//div` and `B%div == base%div`, or `None`.
+///
+/// Line-for-line port of tinygrad `_quotient_base` (`uop/symbolic.py:35-45`):
+///
+/// ```text
+/// def _quotient_base(q:UOp, base:UOp, div:int) -> UOp|None:
+///   (q, s), (num, a) = q.pop_const(), base.pop_const()
+///   if q.op is not Ops.FLOORDIV or q.src[1].op is not Ops.CONST: return None
+///   if div > 0 and num.op is Ops.FLOORDIV and num.src[1].op is Ops.CONST and q.src[1].val == (c:=num.src[1].val)*div:
+///     num, a, D = num.src[0], a*c, c*div
+///   elif q.src[1].val == div: D = div
+///   else: return None
+///   (x, xa), (p, pa) = num.pop_const(), q.src[0].pop_const()
+///   if p is not x or (t:=xa + a - pa) % D: return None
+///   return base - k*div if (k:=t//D - s) else base
+/// ```
+///
+/// Only that congruence is needed to recombine: canonicalization moves consts
+/// freely, so the quotient may be merged (`(x//c + a)//div -> (x + a*c)//(c*div)`
+/// for `div > 0`) and shifted (`(y + k*D)//D == y//D + k`).
+fn quotient_base(q: &Arc<UOp>, base: &Arc<UOp>, div: i128) -> Option<Arc<UOp>> {
+    let (q, s) = q.pop_const(BinaryOp::Add);
+    let (num, a) = base.pop_const(BinaryOp::Add);
+    let (s, a) = (integer_value(s)?, integer_value(a)?);
+    let Op::Binary(BinaryOp::FloorDiv, q_num, q_div) = q.op() else { return None };
+    let q_div = integer_value(get_const_value(q_div)?)?;
+
+    // Merged quotient: `num == x//c` and `q_div == c*div`.
+    let merged = match num.op() {
+        Op::Binary(BinaryOp::FloorDiv, n_num, n_div) if div > 0 => {
+            match get_const_value(n_div).and_then(integer_value) {
+                Some(c) if c.checked_mul(div) == Some(q_div) => Some((n_num.clone(), a.checked_mul(c)?, q_div)),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let (num, a, d) = match merged {
+        Some(merged) => merged,
+        None if q_div == div && div != 0 => (num, a, div),
+        None => return None,
+    };
+
+    let (x, xa) = num.pop_const(BinaryOp::Add);
+    let (p, pa) = q_num.pop_const(BinaryOp::Add);
+    if !Arc::ptr_eq(&p, &x) {
+        return None;
+    }
+    let t = integer_value(xa)?.checked_add(a)?.checked_sub(integer_value(pa)?)?;
+    if t % d != 0 {
+        return None;
+    }
+    // `t % d == 0`, so the exact quotient is the floor quotient.
+    let k = (t / d).checked_sub(s)?;
+    if k == 0 {
+        return Some(base.clone());
+    }
+    // `base - k*div`: upstream negates the host int, keeping the const on the right.
+    let offset = i64::try_from(k.checked_mul(div)?.checked_neg()?).ok()?;
+    base.try_add(&base.const_like(offset)).ok()
+}
+
+/// `(b*mul).usum(*rest)` — `mul == 1` is the identity `pop_const` seeds, and
+/// upstream's redundant `x*1` is folded by `identity_and_zero_patterns` in the
+/// same tier.
+fn scaled_usum(b: &Arc<UOp>, mul: i128, rest: &[Arc<UOp>]) -> Option<Arc<UOp>> {
+    let scaled = if mul == 1 { b.clone() } else { b.try_mul(&b.const_like(i64::try_from(mul).ok()?)).ok()? };
+    rest.iter().try_fold(scaled, |sum, term| sum.try_add(term).ok())
+}
+
+/// Recombine a scaled mod with the partner carrying its quotient.
+///
+/// Line-for-line port of tinygrad `fold_add_divmod_recombine`
+/// (`uop/symbolic.py:47-63`), registered on every `ADD` at `uop/symbolic.py:114`:
+///
+/// ```text
+/// def fold_add_divmod_recombine(x:UOp) -> UOp|None:
+///   terms = list(x.split_uop(Ops.ADD))
+///   for i,u in enumerate(terms):
+///     mod, mul = u.pop_const(Ops.MUL)
+///     if mod.op is not Ops.FLOORMOD or mod.src[1].op is not Ops.CONST: continue
+///     base, div = mod.src[0], mod.src[1].val
+///     for j,v in enumerate(terms):
+///       q, scale = v.pop_const(Ops.MUL)
+///       if i == j or scale != div*mul: continue
+///       rest = [t for k,t in enumerate(terms) if k not in (i,j)]
+///       if (b:=_quotient_base(q, base, div)) is not None: return (b*mul).usum(*rest)
+///       if q.op is Ops.FLOORMOD and q.src[1].op is Ops.CONST and (d:=q.src[1].val) > 0 and \
+///          (b:=_quotient_base(q.src[0], base, div)) is not None:
+///         return ((b % (div*d))*mul).usum(*rest)
+///   return None
+/// ```
+///
+/// A scaled mod `(base%div)*mul` recombines with a partner `q*(div*mul)`
+/// carrying the quotient of a `b == base (mod div)`:
+/// `q == b//div` gives `b*mul` (full recombine), `q == (b//div)%d` gives
+/// `(b%(div*d))*mul` (partial recombine into a wider mod, needs `d > 0`).
+///
+/// Flattening the ADD chain is what lets the `x//c*c` and `x%c` partners be
+/// separated by unrelated terms; upstream's `dtypes.weakint` guard is morok's
+/// `exact_integer_rewrite` no-wrap proof on the concrete dtype.
+fn fold_add_divmod_recombine(x: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let terms = x.split_uop(BinaryOp::Add);
+    for (i, u) in terms.iter().enumerate() {
+        let (m, mul) = u.pop_const(BinaryOp::Mul);
+        let Some(mul) = integer_value(mul) else { continue };
+        let Op::Binary(BinaryOp::FloorMod, base, mod_div) = m.op() else { continue };
+        let Some(div) = get_const_value(mod_div).and_then(integer_value) else { continue };
+        let Some(want) = div.checked_mul(mul) else { continue };
+
+        for (j, v) in terms.iter().enumerate() {
+            let (q, scale) = v.pop_const(BinaryOp::Mul);
+            if i == j || integer_value(scale) != Some(want) {
+                continue;
+            }
+            let rest: Vec<Arc<UOp>> =
+                terms.iter().enumerate().filter(|(k, _)| *k != i && *k != j).map(|(_, t)| t.clone()).collect();
+
+            if let Some(b) = quotient_base(&q, base, div) {
+                return exact_integer_rewrite(x, scaled_usum(&b, mul, &rest)?);
+            }
+            if let Op::Binary(BinaryOp::FloorMod, q_src, q_div) = q.op()
+                && let Some(d) = get_const_value(q_div).and_then(integer_value)
+                && d > 0
+                && let Some(b) = quotient_base(q_src, base, div)
+            {
+                let wide = i64::try_from(div.checked_mul(d)?).ok()?;
+                let wider = b.try_mod(&b.const_like(wide)).ok()?;
+                return exact_integer_rewrite(x, scaled_usum(&wider, mul, &rest)?);
+            }
+        }
+    }
+    None
+}
+
+/// Variations of `(x%c) + (x//c)*c = x` (tinygrad `uop/symbolic.py:114`).
 pub fn div_mod_recombine_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        // x%n + (x//n)*n → x (div-mod identity)
-        // Note: duplicate variable names (x, n) auto-generate Arc::ptr_eq checks
-        original @ Add[FloorMod(x, n), Mul[FloorDiv(x, n), n]]
-          => exact_integer_rewrite(original, Arc::clone(x)),
-
-        // ((x//a) % c) + (x // b) * c → x // a
-        // Condition: a * c == b (divisor composition)
-        // Note: x appears twice, c appears twice → auto ptr_eq checks
-        original @ Add[FloorMod(FloorDiv(x, a @const(a_val)), c @const(c_val)), Mul[FloorDiv(x, _b @const(b_val)), c]] => {
-            let a_int = a_val.try_int()?;
-            let c_int = c_val.try_int()?;
-            let b_int = b_val.try_int()?;
-            if c_int > 0 && a_int.checked_mul(c_int) == Some(b_int) {
-                return exact_integer_rewrite(original, x.try_div(a).ok()?);
-            }
-            None
-        },
-
-        // (x % c1) * c2 + (x // c1) * c3 → x * c2
-        // Condition: c1 * c2 == c3
-        // Note: x appears twice, c1 appears twice → auto ptr_eq checks
-        original @ Add[Mul[FloorMod(x, c1 @const(c1_val)), c2 @const(c2_val)], Mul[FloorDiv(x, c1), _c3 @const(c3_val)]] => {
-            let c1_int = c1_val.try_int()?;
-            let c2_int = c2_val.try_int()?;
-            let c3_int = c3_val.try_int()?;
-            if c1_int.checked_mul(c2_int) == Some(c3_int) {
-                return exact_integer_rewrite(original, x.mul(c2));
-            }
-            None
-        },
-
-        // y + (x//n)*n + x%n → y + x
-        original @ Add[Add[y, Mul[FloorDiv(x, n), n]], FloorMod(x, n)] => {
-            exact_integer_rewrite(original, y.add(x))
-        },
-
-        // y + x%n + (x//n)*n → y + x
-        original @ Add[Add[y, FloorMod(x, n)], Mul[FloorDiv(x, n), n]] => {
-            exact_integer_rewrite(original, y.add(x))
-        },
-
-        // y + (x // c1) * c3 + (x % c1) * c2 → y + x * c2  when c1*c2 == c3
-        original @ Add[Add[y, Mul[FloorDiv(x, c1 @const(c1_val)), _c3 @const(c3_val)]], Mul[FloorMod(x, c1), c2 @const(c2_val)]] => {
-            let c1_int = c1_val.try_int()?;
-            let c2_int = c2_val.try_int()?;
-            let c3_int = c3_val.try_int()?;
-            if c1_int.checked_mul(c2_int) != Some(c3_int) { return None; }
-            exact_integer_rewrite(original, y.add(&x.mul(c2)))
-        },
-
-        // y + (x % c1) * c2 + (x // c1) * c3 → y + x * c2  when c1*c2 == c3
-        original @ Add[Add[y, Mul[FloorMod(x, c1 @const(c1_val)), c2 @const(c2_val)]], Mul[FloorDiv(x, c1), _c3 @const(c3_val)]] => {
-            let c1_int = c1_val.try_int()?;
-            let c2_int = c2_val.try_int()?;
-            let c3_int = c3_val.try_int()?;
-            if c1_int.checked_mul(c2_int) != Some(c3_int) { return None; }
-            exact_integer_rewrite(original, y.add(&x.mul(c2)))
-        },
+        original @ Add(_, _) => fold_add_divmod_recombine(original),
     }
 }
 
