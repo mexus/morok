@@ -94,8 +94,8 @@ pub fn lower_weak_node(u: &Arc<UOp>) -> Option<Arc<UOp>> {
     (!Arc::ptr_eq(&lowered, u)).then_some(lowered)
 }
 
-pub fn pm_lower_weak() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn pm_lower_weak() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         u @const(value) if u.dtype().is_weak() => |u, value| {
             Some(UOp::const_(select_dtype(u), value).cast(u.dtype()))
         },
@@ -129,7 +129,7 @@ pub fn pm_lower_weak() -> TypedPatternMatcher {
 /// same graph result, with only the memoization lifetime differing.
 pub fn lower_weak_srcs(u: &Arc<UOp>) -> Option<Arc<UOp>> {
     fn lower(s: &Arc<UOp>) -> Arc<UOp> {
-        let r = crate::rewrite::graph_rewrite(&pm_lower_weak(), s.clone(), &mut ());
+        let r = crate::rewrite::graph_rewrite(pm_lower_weak(), s.clone(), &mut ());
         match r.op() {
             Op::Cast { src, dtype } if dtype.is_weak() => src.clone(),
             _ => r,

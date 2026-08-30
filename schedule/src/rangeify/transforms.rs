@@ -12,7 +12,7 @@
 //! flatten_range.rs, cycle_detection.rs
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use super::context::RangeifyContext;
 use super::indexing::IndexingContext;
@@ -284,11 +284,14 @@ pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
 
     // Combined earliest bottom-up rewrite, including reduction splitting.
     let t_stage = std::time::Instant::now();
-    let early_combined = super::patterns::movement_op_patterns().with_context::<super::kernel::SplitReduceOpConfig>()
-        + super::patterns::early_rewrites().with_context::<super::kernel::SplitReduceOpConfig>()
-        + super::patterns::split_reduceop_patterns();
+    static EARLY_COMBINED: LazyLock<crate::TypedPatternMatcher<super::kernel::SplitReduceOpConfig>> =
+        LazyLock::new(|| {
+            super::patterns::movement_op_patterns().with_context::<super::kernel::SplitReduceOpConfig>()
+                + super::patterns::early_rewrites().with_context::<super::kernel::SplitReduceOpConfig>()
+                + super::patterns::split_reduceop_patterns()
+        });
     let mut split_config = super::kernel::SplitReduceOpConfig::default();
-    sink = crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&early_combined, sink, &mut split_config);
+    sink = crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&*EARLY_COMBINED, sink, &mut split_config);
     tracing::debug!(
         uop.tree = sink.tree(),
         node_count = sink.node_count(),
@@ -1674,7 +1677,13 @@ fn strip_reshape_on_callable_sources(callable: &Arc<UOp>) -> Option<Arc<UOp>> {
 ///
 /// Uses `allow_locals=false`. Shared RangeifyBufferContext ensures unique buffer
 /// IDs across all pattern matches.
-pub fn pm_add_buffers_patterns() -> crate::TypedPatternMatcher<super::kernel::RangeifyBufferContext> {
+pub fn pm_add_buffers_patterns() -> &'static crate::TypedPatternMatcher<super::kernel::RangeifyBufferContext> {
+    static PM: LazyLock<crate::TypedPatternMatcher<super::kernel::RangeifyBufferContext>> =
+        LazyLock::new(build_add_buffers_patterns);
+    &PM
+}
+
+fn build_add_buffers_patterns() -> crate::TypedPatternMatcher<super::kernel::RangeifyBufferContext> {
     super::patterns::movement_op_patterns().with_context::<super::kernel::RangeifyBufferContext>()
         + crate::patterns! {
             @context super::kernel::RangeifyBufferContext;

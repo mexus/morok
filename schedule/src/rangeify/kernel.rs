@@ -475,20 +475,22 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> Result<(Arc<UOp>, RangeifyBufferC
 
     // PASS 1: stage → store (pm_gate_kernel_sink + pm_add_buffers + pm_add_range_tags, bottom_up=True)
     let t_stage = std::time::Instant::now();
-    let after_buffers = {
-        use svod_ir::op::pattern_derived::OpKey;
-        use svod_ir::pattern::RewriteResult;
-        let mut matcher = pm_add_buffers_patterns();
-        // Skip the SINK subtree of an already-formed kernel AST.
-        matcher.add(&[OpKey::Sink], |node, _ctx| {
-            if matches!(node.op(), Op::Sink { info: Some(_), .. }) {
-                RewriteResult::Gate(node.clone())
-            } else {
-                RewriteResult::NoMatch
-            }
+    static PM: std::sync::LazyLock<crate::TypedPatternMatcher<RangeifyBufferContext>> =
+        std::sync::LazyLock::new(|| {
+            use svod_ir::op::pattern_derived::OpKey;
+            use svod_ir::pattern::RewriteResult;
+            let mut matcher = pm_add_buffers_patterns().clone();
+            // Skip the SINK subtree of an already-formed kernel AST.
+            matcher.add(&[OpKey::Sink], |node, _ctx| {
+                if matches!(node.op(), Op::Sink { info: Some(_), .. }) {
+                    RewriteResult::Gate(node.clone())
+                } else {
+                    RewriteResult::NoMatch
+                }
+            });
+            matcher
         });
-        graph_rewrite_bottom_up(&matcher, root, &mut ctx)
-    };
+    let after_buffers = graph_rewrite_bottom_up(&*PM, root, &mut ctx);
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: pm_add_buffers complete");
 
     trace!(tree = %after_buffers.tree_full(), "after pm_add_buffers");
