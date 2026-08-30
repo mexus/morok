@@ -4,6 +4,12 @@
 //! graph: a refactor that changes a kernel's graph changes its digest. Update an
 //! `expected` const ONLY for an intentional graph change — the failure message
 //! prints the new value to paste.
+//!
+//! One caveat: the digest is the SINK's `content_hash`, which folds each node's
+//! op-data through `Hash`. Changing an op-data type's `Hash` impl (e.g. `AxisId`,
+//! carried by every `RANGE`) therefore moves the digest with a byte-identical
+//! graph. Such a re-baseline is proved by dumping both graphs and diffing them,
+//! not by reading the new digest off the failure.
 
 use std::sync::Arc;
 
@@ -68,16 +74,16 @@ fn fa_sink() -> Arc<UOp> {
 }
 
 // Committed structural golden digests. Update ONLY for an intentional graph change.
-const MATMUL_DIGEST: u128 = 0x60a9_69c4_6a13_4611_0000_0000_0000_0000;
+const MATMUL_DIGEST: u128 = 0x0261_3d2b_1ca8_9f13_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 535;
-const FA_DIGEST: u128 = 0x4841_cd37_170f_693c_0000_0000_0000_0000;
+const FA_DIGEST: u128 = 0x3c39_d807_aa65_c6fd_0000_0000_0000_0000;
 const FA_NODES: usize = 897;
 // Non-causal and non-causal+key-masked build variants (pin the `causal:false` and
 // `key_lens:Some` branches GPU-free). The FA all-masked-row NaN fix is a key_lens
 // clamp at the kernel ENTRY (a tensor-graph op), so the SINK graph is unchanged.
-const FA_NONCAUSAL_DIGEST: u128 = 0x34eb_63d7_de0c_26e5_0000_0000_0000_0000;
+const FA_NONCAUSAL_DIGEST: u128 = 0x5428_d057_e5f1_eba0_0000_0000_0000_0000;
 const FA_NONCAUSAL_NODES: usize = 871;
-const FA_MASKED_DIGEST: u128 = 0x527b_eb24_ecea_0ea3_0000_0000_0000_0000;
+const FA_MASKED_DIGEST: u128 = 0xb58f_daa1_a06e_104c_0000_0000_0000_0000;
 const FA_MASKED_NODES: usize = 895;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
