@@ -5,12 +5,15 @@ use crate::{
     rewrite::graph_rewrite,
     symbolic::patterns::{
         commutative_canonicalization, comparison_dsl_patterns, sym_phase3_patterns, term_combining_dsl_patterns,
+        weak_float_values_are_committed,
     },
     symbolic::{sym, symbolic, symbolic_simple},
 };
 use smallvec::smallvec;
 use std::{f32::consts::PI, sync::Arc};
 use svod_dtype::DType;
+use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::properties::HasWeakFloatProperty;
 use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 
 fn assert_binary_sources(root: &Arc<UOp>, lhs: &Arc<UOp>, rhs: &Arc<UOp>) {
@@ -3416,4 +3419,25 @@ fn test_substitute_gated_empty_map() {
     let map: HashMap<svod_ir::UOpKey, Arc<UOp>> = HashMap::new();
     let result = r0.substitute_gated(&map);
     assert!(Arc::ptr_eq(&result, &r0), "Empty map should return original");
+}
+
+/// The value-sensitive guard runs on every pattern attempt, so it must be a
+/// memoised per-node property rather than a graph walk (previously O(n^2)).
+#[test_case::test_case(DType::Float32, true ; "committed float chain")]
+#[test_case::test_case(DType::WeakFloat, false ; "weak float leaf")]
+fn weak_float_guard_is_memoized_per_node(leaf_dtype: DType, committed: bool) {
+    const DEPTH: usize = 64;
+    let mut root = UOp::const_(leaf_dtype, ConstValue::Float(0.5));
+    for _ in 0..DEPTH {
+        root = UOp::new(Op::Unary(UnaryOp::Sqrt, root), DType::Float32);
+    }
+
+    assert_eq!(weak_float_values_are_committed(&root), committed);
+
+    let nodes = root.toposort();
+    assert_eq!(nodes.len(), DEPTH + 1);
+    for node in &nodes {
+        assert!(HasWeakFloatProperty::cache(node).get().is_some(), "one evaluation per node, cached in place");
+    }
+    assert!(std::ptr::eq(HasWeakFloatProperty::get(&root), HasWeakFloatProperty::get(&root)));
 }
