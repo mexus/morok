@@ -69,58 +69,50 @@ fn compiled_spec_requires_complete_descriptor_abi() {
     assert!(matches!(err, crate::Error::ProgramAbiMismatch { .. }), "{err:?}");
 }
 
+/// Spec parsing is case-insensitive and accepts every vendor alias; the
+/// canonical form always carries an explicit device id.
 #[test]
-fn test_device_spec_parse() {
-    assert_eq!(DeviceSpec::parse("CPU").unwrap(), DeviceSpec::Cpu);
-    assert_eq!(DeviceSpec::parse("cpu").unwrap(), DeviceSpec::Cpu);
-
-    #[cfg(feature = "cuda")]
-    {
-        assert_eq!(DeviceSpec::parse("CUDA:0").unwrap(), DeviceSpec::Cuda { device_id: 0 });
-        assert_eq!(DeviceSpec::parse("cuda").unwrap(), DeviceSpec::Cuda { device_id: 0 });
-        assert_eq!(DeviceSpec::parse("GPU:2").unwrap(), DeviceSpec::Cuda { device_id: 2 });
+fn device_spec_parses_aliases_and_round_trips_through_canonicalize() {
+    let cases = [
+        ("CPU", DeviceSpec::Cpu, "CPU"),
+        ("cpu", DeviceSpec::Cpu, "CPU"),
+        ("AMD", DeviceSpec::Amd { device_id: 0 }, "AMD:0"),
+        ("AMD:1", DeviceSpec::Amd { device_id: 1 }, "AMD:1"),
+        ("hip:2", DeviceSpec::Amd { device_id: 2 }, "AMD:2"),
+        #[cfg(feature = "cuda")]
+        ("cuda", DeviceSpec::Cuda { device_id: 0 }, "CUDA:0"),
+        #[cfg(feature = "cuda")]
+        ("CUDA:1", DeviceSpec::Cuda { device_id: 1 }, "CUDA:1"),
+        #[cfg(feature = "cuda")]
+        ("GPU:2", DeviceSpec::Cuda { device_id: 2 }, "CUDA:2"),
+    ];
+    for (text, spec, canonical) in cases {
+        assert_eq!(DeviceSpec::parse(text).unwrap(), spec, "{text}");
+        assert_eq!(spec.canonicalize(), canonical);
     }
 }
 
+/// Opening AMD must never panic: without a GPU, on an unsupported arch (e.g.
+/// RDNA2/gfx1036), or without permissions it returns a typed error instead.
 #[test]
-fn test_device_spec_parse_amd() {
-    assert_eq!(DeviceSpec::parse("AMD").unwrap(), DeviceSpec::Amd { device_id: 0 });
-    assert_eq!(DeviceSpec::parse("AMD:1").unwrap(), DeviceSpec::Amd { device_id: 1 });
-    assert_eq!(DeviceSpec::parse("hip:2").unwrap(), DeviceSpec::Amd { device_id: 2 });
-}
-
-#[test]
-fn test_device_spec_canonicalize() {
-    assert_eq!(DeviceSpec::Cpu.canonicalize(), "CPU");
-
-    #[cfg(feature = "cuda")]
-    {
-        assert_eq!(DeviceSpec::Cuda { device_id: 1 }.canonicalize(), "CUDA:1");
-    }
-
-    assert_eq!(DeviceSpec::Amd { device_id: 0 }.canonicalize(), "AMD:0");
-    assert_eq!(DeviceSpec::Amd { device_id: 2 }.canonicalize(), "AMD:2");
-}
-
-#[test]
-fn test_amd_device_open_returns_clean_result() {
-    // On hosts without AMD GPU: NoAmdGpu.
-    // On hosts with an unsupported arch (e.g. RDNA2/gfx1036): AmdAllocFailed.
-    // On hosts with a supported gfx target: Ok. Never panics; that's the
-    // load-bearing assertion.
+fn amd_device_open_returns_a_clean_result_on_every_host() {
     use crate::error::Error;
     match crate::registry::get_device("AMD:0") {
         Ok(_)
-        | Err(Error::NoAmdGpu { .. })
-        | Err(Error::AmdAllocFailed { .. })
-        | Err(Error::AmdIoctl { .. })
-        | Err(Error::DeviceUnavailable { .. }) => {}
+        | Err(
+            Error::NoAmdGpu { .. }
+            | Error::AmdAllocFailed { .. }
+            | Error::AmdIoctl { .. }
+            | Error::DeviceUnavailable { .. },
+        ) => {}
         Err(other) => panic!("unexpected error variant: {other:?}"),
     }
 }
 
+/// Every field of a rebuilt spec comes from the PROGRAM's own stages; stale
+/// attached metadata (name, source, buffer counts, I/O sets) is ignored.
 #[test]
-fn test_program_spec_from_uop_ignores_metadata_overrides() {
+fn program_spec_from_uop_ignores_stale_metadata() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
     let linear = UOp::linear(sink.toposort().into());
     let source = UOp::source("// test kernel".to_string());
@@ -128,11 +120,11 @@ fn test_program_spec_from_uop_ignores_metadata_overrides() {
 
     let mut spec =
         crate::device::ProgramSpec::new("k_test".to_string(), "// old src".to_string(), DeviceSpec::Cpu, sink.clone());
+    spec.set_buffer_metadata(vec![1, 0], vec![1], vec![0]);
+    spec.set_var_names(vec!["N".to_string()]);
     spec.buf_count = 2;
 
-    let program = program.with_metadata(spec.clone());
-    let rebuilt = crate::device::ProgramSpec::from_uop(&program).expect("program spec from uop");
-
+    let rebuilt = crate::device::ProgramSpec::from_uop(&program.with_metadata(spec)).expect("program spec from uop");
     assert_eq!(rebuilt.name, "test");
     assert_eq!(rebuilt.src, "// test kernel");
     assert_eq!(rebuilt.device, DeviceSpec::Cpu);
@@ -145,26 +137,7 @@ fn test_program_spec_from_uop_ignores_metadata_overrides() {
 }
 
 #[test]
-fn test_program_spec_from_uop_ignores_metadata_io() {
-    let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let linear = UOp::linear(sink.toposort().into());
-    let source = UOp::source("// test kernel".to_string());
-    let program = program(sink.clone(), DeviceSpec::Cpu, Some(linear), Some(source), None);
-
-    let mut spec =
-        crate::device::ProgramSpec::new("k_test".to_string(), "// old src".to_string(), DeviceSpec::Cpu, sink);
-    spec.set_buffer_metadata(vec![1, 0], vec![1], vec![0]);
-    spec.buf_count = 2;
-
-    let rebuilt = crate::device::ProgramSpec::from_uop(&program.with_metadata(spec)).expect("program spec from uop");
-    assert!(rebuilt.globals.is_empty());
-    assert!(rebuilt.outs.is_empty());
-    assert!(rebuilt.ins.is_empty());
-    assert_eq!(rebuilt.buf_count, 0);
-}
-
-#[test]
-fn test_program_spec_from_uop_without_metadata_derives_name_and_vars() {
+fn program_spec_from_uop_derives_name_and_vars_without_metadata() {
     let var = slotted_var("N", 1, 8, 0);
     let sink = UOp::sink(vec![var]);
     let linear = UOp::linear(sink.toposort().into());
@@ -177,89 +150,60 @@ fn test_program_spec_from_uop_without_metadata_derives_name_and_vars() {
     assert_eq!(rebuilt.vars.len(), 1);
 }
 
-#[test]
-fn test_program_spec_derives_launch_dims_from_specials() {
-    let g = UOp::special(UOp::index_const(8), "gidx0".to_string());
-    let l = UOp::special(UOp::index_const(4), "lidx0".to_string());
-    let sink = UOp::sink(vec![g, l]);
+fn launch_dims(sink: std::sync::Arc<UOp>, vars: &[(&'static str, i64)]) -> crate::device::ConcreteLaunchDims {
     let linear = UOp::linear(sink.toposort().into());
     let source = UOp::source("void launch_kernel() {}".to_string());
-    let program = program(sink, DeviceSpec::Cpu, Some(linear), Some(source), None);
-
-    let spec = crate::device::ProgramSpec::from_uop(&program).expect("program spec from specials");
-    let vars = std::collections::HashMap::new();
-    let launch = spec.launch_dims(&vars).expect("resolve launch dims");
-    assert_eq!(launch.global_size, [8, 1, 1]);
-    assert_eq!(launch.local_size, Some([4, 1, 1]));
+    let staged = program(sink, DeviceSpec::Cpu, Some(linear), Some(source), None);
+    let spec = crate::device::ProgramSpec::from_uop(&staged).expect("program spec");
+    spec.launch_dims(&vars.iter().copied().collect()).expect("resolve launch dims")
 }
 
+/// `gidx`/`lidx` specials split into global and local sizes; a bare `idx`
+/// special is a direct global launch with no local size at all.
 #[test]
-fn test_program_spec_launch_dims_resolves_mulacc_extent() {
-    // The symbolic simplifier fuses `16*ts − 1` (from a reshaped `16·ts`
-    // sequence axis) into a single MulAcc launch extent. The launch-size
-    // evaluator must compute `ts*16 − 1` rather than reject the op.
-    let ts = slotted_var("ts", 1, 8, 0);
-    let sixteen = UOp::const_(DType::Int32, 16.into());
-    let minus_one = UOp::const_(DType::Int32, (-1).into());
-    let extent = UOp::try_mulacc(ts, sixteen, minus_one).expect("build MulAcc extent");
-    let g = UOp::special(extent, "gidx0".to_string());
-    let sink = UOp::sink(vec![g]);
-    let linear = UOp::linear(sink.toposort().into());
-    let source = UOp::source("void mulacc_kernel() {}".to_string());
-    let program = program(sink, DeviceSpec::Cpu, Some(linear), Some(source), None);
+fn program_spec_derives_launch_dims_from_specials() {
+    let gidx = UOp::special(UOp::index_const(8), "gidx0".to_string());
+    let lidx = UOp::special(UOp::index_const(4), "lidx0".to_string());
+    let split = launch_dims(UOp::sink(vec![gidx, lidx]), &[]);
+    assert_eq!((split.global_size, split.local_size), ([8, 1, 1], Some([4, 1, 1])));
 
-    let spec = crate::device::ProgramSpec::from_uop(&program).expect("program spec from mulacc special");
-    let vars = std::collections::HashMap::from([("ts", 8i64)]);
-    let launch = spec.launch_dims(&vars).expect("resolve launch dims with MulAcc extent");
-    assert_eq!(launch.global_size, [127, 1, 1], "ts*16 - 1 = 8*16 - 1 = 127");
-}
-
-#[test]
-fn test_program_spec_direct_global_special_disables_local_size() {
     let idx = UOp::special(UOp::index_const(16), "idx0".to_string());
-    let sink = UOp::sink(vec![idx]);
-    let linear = UOp::linear(sink.toposort().into());
-    let source = UOp::source("void direct_global_kernel() {}".to_string());
-    let program = program(sink, DeviceSpec::Cpu, Some(linear), Some(source), None);
-
-    let spec = crate::device::ProgramSpec::from_uop(&program).expect("program spec from idx special");
-    let vars = std::collections::HashMap::new();
-    let launch = spec.launch_dims(&vars).expect("resolve launch dims");
-    assert_eq!(launch.global_size, [16, 1, 1]);
-    assert_eq!(launch.local_size, None);
+    let direct = launch_dims(UOp::sink(vec![idx]), &[]);
+    assert_eq!((direct.global_size, direct.local_size), ([16, 1, 1], None));
 }
 
+/// The symbolic simplifier fuses `16*ts - 1` (from a reshaped `16*ts` sequence
+/// axis) into one MulAcc launch extent, which the evaluator must compute rather
+/// than reject.
 #[test]
-fn test_program_spec_core_id_sets_cpu_global_size() {
-    let core_id = slotted_var("core_id", 0, 7, 0);
-    let sink = UOp::sink(vec![core_id]);
-    let linear = UOp::linear(sink.toposort().into());
-    let source = UOp::source("void core_kernel(int core_id) {}".to_string());
-    let program = program(sink, DeviceSpec::Cpu, Some(linear), Some(source), None);
-
-    let spec = crate::device::ProgramSpec::from_uop(&program).expect("program spec from core_id");
-    let vars = std::collections::HashMap::new();
-    let launch = spec.launch_dims(&vars).expect("resolve launch dims");
-    assert_eq!(launch.global_size, [8, 1, 1]);
+fn program_spec_launch_dims_resolves_mulacc_extent() {
+    let extent = UOp::try_mulacc(
+        slotted_var("ts", 1, 8, 0),
+        UOp::const_(DType::Int32, 16.into()),
+        UOp::const_(DType::Int32, (-1).into()),
+    )
+    .expect("build MulAcc extent");
+    let sink = UOp::sink(vec![UOp::special(extent, "gidx0".to_string())]);
+    assert_eq!(launch_dims(sink, &[("ts", 8)]).global_size, [127, 1, 1], "ts*16 - 1 = 8*16 - 1 = 127");
 }
 
+/// A `core_id` variable sets the CPU global size from its bounds, and attached
+/// metadata never overrides the bounds ProgramInfo carries.
 #[test]
-fn test_program_spec_metadata_launch_dims_do_not_hide_program_info_core_id() {
-    let core_id = slotted_var("core_id", 0, 3, 0);
-    let sink = UOp::sink(vec![core_id]);
+fn program_spec_core_id_sets_cpu_global_size_over_any_metadata() {
+    assert_eq!(launch_dims(UOp::sink(vec![slotted_var("core_id", 0, 7, 0)]), &[]).global_size, [8, 1, 1]);
+
+    let sink = UOp::sink(vec![slotted_var("core_id", 0, 3, 0)]);
     let linear = UOp::linear(sink.toposort().into());
     let source = UOp::source("void core_kernel(int core_id) {}".to_string());
-    let program = program(sink.clone(), DeviceSpec::Cpu, Some(linear), Some(source), None);
+    let staged = program(sink.clone(), DeviceSpec::Cpu, Some(linear), Some(source), None);
     let meta = crate::device::ProgramSpec::new("core".to_string(), "// old".to_string(), DeviceSpec::Cpu, sink);
-
-    let spec = crate::device::ProgramSpec::from_uop(&program.with_metadata(meta)).expect("program spec from metadata");
-    let vars = std::collections::HashMap::new();
-    let launch = spec.launch_dims(&vars).expect("resolve launch dims");
-    assert_eq!(launch.global_size, [4, 1, 1]);
+    let spec = crate::device::ProgramSpec::from_uop(&staged.with_metadata(meta)).expect("program spec");
+    assert_eq!(spec.launch_dims(&std::collections::HashMap::new()).unwrap().global_size, [4, 1, 1]);
 }
 
 #[test]
-fn test_program_spec_from_uop_without_metadata_derives_buf_count_and_io() {
+fn program_spec_from_uop_derives_buf_count_and_io_without_metadata() {
     let param = UOp::param(0, 16, DType::Float32, None);
     let idx = UOp::index_const(0);
     let load_idx = UOp::index().buffer(param.clone()).indices(vec![idx.clone()]).call().expect("load index");
@@ -357,7 +301,7 @@ fn program_spec_accepts_semantically_identical_nonidentical_var() {
 }
 
 #[test]
-fn test_program_spec_from_uop_requires_program_source() {
+fn program_spec_from_uop_requires_a_proven_program_source() {
     let sink = UOp::sink(vec![UOp::native_const(3.0f32)]);
     let linear = UOp::linear(sink.toposort().into());
     let program_without_source = program(sink.clone(), DeviceSpec::Cpu, Some(linear), None, None);
@@ -382,16 +326,10 @@ fn test_program_spec_from_uop_requires_program_source() {
     );
     let err = crate::device::ProgramSpec::from_uop(&raw).expect_err("identity-less SOURCE must be rejected");
     assert!(matches!(err, crate::Error::ProgramStageMismatch { stage: "SOURCE", .. }), "{err:?}");
-
-    if let Op::Program { .. } = bad_program.op() {
-        // ensure we exercised Program path in this test
-    } else {
-        panic!("expected PROGRAM op");
-    }
 }
 
 #[test]
-fn test_program_spec_from_uop_binary_stage_ignores_metadata() {
+fn program_spec_from_uop_binary_stage_ignores_metadata() {
     let sink = UOp::sink(vec![UOp::native_const(4.0f32)]);
     let linear = UOp::linear(sink.toposort().into());
     let source = UOp::source("// binary source".to_string());
@@ -484,15 +422,4 @@ fn beam_worker_artifact_validates_source_binary_abi_and_compiler_identity() {
         )
         .is_err()
     );
-}
-
-#[test]
-fn test_program_spec_from_uop_without_metadata_defaults_name_to_kernel() {
-    let sink = UOp::sink(vec![UOp::native_const(4.5f32)]);
-    let linear = UOp::linear(sink.toposort().into());
-    let source = UOp::source("void default_name_kernel() {}".to_string());
-    let program = program(sink, DeviceSpec::Cpu, Some(linear), Some(source), None);
-
-    let rebuilt = crate::device::ProgramSpec::from_uop(&program).expect("metadata-free from_uop should succeed");
-    assert_eq!(rebuilt.name, "test");
 }

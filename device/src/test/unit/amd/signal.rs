@@ -1,50 +1,40 @@
-use super::test_support::{MockAmdCall, MockAmdIface, amd_alloc_or_skip};
+use super::test_support::{MockAmdCall, MockAmdIface, amd_alloc_or_skip, mock_device};
 use crate::amd::AmdAllocator;
+use crate::amd::connector::SubmissionFinalizer;
 use crate::amd::signal::*;
 use crate::error::Error;
 use crate::sync::TimelineSignal;
 use std::sync::Arc;
 
-fn mock_signal() -> (Arc<MockAmdIface>, Arc<crate::amd::AmdDevice>, Arc<SignalPool>, Arc<AmdSignal>) {
-    let iface = Arc::new(MockAmdIface::default());
-    let device = iface.device();
-    let allocator = AmdAllocator { dev: Arc::clone(&device), device_id: 0 };
+fn mock_signal() -> (Arc<MockAmdIface>, AmdAllocator, Arc<SignalPool>, Arc<AmdSignal>) {
+    let (iface, allocator) = mock_device(1);
     let pool = SignalPool::new(&allocator, 1).expect("mock signal pool");
     let signal = Arc::new(pool.acquire().expect("mock signal"));
-    (iface, device, pool, signal)
+    (iface, allocator, pool, signal)
 }
 
-/// Live pool round-trip on real hardware (skipped when no supported AMD
-/// GPU is present).
+fn wait_count(iface: &MockAmdIface) -> usize {
+    iface.call_count(|call| matches!(call, MockAmdCall::WaitEvents { .. }))
+}
+
+/// Live pool round-trip: concurrent slots are distinct, and a released slot is
+/// handed back out with its value zeroed.
 #[test]
-fn signal_pool_acquire_release_roundtrip() {
+fn signal_pool_slots_are_distinct_and_reset_before_reuse() {
     let Some(alloc) = amd_alloc_or_skip() else { return };
     let pool = SignalPool::new(&alloc, 64).expect("create pool");
-    let s1 = pool.acquire().expect("acquire 1");
-    let s2 = pool.acquire().expect("acquire 2");
-    assert_ne!(s1.value_addr(), s2.value_addr());
-    assert_eq!(s1.value(), 0);
-    s1.set(7);
-    assert_eq!(s1.value(), 7);
-    drop(s1);
-    // After drop, slot is back in the pool; acquiring should give it back
-    // (slot count restored).
-    let s3 = pool.acquire().expect("acquire 3");
-    let _ = s3;
-    let _ = s2;
-}
+    let first = pool.acquire().expect("acquire");
+    let second = pool.acquire().expect("acquire");
+    assert_ne!(first.value_addr(), second.value_addr());
+    assert_eq!(first.value(), 0);
+    first.set(7);
+    assert_eq!(first.value(), 7);
 
-#[test]
-fn signal_pool_exhaustion_is_clean_err() {
-    let Some(alloc) = amd_alloc_or_skip() else { return };
-    const N: usize = 64;
-    let pool = SignalPool::new(&alloc, N).expect("create pool");
-    let mut sigs = Vec::new();
-    for _ in 0..N {
-        sigs.push(pool.acquire().expect("ack"));
-    }
-    let err = pool.acquire().expect_err("pool must be exhausted");
-    assert!(matches!(err, Error::AmdAllocFailed { .. }));
+    let slot = first.slot();
+    drop(first);
+    let reused = pool.acquire().expect("reacquire");
+    assert_eq!(reused.slot(), slot);
+    assert_eq!(reused.value(), 0, "a reused slot must not carry the old value");
 }
 
 #[test]
@@ -54,7 +44,7 @@ fn signal_slot_releases_once_after_last_finalizer_clone_drops() {
     let free = pool.free();
     let signal = Arc::new(pool.acquire().expect("acquire"));
     signal.reset(0);
-    let finalizer = crate::amd::connector::SubmissionFinalizer::timeline(signal, 1, None);
+    let finalizer = SubmissionFinalizer::timeline(signal, 1, None);
     let clone = Arc::clone(&finalizer);
     assert_eq!(pool.free(), free - 1);
     drop(finalizer);
@@ -63,44 +53,39 @@ fn signal_slot_releases_once_after_last_finalizer_clone_drops() {
     assert_eq!(pool.free(), free, "the finalizer's last drop releases exactly once");
 }
 
+/// A backend wait failure surfaces verbatim and latches the device; afterwards
+/// every wait fails on the latch without reaching the backend again.
 #[test]
-fn released_signal_slot_is_reset_before_reuse() {
-    let Some(alloc) = amd_alloc_or_skip() else { return };
-    let pool = SignalPool::new(&alloc, 64).expect("create pool");
-    let slot = {
-        let signal = pool.acquire().expect("first acquire");
-        signal.set(99);
-        signal.slot()
-    };
-    let reused = pool.acquire().expect("reacquire");
-    assert_eq!(reused.slot(), slot);
-    assert_eq!(reused.value(), 0);
-}
-
-#[test]
-fn wait_events_error_stays_typed_and_poisons_owner() {
-    let (iface, device, _pool, signal) = mock_signal();
+fn wait_events_error_stays_typed_poisons_owner_and_short_circuits_later_waits() {
+    let (iface, allocator, _pool, signal) = mock_signal();
     iface.script_wait(Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: 5 }));
 
     let error = signal.wait(1, 10_000).expect_err("scripted wait failure");
     assert!(matches!(error, Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: 5 }));
-    assert!(device.is_poisoned());
-    assert!(matches!(device.poison_error(), Some(Error::Runtime { message }) if message.contains("WAIT_EVENTS")));
-    assert_eq!(iface.transcript().iter().filter(|call| matches!(call, MockAmdCall::WaitEvents { .. })).count(), 1);
+    assert!(allocator.dev.is_poisoned());
+    assert!(
+        matches!(allocator.dev.poison_error(), Some(Error::Runtime { message }) if message.contains("WAIT_EVENTS"))
+    );
+    let waits = wait_count(&iface);
+    assert_eq!(waits, 1);
+
+    let error = signal.wait(1, 10_000).expect_err("poison must fail before polling");
+    assert!(matches!(error, Error::Runtime { message } if message.contains("WAIT_EVENTS")));
+    assert_eq!(wait_count(&iface), waits, "a later wait reached the backend despite the poison latch");
 }
 
 #[test]
 fn poisoned_owner_wakes_active_signal_waiter() {
-    let (iface, device, _pool, signal) = mock_signal();
+    let (iface, allocator, _pool, signal) = mock_signal();
     let (tx, rx) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn(move || tx.send(signal.wait(1, 60_000)).unwrap());
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while !iface.transcript().iter().any(|call| matches!(call, MockAmdCall::WaitEvents { .. })) {
+    while wait_count(&iface) == 0 {
         assert!(std::time::Instant::now() < deadline, "waiter never entered event polling");
         std::thread::yield_now();
     }
-    device.poison("concurrent synthetic fault");
+    allocator.dev.poison("concurrent synthetic fault");
     let error = rx
         .recv_timeout(std::time::Duration::from_secs(1))
         .expect("poisoned waiter did not wake")
@@ -110,23 +95,8 @@ fn poisoned_owner_wakes_active_signal_waiter() {
 }
 
 #[test]
-fn future_signal_wait_fails_without_another_backend_wait() {
-    let (iface, _device, _pool, signal) = mock_signal();
-    iface.script_wait(Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: 19 }));
-    assert!(matches!(signal.wait(1, 10_000), Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: 19 })));
-    let waits_before = iface.transcript().iter().filter(|call| matches!(call, MockAmdCall::WaitEvents { .. })).count();
-
-    let error = signal.wait(1, 10_000).expect_err("poison must fail before polling");
-    assert!(matches!(error, Error::Runtime { message } if message.contains("WAIT_EVENTS")));
-    let waits_after = iface.transcript().iter().filter(|call| matches!(call, MockAmdCall::WaitEvents { .. })).count();
-    assert_eq!(waits_after, waits_before, "future wait reached the backend despite device poison");
-}
-
-#[test]
-fn mock_signal_pool_construction_failure_and_drop_balance_backing() {
-    let iface = Arc::new(MockAmdIface::default());
-    let device = iface.device();
-    let allocator = AmdAllocator { dev: device, device_id: 0 };
+fn signal_pool_construction_failure_and_drop_balance_backing() {
+    let (iface, allocator) = mock_device(1);
     iface.script_alloc(Err(Error::Runtime { message: "scripted signal allocation".into() }));
     assert!(SignalPool::new(&allocator, 64).is_err());
     assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (0, 0, 0));
@@ -139,10 +109,8 @@ fn mock_signal_pool_construction_failure_and_drop_balance_backing() {
 }
 
 #[test]
-fn mock_signal_pool_grows_a_chunk_and_releases_unwound_slots() {
-    let iface = Arc::new(MockAmdIface::default());
-    let device = iface.device();
-    let allocator = AmdAllocator { dev: device, device_id: 0 };
+fn signal_pool_grows_a_chunk_and_releases_unwound_slots() {
+    let (iface, allocator) = mock_device(1);
     let pool = SignalPool::new(&allocator, 64).unwrap();
     let capacity = pool.capacity();
     let held = (0..capacity).map(|_| pool.acquire().expect("slot")).collect::<Vec<_>>();
@@ -168,8 +136,8 @@ fn mock_signal_pool_grows_a_chunk_and_releases_unwound_slots() {
 
 #[test]
 fn prepared_finalizer_wait_is_bounded_by_its_deadline() {
-    let (_iface, _device, _pool, signal) = mock_signal();
-    let finalizer = crate::amd::connector::SubmissionFinalizer::prepared_timeline(signal, 1, Vec::new());
+    let (_iface, _allocator, _pool, signal) = mock_signal();
+    let finalizer = SubmissionFinalizer::prepared_timeline(signal, 1, Vec::new());
     let started = std::time::Instant::now();
     let error = finalizer.wait(50).expect_err("an unpublished submission must not park forever");
     assert!(matches!(error, Error::TimelineTimeout { what: "AMD submission publication", .. }), "{error:?}");

@@ -1,30 +1,11 @@
-use super::test_support::{MockAmdCall, MockAmdIface, MockFreeIssue, amd_alloc_or_skip};
+use super::test_support::{
+    MockAmdCall, MockAmdIface, MockFreeIssue, amd_alloc_or_skip, install_signal_pool, mock_device,
+};
 use crate::allocator::{Allocator, AmdBufferGuard, BufferSpec, RawBuffer};
-use crate::amd::allocator::*;
 use crate::amd::iface::{AllocKind, AmdIface};
 use crate::amd::va_registry::AllocTag;
 use crate::error::Error;
 use std::sync::Arc;
-
-fn mock_allocator(iface: &Arc<MockAmdIface>) -> AmdAllocator {
-    AmdAllocator { dev: iface.device(), device_id: 0 }
-}
-
-/// Construction either succeeds (real hardware + supported arch) or
-/// returns a clean error variant; never panics.
-#[test]
-fn allocator_construction_is_clean() {
-    match AmdAllocator::new(0) {
-        Ok(_alloc) => {}
-        Err(
-            Error::NoAmdGpu { .. }
-            | Error::DeviceUnavailable { .. }
-            | Error::AmdAllocFailed { .. }
-            | Error::AmdIoctl { .. },
-        ) => {}
-        Err(e) => panic!("unexpected error: {e:?}"),
-    }
-}
 
 /// Live VRAM alloc → free round-trip. Skipped on hosts that can't open an
 /// AmdDevice (no GPU, unsupported arch, missing perms).
@@ -39,26 +20,23 @@ fn alloc_free_roundtrip_if_hw_supports() {
 }
 
 #[test]
-fn mock_raw_allocation_is_aligned_stable_and_freed_once() {
-    let iface = Arc::new(MockAmdIface::default());
-    let alloc = mock_allocator(&iface);
+fn raw_allocation_is_page_aligned_stable_and_freed_once() {
+    let (iface, alloc) = mock_device(1);
     let opts = BufferSpec { cpu_access: true, ..Default::default() };
     let buffer = alloc.alloc(17, &opts, true).expect("mock allocation");
-    let (gpu_addr, host_ptr, size) = match &buffer {
-        RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host_ptr), size, .. } => (*gpu_addr, *host_ptr, *size),
-        other => panic!("unexpected buffer: {other:?}"),
+    let RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host_ptr), size, .. } = &buffer else {
+        panic!("unexpected buffer: {buffer:?}")
     };
+    let (gpu_addr, host_ptr) = (*gpu_addr, *host_ptr);
     assert_eq!(gpu_addr as usize % 0x1000, 0);
     assert_eq!(host_ptr.as_ptr() as u64, gpu_addr);
-    assert_eq!(size, 0x1000);
+    assert_eq!(*size, 0x1000, "a sub-page request is rounded up to a whole page");
     unsafe { host_ptr.as_ptr().write(0x5a) };
     assert_eq!(unsafe { host_ptr.as_ptr().read() }, 0x5a);
-    assert_eq!(iface.allocation_count(), 1);
-    assert_eq!(iface.live_handle_count(), 1);
+    assert_eq!((iface.allocation_count(), iface.live_handle_count()), (1, 1));
 
     alloc.free(buffer, 17, &opts);
-    assert_eq!(iface.free_count(), 1);
-    assert_eq!(iface.live_handle_count(), 0);
+    assert_eq!((iface.free_count(), iface.live_handle_count()), (1, 0));
     assert_eq!(
         iface.transcript().iter().map(std::mem::discriminant).collect::<Vec<_>>(),
         [
@@ -68,46 +46,28 @@ fn mock_raw_allocation_is_aligned_stable_and_freed_once() {
     );
 }
 
-#[test]
-fn construction_guard_reclaims_on_error_unwind() {
-    fn fail_after_alloc(alloc: &AmdAllocator) -> crate::error::Result<()> {
-        let options = BufferSpec::default();
-        let _guard = AmdBufferGuard::new(alloc.alloc(64, &options, true)?);
+/// A construction guard reclaims its buffer when a later step fails, but leaves
+/// it mapped whenever the device may still be touching it — a poison latch, or
+/// an unwind that abandoned the owning object mid-construction.
+#[test_case::test_case(false, false, 1; "error return reclaims")]
+#[test_case::test_case(true, false, 0; "poisoned device quarantines")]
+#[test_case::test_case(false, true, 0; "panic unwind quarantines")]
+fn construction_guard_reclaims_unless_the_device_may_still_read(poison: bool, panicking: bool, frees: usize) {
+    let (iface, alloc) = mock_device(1);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> crate::error::Result<()> {
+        let _guard = AmdBufferGuard::new(alloc.alloc(64, &BufferSpec::default(), true)?);
+        if poison {
+            alloc.dev.core().poison("synthetic fault");
+        }
+        assert!(!panicking, "synthetic construction panic");
         Err(Error::Runtime { message: "later construction step failed".into() })
-    }
-
-    let iface = Arc::new(MockAmdIface::default());
-    let alloc = mock_allocator(&iface);
-    assert!(fail_after_alloc(&alloc).is_err());
-    assert_eq!(iface.allocation_count(), 1);
-    assert_eq!(iface.free_count(), 1);
-    assert_eq!(iface.live_handle_count(), 0);
-}
-
-#[test]
-fn construction_guard_quarantines_when_device_is_poisoned() {
-    let iface = Arc::new(MockAmdIface::default());
-    let alloc = mock_allocator(&iface);
-    let guard = AmdBufferGuard::new(alloc.alloc(64, &BufferSpec::default(), true).unwrap());
-    alloc.dev.core().poison("synthetic fault");
-    drop(guard);
-    assert_eq!(iface.free_count(), 0);
-    assert_eq!(iface.live_handle_count(), 1);
-}
-
-#[test]
-fn construction_guard_quarantines_during_panic() {
-    let iface = Arc::new(MockAmdIface::default());
-    let alloc = mock_allocator(&iface);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = AmdBufferGuard::new(alloc.alloc(64, &BufferSpec::default(), true).unwrap());
-        panic!("synthetic construction panic");
     }));
-    assert!(result.is_err());
-    assert_eq!(iface.free_count(), 0);
-    assert_eq!(iface.live_handle_count(), 1);
+    assert_eq!(result.is_err(), panicking);
+    assert_eq!(iface.allocation_count(), 1);
+    assert_eq!((iface.free_count(), iface.live_handle_count()), (frees, 1 - frees));
 }
 
+/// The mock's own free accounting, which every lifecycle test asserts empty.
 #[test]
 fn mock_detects_double_and_unknown_frees() {
     let iface = MockAmdIface::default();
@@ -125,22 +85,9 @@ fn mock_detects_double_and_unknown_frees() {
 }
 
 #[test]
-fn mock_allocation_outcomes_are_scripted_fifo() {
-    let iface = Arc::new(MockAmdIface::default());
-    iface.script_alloc(Err(Error::AmdIoctl { ioctl: "mock alloc", errno: 12 }));
-    let alloc = mock_allocator(&iface);
-    let error = alloc.alloc(64, &BufferSpec::default(), false).expect_err("scripted allocation failure");
-    assert!(matches!(error, Error::AmdIoctl { ioctl: "mock alloc", errno: 12 }));
-    let buffer = alloc.alloc(64, &BufferSpec::default(), false).expect("default scripted success");
-    assert_eq!(iface.allocation_count(), 1);
-    alloc.free(buffer, 64, &BufferSpec::default());
-}
-
-#[test]
 fn user_buffer_free_failed_drain_poisons_and_quarantines_allocation() {
-    let iface = Arc::new(MockAmdIface::default());
-    let alloc = mock_allocator(&iface);
-    alloc.dev.core().install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).unwrap());
+    let (iface, alloc) = mock_device(1);
+    install_signal_pool(&alloc);
     let pool = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(alloc.dev.core()), &alloc).unwrap();
     let buffer = alloc.alloc(64, &BufferSpec::default(), false).unwrap();
     let allocations = iface.allocation_count();
@@ -150,8 +97,7 @@ fn user_buffer_free_failed_drain_poisons_and_quarantines_allocation() {
     alloc.free(buffer, 64, &BufferSpec::default());
     assert!(alloc.dev.is_poisoned());
     assert_eq!(iface.allocation_count(), allocations);
-    assert_eq!(iface.free_count(), 0);
-    assert_eq!(iface.live_handle_count(), allocations);
+    assert_eq!((iface.free_count(), iface.live_handle_count()), (0, allocations));
     drop(pool);
     assert_eq!(iface.free_count(), 0);
 }
