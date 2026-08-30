@@ -4,6 +4,7 @@ use std::sync::Arc;
 use svod_dtype::DType;
 use svod_ir::types::TernaryOp;
 use svod_ir::{Op, UOp};
+use test_case::test_case;
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;
@@ -107,4 +108,24 @@ fn test_nested_where_elimination() {
 
     // Should eliminate to val2
     assert!(Arc::ptr_eq(&result, &val2));
+}
+
+/// `WHERE(cond, INVALID, INVALID)` must collapse to `INVALID` instead of
+/// ping-ponging through the INVALID canonicalization
+/// (`WHERE(c, INV, x) → WHERE(NOT c, x, INV)`), which flips the gate forever.
+#[test_case(false ; "plain condition")]
+#[test_case(true ; "negated condition")]
+fn where_with_two_invalid_branches_collapses(negate: bool) {
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let fifty = UOp::native_const(50i32);
+    let cond = x.try_cmplt(&fifty).expect("LT should succeed");
+    let cond = if negate { cond.not() } else { cond };
+    let invalid = UOp::invalid_marker();
+
+    let where_op = UOp::try_where(cond, invalid.clone(), invalid).unwrap();
+
+    let matcher = symbolic_simple();
+    let result = graph_rewrite(&matcher, where_op, &mut ());
+
+    assert!(UOp::is_invalid_marker(&result), "expected bare INVALID, got {:?}", result.op());
 }
