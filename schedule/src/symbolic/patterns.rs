@@ -18,7 +18,7 @@ use svod_ir::uop::eval::{
     eval_add_typed, eval_binary_op, eval_binary_op_broadcast, eval_binary_op_broadcast_typed, eval_mul_typed,
     eval_sub_typed, eval_unary_op_vec_typed,
 };
-use svod_ir::uop::properties::{SoundVminVmaxProperty, VminVmaxProperty};
+use svod_ir::uop::properties::{HasWeakFloatProperty, SoundVminVmaxProperty, VminVmaxProperty};
 use svod_ir::{IntoUOp, Op, UOp};
 
 use crate::TypedPatternMatcher;
@@ -33,8 +33,11 @@ use tracing::trace;
 /// Weak integers select an exact i32/i64 representation, so inspecting their
 /// mathematical values before lowering is safe and required by index rewrites.
 /// Weak floats select the default float and can change value at commitment.
-fn weak_float_values_are_committed(root: &Arc<UOp>) -> bool {
-    !root.toposort().iter().any(|node| node.dtype().base() == ScalarDType::WeakFloat)
+///
+/// Memoised per node via [`HasWeakFloatProperty`]: the guard runs on every
+/// pattern-match attempt, so a per-attempt graph walk would be quadratic.
+pub(crate) fn weak_float_values_are_committed(root: &Arc<UOp>) -> bool {
+    !*HasWeakFloatProperty::get(root)
 }
 
 fn value_sensitive(patterns: &TypedPatternMatcher) -> TypedPatternMatcher {

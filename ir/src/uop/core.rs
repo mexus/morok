@@ -151,6 +151,10 @@ pub struct UOp {
     /// O(1) membership test via `backward_slice_ids().contains(&target.id)`.
     #[debug(skip)]
     pub(crate) backward_slice_cache: std::sync::OnceLock<HashSet<u64>>,
+    /// Whether this node or any node in its backward slice has a weak-float dtype.
+    /// Cached O(1) lookup used by the value-sensitive symbolic guard.
+    #[debug(skip)]
+    pub(crate) has_weak_float_cache: std::sync::OnceLock<bool>,
     /// Structural content hash — deterministic regardless of allocation order.
     /// Computed at creation time: hash(op_discriminant, dtype, op_data, children_content_hashes).
     /// O(1) per node since children are already created with their content_hash set.
@@ -1423,6 +1427,7 @@ impl Clone for UOp {
             sound_vmin_vmax_cache: std::sync::OnceLock::new(),
             has_index_in_sources_cache: std::sync::OnceLock::new(),
             backward_slice_cache: std::sync::OnceLock::new(),
+            has_weak_float_cache: std::sync::OnceLock::new(),
             metadata: self.metadata.clone(),
         }
     }

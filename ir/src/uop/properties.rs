@@ -199,3 +199,27 @@ cached_property! {
         compute: |uop| crate::uop::range_eval::compute_sound_vmin_vmax(uop)
     }
 }
+
+// ============================================================================
+// Weak Float Property
+// ============================================================================
+
+cached_property! {
+    /// Cached "backward slice contains a weak-float dtype" predicate.
+    ///
+    /// Equivalent to `uop.toposort().iter().any(|n| n.dtype().base() == WeakFloat)`,
+    /// but memoised per node: O(N) once over the whole graph instead of O(N) per
+    /// query. Value-sensitive symbolic rewrites use it as a match guard, so it is
+    /// evaluated on every pattern attempt.
+    HasWeakFloatProperty: bool {
+        cache_field: has_weak_float_cache,
+        compute: |uop| {
+            if uop.dtype.base() == svod_dtype::ScalarDType::WeakFloat {
+                return true;
+            }
+            let mut result = false;
+            uop.op.map_child(|src| result |= *HasWeakFloatProperty::get(src));
+            result
+        }
+    }
+}
