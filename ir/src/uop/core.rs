@@ -569,7 +569,7 @@ impl UOp {
     ///
     /// Returns nodes in an order where all dependencies come before their dependents.
     pub fn toposort(self: &Arc<Self>) -> Vec<Arc<Self>> {
-        let mut visited = visited_set();
+        let mut visited = visited_set(FULL_GRAPH_HINT);
         let mut result = Vec::new();
         let mut stack = vec![(self.clone(), false)];
 
@@ -632,7 +632,7 @@ impl UOp {
     where
         F: Fn(&Arc<UOp>) -> bool,
     {
-        let mut visited = visited_set();
+        let mut visited = visited_set(LOCAL_HINT);
         let mut result = Vec::new();
         let mut stack = vec![(self.clone(), false)];
 
@@ -678,7 +678,7 @@ impl UOp {
     pub fn toposort_call_aware(self: &Arc<Self>, include_call_bodies: bool) -> Vec<Arc<Self>> {
         let mode = if include_call_bodies { TraversalMode::Full } else { TraversalMode::PreserveCalls };
 
-        let mut visited = visited_set();
+        let mut visited = visited_set(FULL_GRAPH_HINT);
         let mut result = Vec::new();
         let mut stack = vec![(self.clone(), false)];
 
@@ -716,7 +716,7 @@ impl UOp {
     {
         let mode = if include_call_bodies { TraversalMode::Full } else { TraversalMode::PreserveCalls };
 
-        let mut visited = visited_set();
+        let mut visited = visited_set(LOCAL_HINT);
         let mut result = Vec::new();
         let mut stack = vec![(self.clone(), false)];
 
@@ -756,7 +756,7 @@ impl UOp {
     where
         F: Fn(&Arc<UOp>) -> bool,
     {
-        let mut visited = visited_set();
+        let mut visited = visited_set(FULL_GRAPH_HINT);
         let mut stack = vec![self.clone()];
         while let Some(node) = stack.pop() {
             if !visited.insert(Arc::as_ptr(&node)) {
@@ -782,7 +782,7 @@ impl UOp {
     where
         F: Fn(&Arc<UOp>) -> bool,
     {
-        let mut visited = visited_set();
+        let mut visited = visited_set(FULL_GRAPH_HINT);
         let mut stack = vec![self.clone()];
         let mut result = Vec::new();
         while let Some(node) = stack.pop() {
@@ -806,7 +806,7 @@ impl UOp {
     /// Much cheaper than `toposort().len()` — no result Vec, no ordering.
     /// Uses pointer-based visited set for O(1) identity checks.
     pub fn node_count(self: &Arc<Self>) -> usize {
-        let mut visited = visited_set();
+        let mut visited = visited_set(FULL_GRAPH_HINT);
         let mut stack = vec![self.clone()];
         while let Some(node) = stack.pop() {
             if !visited.insert(Arc::as_ptr(&node)) {
@@ -1412,12 +1412,20 @@ impl UOp {
     }
 }
 
+/// Pre-sizing hint for traversals that walk a whole kernel graph.
+const FULL_GRAPH_HINT: usize = 256;
+
+/// Pre-sizing hint for traversals that typically stop after a handful of nodes
+/// (cached-property cold paths walk ~2 nodes on average).
+const LOCAL_HINT: usize = 8;
+
 /// Visited set for the pointer-identity graph traversals below.
 ///
 /// `Arc::as_ptr` values are already well distributed, so FxHash is both faster
-/// and sufficient; the pre-sized capacity avoids rehashing on typical kernels.
-fn visited_set() -> rustc_hash::FxHashSet<*const UOp> {
-    rustc_hash::FxHashSet::with_capacity_and_hasher(256, Default::default())
+/// and sufficient; `capacity` is the caller's expected node count, which avoids
+/// both rehashing on full-graph walks and 2 KiB of dead table on local ones.
+fn visited_set(capacity: usize) -> rustc_hash::FxHashSet<*const UOp> {
+    rustc_hash::FxHashSet::with_capacity_and_hasher(capacity, Default::default())
 }
 
 impl Clone for UOp {

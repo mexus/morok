@@ -1330,3 +1330,37 @@ fn test_multiple_properties_coexist() {
     assert_eq!(ranges.len(), ranges2.len());
     assert_eq!(in_scope.len(), in_scope2.len());
 }
+
+/// The warm-children fast path in `CachedProperty::get` must produce exactly what
+/// the filtered-toposort path produces. Both rows build the same diamond shape
+/// (`root = r*2 + r*3`, both arms sharing one RANGE) over a distinct axis id so
+/// hash consing hands each row a genuinely cold graph.
+#[test_case::test_case(true ; "children warmed first takes the fast path")]
+#[test_case::test_case(false ; "cold children fall back to filtered toposort")]
+fn test_cached_property_diamond_fast_path_matches_slow_path(warm_children: bool) {
+    use crate::AxisType;
+    use crate::uop::cached_property::CachedProperty;
+    use crate::uop::properties::{RangesProperty, VminVmaxProperty};
+
+    let axis = AxisId::Renumbered(if warm_children { 9001 } else { 9002 });
+    let range = UOp::range_axis(UOp::index_const(10), axis, AxisType::Loop);
+    let left = range.try_mul(&UOp::index_const(2)).unwrap();
+    let right = range.try_mul(&UOp::index_const(3)).unwrap();
+    let root = left.try_add(&right).unwrap();
+
+    if warm_children {
+        RangesProperty::get(&left);
+        RangesProperty::get(&right);
+        VminVmaxProperty::get(&left);
+        VminVmaxProperty::get(&right);
+    }
+    assert!(RangesProperty::cache(&root).get().is_none(), "root must be cold before the measured get");
+    assert!(VminVmaxProperty::cache(&root).get().is_none(), "root must be cold before the measured get");
+
+    let ranges = RangesProperty::get(&root);
+    assert_eq!(ranges.len(), 1, "diamond must dedup the shared RANGE");
+    assert!(Arc::ptr_eq(&ranges[0], &range));
+    // range in [0, 9] => 2*r + 3*r in [0, 45].
+    assert_eq!(root.vmin(), &ConstValue::Int(0));
+    assert_eq!(root.vmax(), &ConstValue::Int(45));
+}
