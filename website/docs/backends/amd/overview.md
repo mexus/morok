@@ -81,7 +81,7 @@ The backend is split into two halves by the **`AmdIface`** trait
 flowchart TD
   subgraph above["ABOVE THE SEAM — backend-agnostic (no ioctls)"]
     A1["AmdProgram, AmdComputeQueue, KernargArena, Timeline"]
-    A2["AmdConnector, AmdGraph, SignalPool, AmdAllocator"]
+    A2["QueuePool, AmdGraph, SignalPool, AmdAllocator"]
     A3["PM4 / AQL packet builders, ring back-pressure"]
   end
   subgraph below["BELOW THE SEAM — the actual driver"]

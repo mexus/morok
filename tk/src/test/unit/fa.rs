@@ -35,23 +35,24 @@ fn dummy_fa_buffers(b: usize, n: usize, h: usize, h_kv: usize, d: usize) -> Vec<
     ]
 }
 
-/// The target gate rejects a non-gfx942 device up front (host — no GPU needed): a
+/// The target gate rejects a non-AMD device up front (host — no GPU needed): a
 /// CPU spec resolves to no AMD arch, so `check_target` errs `UnsupportedArch`
-/// instead of letting the gfx942-only kernel mis-render/compile-fail later. The
+/// instead of letting an AMD-only kernel mis-render/compile-fail later. The
 /// gate is generic over the kernel's declared `FA_SUPPORTED_ARCHS`, not a hardcoded
 /// arch — adding another GPU is extending that list, not rewriting the gate.
 #[test]
-fn test_target_gate_rejects_non_gfx942() {
+fn test_target_gate_rejects_non_amd() {
     use crate::kernels::fa::FA_SUPPORTED_ARCHS;
+    assert!(!crate::flash_attention_supported(&DeviceSpec::Cpu));
     let err = crate::target::check_target(&DeviceSpec::Cpu, FA_SUPPORTED_ARCHS);
     assert!(
         matches!(err, Err(crate::launch::Error::UnsupportedArch { .. })),
-        "a CPU device must be rejected by the gfx942 gate, got {err:?}"
+        "a CPU device must be rejected by the AMD gate, got {err:?}"
     );
 }
 
 /// Render-regression (CPU, no GPU): the rolled-db FA must render to AMD LLVM IR
-/// in **bounded** memory/time. The `Mod`-based prefetch clamp in
+/// in **bounded** memory/time. The `FloorMod`-based prefetch clamp in
 /// [`build_fa_mw_rdb`] avoids a `WHERE` in the prefetch-block index that the
 /// renderer mis-orders past its address-MUL consumer (which would make it hit
 /// `RenderContext::get` on an unrendered node and `{:?}` the whole shared graph).
@@ -80,8 +81,12 @@ fn test_fa_mw_rdb_renders_bounded() {
             false,
         );
         let sink = ker.finish(1);
-        let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
-        let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu);
+        let pm = svod_schedule::symbolic::pm_lower_index_dtype()
+            + svod_ir::decompositions::divmod_decomposition_patterns()
+                .with_context::<svod_schedule::symbolic::WeakMemo>();
+        let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut svod_schedule::symbolic::WeakMemo::default());
+        let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu)
+            .expect("final target graph");
         let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
         let linear_uop = linearized
             .toposort()
@@ -89,7 +94,7 @@ fn test_fa_mw_rdb_renders_bounded() {
             .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
             .expect("LINEAR present");
         let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
-        // Returns (no OOM/hang) ⇒ the Mod-clamped prefetch index renders.
+        // Returns (no OOM/hang) ⇒ the FloorMod-clamped prefetch index renders.
         svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("fa_rdb")).expect("render").code
     };
 
@@ -116,10 +121,10 @@ fn test_fa_mw_rdb_renders_bounded() {
 /// Host regression guard for the **graph/realize-path** lowering of a hand-lowered
 /// (`opts_to_apply=Some(vec![])`) tile-kernel SINK on AMD. Mirrors the realize
 /// optimize→render path: `optimize_kernel_with_config` → `decompose_with` →
-/// `program_from_sink` → `do_linearize` → `type_verify`. The optimizer's
-/// hand-lowered bypass (`schedule/src/optimizer/mod.rs`) reduces the SINK with
-/// `pm_lower_index_dtype` only; the SINK's `Op::Special` (gidx/lidx) marker is
-/// what activates it. Renders identically to the direct path
+/// `program_from_sink` → `do_linearize` → `type_verify`. There is no
+/// `Op::Special` bypass: the SINK's `opts_to_apply = Some(vec![])` makes the
+/// optimizer apply zero schedule opts, and the body then runs the shared
+/// pre/post-optimization pipeline. Renders identically to the direct path
 /// (`test_fa_mw_rdb_renders_bounded`): rolled QKᵀ/A·V loops, one iglp.
 #[test]
 fn test_fa_graph_path_renders_clean() {
@@ -148,17 +153,17 @@ fn test_fa_graph_path_renders_clean() {
     let sink = ker.finish(1);
 
     // Realize builds the optimizer renderer for gfx942 via for_amd_arch.
-    let opt_ren = OptimizerRenderer::for_amd_arch(svod_dtype::AmdArch::Gfx942);
+    let text_ren = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
+    let opt_ren = OptimizerRenderer::for_amd_arch(svod_dtype::AmdArch::Gfx942).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        svod_codegen::traits::Renderer::decompositor(&text_ren),
+        None,
+    );
     let config = OptimizerConfig::default();
     let optimized = optimize_kernel_with_config(sink, &opt_ren, &config).expect("optimize");
 
-    // Decompose (AMD renderer's decompositor) then program_from_sink + linearize.
-    let text_ren = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
-    let decomposed = match svod_codegen::traits::Renderer::decompositor(&text_ren) {
-        Some(m) => svod_ir::decompositions::decompose_with(&optimized, &m),
-        None => optimized,
-    };
-    let program = svod_codegen::program_pipeline::program_from_sink(decomposed, svod_dtype::DeviceSpec::Cpu);
+    let program = svod_codegen::program_pipeline::program_from_sink(optimized, svod_dtype::DeviceSpec::Cpu)
+        .expect("final target graph");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
     let linear_uop = linearized
         .toposort()
@@ -166,7 +171,9 @@ fn test_fa_graph_path_renders_clean() {
         .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
         .expect("LINEAR present");
     // This is the verify the real do_render runs (program_pipeline.rs:129-131).
-    svod_schedule::spec::type_verify(&linear_uop, &svod_schedule::spec::spec_program())
+    let svod_ir::Op::Linear { ops } = linear_uop.op() else { unreachable!() };
+    let verify_root = svod_ir::UOp::sink(ops.iter().cloned().collect());
+    svod_schedule::spec::type_verify(&verify_root, &svod_schedule::spec::spec_program())
         .expect("type_verify must pass (the Ptr{vcount:4} failure surfaces here)");
     let code = svod_codegen::traits::Renderer::render(&text_ren, &linear_uop, Some("fa_rdb")).expect("render").code;
     let mfma = code.lines().filter(|l| l.contains("mfma.f32.16x16x16bf16.1k") && !l.contains("declare")).count();
@@ -183,9 +190,9 @@ fn test_fa_graph_path_renders_clean() {
 
 /// Host regression guard for the **graph/realize-path** lowering of a hand-lowered
 /// FA SINK on **RDNA3.5 (gfx1151, wave32)** — the wave32 peer of
-/// `test_fa_graph_path_renders_clean`. The optimizer's hand-lowered bypass
-/// reduces the SINK with `pm_lower_index_dtype` only, then renders to gfx11
-/// LLVM IR. Asserts the rendered IR contains zero `x ptr>` tokens (the illegal
+/// `test_fa_graph_path_renders_clean`. `opts_to_apply = Some(vec![])` makes the
+/// optimizer apply zero schedule opts; the body then runs the shared
+/// pre/post-optimization pipeline and renders to gfx11 LLVM IR. Asserts the rendered IR contains zero `x ptr>` tokens (the illegal
 /// vector-of-pointers shape) and that the wave32 WMMA calls are present.
 #[test]
 fn test_fa_graph_path_renders_clean_gfx1151() {
@@ -214,23 +221,27 @@ fn test_fa_graph_path_renders_clean_gfx1151() {
     );
     let sink = ker.finish(1);
 
-    let opt_ren = OptimizerRenderer::for_amd_arch(svod_dtype::AmdArch::Gfx1151);
+    let text_ren = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx1151);
+    let opt_ren = OptimizerRenderer::for_amd_arch(svod_dtype::AmdArch::Gfx1151).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        svod_codegen::traits::Renderer::decompositor(&text_ren),
+        None,
+    );
     let config = OptimizerConfig::default();
     let optimized = optimize_kernel_with_config(sink, &opt_ren, &config).expect("optimize");
 
-    let text_ren = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx1151);
-    let decomposed = match svod_codegen::traits::Renderer::decompositor(&text_ren) {
-        Some(m) => svod_ir::decompositions::decompose_with(&optimized, &m),
-        None => optimized,
-    };
-    let program = svod_codegen::program_pipeline::program_from_sink(decomposed, svod_dtype::DeviceSpec::Cpu);
+    let program = svod_codegen::program_pipeline::program_from_sink(optimized, svod_dtype::DeviceSpec::Cpu)
+        .expect("final target graph");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
     let linear_uop = linearized
         .toposort()
         .into_iter()
         .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
         .expect("LINEAR present");
-    svod_schedule::spec::type_verify(&linear_uop, &svod_schedule::spec::spec_program()).expect("type_verify must pass");
+    let svod_ir::Op::Linear { ops } = linear_uop.op() else { unreachable!() };
+    let verify_root = svod_ir::UOp::sink(ops.iter().cloned().collect());
+    svod_schedule::spec::type_verify(&verify_root, &svod_schedule::spec::spec_program())
+        .expect("type_verify must pass");
     let code = svod_codegen::traits::Renderer::render(&text_ren, &linear_uop, Some("fa_rdb_w32")).expect("render").code;
 
     // The illegal vector-of-pointers (`<N x ptr>`) must NEVER appear in the
@@ -277,8 +288,11 @@ fn test_fa_mw_rdb_renders_wave32() {
         false,
     );
     let sink = ker.finish(1);
-    let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
-    let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu);
+    let pm = svod_schedule::symbolic::pm_lower_index_dtype()
+        + svod_ir::decompositions::divmod_decomposition_patterns().with_context::<svod_schedule::symbolic::WeakMemo>();
+    let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut svod_schedule::symbolic::WeakMemo::default());
+    let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu)
+        .expect("final target graph");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
     let linear_uop = linearized
         .toposort()

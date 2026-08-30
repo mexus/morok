@@ -23,25 +23,31 @@ fn test_const_factor_addition() {
     assert_eq!(add.const_factor(), 3); // GCD(6, 9) = 3
 }
 
+/// `divides` folds only when the division is exact; the quotient keeps the sign of a
+/// negative divisor, and a zero divisor never divides.
 #[test]
-fn test_divides_constant_exact() {
-    let c = UOp::const_(DType::Int32, ConstValue::Int(12));
-    let result = c.divides(3);
-
-    assert!(result.is_some());
-    if let Some(r) = result {
-        if let Op::Const(cv) = r.op() {
-            assert_eq!(cv.0, ConstValue::Int(4));
-        } else {
-            panic!("Expected constant result");
+fn test_divides_constant() {
+    for (value, divisor, expected) in [(12i64, 3i64, Some(4i64)), (12, -3, Some(-4)), (10, 3, None), (12, 0, None)] {
+        let result = UOp::const_(DType::Int32, ConstValue::Int(value)).divides(divisor);
+        match expected {
+            Some(quotient) => assert!(
+                matches!(result.as_ref().map(|r| r.op()), Some(Op::Const(cv)) if cv.0 == ConstValue::Int(quotient)),
+                "{value} / {divisor}"
+            ),
+            None => assert!(result.is_none(), "{value} / {divisor}"),
         }
     }
 }
 
 #[test]
-fn test_divides_constant_not_exact() {
-    let c = UOp::const_(DType::Int32, ConstValue::Int(10));
-    assert!(c.divides(3).is_none());
+fn test_exact_division_rejects_signed_min_over_neg_one_without_panicking() {
+    let min = UOp::const_(DType::Int64, ConstValue::Int(i64::MIN));
+    assert!(min.divides(-1).is_none());
+
+    let x = UOp::var("x", DType::Int64, 1, 2);
+    let numerator = min.mul(&x);
+    let divisor = UOp::const_(DType::Int64, ConstValue::Int(-1)).mul(&x);
+    assert!(numerator.divide_exact(&divisor).is_none());
 }
 
 #[test]
@@ -67,6 +73,18 @@ fn test_pop_const_without_constant() {
     assert!(Arc::ptr_eq(&rest, &add));
     // No literal const present → identity (Int(0) for ADD on Int32).
     assert_eq!(const_val, ConstValue::Int(0));
+}
+
+#[test]
+fn test_pop_const_float_max_uses_negative_infinity_identity() {
+    let x = UOp::var("x", DType::Float32, 0, 100);
+    let y = UOp::var("y", DType::Float32, 0, 100);
+    let max = x.try_max(&y).unwrap();
+
+    let (rest, const_val) = max.pop_const(BinaryOp::Max);
+
+    assert!(Arc::ptr_eq(&rest, &max));
+    assert_eq!(const_val, ConstValue::Float(f64::NEG_INFINITY));
 }
 
 #[test]
@@ -166,6 +184,22 @@ fn test_const_factor_vconst_no_common() {
 }
 
 #[test]
+fn test_const_factor_and_gcd_handle_signed_min_conservatively() {
+    let min = UOp::const_(DType::Int64, ConstValue::Int(i64::MIN));
+    assert_eq!(min.const_factor(), 1);
+
+    let values = UOp::vconst(vec![ConstValue::Int(i64::MIN), ConstValue::Int(i64::MIN)], DType::Int64);
+    assert_eq!(values.const_factor(), 1);
+    assert_eq!(gcd(i64::MIN, 6), 1);
+
+    let x = UOp::var("min_factor_x", DType::Int64, 0, 1);
+    let y = UOp::var("min_factor_y", DType::Int64, 0, 1);
+    let nested = x.mul(&min).add(&y);
+    assert_eq!(nested.const_factor(), 1);
+    let _ = UOp::symbolic_gcd(&[nested, y]);
+}
+
+#[test]
 fn test_divides_vconst() {
     let vc = UOp::vconst(vec![ConstValue::Int(6), ConstValue::Int(12)], DType::Int64);
     let result = vc.divides(3);
@@ -228,7 +262,7 @@ fn test_is_increasing_mul_negative_const() {
 fn test_is_increasing_idiv_positive_const() {
     let x = UOp::var("x", DType::Int32, 0, 100);
     let two = UOp::const_(DType::Int32, ConstValue::Int(2));
-    let divided = x.idiv(&two);
+    let divided = x.floor_div(&two);
     assert!(divided.is_increasing());
 }
 

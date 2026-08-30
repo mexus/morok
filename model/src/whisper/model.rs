@@ -32,26 +32,36 @@ impl Whisper {
         self.decoder.forward(tokens, audio_features, offset)
     }
 
-    /// Decode with cross-attention weights for DTW alignment.
-    /// Returns `(logits, cross_attn_qk_per_layer)`.
-    pub fn decode_with_alignment(
+    /// Teacher-forced alignment using retained packed cross-attention K/V.
+    pub fn align_with_cross_kv(
         &self,
         tokens: &Tensor,
-        audio_features: &Tensor,
-        offset: usize,
-    ) -> Result<(Tensor, Vec<Tensor>)> {
-        self.decoder.forward_with_alignment(tokens, audio_features, offset)
+        cross_k: &Tensor,
+        cross_v: &Tensor,
+        alignment_heads: &[(usize, usize)],
+    ) -> Result<Tensor> {
+        self.decoder.forward_alignment(tokens, cross_k, cross_v, alignment_heads)
+    }
+
+    /// Project encoder features into packed cross-attention K/V once per window.
+    pub fn project_cross_kv(&self, audio_features: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.decoder.project_cross_kv(audio_features)
+    }
+
+    /// Decode logits using packed cross-attention K/V.
+    pub fn decode_with_cross_kv(&self, tokens: &Tensor, cross_k: &Tensor, cross_v: &Tensor) -> Result<Tensor> {
+        self.decoder.forward_with_cross_kv(tokens, cross_k, cross_v, 0)
     }
 
     /// Prefill: initial tokens → logits + packed K/V caches.
-    #[allow(clippy::type_complexity)]
     pub fn decode_prefill(
         &self,
         tokens: &Tensor,
-        audio_features: &Tensor,
+        cross_k: &Tensor,
+        cross_v: &Tensor,
         offset: usize,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
-        self.decoder.forward_prefill(tokens, audio_features, offset)
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.decoder.forward_prefill(tokens, cross_k, cross_v, offset)
     }
 
     /// Single-token step with KV cache → (logits, new_self_k, new_self_v).
@@ -64,9 +74,9 @@ impl Whisper {
         self_v_cache: &Tensor,
         cross_k: &Tensor,
         cross_v: &Tensor,
-        self_mask: &Tensor,
+        self_key_lens: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        self.decoder.forward_step(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_mask)
+        self.decoder.forward_step(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_key_lens)
     }
 
     /// Full forward: encode + decode.

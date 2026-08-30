@@ -29,7 +29,7 @@ Svod एक Rust-आधारित ML कम्पाइलर है जो [T
 | [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp ग्राफ़ IR: 80+ ops, symbolic integers, प्रोवेनेंस |
 | [device](https://github.com/npatsakula/svod/tree/main/device/) | बफ़र मैनेजमेंट: lazy alloc, zero-copy views, LRU कैशिंग |
 | [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | ऑप्टिमाइज़ेशन इंजन: 20+ पासेज़, RANGEIFY, Z3 वेरिफ़िकेशन |
-| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | कोड जनरेशन: Clang (डिफ़ॉल्ट), LLVM JIT, MLIR |
+| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | कोड जनरेशन: Clang (डिफ़ॉल्ट), LLVM JIT |
 | [runtime](https://github.com/npatsakula/svod/tree/main/runtime/) | JIT कम्पाइलेशन और कर्नेल एक्ज़ीक्यूशन |
 | [tensor](https://github.com/npatsakula/svod/tree/main/tensor/) | हाई-लेवल lazy tensor API |
 | [onnx](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX मॉडल इम्पोर्टर |

@@ -4,6 +4,12 @@
 //! graph: a refactor that changes a kernel's graph changes its digest. Update an
 //! `expected` const ONLY for an intentional graph change — the failure message
 //! prints the new value to paste.
+//!
+//! One caveat: the digest is the SINK's `content_hash`, which folds each node's
+//! op-data through `Hash`. Changing an op-data type's `Hash` impl (e.g. `AxisId`,
+//! carried by every `RANGE`) therefore moves the digest with a byte-identical
+//! graph. Such a re-baseline is proved by dumping both graphs and diffing them,
+//! not by reading the new digest off the failure.
 
 use std::sync::Arc;
 
@@ -68,17 +74,17 @@ fn fa_sink() -> Arc<UOp> {
 }
 
 // Committed structural golden digests. Update ONLY for an intentional graph change.
-const MATMUL_DIGEST: u128 = 0x6698_e812_748b_1ec0_0000_0000_0000_0000;
-const MATMUL_NODES: usize = 483;
-const FA_DIGEST: u128 = 0x9d50_df63_2af9_357f_0000_0000_0000_0000;
-const FA_NODES: usize = 878;
+const MATMUL_DIGEST: u128 = 0x0261_3d2b_1ca8_9f13_0000_0000_0000_0000;
+const MATMUL_NODES: usize = 535;
+const FA_DIGEST: u128 = 0x3c39_d807_aa65_c6fd_0000_0000_0000_0000;
+const FA_NODES: usize = 897;
 // Non-causal and non-causal+key-masked build variants (pin the `causal:false` and
 // `key_lens:Some` branches GPU-free). The FA all-masked-row NaN fix is a key_lens
 // clamp at the kernel ENTRY (a tensor-graph op), so the SINK graph is unchanged.
-const FA_NONCAUSAL_DIGEST: u128 = 0xd081_e893_a4c5_1800_0000_0000_0000_0000;
-const FA_NONCAUSAL_NODES: usize = 854;
-const FA_MASKED_DIGEST: u128 = 0xa94c_b474_e725_3199_0000_0000_0000_0000;
-const FA_MASKED_NODES: usize = 877;
+const FA_NONCAUSAL_DIGEST: u128 = 0x5428_d057_e5f1_eba0_0000_0000_0000_0000;
+const FA_NONCAUSAL_NODES: usize = 871;
+const FA_MASKED_DIGEST: u128 = 0xb58f_daa1_a06e_104c_0000_0000_0000_0000;
+const FA_MASKED_NODES: usize = 895;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
     let fp = kernel_fingerprint(&sink);
@@ -121,13 +127,15 @@ fn fingerprint_is_build_deterministic() {
     assert_eq!(kernel_fingerprint(&fa_sink()).digest, kernel_fingerprint(&fa_sink()).digest);
 }
 
-/// Sorted, de-duped `DefineLocal` slots and `DefineReg` ids in a kernel graph.
+/// Sorted, de-duped local/register `BUFFER` slots in a kernel graph.
 fn local_slots_and_reg_ids(sink: &Arc<UOp>) -> (Vec<usize>, Vec<usize>) {
     let (mut locals, mut regs) = (Vec::new(), Vec::new());
     for u in sink.toposort() {
         match u.op() {
-            svod_ir::Op::DefineLocal(slot) => locals.push(*slot),
-            svod_ir::Op::DefineReg { id, .. } => regs.push(*id),
+            svod_ir::Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
+                locals.push(arg.slot)
+            }
+            svod_ir::Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => regs.push(arg.slot),
             _ => {}
         }
     }
@@ -138,19 +146,19 @@ fn local_slots_and_reg_ids(sink: &Arc<UOp>) -> (Vec<usize>, Vec<usize>) {
     (locals, regs)
 }
 
-/// The per-kernel `DefineLocal`/`DefineReg` ids are deterministic across two
+/// The per-kernel local/register `BUFFER` slots are deterministic across two
 /// builds AND a dense `0..n` range — the contract the custom-kernel compile-dedup
 /// relies on (structurally identical kernels mint identical LDS slot / register
-/// ids → hash-cons to ONE compiled artifact; the `@local{slot}` LDS name is
+/// slots → hash-cons to ONE compiled artifact; the `@local{slot}` LDS name is
 /// stable). The fingerprint guards this only indirectly; this pins it directly.
 #[test]
 fn define_ids_are_deterministic_and_dense() {
     for build in [matmul_sink as fn() -> Arc<UOp>, fa_sink] {
         let (l1, r1) = local_slots_and_reg_ids(&build());
         let (l2, r2) = local_slots_and_reg_ids(&build());
-        assert_eq!(l1, l2, "DefineLocal slots differ across two builds (dedup would break)");
-        assert_eq!(r1, r2, "DefineReg ids differ across two builds (dedup would break)");
-        assert_eq!(l1, (0..l1.len()).collect::<Vec<_>>(), "DefineLocal slots must be dense 0..n, got {l1:?}");
-        assert_eq!(r1, (0..r1.len()).collect::<Vec<_>>(), "DefineReg ids must be dense 0..n, got {r1:?}");
+        assert_eq!(l1, l2, "local BUFFER slots differ across two builds (dedup would break)");
+        assert_eq!(r1, r2, "register BUFFER slots differ across two builds (dedup would break)");
+        assert_eq!(l1, (0..l1.len()).collect::<Vec<_>>(), "local BUFFER slots must be dense 0..n, got {l1:?}");
+        assert_eq!(r1, (0..r1.len()).collect::<Vec<_>>(), "register BUFFER slots must be dense 0..n, got {r1:?}");
     }
 }

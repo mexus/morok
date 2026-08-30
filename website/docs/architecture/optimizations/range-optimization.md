@@ -28,7 +28,7 @@ flowchart TD
 
 **Why**: After splitting, the inner range can be vectorized (UPCAST to SIMD width) while the outer range can be parallelized (GPU blocks, CPU threads). Without splitting, the modulo prevents both optimizations.
 
-**Mechanism**: The `pm_split_ranges` pattern matcher collects ranges with modulo usage but does NOT transform immediately. It waits until it sees the SINK node, then performs all substitutions at once (avoids inconsistent partial rewrites). Fresh `axis_id`s are assigned to the new ranges.
+**Mechanism**: The `pm_split_ranges` pattern matcher collects ranges with modulo usage but does NOT transform immediately. It waits until it sees the SINK node, then performs all substitutions at once (avoids inconsistent partial rewrites). The outer and inner ranges append `0` and `1` to the original axis path, matching Tinygrad without allocating global range IDs.
 
 **Guard**: Only fires when `end % c == 0` (exact divisibility). Non-divisible cases are left as-is.
 

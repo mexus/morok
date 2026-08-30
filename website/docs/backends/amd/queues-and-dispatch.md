@@ -4,261 +4,153 @@ sidebar_label: Queues & Dispatch
 
 # Queues & Dispatch
 
-Dispatching a kernel means writing command packets into a ring buffer and
-ringing a doorbell. This page covers the ring machinery (`AmdComputeQueue`), the
-per-owner bundle that wraps it (`AmdConnector`), the two dispatch strategies
-(single-queue vs multi-queue), the completion primitive (`Timeline`), and every
-environment variable that configures the backend.
+The AMD backend preserves Tinygrad's validated PM4, AQL, and SDMA packet
+semantics, but uses Rust ownership for queue scheduling and failure handling.
+The central rule is simple: **one non-clone lease is the only publication
+authority for a compute lane**.
 
-The shape of this design comes from one fact: **tinygrad is GIL-serialized** —
-one compute queue per device, with Python's GIL making each dispatch atomic.
-Svod removes the GIL to get real concurrency, so the invariants the GIL provided
-have to be rebuilt explicitly. The result is a dispatch path that can be
-lock-free.
+## Compute lanes
 
----
+`AmdDeviceCore` owns a bounded `QueuePool`. Its slots are fixed `OnceLock`s and
+queues are created lazily up to `SVOD_AMD_HW_QUEUES` (default 4, maximum 64).
+An atomic bitset tracks leases:
 
-## The command ring: `AmdComputeQueue`
+- claiming an initialized idle lane is an atomic compare-exchange;
+- queue creation is a cold serialized path;
+- when every lane is leased, callers park on a condition variable;
+- dropping `QueueLease` clears the bit and wakes one waiter;
+- queues never co-tenant host publishers.
 
-`device/src/amd/queue.rs` defines `AmdComputeQueue`, which owns:
+The `QueueLease` is deliberately not stored in programs or graph templates.
+`OwnerCtx` contains logical plan state: completion, profiling configuration,
+and an optional linked replay template.
 
-- a **16 MiB host-visible ring** (`COMPUTE_RING_BYTES`) — command packets are
-  written straight into it from the CPU;
-- a **doorbell** (`*mut u64` MMIO) — the GPU's command processor is told "new
-  work" by writing the new write-index here;
-- GART-resident **write/read dispatch-id** slots — KFD reads the write pointer
-  in addition to the doorbell, so it's published first.
+Direct semantic fallback keeps one lease across all kernels in a replay epoch,
+then `PlanContext::finish_replay` releases it. A later epoch waits the prior
+finalizer before acquiring another lane, because a different queue would not
+inherit the old queue's FIFO ordering. Graph and native linked replay already
+wait before reusing their mutable kernarg/control storage and lease a lane for
+each publication epoch.
 
-### PM4 vs AQL
+## Native queues
 
-There are two on-wire packet formats, chosen once at queue creation from the
-device's XCC count:
-
-```text
-will_use_pm4(core) = !SVOD_AMD_AQL && num_xcc == 1
-```
-
-- **PM4** (single-XCC: the gfx11/12 default) — raw PM4 dwords written directly
-  into the ring (`KFD_IOC_QUEUE_TYPE_COMPUTE`). The doorbell is rung with the
-  next dword index.
-- **AQL** (multi-XCC CDNA) — 64-byte AQL packets
-  (`KFD_IOC_QUEUE_TYPE_COMPUTE_AQL`), with PM4 helpers wrapped inside AQL
-  vendor-IB packets. The doorbell is rung with the last-completed slot
-  (`write_idx - 1`).
-
-A single PM4 dispatch is a fixed sequence, mirroring tinygrad's
-`hcq.py:371-378`:
-
-```mermaid
-flowchart LR
-  A["wait(timeline, prev)"] --> B["hdp_flush"]
-  B --> C["acquire_mem"]
-  C --> D["exec"]
-  D --> E["release_mem(timeline, next)"]
-```
-
-`exec` is the `SET_SH_REG` stream that loads the shader address, the
-`RSRC1/2/3` registers, the scratch descriptor and `TMPRING_SIZE`, the
-`USER_DATA` SGPRs, the launch dims, then `DISPATCH_DIRECT` followed by a
-`CS_PARTIAL_FLUSH`. The `release_mem` at the end writes the dispatch's timeline
-value to the connector's signal slot when the GPU finishes.
-
-### Lock-free interior mutability
-
-`AmdComputeQueue.inner` is an `UnsafeCell<QueueInner>`, not a `Mutex` — dispatch
-mutates it through `&self` with no lock. This is sound because of a
-**single-owner invariant**: for the lifetime of a `ConnectorLease`, exactly one
-thread issues sequential, non-reentrant dispatch against the queue (the same
-pattern `RawBuffer` uses in `device/src/allocator.rs`). The shared drainer never
-touches the queue — it reads only the timeline (see below). Distinct connectors'
-queues are interleaved by the GPU's hardware scheduler (MES — the MicroEngine
-Scheduler), not a CPU lock.
-
-### Ring back-pressure
-
-A host running `wait=false` faster than the GPU drains would lap the 16 MiB ring
-and overwrite unconsumed packets. `wait_dispatch_headroom` prevents this by
-bounding the number of un-retired dispatches to `RING_MAX_INFLIGHT` (half the
-ring), blocking on the **timeline signal** when the bound is hit:
-
-```rust
-let last_reserved = conn.timeline_value().saturating_sub(1);
-if last_reserved > RING_MAX_INFLIGHT {
-    let target = last_reserved - RING_MAX_INFLIGHT;
-    conn.timeline_signal().wait_signal_value(target, 30_000)?;
-}
-```
-
-It gates on the timeline signal — the proven completion primitive — rather than
-the PM4 read pointer, whose COMPUTE-queue semantics are unreliable and would
-deadlock a spin.
-
----
-
-## The per-owner bundle: `AmdConnector`
-
-A queue alone isn't enough to dispatch. `AmdConnector`
-(`device/src/amd/connector.rs`) bundles everything one independent caller needs:
-
-| Field | What it is |
-|---|---|
-| `queue: Box<AmdComputeQueue>` | The ring + doorbell + GART (sole owner → lock-free) |
-| `arena: Box<KernargArena>` | A 16 MiB GTT kernarg bump arena |
-| `scratch_state: Mutex<ScratchState>` | Register-spill scratch backing, grown on demand |
-| `timeline: Arc<Timeline>` | The monotonic counter + completion signal |
-
-Every `ExecutionPlan` and every `AmdGraph` owns its own connector. The `Box`
-(not `Arc`) on the queue and arena is load-bearing: it proves there is no second
-handle aliasing the `UnsafeCell`, which is what makes lock-free dispatch sound.
-The arena is per-connector so its bump cursor and the connector's timeline share
-one ordering — a wrapped kernarg slot is provably free once that timeline
-drains.
-
-`ensure_has_local_memory(private_segment_size)` grows the scratch buffer when a
-freshly-loaded kernel needs more bytes-per-thread than currently allocated
-(alloc new → swap → drain → free old). Scratch is GPU-only VRAM, dynamically
-realloc'd, and the historical source of `NotPresent` faults — see
-[Debugging](./debugging.md).
-
----
-
-## Two dispatch strategies
-
-The per-device `Dispatcher` enum (`device/src/amd/device.rs`) chooses how owners
-get a connector and whether dispatch is serialized. It is built once at
-device-open from `SVOD_AMD_SINGLE_QUEUE`:
-
-### Single-queue (default)
+`AmdComputeQueue` owns a 16 MiB host-visible ring, GART read/write pointers, a
+doorbell mapping, and KFD queue backing. Packet format is selected once:
 
 ```text
-SVOD_AMD_SINGLE_QUEUE unset or ≠ 0
+PM4 = num_xcc == 1 && SVOD_AMD_AQL != 1
+AQL = otherwise
 ```
 
-Every owner shares **one** connector per physical device, and dispatch +
-scratch-realloc are serialized behind a `Mutex<()>` taken via `exec_guard()`.
-The kernel then only ever sees one compute queue per GPU — tinygrad's model.
+- PM4 queues publish raw dwords and ring the next dword index.
+- AQL queues publish 64-byte packets and ring the last completed packet index.
+- AQL kernel `completion_signal` remains zero. Vendor-IB PM4 waits/stores own
+  timeline completion, with XCC0 `PRED_EXEC` on multi-XCC hardware.
 
-This is the **KFD-safe** mode, and it is the default for a concrete reason:
-heavy concurrent multi-queue dispatch **overloads the kernel's MES/runlist
-scheduler and can crash the kernel**. One GPU has one command processor and runs
-dispatches sequentially anyway; multi-queue only overlapped CPU-side packet
-assembly, which is what drove KFD into the bad path. Single-queue removes that
-crash.
+The lane lease eliminates compute co-tenancy. `AmdComputeQueue.inner` still uses
+a mutex as a Rust aliasing guard; it is uncontended on the normal compute path.
+The singleton SDMA queue is independently mutex-protected because copies from
+different plans may share it.
 
-### Multi-queue (opt-in)
+## Publication
+
+Submission is split into preparation and publication:
+
+1. Validate program identity, concrete buffer ownership, ABI, launch geometry,
+   patch tables, and hardware stream limits.
+2. Reserve and write kernargs/control data.
+3. Acquire ring headroom.
+4. Register a prepared finalizer when device-wide drains need to observe a
+   plan-owned timeline.
+5. Publish packets and doorbells.
+6. Mark the finalizer published.
+
+If an error unwinds after registration, the prepared finalizer becomes failed.
+A concurrent drain wakes and fails immediately rather than waiting for a
+terminal store that was never published. The physical device is then poisoned,
+so the lane cannot be reused and hardware-referenced allocations are
+quarantined.
+
+PM4, AQL, and SDMA publication all check monotonically increasing KFD read
+pointers before wrapping their rings. Ordinary dispatch additionally bounds
+in-flight timeline values. PM4 timeline values drain and reset at the 2^31
+watermark because hardware wait/store packets compare the low 32 bits.
+
+## Resource lifetime
+
+Every direct submission finalizer retains its code object. Graphs and linked
+plans retain all code objects they link. Persistent kernarg, resident command,
+control, timestamp, and PMC allocations remain owned until their exact replay
+completion is retired.
+
+Queue lifecycle is explicit:
 
 ```text
-SVOD_AMD_SINGLE_QUEUE=0
+Constructing -> Active
+Constructing -> Destroyed | Quarantined
+Active -> Destroyed
+Active -> Quarantined
 ```
 
-Each owner leases an **exclusively-owned** connector from an idle pool (bounded
-by `CONNECTOR_POOL_CAP = 4`); the MES interleaves the N queues, so dispatch
-needs no CPU lock and `exec_guard()` returns `None`. The lease being exclusive
-and un-aliasable is what stops two dispatchers from sharing one KFD queue.
+Orderly compute teardown is drain, KFD `DESTROY_QUEUE`, scratch release, then
+ring/GART/context release. A failed drain or destroy poisons the physical device
+and leaves all potentially referenced backing mapped. Doorbell unmap failure
+after successful queue destruction is reported as a host mapping leak, but does
+not unnecessarily quarantine safe GPU backing.
 
-:::caution The kernel-overload caveat
-Multi-queue is the lock-free, maximally-concurrent path, but it is the one that
-overloads KFD under load. It is opt-in for that reason. The real fix — owning
-the GPU so the kernel is never in the dispatch path — is the
-[userspace AM driver](./am-driver.md).
-:::
+If `CREATE_QUEUE` succeeds but doorbell mapping and rollback destruction both
+fail, `setup_ring` returns `AmdQueueStillActive`. The caller poisons the device
+before allocation guards unwind, preventing a live KFD queue from observing
+freed ring memory.
 
-### `ConnectorLease`
+Panic abandonment also poisons the device. Signal slots are not returned to the
+pool while panicking or after poison, so a caught panic cannot recycle a slot
+that an abandoned queue may still target.
 
-`lease_connector` returns a `ConnectorLease` — a non-`Clone` handle that
-`Deref`s to `&AmdConnector`, so callers are mode-agnostic. On drop,
-`return_connector` does the mode-appropriate thing: re-pool it (multi-queue, up
-to the cap) or nothing (single-queue — the shared connector lives on the core).
-It does **not** synchronize on drop; the connector's `Timeline` stays registered
-so the device-wide drain still covers it.
+## Device-wide drains
 
----
+Each lane owns a queue timeline and a FIFO of non-queue finalizers. The device
+core keeps weak references to every initialized lane. Host reads, host writes,
+and destructive frees call `synchronize_all`, which snapshots those lanes and
+waits their timelines without taking publication locks.
 
-## The completion primitive: `Timeline`
+Native replay additionally validates every current PROGRAM and COPY endpoint.
+For AMD buffers this compares the actual `RawBuffer::AmdDevice` core with the
+selected physical device; an allocator merely reporting `AMD:N` is not enough.
 
-`Timeline` (`device/src/amd/signal.rs`) is a monotonic `AtomicU64` counter plus
-the GTT-coherent `AmdSignal` slot the GPU writes on dispatch completion. It is
-**the one primitive that crosses owners**:
+## Backend seam
 
-- a connector *dispatches* against it — `next()` does `fetch_add(1)` to reserve
-  the value its `release_mem` packet will write;
-- any thread can *drain* it — `drain()` reads the atomic and polls the signal
-  slot, **never touching the queue**.
-
-That decoupling is what keeps dispatch lock-free. The device core
-(`AmdDeviceCore`) holds `Weak<Timeline>` for every connector — not
-`Weak<AmdConnector>` — so `synchronize_all` (the fence before any host read or
-buffer free) drains all in-flight work purely through these atomics:
-
-```text
-AmdDeviceCore.synchronize_all():
-   for each live Timeline:  timeline.drain(30s)   // atomics + signal slot only
-```
-
-`AmdSignal::wait_signal_value` polls in tiers — tight spin → `yield_now` → KFD
-`WAIT_EVENTS` sleep after 200 ms — so a long or stalled wait doesn't burn a CPU,
-and a GPU fault during the wait surfaces immediately instead of blocking the
-full 30 s timeout.
-
-:::note 2³² wraparound
-PM4 `WAIT_REG_MEM`/`RELEASE_MEM` compare the low 32 bits of the signal slot, so
-the counter must stay below 2³². `ensure_timeline_headroom` drains and resets at
-a 2³¹ watermark (`TIMELINE_WRAP_WATERMARK`) before reserving each value, so a
-long `wait=false` loop can't climb past 2³² and produce a false timeout.
-:::
-
----
-
-## The seam
-
-All four kernel operations the queue layer needs route through the
-[`AmdIface`](./overview.md) trait on the device core:
+KFD operations are isolated behind `AmdIface`:
 
 ```rust
 pub trait AmdIface: Send + Sync + std::fmt::Debug {
-    fn alloc_raw(&self, size, kind, tag, cpu_access, zero) -> Result<AllocResult>;
-    fn free_raw(&self, gpu_va, size, handle);
+    fn alloc_raw(/* ... */) -> Result<AllocResult>;
+    fn free_raw(&self, gpu_va: u64, size: usize, handle: u64);
     fn setup_ring(&self, desc: &RingDesc) -> Result<QueueHandle>;
-    fn teardown_ring(&self, queue_id: u32);
+    fn teardown_ring(
+        &self,
+        queue_id: u32,
+        doorbell_base: NonNull<u8>,
+    ) -> Result<QueueTeardown>;
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
 }
 ```
 
-Note what is *not* in the trait: the ring, GART, EOP and ctx-save buffers are
-all allocated above the seam (via `alloc_raw`) inside `create_queue`. The trait
-only **activates** the queue — `setup_ring` issues `CREATE_QUEUE` and `mmap`s
-the doorbell over a ring the upper half already owns. `KfdIface` is the sole
-implementor today.
+Ring, GART, EOP, context-save, and inactive-signal buffers are allocated above
+this seam. `setup_ring` activates those resources and maps the doorbell.
 
----
-
-## Configuration reference
-
-Every environment variable that affects the AMD backend:
+## Configuration
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SVOD_DEVICE` | `CPU` | Selects the default device for tensors. Set `SVOD_DEVICE=AMD:0` to run on the first AMD GPU |
-| `SVOD_AMD_BACKEND` | `kfd` | Backend selection. Only `kfd` is accepted today; `am` is the future seam (errors if set) |
-| `SVOD_AMD_SINGLE_QUEUE` | `1` (on) | `=0` opts into lock-free multi-queue dispatch; otherwise the KFD-safe single-queue mode |
-| `SVOD_AMD_AQL` | `0` (off) | `=1` forces AQL packets even on single-XCC hardware — for bisecting PM4 vs AQL issues |
-| `SVOD_JIT_GRAPH` | unset | Enables PM4 graph capture/replay (also requires multi-queue mode). See [Compile & Graph](./compile-and-graph.md) |
-| `SVOD_KFD_TOPOLOGY` | sysfs path | Overrides the topology root, for testing without hardware |
-| `SVOD_DEBUG_DISPATCH` | unset | Dumps per-dispatch kernel / grid / kernarg / scratch / buffer VAs. See [Debugging](./debugging.md) |
-| `SVOD_DUMP_AMD_IR` | unset | If set to a directory, dumps each kernel's AMD LLVM IR there |
+| `SVOD_DEVICE` | `CPU` | Select default tensor device, for example `AMD:0` |
+| `SVOD_AMD_BACKEND` | `kfd` | AMD backend; only `kfd` is currently accepted |
+| `SVOD_AMD_HW_QUEUES` | `4` | Bounded compute-lane count, clamped to 1 through 64 |
+| `SVOD_AMD_AQL` | unset | Nonzero forces AQL on single-XCC hardware |
+| `SVOD_PM4_GRAPH` | unset | `=1` enables PM4 graph capture |
+| `SVOD_KFD_TOPOLOGY` | sysfs | Override KFD topology root for tests |
+| `SVOD_DEBUG_DISPATCH` | unset | Print dispatch grid, kernarg, scratch, and buffer addresses |
+| `SVOD_DUMP_AMD_IR` | unset | Directory for generated AMD LLVM IR |
 
-:::caution There is no `SVOD_AMD_MAX_QUEUES`
-The multi-queue idle-pool size is the compile-time constant
-`CONNECTOR_POOL_CAP = 4` in `device.rs`, not an environment variable.
-:::
-
----
-
-## Why this matters
-
-The GIL gave tinygrad an atomic dispatch critical section for free. Svod rebuilds
-that guarantee three ways: **single-owner ownership** for the ring (no dispatch
-lock), a **shared timeline signal** for drains (atomics, never the queue), and
-**explicit ring back-pressure**. The single-queue default keeps the kernel safe
-today; the lock-free multi-queue path is ready for when the
-[AM driver](./am-driver.md) takes the kernel out of the loop entirely.
+There is no `SVOD_AMD_SINGLE_QUEUE`. Set `SVOD_AMD_HW_QUEUES=1` when a single
+hardware lane is required.

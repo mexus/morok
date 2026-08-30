@@ -7,12 +7,10 @@
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
-use svod_ir::{AxisType, ConstValue, UOp};
+use svod_ir::{AxisType, ConstValue, Op, UOp};
 
 use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, lane_rc, wave_offset};
-use crate::index::{
-    Idx, cidx, flat_index, flat_offset, index_off, index_off_gated, load_at, load_off, load_off_gated, load_vec,
-};
+use crate::index::{Idx, cidx, flat_index, flat_offset, index_off, index_off_gated, load_at, load_off, load_off_gated};
 use crate::tile::{GL, RT, ST};
 use crate::tiles::TileLayout;
 
@@ -308,7 +306,7 @@ impl<'k> Group<'k> {
         self.finalize_st(st, ended)
     }
 
-    /// Vectorized GLOBAL→LOCAL fill: the [`Self::load_global_to_local`]
+    /// Stackd GLOBAL→LOCAL fill: the [`Self::load_global_to_local`]
     /// counterpart that issues **128-bit** (`vec8` bf16) coalesced global loads
     /// (one `global_load_dwordx4`/lane) and commits each into the XOR-swizzled
     /// LDS as `vec8/sw` contiguous `vec_sw` stores. The swizzle's XOR delta is
@@ -387,9 +385,20 @@ impl<'k> Group<'k> {
         let row = imod(&row0, base_rows);
         let width = idiv(&col0, base_cols);
 
-        // One 128-bit coalesced global load of the contiguous `vw`-run.
+        // One shaped scalar-dtype load of the contiguous `vw`-run. The compiler
+        // may coalesce these logical lanes without widening the storage dtype.
         let off = iadd(&src_i_base, &iadd(&imul(&row0, row_stride), &col0));
-        let loaded = load_vec(src.uop(), off, vw as usize);
+        let src_offsets =
+            UOp::stack((0..vw).map(|lane| if lane == 0 { off.clone() } else { iadd(&off, &cidx(lane)) }).collect());
+        let loaded = UOp::load()
+            .index(
+                UOp::index()
+                    .buffer(src.uop().clone())
+                    .indices(vec![src_offsets])
+                    .call()
+                    .expect("vec fill source INDEX"),
+            )
+            .call();
 
         // Commit as `vw/sw` swizzle-safe `vec_sw` LDS stores (delta is constant
         // across the fragment row, so each `sw`-group maps contiguously).
@@ -397,9 +406,32 @@ impl<'k> Group<'k> {
             .map(|j| {
                 let col = imod(&iadd(&col0, &cidx(j * sw)), base_cols);
                 let (srow, scol) = st.base.swizzle.swizzle_rc(row.clone(), col, st.base.base.cols, st.elem().base());
-                let val = loaded.gep(((j * sw) as usize..(j * sw + sw) as usize).collect());
                 let didx = [Idx::Uop(height.clone()), Idx::Uop(width.clone()), Idx::Uop(srow), Idx::Uop(scol)];
-                st_index(&st, &didx).store(val)
+                let dst = st_index(&st, &didx);
+                let Op::Index { buffer, indices } = dst.op() else { unreachable!("st_index returns INDEX") };
+                let dst_base = indices[0].clone();
+                let dst_offsets = UOp::stack(
+                    (0..sw)
+                        .map(|lane| if lane == 0 { dst_base.clone() } else { iadd(&dst_base, &cidx(lane)) })
+                        .collect(),
+                );
+                let dst = UOp::index()
+                    .buffer(buffer.clone())
+                    .indices(vec![dst_offsets])
+                    .call()
+                    .expect("vec fill destination INDEX");
+                let val = UOp::stack(
+                    (j * sw..j * sw + sw)
+                        .map(|lane| {
+                            UOp::index()
+                                .buffer(loaded.clone())
+                                .indices(vec![cidx(lane)])
+                                .call()
+                                .expect("vec fill loaded lane INDEX")
+                        })
+                        .collect(),
+                );
+                dst.store(val)
             })
             .collect();
         let grouped = if stores.len() == 1 { stores.into_iter().next().unwrap() } else { UOp::group(stores) };
@@ -697,5 +729,5 @@ fn st_index(st: &ST, idxs: &[Idx]) -> Arc<UOp> {
 /// ST flat LOAD honoring [`ST::base_offset`] — the [`crate::index::load_at`] analog.
 fn st_load(st: &ST, idxs: &[Idx]) -> Arc<UOp> {
     let idx = st_index(st, idxs);
-    UOp::load().buffer(st.uop().clone()).index(idx).call()
+    UOp::load().index(idx).call()
 }

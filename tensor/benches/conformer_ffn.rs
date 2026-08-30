@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use svod_dtype::DType;
-use svod_schedule::{HeuristicsConfig, OptStrategy, OptimizerConfig};
+use svod_schedule::{HeuristicsConfig, OptStrategy, OptimizerConfig, TcOptLevel};
 use svod_tensor::{PrepareConfig, Tensor};
 
 /// Shape envelope for the FFN forward pass.
@@ -79,7 +79,9 @@ fn make_configs() -> Vec<(&'static str, PrepareConfig)> {
 
     let heuristic: PrepareConfig = OptimizerConfig::builder()
         .strategy(OptStrategy::Heuristic)
-        .heuristics(HeuristicsConfig::builder().build())
+        // TC_OPT is pinned: the heuristic default (Strict, tinygrad `helpers.py:238`)
+        // is what these numbers measure, not the BEAM action space's TC_OPT=2.
+        .heuristics(HeuristicsConfig::builder().tc_opt(TcOptLevel::Strict).build())
         .build()
         .into();
     out.push(("heuristic", heuristic));

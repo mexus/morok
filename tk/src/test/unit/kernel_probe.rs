@@ -34,13 +34,23 @@ fn f32c(v: f32) -> Arc<UOp> {
     UOp::const_(DType::Float32, ConstValue::Float(v as f64))
 }
 fn index0(buf: &Arc<UOp>) -> Arc<UOp> {
-    UOp::index().buffer(buf.clone()).indices(vec![cidx(0)]).ptr(true).call().expect("INDEX[0]")
+    UOp::index().buffer(buf.clone()).indices(vec![cidx(0)]).call().expect("INDEX[0]")
 }
 fn load0(buf: &Arc<UOp>) -> Arc<UOp> {
-    UOp::load().buffer(buf.clone()).index(index0(buf)).call()
+    UOp::load().index(index0(buf)).call()
 }
 
 const INPUT: [f32; 8] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+
+#[test]
+fn sparse_and_interleaved_program_slots_plan_compact_buffers() {
+    assert_eq!(crate::launch::plan_compact_buffers(&[0, 5], 2).unwrap(), vec![(0, 0), (1, 5)]);
+    assert_eq!(crate::launch::plan_compact_buffers(&[0, 2], 2).unwrap(), vec![(0, 0), (1, 2)]);
+    assert!(matches!(
+        crate::launch::plan_compact_buffers(&[0, 5], 1),
+        Err(crate::launch::Error::BufferCount { expected: 2, supplied: 1, .. })
+    ));
+}
 
 /// The canonical accumulator shape, identical to svod's own `reduce_to_acc`
 /// lowering (`schedule/src/devectorize.rs`) and `Kernel::endrange`:
@@ -93,7 +103,8 @@ fn test_accumulator_after_bare_store_cpu() {
         let result = load0(&acc.after(smallvec![store_end]));
 
         let out_store = index0(&out_buf).store(result);
-        let sink = UOp::sink_with_info(vec![out_store], KernelInfo { opts_to_apply: Some(vec![]), name: None });
+        let sink =
+            UOp::sink_with_info(vec![out_store], KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() });
 
         // Compile + dispatch directly against the concrete buffers (outputs first).
         let device = svod_runtime::create_cpu_device_with_backend(svod_device::registry::registry(), CpuBackend::Clang)

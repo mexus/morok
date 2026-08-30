@@ -91,7 +91,9 @@ fn test_row_reduce_graph_shape() {
         "row_reduce gathers sibling lanes with a ds_bpermute Op::Custom shuffle"
     );
     assert!(
-        !topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))),
+        !topo
+            .iter()
+            .any(|u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
         "the wave-shuffle reduce allocates no LDS scratch"
     );
     assert!(
@@ -132,7 +134,13 @@ fn test_row_arg_reduce_graph_shape() {
             caps.arch
         );
         assert!(topo.iter().any(|u| matches!(u.op(), Op::Binary(BinaryOp::Eq, ..))), "{:?}: tie Eq compare", caps.arch);
-        assert!(!topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "{:?}: no LDS scratch", caps.arch);
+        assert!(
+            !topo
+                .iter()
+                .any(|u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
+            "{:?}: no LDS scratch",
+            caps.arch
+        );
         assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "{:?}: no barrier", caps.arch);
         assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "{:?}: no WMMA", caps.arch);
     }

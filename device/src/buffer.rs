@@ -130,7 +130,66 @@ pub struct Buffer {
     shape: SmallVec<[usize; 4]>,
 }
 
+/// A [`DeviceSpec`](svod_dtype::DeviceSpec) resolved to the backend identity
+/// that [`Buffer::matches_native`] compares against.
+///
+/// `AmdDevice::open` takes a process-global cache mutex, so a caller checking
+/// many buffers against one device resolves this once. The AMD core is opened
+/// lazily, on the first buffer that is actually AMD-backed: a host-backed
+/// buffer merely *tagged* AMD is a mismatch, not a reason to demand that the
+/// GPU be openable.
+pub enum NativeDevice {
+    Host(svod_dtype::DeviceSpec),
+    Amd { device_id: usize, core: OnceLock<Arc<crate::amd::AmdDeviceCore>> },
+}
+
+impl NativeDevice {
+    pub fn resolve(spec: &svod_dtype::DeviceSpec) -> Self {
+        match spec {
+            svod_dtype::DeviceSpec::Amd { device_id } => Self::Amd { device_id: *device_id, core: OnceLock::new() },
+            host => Self::Host(host.clone()),
+        }
+    }
+}
+
 impl Buffer {
+    /// Device which owns the underlying allocation.
+    pub fn device_spec(&self) -> svod_dtype::DeviceSpec {
+        self.data.allocator.device_spec()
+    }
+
+    /// Verify that an AMD-tagged buffer is backed by the exact physical KFD
+    /// device, not merely by an allocator reporting the same display spec.
+    ///
+    /// Resolving the spec costs a lock on the process-global AMD device cache,
+    /// so a caller validating many buffers against one device should resolve a
+    /// [`NativeDevice`] once and use [`Buffer::matches_native`].
+    pub fn matches_native_device(&self, expected: &svod_dtype::DeviceSpec) -> Result<bool> {
+        self.matches_native(&NativeDevice::resolve(expected))
+    }
+
+    /// [`matches_native_device`](Self::matches_native_device) against an
+    /// already-resolved device.
+    pub fn matches_native(&self, expected: &NativeDevice) -> Result<bool> {
+        match expected {
+            NativeDevice::Host(spec) => Ok(self.device_spec() == *spec),
+            NativeDevice::Amd { device_id, core } => {
+                self.data.ensure_allocated()?;
+                let RawBuffer::AmdDevice { device, .. } = self.data.raw() else {
+                    return Ok(false);
+                };
+                let expected = match core.get() {
+                    Some(core) => core,
+                    None => {
+                        let opened = Arc::clone(crate::amd::AmdDevice::open(*device_id)?.core());
+                        core.get_or_init(|| opened)
+                    }
+                };
+                Ok(Arc::ptr_eq(device.core(), expected))
+            }
+        }
+    }
+
     /// Create a new buffer with lazy allocation (not zero-initialized).
     pub fn new(allocator: Arc<dyn Allocator>, dtype: DType, shape: Vec<usize>, options: BufferSpec) -> Self {
         Self::new_with_zero_init(allocator, dtype, shape, options, false)
@@ -506,6 +565,19 @@ impl Buffer {
         self.data.allocator._copyin(self.data.raw(), self.offset, src)
     }
 
+    /// Copy `src` into this buffer starting at byte `dst_off`. Partial-write
+    /// counterpart to [`copyout_prefix`] — used to seed a region of a
+    /// device-local buffer (e.g. one lane's KV-cache row) from host memory
+    /// via the copy engine, without a host-visible mapping.
+    pub fn copyin_at(&mut self, dst_off: usize, src: &[u8]) -> Result<()> {
+        self.ensure_allocated()?;
+        let end = dst_off
+            .checked_add(src.len())
+            .ok_or(crate::error::Error::SizeMismatch { expected: self.size, actual: usize::MAX })?;
+        snafu::ensure!(end <= self.size, SizeMismatchSnafu { expected: self.size, actual: end });
+        self.data.allocator._copyin(self.data.raw(), self.offset + dst_off, src)
+    }
+
     /// Copy data from this buffer to host memory.
     ///
     /// Delegates to the allocator's `_copyout`. Device backends synchronize
@@ -563,13 +635,43 @@ impl Buffer {
     pub fn copy_region_from(&mut self, dst_off: usize, src: &Buffer, src_off: usize, len: usize) -> Result<()> {
         self.ensure_allocated()?;
         src.ensure_allocated()?;
-        snafu::ensure!(dst_off + len <= self.size, SizeMismatchSnafu { expected: self.size, actual: dst_off + len });
-        snafu::ensure!(src_off + len <= src.size, SizeMismatchSnafu { expected: src.size, actual: src_off + len });
+        let dst_end = dst_off
+            .checked_add(len)
+            .ok_or(crate::error::Error::SizeMismatch { expected: self.size, actual: usize::MAX })?;
+        let src_end = src_off
+            .checked_add(len)
+            .ok_or(crate::error::Error::SizeMismatch { expected: src.size, actual: usize::MAX })?;
+        snafu::ensure!(dst_end <= self.size, SizeMismatchSnafu { expected: self.size, actual: dst_end });
+        snafu::ensure!(src_end <= src.size, SizeMismatchSnafu { expected: src.size, actual: src_end });
         snafu::ensure!(
             Arc::ptr_eq(&self.data.allocator, &src.data.allocator),
             UnsupportedSnafu { op: "copy_region_from across allocators" }
         );
         self.data.allocator._transfer(self.data.raw(), self.offset + dst_off, src.data.raw(), src.offset + src_off, len)
+    }
+
+    /// Copy a region within this buffer to another region in the same buffer
+    /// (on-device SDMA, no host round-trip). Used to relocate a cache row when
+    /// lane compaction shifts a surviving lane to a new row. The regions must
+    /// not overlap.
+    pub fn copy_within(&mut self, dst_off: usize, src_off: usize, len: usize) -> Result<()> {
+        self.ensure_allocated()?;
+        let dst_end = dst_off
+            .checked_add(len)
+            .ok_or(crate::error::Error::SizeMismatch { expected: self.size, actual: usize::MAX })?;
+        let src_end = src_off
+            .checked_add(len)
+            .ok_or(crate::error::Error::SizeMismatch { expected: self.size, actual: usize::MAX })?;
+        snafu::ensure!(dst_end <= self.size, SizeMismatchSnafu { expected: self.size, actual: dst_end });
+        snafu::ensure!(src_end <= self.size, SizeMismatchSnafu { expected: self.size, actual: src_end });
+        snafu::ensure!(
+            len == 0 || dst_end <= src_off || src_end <= dst_off,
+            crate::error::RuntimeSnafu { message: "copy_within regions must not overlap" }
+        );
+        // No borrow conflict: .raw() returns an owned RawBuffer handle, so we
+        // can capture it twice without aliasing &mut self.
+        let src_raw = self.data.raw();
+        self.data.allocator._transfer(self.data.raw(), self.offset + dst_off, src_raw, self.offset + src_off, len)
     }
 
     /// Synchronize the device (wait for all operations to complete).
@@ -616,6 +718,16 @@ impl Buffer {
                 unimplemented!("CUDA buffer raw pointers not yet supported for kernel execution")
             }
         }
+    }
+
+    /// Resolve this buffer view to the address consumed by a target program.
+    /// This is Tinygrad HCQ's host-side GETADDR stage: AMD returns a GPU VA,
+    /// while host backends return their process address.
+    pub fn device_address(&self) -> Result<u64> {
+        self.ensure_allocated()?;
+        // SAFETY: the returned integer is used only while the owning Buffer is
+        // retained by the execution plan; it is never dereferenced here.
+        Ok(unsafe { self.as_raw_ptr() } as usize as u64)
     }
 
     /// Get the raw data pointer for testing buffer identity.

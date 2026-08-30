@@ -13,6 +13,8 @@
 //!
 //! Usage:
 //!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav
+//!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav --encoder-dtype int8
+//!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav --encoder-dtype fp8
 //!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav --rnnt --profile
 //!
 //! Env knobs (all optional):
@@ -22,9 +24,10 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use svod_arch::pipelines::audio::{Asr, RunOptions};
+use svod_dtype::DType;
 use svod_model::audio::EncoderBounds;
 use svod_model::firered_vad::FireRedVadSplitter;
 use svod_model::gigaam::{GigaAm, GigaAmTranscriber, TranscribeOpts};
@@ -35,7 +38,7 @@ struct Args {
     /// Input WAV (16 kHz mono; ints or floats).
     wav: PathBuf,
 
-    /// HF Hub repo with the model weights.
+    /// HF Hub repo or local model directory with the model weights.
     #[arg(long, default_value = "vpermilp/GigaAM-v3")]
     repo: String,
 
@@ -63,6 +66,42 @@ struct Args {
     /// SDPA scores buffer budget (MiB).
     #[arg(long, default_value_t = 256)]
     max_scores_mib: usize,
+
+    /// Encoder compute/storage format (default: FP16).
+    /// FP8/INT8 select their named checkpoints and use FP16 activations.
+    #[arg(long, value_enum)]
+    encoder_dtype: Option<EncoderDtype>,
+
+    /// Override the safetensors file selected by --encoder-dtype.
+    #[arg(long)]
+    weights: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EncoderDtype {
+    F32,
+    F16,
+    Bf16,
+    Fp8,
+    Int8,
+}
+
+impl EncoderDtype {
+    fn compute_dtype(self) -> DType {
+        match self {
+            EncoderDtype::F32 => DType::Float32,
+            EncoderDtype::F16 | EncoderDtype::Fp8 | EncoderDtype::Int8 => DType::Float16,
+            EncoderDtype::Bf16 => DType::BFloat16,
+        }
+    }
+
+    fn weights(self) -> &'static str {
+        match self {
+            EncoderDtype::Fp8 => "model_fp8.safetensors",
+            EncoderDtype::Int8 => "model_int8.safetensors",
+            EncoderDtype::F32 | EncoderDtype::F16 | EncoderDtype::Bf16 => "model.safetensors",
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -71,6 +110,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_total = Instant::now();
     let args = Args::parse();
     let revision = args.revision.clone().unwrap_or_else(|| if args.rnnt { "e2e_rnnt" } else { "ctc" }.to_string());
+    let encoder_dtype = args.encoder_dtype.map_or(DType::Float16, EncoderDtype::compute_dtype);
+    let weights = args
+        .weights
+        .as_deref()
+        .unwrap_or_else(|| args.encoder_dtype.map_or("model.safetensors", EncoderDtype::weights));
     let opts = TranscribeOpts::builder().beam_decode(args.beam_decode).max_scores_mib(args.max_scores_mib).build();
 
     println!("Loading audio: {}", args.wav.display());
@@ -78,8 +122,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let duration_s = waveform.len() as f32 / sample_rate as f32;
     println!("Samples: {} ({:.1}s @ {} Hz)", waveform.len(), duration_s, sample_rate);
 
-    println!("\nLoading GigaAM from {} ({revision})...", args.repo);
-    let model = GigaAm::from_hub_with_revision(&args.repo, &revision)?;
+    let local_repo = PathBuf::from(&args.repo);
+    println!(
+        "\nLoading GigaAM from {}{}...",
+        args.repo,
+        if local_repo.is_dir() { String::new() } else { format!(" ({revision})") }
+    );
+    let model = if local_repo.is_dir() {
+        GigaAm::from_dir_with_weights_and_encoder_dtype(&local_repo, weights, encoder_dtype)?
+    } else {
+        GigaAm::from_hub_with_revision_and_weights_and_encoder_dtype(&args.repo, &revision, weights, encoder_dtype)?
+    };
     if args.rnnt && model.head.as_rnnt().is_none() {
         return Err(format!("{}@{revision} has a CTC head, not RN-T.", args.repo).into());
     }
@@ -104,7 +157,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_transcribe = Instant::now();
     // VAD split → arch pipeline machinery (decode windows → crop → stitch),
     // with the VAD stage folded into the profile.
-    let result = asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile: args.profile })?;
+    let result =
+        asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile: args.profile, ..Default::default() })?;
     let dt_transcribe = t_transcribe.elapsed();
 
     if args.timestamps {

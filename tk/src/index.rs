@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use svod_dtype::DType;
-use svod_ir::{ConstValue, Op, UOp};
+use svod_ir::{Op, UOp};
 
 /// An index component: a compile-time constant or a runtime `Index`-typed UOp
 /// (a loop range, `Special`, or derived lane arithmetic).
@@ -114,9 +114,9 @@ impl IntoIdxs for Vec<Idx> {
     }
 }
 
-/// A constant `Index`-typed UOp.
+/// A weak mathematical integer constant used in index expressions.
 pub(crate) fn cidx(v: i64) -> Arc<UOp> {
-    UOp::const_(DType::Index, ConstValue::Int(v))
+    UOp::index_const(v)
 }
 
 /// Row-major strides for `shape`.
@@ -128,7 +128,7 @@ pub fn strides(shape: &[usize]) -> Vec<i64> {
     s
 }
 
-/// Collapse multi-dim `idxs` into a single `Index`-typed offset UOp, folding the
+/// Collapse multi-dim `idxs` into a single integer offset UOp, folding the
 /// all-constant contribution into one constant and chaining only the dynamic
 /// terms with `try_add`/`try_mul`.
 pub fn flat_offset(shape: &[usize], idxs: &[Idx]) -> Arc<UOp> {
@@ -171,40 +171,37 @@ pub fn flat_ptr(placeholder: &Arc<UOp>) -> (Arc<UOp>, DType) {
     (buf, elem)
 }
 
-/// INDEX (ptr=true) into `buf` at the flattened offset — usable as both a STORE
-/// target and a LOAD source.
+/// INDEX into `buf` at the flattened offset.
 pub fn flat_index(buf: &Arc<UOp>, shape: &[usize], idxs: &[Idx]) -> Arc<UOp> {
     let off = flat_offset(shape, idxs);
-    UOp::index().buffer(buf.clone()).indices(vec![off]).ptr(true).call().expect("flat_index: INDEX construction")
+    UOp::index().buffer(buf.clone()).indices(vec![off]).call().expect("flat_index: INDEX construction")
 }
 
 /// LOAD from `buf` at the flattened offset (element dtype inferred from the
 /// buffer's pointer base).
 pub fn load_at(buf: &Arc<UOp>, shape: &[usize], idxs: &[Idx]) -> Arc<UOp> {
     let idx = flat_index(buf, shape, idxs);
-    UOp::load().buffer(buf.clone()).index(idx).call()
+    UOp::load().index(idx).call()
 }
 
-/// INDEX (ptr=true) into `buf` at an already-flattened element `offset` — the
+/// INDEX into `buf` at an already-flattened element `offset` — the
 /// 1-D form used for flat GLOBAL buffer access (`srcf[src_i]` in tinygrad).
 pub fn index_off(buf: &Arc<UOp>, offset: Arc<UOp>) -> Arc<UOp> {
-    UOp::index().buffer(buf.clone()).indices(vec![offset]).ptr(true).call().expect("index_off: INDEX construction")
+    UOp::index().buffer(buf.clone()).indices(vec![offset]).call().expect("index_off: INDEX construction")
 }
 
 /// LOAD from `buf` at an already-flattened element `offset`.
 pub fn load_off(buf: &Arc<UOp>, offset: Arc<UOp>) -> Arc<UOp> {
     let idx = index_off(buf, offset);
-    UOp::load().buffer(buf.clone()).index(idx).call()
+    UOp::load().index(idx).call()
 }
 
-/// Gated INDEX (ptr=true) at a flat `offset`: a STORE through it writes only when
+/// Validity-encoded INDEX at a flat `offset`: a STORE through it writes only when
 /// `gate` is true (out-of-bounds writes are dropped) — the masked-store form.
 pub fn index_off_gated(buf: &Arc<UOp>, offset: Arc<UOp>, gate: Arc<UOp>) -> Arc<UOp> {
     UOp::index()
         .buffer(buf.clone())
-        .indices(vec![offset])
-        .gate(gate)
-        .ptr(true)
+        .indices(vec![offset.valid(gate)])
         .call()
         .expect("index_off_gated: INDEX construction")
 }
@@ -212,20 +209,7 @@ pub fn index_off_gated(buf: &Arc<UOp>, offset: Arc<UOp>, gate: Arc<UOp>) -> Arc<
 /// Gated LOAD at a flat `offset`: returns the loaded value when `gate` is true,
 /// else `alt` (out-of-bounds reads fold to the fill) — the masked-load form.
 pub fn load_off_gated(buf: &Arc<UOp>, offset: Arc<UOp>, gate: Arc<UOp>, alt: Arc<UOp>) -> Arc<UOp> {
-    let idx = index_off_gated(buf, offset, gate);
-    UOp::load().buffer(buf.clone()).index(idx).alt(alt).call()
-}
-
-/// Wide LOAD of `lanes` contiguous elements from `buf` starting at element
-/// `offset` — a single `<lanes × elem>` vector load (the 128-bit coalesced
-/// GLOBAL fill: `bf16` × 8 = `global_load_dwordx4`). The INDEX points at the
-/// first element; the vector LOAD reads the `lanes`-wide contiguous run. The
-/// caller must guarantee `offset` is `lanes`-aligned (16-byte for `vec8` bf16).
-pub fn load_vec(buf: &Arc<UOp>, offset: Arc<UOp>, lanes: usize) -> Arc<UOp> {
-    let idx = index_off(buf, offset);
-    let elem = match buf.dtype() {
-        DType::Ptr { base, .. } => (*base).clone(),
-        dt => dt,
-    };
-    UOp::load().buffer(buf.clone()).index(idx).dtype(elem.vec(lanes).expect("load_vec element must be a scalar")).call()
+    let idx = index_off_gated(buf, offset, gate.clone());
+    let load = UOp::load().index(idx).call();
+    UOp::try_where(gate, load, alt).expect("load_off_gated: WHERE construction")
 }

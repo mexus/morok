@@ -22,7 +22,7 @@ use svod_dtype::DeviceSpec;
 /// - Special ops with extra data remain separate: Cast (dtype), MSelect (device_index)
 /// - Variable-arity ops use SmallVec: `Index { indices: SmallVec<[Arc<UOp>; 4]> }`
 /// - SmallVec avoids heap allocation for common cases (≤4 children)
-/// - Gate is on INDEX (not LOAD/STORE) following Tinygrad's model
+/// - Late gating is carried by LOAD/STORE following Tinygrad's model
 ///
 /// Hash is derived and uses UOp's Hash impl for `Arc<UOp>` children.
 /// UOp hashes by content (dtype + op), enabling content-based hashing for caching.
@@ -31,15 +31,11 @@ use svod_dtype::DeviceSpec;
 #[derive(svod_macros::PatternEnum)]
 #[pattern(grouped = [Unary, Binary, Ternary])]
 pub enum Op {
-    // Nullary operations (8 variants)
+    // Nullary operations
     Const(ConstValueHash),
     Unique(usize),
     LUnique(usize),
-    Device(DeviceSpec),
     Noop,
-    #[pattern(skip)]
-    Invalid,
-    DefineLocal(usize),
 
     // Graph organization operations (2 variants)
     Sink {
@@ -81,21 +77,21 @@ pub enum Op {
     /// enabling structural deduplication of identical computations on different buffers.
     /// Matches Tinygrad's Ops.PARAM (engine/schedule.py:125).
     Param {
-        slot: usize,
-        size: usize,
-        device: Option<Arc<UOp>>,
+        shape: Arc<UOp>,
+        arg: ParamArg,
     },
     Buffer {
-        unique: Arc<UOp>,
-        device: Arc<UOp>,
-        size: usize,
+        shape: Arc<UOp>,
+        arg: ParamArg,
     },
-    BufferView {
+    /// Contiguous typed slice of a buffer. The offset is in source elements.
+    /// Concrete allocation aliasing is owned by `svod_device::Buffer`.
+    Slice {
         buffer: Arc<UOp>,
+        offset: Arc<UOp>,
         size: usize,
-        offset: usize,
     },
-    Bufferize {
+    Stage {
         compute: Arc<UOp>,
         ranges: SmallVec<[Arc<UOp>; 4]>,
         opts: BufferizeOpts,
@@ -103,15 +99,14 @@ pub enum Op {
     Index {
         buffer: Arc<UOp>,
         indices: SmallVec<[Arc<UOp>; 4]>,
-        gate: Option<Arc<UOp>>,
     },
-    PointerIndex {
-        ptr: Arc<UOp>,
-        offset: Arc<UOp>,
+    GetAddr {
+        src: Arc<UOp>,
+        device: DeviceSpec,
     },
     Copy {
         src: Arc<UOp>,
-        device: Arc<UOp>,
+        device: DeviceSpec,
     },
     MStack {
         buffers: SmallVec<[Arc<UOp>; 4]>,
@@ -137,8 +132,8 @@ pub enum Op {
     },
     Shrink {
         src: Arc<UOp>,
-        begins: Arc<UOp>,
-        ends: Arc<UOp>,
+        offsets: Arc<UOp>,
+        sizes: Arc<UOp>,
     },
     Flip {
         src: Arc<UOp>,
@@ -159,10 +154,11 @@ pub enum Op {
         src: Arc<UOp>,
         ranges: SmallVec<[Arc<UOp>; 4]>,
         reduce_op: ReduceOp,
+        num_axes: usize,
     },
     AllReduce {
         src: Arc<UOp>,
-        device: Arc<UOp>,
+        device: DeviceSpec,
         reduce_op: ReduceOp,
     },
 
@@ -189,27 +185,12 @@ pub enum Op {
         deps: SmallVec<[Arc<UOp>; 4]>,
     },
 
-    // Vector operations (5 variants)
-    Vectorize {
-        elements: SmallVec<[Arc<UOp>; 4]>,
-    },
-    Gep {
-        vector: Arc<UOp>,
-        indices: Vec<usize>,
+    // Shaped values and late vector operations
+    Stack {
+        sources: SmallVec<[Arc<UOp>; 4]>,
     },
     VConst {
         values: Vec<ConstValue>,
-    },
-    /// Concatenate vectors into larger vector (expander op).
-    /// Like VECTORIZE but sources can be vectors themselves.
-    /// Output vcount = sum of all input vcounts.
-    Cat {
-        sources: SmallVec<[Arc<UOp>; 4]>,
-    },
-    /// Concatenate pointers into vectorized pointer (expander op).
-    /// Used for grouping memory accesses in devectorizer.
-    PtrCat {
-        sources: SmallVec<[Arc<UOp>; 4]>,
     },
 
     // Symbolic/Define operations (3 variants)
@@ -222,12 +203,6 @@ pub enum Op {
         var: Arc<UOp>,
         value: Arc<UOp>,
     },
-    DefineReg {
-        size: usize,
-        /// Unique accumulator ID for disambiguation.
-        /// Without this, two same-dtype reduces would share one DefineReg via hash consing.
-        id: usize,
-    },
 
     // Advanced operations (11 variants)
     Wmma {
@@ -235,14 +210,6 @@ pub enum Op {
         b: Arc<UOp>,
         c: Arc<UOp>,
         metadata: WmmaMetadata,
-    },
-    Contract {
-        src: Arc<UOp>,
-        upcast_ranges: Vec<(usize, usize)>,
-    },
-    Unroll {
-        src: Arc<UOp>,
-        unroll_axes: Vec<(usize, usize)>,
     },
     Call {
         body: Arc<UOp>,
@@ -268,7 +235,7 @@ pub enum Op {
     },
     Program {
         sink: Arc<UOp>,
-        device: Arc<UOp>,
+        info: ProgramInfo,
         linear: Option<Arc<UOp>>,
         source: Option<Arc<UOp>>,
         binary: Option<Arc<UOp>>,
@@ -278,9 +245,11 @@ pub enum Op {
     },
     Source {
         code: String,
+        identity: Option<SourceStageIdentity>,
     },
     ProgramBinary {
         bytes: Vec<u8>,
+        identity: Option<BinaryStageIdentity>,
     },
     Detach {
         src: Arc<UOp>,
@@ -314,23 +283,24 @@ pub enum Op {
     },
 
     // Memory operations (low-level, after kernel splitting, 2 variants)
-    // Gate is on INDEX, not LOAD/STORE (following Tinygrad's model)
     /// Load from buffer at index.
     ///
-    /// - `buffer`: The buffer to load from
-    /// - `index`: The INDEX operation specifying where to load (may be gated)
-    /// - `alt`: Optional alternative value for gated loads (used when gate is false)
-    ///
-    /// When `alt` is Some, the load behaves as: `if gate { load(index) } else { alt }`.
-    /// This is used for masked loads in image processing and padding scenarios.
+    /// Gated loads carry both `alt` and `gate`; ungated loads carry neither.
     Load {
-        buffer: Arc<UOp>,
         index: Arc<UOp>,
         alt: Option<Arc<UOp>>,
+        gate: Option<Arc<UOp>>,
     },
     Store {
         index: Arc<UOp>,
         value: Arc<UOp>,
+        gate: Option<Arc<UOp>>,
+    },
+    /// Target instruction selected by an ISA renderer. Kept at the enum tail so
+    /// adding ISA support does not perturb existing operation discriminants.
+    Ins {
+        sources: SmallVec<[Arc<UOp>; 4]>,
+        arg: InsArg,
     },
 }
 
@@ -345,19 +315,13 @@ impl Op {
             Self::Const(_)
             | Self::Unique(_)
             | Self::LUnique(_)
-            | Self::Device(_)
             | Self::Noop
-            | Self::Invalid
-            | Self::DefineLocal(_)
             | Self::VConst { .. }
             | Self::DefineVar { .. }
-            | Self::DefineReg { .. }
             | Self::Source { .. }
             | Self::ProgramBinary { .. } => SmallVec::new(),
 
-            // Param has optional device child — pre-kernel PARAMs have device, codegen PARAMs don't
-            Self::Param { device: Some(d), .. } => SmallVec::from_slice(&[d]),
-            Self::Param { device: None, .. } => SmallVec::new(),
+            Self::Param { shape, .. } => SmallVec::from_slice(&[shape]),
 
             // Graph organization operations
             Self::Sink { sources, .. } | Self::Group { sources } => sources.iter().collect(),
@@ -375,21 +339,20 @@ impl Op {
             Self::Special { end, .. } => SmallVec::from_slice(&[end]),
 
             // Buffer operations
-            Self::Buffer { unique, device, .. } => SmallVec::from_slice(&[unique, device]),
-            Self::BufferView { buffer, .. } => SmallVec::from_slice(&[buffer]),
-            Self::Bufferize { compute, ranges, .. } => {
+            Self::Buffer { shape, .. } => SmallVec::from_slice(&[shape]),
+            Self::Slice { buffer, offset, .. } => SmallVec::from_slice(&[buffer, offset]),
+            Self::Stage { compute, ranges, .. } => {
                 let mut children = SmallVec::from_slice(&[compute]);
                 children.extend(ranges.iter());
                 children
             }
-            Self::Index { buffer, indices, gate } => {
+            Self::Index { buffer, indices } => {
                 let mut children = SmallVec::from_slice(&[buffer]);
                 children.extend(indices.iter());
-                children.extend(gate);
                 children
             }
-            Self::PointerIndex { ptr, offset } => SmallVec::from_slice(&[ptr, offset]),
-            Self::Copy { src, device } => SmallVec::from_slice(&[src, device]),
+            Self::GetAddr { src, .. } => SmallVec::from_slice(&[src]),
+            Self::Copy { src, .. } => SmallVec::from_slice(&[src]),
             Self::MStack { buffers } => buffers.iter().collect(),
 
             // Movement operations
@@ -399,7 +362,7 @@ impl Op {
             }
             Self::Expand { src, new_shape } => SmallVec::from_slice(&[src, new_shape]),
             Self::Pad { src, begin_pads, end_pads } => SmallVec::from_slice(&[src, begin_pads, end_pads]),
-            Self::Shrink { src, begins, ends } => SmallVec::from_slice(&[src, begins, ends]),
+            Self::Shrink { src, offsets, sizes } => SmallVec::from_slice(&[src, offsets, sizes]),
 
             // Reduction operations
             Self::ReduceAxis { src, .. } => SmallVec::from_slice(&[src]),
@@ -408,7 +371,7 @@ impl Op {
                 children.extend(ranges.iter());
                 children
             }
-            Self::AllReduce { src, device, .. } => SmallVec::from_slice(&[src, device]),
+            Self::AllReduce { src, .. } => SmallVec::from_slice(&[src]),
 
             // Control flow operations
             Self::If { condition, body } => {
@@ -433,19 +396,15 @@ impl Op {
                 children
             }
 
-            // Vector operations
-            Self::Vectorize { elements } => elements.iter().collect(),
-            Self::Gep { vector, .. } => SmallVec::from_slice(&[vector]),
-            Self::Cat { sources } | Self::PtrCat { sources } => sources.iter().collect(),
+            // Shaped value and late vector operations
+            Self::Stack { sources } => sources.iter().collect(),
 
             // Symbolic/Define operations
             Self::Bind { var, value } => SmallVec::from_slice(&[var, value]),
 
             // Advanced operations
             Self::Wmma { a, b, c, .. } => SmallVec::from_slice(&[a, b, c]),
-            Self::Contract { src, .. }
-            | Self::Unroll { src, .. }
-            | Self::Detach { src }
+            Self::Detach { src }
             | Self::Contiguous { src, .. }
             | Self::ContiguousBackward { src }
             | Self::Precast { src } => SmallVec::from_slice(&[src]),
@@ -456,14 +415,15 @@ impl Op {
             }
             Self::Tuple { src } => src.iter().collect(),
             Self::GetTuple { src, .. } => SmallVec::from_slice(&[src]),
-            Self::Program { sink, device, linear, source, binary } => {
-                let mut children = SmallVec::from_slice(&[sink, device]);
+            Self::Program { sink, linear, source, binary, .. } => {
+                let mut children = SmallVec::from_slice(&[sink]);
                 children.extend(linear.iter());
                 children.extend(source.iter());
                 children.extend(binary.iter());
                 children
             }
             Self::Linear { ops } => ops.iter().collect(),
+            Self::Ins { sources, .. } => sources.iter().collect(),
             Self::After { passthrough, deps } => {
                 let mut children = SmallVec::from_slice(&[passthrough]);
                 children.extend(deps.iter());
@@ -473,12 +433,17 @@ impl Op {
             Self::CustomFunction { attrs, .. } => attrs.iter().collect(),
 
             // Memory operations
-            Self::Load { buffer, index, alt } => {
-                let mut children = SmallVec::from_slice(&[buffer, index]);
+            Self::Load { index, alt, gate } => {
+                let mut children = SmallVec::from_slice(&[index]);
                 children.extend(alt);
+                children.extend(gate);
                 children
             }
-            Self::Store { index, value } => SmallVec::from_slice(&[index, value]),
+            Self::Store { index, value, gate } => {
+                let mut children = SmallVec::from_slice(&[index, value]);
+                children.extend(gate);
+                children
+            }
         }
     }
 
@@ -529,7 +494,7 @@ impl Op {
     /// Returns `Some(index)` if this operation ends ranges, `None` otherwise.
     ///
     /// Operations that end ranges:
-    /// - BUFFERIZE: ranges start at index 1 (compute is 0, ranges are 1+)
+    /// - STAGE: ranges start at index 1 (compute is 0, ranges are 1+)
     /// - REDUCE: ranges start at index 1 (src is 0, ranges are 1+)
     /// - STORE: ranges start at index 2 (index=0, value=1, ranges=2+)
     /// - WMMA: ranges start at index 3 (a=0, b=1, c=2)
@@ -545,9 +510,9 @@ impl Op {
     /// ```ignore
     /// use svod_ir::Op;
     ///
-    /// // BUFFERIZE ends ranges starting at source index 1
-    /// let bufferize_op = Op::Bufferize { /* ... */ };
-    /// assert_eq!(bufferize_op.range_ending_src_index(), Some(1));
+    /// // STAGE ends ranges starting at source index 1
+    /// let stage_op = Op::Stage { /* ... */ };
+    /// assert_eq!(stage_op.range_ending_src_index(), Some(1));
     ///
     /// // Regular arithmetic operations don't end ranges
     /// let binary_op = Op::Binary(/* ... */);
@@ -555,13 +520,13 @@ impl Op {
     /// ```
     pub fn range_ending_src_index(&self) -> Option<usize> {
         // Source layout for range-ending ops:
-        // - BUFFERIZE: compute=0, ranges=1+
+        // - STAGE: compute=0, ranges=1+
         // - REDUCE: src=0, ranges=1+
         // - WMMA: a=0, b=1, c=2, (ranges start at 3)
         // - END: computation=0, ranges=1+
         // - CALL/FUNCTION: body=0, args=1+
         match self {
-            Self::Bufferize { .. } => Some(1),
+            Self::Stage { .. } => Some(1),
             Self::Reduce { .. } => Some(1),
             Self::Wmma { .. } => Some(3),
             Self::End { .. } => Some(1),
@@ -570,19 +535,18 @@ impl Op {
         }
     }
 
-    /// Check if this operation should be expanded when it has UNROLL inputs.
+    /// Check if this operation participates in shaped range expansion.
     ///
-    /// Based on Tinygrad's expander.py:97-98 pattern which expands:
+    /// The expander handles:
     /// - ALU ops (Unary, Binary, Ternary)
     /// - Type ops (Cast, BitCast)
-    /// - Vector ops (Gep, Vectorize)
+    /// - Shaped values (Stack, Index)
     /// - Tensor core ops (Wmma)
     /// - Memory ops (Load, Store, Index)
-    /// - Buffer ops (Bufferize)
+    /// - Buffer ops (Stage)
     /// - Control flow (Reduce, End, After)
     ///
-    /// These operations propagate vectorization through the computation graph
-    /// when any of their sources is an UNROLL operation.
+    /// These operations propagate expanded lanes through the computation graph.
     pub fn is_expandable(&self) -> bool {
         matches!(
             self,
@@ -590,15 +554,14 @@ impl Op {
             Self::Unary(..) | Self::Binary(..) | Self::Ternary(..) |
             // Type operations
             Self::Cast { .. } | Self::BitCast { .. } |
-            // Vector operations
-            Self::Gep { .. } | Self::Vectorize { .. } |
+            Self::Stack { .. } |
             // Tensor core
             Self::Wmma { .. } |
             // Memory operations
             Self::Load { .. } | Self::Store { .. } |
-            Self::Index { .. } | Self::PointerIndex { .. } |
+            Self::Index { .. } |
             // Buffer operations
-            Self::Bufferize { .. } |
+            Self::Stage { .. } |
             // Control flow (range-ending ops)
             Self::Reduce { .. } | Self::End { .. } | Self::After { .. }
         )
@@ -642,9 +605,9 @@ impl Op {
                 result.extend(dep.op().ended_ranges());
             }
             result
-        } else if matches!(self, Self::Copy { .. } | Self::BufferView { .. }) {
+        } else if matches!(self, Self::Copy { .. } | Self::Slice { .. }) {
             // Tinygrad (ops.py:314): return self.src[0].ranges
-            // COPY/BUFFER_VIEW ends all ranges from the source.
+            // COPY/SLICE ends all ranges from the source.
             // We return the source itself (not individual ranges) — the
             // InScopeRangesProperty handles the non-RANGE branch by looking
             // up the ended node's in_scope_ranges and removing them all.
@@ -653,5 +616,67 @@ impl Op {
         } else {
             SmallVec::new()
         }
+    }
+}
+
+/// Number of `u64` words needed to hold one bit per [`pattern_derived::OpKey`].
+const OP_MASK_WORDS: usize = pattern_derived::OP_KEY_COUNT.div_ceil(64);
+
+/// Set of operation kinds, one bit per [`pattern_derived::OpKey`].
+///
+/// Backs the pattern matcher's early reject: every UOp caches the mask of its direct
+/// children's op kinds ([`UOp::src_ops`]), and every compiled pattern entry carries the
+/// mask of op kinds its fixed-position sources demand. An entry whose mask is not a
+/// subset of the node's mask cannot match, so its closure is never called.
+///
+/// Tinygrad equivalent: `UPat.early_reject` / `UOp._src_ops` (uop/ops.py:1352, 1480).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct OpMask([u64; OP_MASK_WORDS]);
+
+impl OpMask {
+    /// Mask with no op kinds set — never rejects.
+    pub const EMPTY: Self = Self([0; OP_MASK_WORDS]);
+
+    /// Mask holding exactly `key`.
+    #[inline]
+    pub const fn of_key(key: &pattern_derived::OpKey) -> Self {
+        let index = key.index();
+        let mut words = [0; OP_MASK_WORDS];
+        words[index / 64] = 1 << (index % 64);
+        Self(words)
+    }
+
+    /// Mask holding exactly the kind of `op`.
+    #[inline]
+    pub fn of_op(op: &Op) -> Self {
+        Self::of_key(&pattern_derived::OpKey::from_op(op))
+    }
+
+    /// Union of two masks.
+    #[inline]
+    pub fn union(self, other: Self) -> Self {
+        let mut words = self.0;
+        for (word, other) in words.iter_mut().zip(other.0) {
+            *word |= other;
+        }
+        Self(words)
+    }
+
+    /// Whether every kind in `self` is also in `other` (Tinygrad: `issubset`).
+    #[inline]
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.0.iter().zip(other.0).all(|(mine, theirs)| mine & !theirs == 0)
+    }
+
+    /// Whether no kind is set.
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.0.iter().all(|word| *word == 0)
+    }
+}
+
+impl FromIterator<pattern_derived::OpKey> for OpMask {
+    fn from_iter<I: IntoIterator<Item = pattern_derived::OpKey>>(keys: I) -> Self {
+        keys.into_iter().fold(Self::EMPTY, |mask, key| mask.union(Self::of_key(&key)))
     }
 }

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use svod_device::Buffer;
 use svod_ir::UOp;
+use test_case::test_case;
 
 fn make_buffer(numel: usize) -> Buffer {
     let alloc = svod_device::registry::cpu().expect("cpu allocator");
@@ -43,8 +44,13 @@ fn make_nonsink_item(id: u64, buffer: Buffer) -> ScheduleItem {
     }
 }
 
-fn make_store_item(buffer_uop: &Arc<UOp>, buffer: Buffer, index: Arc<UOp>) -> ScheduleItem {
-    let ast = UOp::sink(vec![index.store(UOp::native_const(1.0f32))]);
+fn make_store_item(buffer_uop: &Arc<UOp>, buffer: Buffer, index: Arc<UOp>, gate: Option<Arc<UOp>>) -> ScheduleItem {
+    let value = UOp::native_const(1.0f32);
+    let store = match gate {
+        Some(gate) => index.store_gated(value, gate),
+        None => index.store(value),
+    };
+    let ast = UOp::sink(vec![store]);
     ScheduleItem {
         kernel: ast.clone(),
         ast,
@@ -95,6 +101,21 @@ fn test_parse_mode_default_is_arena() {
     // Env unset (`NO_MEMORY_PLANNER=0`) → arena planner runs.
     assert_eq!(parse_mode(None), PlannerMode::Arena);
     assert_eq!(parse_mode(Some("")), PlannerMode::Arena);
+}
+
+#[test]
+fn test_prepare_config_planner_mode_follows_env() {
+    // `default()` and `From<OptimizerConfig>` hardcoded Arena, so the
+    // `SVOD_MEMORY_PLANNER` escape hatch only worked on `from_env()`.
+    let expected = parse_mode(std::env::var("SVOD_MEMORY_PLANNER").ok().as_deref());
+    for (name, config) in [
+        ("default", crate::PrepareConfig::default()),
+        ("from_env", crate::PrepareConfig::from_env()),
+        ("for_cpu_backend", crate::PrepareConfig::for_cpu_backend(crate::CpuBackend::Clang)),
+        ("from_optimizer", crate::PrepareConfig::from(svod_schedule::OptimizerConfig::default())),
+    ] {
+        assert_eq!(config.planner_mode, expected, "{name}");
+    }
 }
 
 #[test]
@@ -304,7 +325,7 @@ fn test_memory_planner_reuses_unmasked_store_outputs() {
     let target = UOp::new_buffer(DeviceSpec::Cpu, 256, DType::Float32);
     let index = UOp::index().buffer(target.clone()).indices(vec![UOp::index_const(0)]).call().unwrap();
 
-    let mut schedule = vec![make_store_item(&target, b0.clone(), index), make_sink_item(61, b1)];
+    let mut schedule = vec![make_store_item(&target, b0.clone(), index, None), make_sink_item(61, b1)];
     chain_deps(&mut schedule);
     let result = plan(&schedule, &HashSet::new(), PlannerMode::Remap);
 
@@ -314,47 +335,24 @@ fn test_memory_planner_reuses_unmasked_store_outputs() {
     assert_eq!(replacement.id(), b0.id());
 }
 
-#[test]
-fn test_memory_planner_skips_masked_store_outputs() {
-    // b1 is at a later level and would reuse b0 — but the masked store output
-    // b0 is non-plannable, so no reuse happens.
+#[test_case(false; "bare_index")]
+#[test_case(true; "index_behind_a_cast")]
+fn test_memory_planner_skips_gated_store_outputs(wrap_index: bool) {
+    // b1 is at a later level and would reuse b0 — but a gated store writes only
+    // part of b0, so arena mode must not pack a later tenant over it.
     let b0 = make_buffer(256);
     let b1 = make_buffer(256);
     let target = UOp::new_buffer(DeviceSpec::Cpu, 256, DType::Float32);
-    let index = UOp::index()
-        .buffer(target.clone())
-        .indices(vec![UOp::index_const(0)])
-        .gate(UOp::native_const(true))
-        .call()
-        .unwrap();
+    let index = UOp::index().buffer(target.clone()).indices(vec![UOp::index_const(0)]).call().unwrap();
+    let index = if wrap_index { index.cast(DType::Index) } else { index };
 
-    let mut schedule = vec![make_store_item(&target, b0, index), make_sink_item(62, b1)];
+    let mut schedule = vec![make_store_item(&target, b0, index, Some(UOp::native_const(true))), make_sink_item(62, b1)];
     chain_deps(&mut schedule);
     let result = plan(&schedule, &HashSet::new(), PlannerMode::Remap);
 
     assert_eq!(result.buffers_reused, 0);
     assert!(result.buffer_replace.is_empty());
-}
-
-#[test]
-fn test_memory_planner_skips_wrapped_masked_store_outputs() {
-    let b0 = make_buffer(256);
-    let b1 = make_buffer(256);
-    let target = UOp::new_buffer(DeviceSpec::Cpu, 256, DType::Float32);
-    let index = UOp::index()
-        .buffer(target.clone())
-        .indices(vec![UOp::index_const(0)])
-        .gate(UOp::native_const(true))
-        .call()
-        .unwrap()
-        .cast(DType::Index);
-
-    let mut schedule = vec![make_store_item(&target, b0, index), make_sink_item(63, b1)];
-    chain_deps(&mut schedule);
-    let result = plan(&schedule, &HashSet::new(), PlannerMode::Remap);
-
-    assert_eq!(result.buffers_reused, 0);
-    assert!(result.buffer_replace.is_empty());
+    assert_eq!(result.metrics.exclusions[&PlannerExclusionReason::GatedStore].allocations, 1);
 }
 
 #[test]
@@ -543,18 +541,91 @@ fn test_arena_storage_sharers_have_disjoint_levels() {
 }
 
 #[test]
-fn test_arena_reports_memory_savings() {
-    // Two same-size buffers at distinct levels share one arena slot → savings.
-    let b0 = make_buffer(256);
-    let b1 = make_buffer(256);
-
-    let mut schedule = vec![make_sink_item(90, b0), make_sink_item(91, b1)];
+fn test_planner_metrics_report_padding_commitment_and_reuse() {
+    // Each logical buffer is 400 bytes and rounds to 512; the two live at
+    // distinct levels, so both planners reuse one allocation for both.
+    let mut schedule = vec![make_sink_item(100, make_buffer(100)), make_sink_item(101, make_buffer(100))];
     chain_deps(&mut schedule);
-    let result = plan(&schedule, &HashSet::new(), PlannerMode::Arena);
 
+    // Arena commits one rounded 512-byte block for 800 logical / 1024 rounded bytes.
+    let arena = plan(&schedule, &HashSet::new(), PlannerMode::Arena);
+    assert!(arena.memory_saved > 0, "packing two cross-level buffers must report savings");
+    let arena = arena.metrics;
+    assert_eq!((arena.logical_allocations, arena.logical_bytes, arena.rounded_bytes), (2, 800, 1024));
+    assert_eq!((arena.padding_bytes, arena.logical_peak_bytes), (224, 400));
+    assert_eq!((arena.arena_committed_bytes, arena.physical_bytes, arena.fragmentation_bytes), (512, 512, 112));
+    assert_eq!((arena.reused_allocations, arena.reused_bytes), (1, 288));
+
+    // Remap hands back the un-rounded buffer, so physical == one logical allocation.
+    let remap = plan(&schedule, &HashSet::new(), PlannerMode::Remap).metrics;
+    assert_eq!((remap.logical_bytes, remap.rounded_bytes, remap.physical_bytes), (800, 1024, 400));
+    assert_eq!((remap.reused_allocations, remap.reused_bytes), (1, 400));
+}
+
+#[test]
+fn test_disabled_mode_measures_baseline_and_exclusion_reasons() {
+    let eligible = make_buffer(64);
+    let output = make_buffer(32);
+    let transfer_owned = make_buffer(16);
+    let mut schedule = vec![
+        make_sink_item(110, eligible),
+        make_sink_item(111, output.clone()),
+        make_nonsink_item(112, transfer_owned),
+    ];
+    chain_deps(&mut schedule);
+    let result = plan(&schedule, &HashSet::from([output.id().0]), PlannerMode::Disabled);
+
+    assert_eq!(result.metrics.mode, PlannerMode::Disabled);
+    assert_eq!(result.metrics.logical_allocations, 1);
+    assert_eq!(result.metrics.logical_bytes, 256);
+    assert_eq!(result.metrics.physical_bytes, 256);
+    assert_eq!(result.metrics.reused_allocations, 0);
+    assert_eq!(result.metrics.exclusions[&PlannerExclusionReason::Output].allocations, 1);
+    assert_eq!(result.metrics.exclusions[&PlannerExclusionReason::Output].bytes, 128);
+    assert_eq!(result.metrics.exclusions[&PlannerExclusionReason::NonSinkOperation].allocations, 1);
+    assert_eq!(result.metrics.exclusions[&PlannerExclusionReason::NonSinkOperation].bytes, 64);
+}
+
+#[test]
+fn test_fork_join_same_level_buffers_never_alias_overlapping_arena_bytes() {
+    let mut schedule: Vec<_> = (0..4).map(|i| make_sink_item(120 + i, make_buffer(256))).collect();
+    let root = schedule[0].kernel.id;
+    let (left, right) = (schedule[1].kernel.id, schedule[2].kernel.id);
+    schedule[1].dependencies = vec![root];
+    schedule[2].dependencies = vec![root];
+    schedule[3].dependencies = vec![left, right];
+    assert_eq!(compute_item_levels(&schedule).unwrap(), [0, 1, 1, 2]);
+
+    let result = plan(&schedule, &HashSet::new(), PlannerMode::Arena);
+    let left = &result.buffer_replace[&BufferKey { kernel_idx: 1, buffer_idx: 0 }];
+    let right = &result.buffer_replace[&BufferKey { kernel_idx: 2, buffer_idx: 0 }];
+    assert_eq!(left.storage_id(), right.storage_id());
     assert!(
-        result.memory_saved > 0,
-        "arena packing of two cross-level same-size buffers must report savings, got {} bytes",
-        result.memory_saved
+        left.offset() + left.size() <= right.offset() || right.offset() + right.size() <= left.offset(),
+        "same-level fork allocations overlap: left=[{},{}), right=[{},{})",
+        left.offset(),
+        left.offset() + left.size(),
+        right.offset(),
+        right.offset() + right.size(),
     );
+    assert_eq!(result.metrics.logical_peak_bytes, left.size() + right.size());
+}
+
+#[test]
+fn test_real_numeric_result_matches_with_planner_disabled_and_arena() {
+    fn run(mode: PlannerMode) -> Vec<f32> {
+        let a = crate::Tensor::from_slice([1.0f32, -2.0, 3.5, 4.0]);
+        let b = crate::Tensor::from_slice([0.5f32, 3.0, -1.5, 2.0]);
+        let first = &a + &b;
+        let second = &first * &a;
+        let mut output = &second + &b;
+        let config = crate::PrepareConfig { planner_mode: mode, disable_schedule_cache: true, ..Default::default() };
+        output.realize_with(&config).expect("realize numeric planner differential");
+        output.as_vec::<f32>().expect("numeric output")
+    }
+
+    let disabled = run(PlannerMode::Disabled);
+    let arena = run(PlannerMode::Arena);
+    assert_eq!(arena, disabled);
+    assert_eq!(arena, [2.0, 1.0, 5.5, 26.0]);
 }

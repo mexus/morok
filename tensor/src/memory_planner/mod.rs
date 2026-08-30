@@ -28,7 +28,7 @@
 
 mod tlsf;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use snafu::ResultExt;
@@ -50,7 +50,7 @@ const MIN_BLOCK_SIZE: usize = 256;
 ///   share an underlying allocation.
 /// - `Arena` packs all plannable buffers into one per-device arena using a TLSF
 ///   allocator and rewrites each logical buffer as a `Buffer::view` into it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlannerMode {
     /// Skip the planner entirely. Each `Buffer` keeps its original allocation
     /// and is freed by lazy `Drop`. Useful for memory-debugging baselines.
@@ -62,6 +62,7 @@ pub enum PlannerMode {
     /// Arena packing: pack every plannable buffer into a per-device arena using
     /// a TLSF allocator and rewrite each logical buffer as a fresh
     /// `Buffer::view` into it.
+    #[default]
     Arena,
 }
 
@@ -89,7 +90,7 @@ pub fn mode_from_env() -> PlannerMode {
     parse_mode(std::env::var("SVOD_MEMORY_PLANNER").ok().as_deref())
 }
 
-type LogicalBufferView = (usize, usize, DType, Vec<usize>);
+type LogicalBufferAlias = (usize, usize, DType, Vec<usize>);
 
 /// Round up to the nearest multiple of block_size.
 #[inline]
@@ -156,6 +157,7 @@ struct PlannerInput {
     liveness: HashMap<u64, BufferLiveness>,
     /// Logical schedule slots that are eligible for replacement.
     occurrences: Vec<(BufferKey, u64)>,
+    metrics: MemoryPlannerMetrics,
 }
 
 /// Key to identify a buffer within a schedule.
@@ -180,6 +182,59 @@ pub struct MemoryPlannerResult {
     pub memory_saved: usize,
     /// Number of buffers that were reused.
     pub buffers_reused: usize,
+    /// Detailed demand, exclusion, and physical-allocation measurements.
+    pub metrics: MemoryPlannerMetrics,
+}
+
+/// Why a logical allocation was conservatively excluded from reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlannerExclusionReason {
+    Disk,
+    ViewOrOffset,
+    AlreadyAllocated,
+    Output,
+    AliasedStorage,
+    NonSinkOperation,
+    GatedStore,
+}
+
+/// Unique allocation count and logical bytes excluded for one reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlannerExclusionStats {
+    pub allocations: usize,
+    pub bytes: usize,
+}
+
+/// Measurements for one planner invocation. Byte counts are exact logical
+/// buffer sizes unless explicitly named `rounded` or `committed`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryPlannerMetrics {
+    /// Policy used for this measurement.
+    pub mode: PlannerMode,
+    /// Unique allocations eligible for planning after exclusions.
+    pub logical_allocations: usize,
+    /// Exact bytes requested by eligible logical allocations over the plan.
+    pub logical_bytes: usize,
+    /// Eligible bytes after applying the planner's 256-byte request rounding.
+    pub rounded_bytes: usize,
+    /// Maximum exact eligible bytes live in any execution level.
+    pub logical_peak_bytes: usize,
+    /// Bytes committed to per-device arenas; zero outside arena mode.
+    pub arena_committed_bytes: usize,
+    /// Physical bytes representing eligible allocations after planning.
+    pub physical_bytes: usize,
+    /// Cumulative request rounding overhead across logical allocations.
+    pub padding_bytes: usize,
+    /// Arena commitment above peak exact live demand, including alignment
+    /// holes and independently resident per-device arenas.
+    pub fragmentation_bytes: usize,
+    /// Logical allocations consolidated into an already-counted physical
+    /// allocation (a pooled buffer or per-device arena).
+    pub reused_allocations: usize,
+    /// Exact logical bytes avoided relative to separate eligible allocations.
+    pub reused_bytes: usize,
+    /// Unique excluded allocation counts and exact bytes by first reason.
+    pub exclusions: BTreeMap<PlannerExclusionReason, PlannerExclusionStats>,
 }
 
 // ============================================================================
@@ -192,13 +247,26 @@ pub struct MemoryPlannerResult {
 /// - Already allocated buffers (inputs)
 /// - Output buffers
 /// - Transfer operations
-fn collect_noopt_buffer_ids(schedule: &Schedule) -> HashSet<u64> {
+///
+/// Buffer ids excluded from reuse, grouped by the reason that first applies.
+#[derive(Default)]
+struct ExcludedBufferIds {
+    aliased: HashSet<u64>,
+    non_sink: HashSet<u64>,
+    /// Written by a gated STORE: only part of the buffer is written, so arena
+    /// mode must not pack a later tenant over the untouched bytes. Tinygrad's
+    /// TLSF planner (`engine/memory.py:17,70`) has no equivalent because it
+    /// never packs a new tenant over a live one.
+    gated_store: HashSet<u64>,
+}
+
+fn collect_excluded_buffer_ids(schedule: &Schedule) -> ExcludedBufferIds {
     // Alias detection groups views/buffers that share the same underlying
     // storage. Keying by `Buffer::id()` would miss views (since each view
     // mints a fresh handle id); keying by `storage_id()` correctly groups
     // every view of one allocation under one bucket.
-    let mut by_storage: HashMap<u64, HashSet<LogicalBufferView>> = HashMap::new();
-    let mut masked_store_ids = HashSet::new();
+    let mut by_storage: HashMap<u64, HashSet<LogicalBufferAlias>> = HashMap::new();
+    let mut gated_store = HashSet::new();
     for item in schedule {
         for buffer in &item.buffers {
             by_storage.entry(buffer.storage_id().0).or_default().insert((
@@ -209,13 +277,11 @@ fn collect_noopt_buffer_ids(schedule: &Schedule) -> HashSet<u64> {
             ));
         }
 
-        let uop_id_to_buffer_id: HashMap<u64, u64> =
+        let by_uop_id: HashMap<u64, u64> =
             item.buffer_uop_ids.iter().copied().zip(item.buffers.iter().map(|b| b.id().0)).collect();
         for node in item.ast.toposort() {
-            let Op::Store { index, .. } = node.op() else {
-                continue;
-            };
-            collect_masked_store_buffer_ids(index, &uop_id_to_buffer_id, &mut masked_store_ids);
+            let Op::Store { index, gate: Some(_), .. } = node.op() else { continue };
+            gated_store.extend(indexed_buffer(index).and_then(|uop| by_uop_id.get(&uop.buf_uop().id)).copied());
         }
     }
 
@@ -231,43 +297,46 @@ fn collect_noopt_buffer_ids(schedule: &Schedule) -> HashSet<u64> {
             .collect::<Vec<_>>()
     });
 
-    schedule
+    let non_sink = schedule
         .iter()
         .filter(|item| !matches!(item.ast.op(), Op::Sink { .. }))
         .flat_map(|item| item.buffers.iter().map(|b| b.id().0))
-        .chain(aliased_ids)
-        .chain(masked_store_ids)
-        .collect()
+        .collect();
+    ExcludedBufferIds { aliased: aliased_ids.collect(), non_sink, gated_store }
 }
 
-fn collect_masked_store_buffer_ids(
-    index: &Arc<UOp>,
-    uop_id_to_buffer_id: &HashMap<u64, u64>,
-    masked_store_ids: &mut HashSet<u64>,
-) {
+/// The buffer an INDEX addresses, looking through the casts and arithmetic a
+/// lowered store index can carry.
+fn indexed_buffer(index: &Arc<UOp>) -> Option<&Arc<UOp>> {
     match index.op() {
-        Op::Index { buffer, gate: Some(_), .. } => {
-            if let Some(buffer_id) = uop_id_to_buffer_id.get(&buffer.buf_uop().id) {
-                masked_store_ids.insert(*buffer_id);
-            }
-        }
-        Op::Index { .. } => {}
-        other => {
-            for child in other.children() {
-                collect_masked_store_buffer_ids(child, uop_id_to_buffer_id, masked_store_ids);
-            }
-        }
+        Op::Index { buffer, .. } => Some(buffer),
+        other => other.children().into_iter().find_map(indexed_buffer),
     }
 }
 
-fn should_skip_buffer(buffer: &Buffer, output_buffer_ids: &HashSet<u64>, noopt_buffer_ids: &HashSet<u64>) -> bool {
-    // Phase 1 planner only remaps full logical buffers. View/offset buffers require
-    // an alias-preserving remap pass (planned for arena phase).
-    buffer.allocator().device_spec().is_disk()
-        || buffer.offset() != 0
-        || buffer.is_allocated()
-        || output_buffer_ids.contains(&buffer.id().0)
-        || noopt_buffer_ids.contains(&buffer.id().0)
+fn exclusion_reason(
+    buffer: &Buffer,
+    output_buffer_ids: &HashSet<u64>,
+    excluded: &ExcludedBufferIds,
+) -> Option<PlannerExclusionReason> {
+    let id = buffer.id().0;
+    if buffer.allocator().device_spec().is_disk() {
+        Some(PlannerExclusionReason::Disk)
+    } else if buffer.offset() != 0 {
+        Some(PlannerExclusionReason::ViewOrOffset)
+    } else if buffer.is_allocated() {
+        Some(PlannerExclusionReason::AlreadyAllocated)
+    } else if output_buffer_ids.contains(&id) {
+        Some(PlannerExclusionReason::Output)
+    } else if excluded.aliased.contains(&id) {
+        Some(PlannerExclusionReason::AliasedStorage)
+    } else if excluded.non_sink.contains(&id) {
+        Some(PlannerExclusionReason::NonSinkOperation)
+    } else if excluded.gated_store.contains(&id) {
+        Some(PlannerExclusionReason::GatedStore)
+    } else {
+        None
+    }
 }
 
 /// Compute a per-schedule-item execution level via the SHARED leveling routine
@@ -280,7 +349,7 @@ fn should_skip_buffer(buffer: &Buffer, output_buffer_ids: &HashSet<u64>, noopt_b
 /// Sharing one implementation guarantees these levels equal the runtime's
 /// per-op levels (so level-interval reuse decisions match real execution
 /// order), provided op emission stays 1:1 with schedule items — enforced by the
-/// BufferView guard + the `op_count` assert in `prepare_execution_plan`.
+/// the `op_count` assert in `prepare_execution_plan`.
 pub fn compute_item_levels(schedule: &Schedule) -> crate::Result<Vec<usize>> {
     let node_ids: Vec<u64> = schedule.iter().map(|it| it.kernel.id).collect();
     let callable_deps: Vec<Vec<u64>> = schedule.iter().map(|it| it.dependencies.clone()).collect();
@@ -317,10 +386,17 @@ pub fn compute_item_levels(schedule: &Schedule) -> crate::Result<Vec<usize>> {
 /// already PARAM-rewritten (Buffer→codegen `PARAM`, no handle id), so a check
 /// re-deriving "buffers the AST touches" would duplicate `collect_callable_buffers`
 /// and risk false positives. The invariant is enforced upstream at CALL build.
-fn analyze_liveness(schedule: &Schedule, item_levels: &[usize], output_buffer_ids: &HashSet<u64>) -> PlannerInput {
-    let noopt_buffer_ids = collect_noopt_buffer_ids(schedule);
+fn analyze_liveness(
+    schedule: &Schedule,
+    item_levels: &[usize],
+    output_buffer_ids: &HashSet<u64>,
+    mode: PlannerMode,
+) -> PlannerInput {
+    let excluded = collect_excluded_buffer_ids(schedule);
     let mut liveness: HashMap<u64, BufferLiveness> = HashMap::new();
     let mut occurrences: Vec<(BufferKey, u64)> = Vec::new();
+    let mut metrics = MemoryPlannerMetrics { mode, ..Default::default() };
+    let mut classified = HashSet::new();
 
     for (step_idx, item) in schedule.iter().enumerate() {
         let level = item_levels[step_idx];
@@ -328,7 +404,12 @@ fn analyze_liveness(schedule: &Schedule, item_levels: &[usize], output_buffer_id
             let key = BufferKey { kernel_idx: step_idx, buffer_idx: buf_idx };
             let buf_id = buffer.id().0;
 
-            if should_skip_buffer(buffer, output_buffer_ids, &noopt_buffer_ids) {
+            if let Some(reason) = exclusion_reason(buffer, output_buffer_ids, &excluded) {
+                if classified.insert(buf_id) {
+                    let excluded = metrics.exclusions.entry(reason).or_default();
+                    excluded.allocations += 1;
+                    excluded.bytes += buffer.size();
+                }
                 trace!(step_idx, buf_idx, buffer_id = buf_id, "skipping buffer in memory planner");
                 continue;
             }
@@ -356,9 +437,27 @@ fn analyze_liveness(schedule: &Schedule, item_levels: &[usize], output_buffer_id
         }
     }
 
+    metrics.logical_allocations = liveness.len();
+    metrics.logical_bytes = liveness.values().map(|info| info.prototype.size()).sum();
+    metrics.rounded_bytes = liveness.values().map(|info| info.pool_key.size).sum();
+    metrics.padding_bytes = metrics.rounded_bytes.saturating_sub(metrics.logical_bytes);
+    let max_level = liveness.values().map(|info| info.last_level).max();
+    metrics.logical_peak_bytes = max_level.map_or(0, |max_level| {
+        (0..=max_level)
+            .map(|level| {
+                liveness
+                    .values()
+                    .filter(|info| info.first_level <= level && level <= info.last_level)
+                    .map(|info| info.prototype.size())
+                    .sum()
+            })
+            .max()
+            .unwrap_or(0)
+    });
+
     debug!(num_optimizable = liveness.len(), "liveness analysis complete");
 
-    PlannerInput { liveness, occurrences }
+    PlannerInput { liveness, occurrences, metrics }
 }
 
 // ============================================================================
@@ -406,7 +505,7 @@ fn process_events(
     events: &[BufferEvent],
     liveness: &HashMap<u64, BufferLiveness>,
     occurrences: &[(BufferKey, u64)],
-) -> (HashMap<BufferKey, Buffer>, usize, usize) {
+) -> (HashMap<BufferKey, Buffer>, usize, usize, usize) {
     let mut free_pools: HashMap<BufferPoolKey, Vec<Buffer>> = HashMap::new();
     let mut memory_saved: usize = 0;
     let mut buffers_reused: usize = 0;
@@ -457,7 +556,10 @@ fn process_events(
         }
     }
 
-    (buffer_replace, memory_saved, buffers_reused)
+    let mut physical_ids = HashSet::new();
+    let physical_bytes =
+        chosen_by_id.values().filter(|buffer| physical_ids.insert(buffer.id().0)).map(Buffer::size).sum();
+    (buffer_replace, memory_saved, buffers_reused, physical_bytes)
 }
 
 // ============================================================================
@@ -484,12 +586,14 @@ fn memory_plan_arena(
     item_levels: &[usize],
     output_buffer_ids: &HashSet<u64>,
 ) -> MemoryPlannerResult {
-    let empty_result = || MemoryPlannerResult { buffer_replace: HashMap::new(), memory_saved: 0, buffers_reused: 0 };
-
-    let planner_input = analyze_liveness(schedule, item_levels, output_buffer_ids);
+    let planner_input = analyze_liveness(schedule, item_levels, output_buffer_ids, PlannerMode::Arena);
+    let empty_result = |mut metrics: MemoryPlannerMetrics| {
+        metrics.physical_bytes = metrics.logical_bytes;
+        MemoryPlannerResult { buffer_replace: HashMap::new(), memory_saved: 0, buffers_reused: 0, metrics }
+    };
     let liveness = planner_input.liveness;
     if liveness.is_empty() {
-        return empty_result();
+        return empty_result(planner_input.metrics);
     }
 
     let lane_key = |id: u64| -> LaneKey { liveness[&id].prototype.allocator().device_spec() };
@@ -519,7 +623,7 @@ fn memory_plan_arena(
                 Ok(o) => o,
                 Err(e) => {
                     tracing::warn!(?e, "arena planner: TLSF alloc failed; skipping arena rewrite");
-                    return empty_result();
+                    return empty_result(planner_input.metrics);
                 }
             };
             offsets.insert(event.buffer_id, off);
@@ -533,7 +637,7 @@ fn memory_plan_arena(
             && let Err(e) = alloc.free(off)
         {
             tracing::warn!(?e, "arena planner: TLSF free failed; skipping arena rewrite");
-            return empty_result();
+            return empty_result(planner_input.metrics);
         }
     }
 
@@ -578,7 +682,7 @@ fn memory_plan_arena(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(?e, "arena planner: view failed; aborting arena rewrite");
-                return empty_result();
+                return empty_result(planner_input.metrics);
             }
         };
         buffer_replace.insert(*key, view);
@@ -587,6 +691,12 @@ fn memory_plan_arena(
 
     let arena_total: usize = peaks.values().map(|&p| round_up(p, MIN_BLOCK_SIZE)).sum();
     let memory_saved = total_bytes.saturating_sub(arena_total);
+    let mut metrics = planner_input.metrics;
+    metrics.arena_committed_bytes = arena_total;
+    metrics.physical_bytes = arena_total;
+    metrics.fragmentation_bytes = arena_total.saturating_sub(metrics.logical_peak_bytes);
+    metrics.reused_allocations = metrics.logical_allocations.saturating_sub(arenas.len());
+    metrics.reused_bytes = metrics.logical_bytes.saturating_sub(arena_total);
 
     debug!(
         buffers_planned = liveness.len(),
@@ -596,7 +706,7 @@ fn memory_plan_arena(
         "arena memory planner complete"
     );
 
-    MemoryPlannerResult { buffer_replace, memory_saved, buffers_reused }
+    MemoryPlannerResult { buffer_replace, memory_saved, buffers_reused, metrics }
 }
 
 // ============================================================================
@@ -629,14 +739,13 @@ pub fn memory_planner(
     output_buffer_ids: &HashSet<u64>,
     mode: PlannerMode,
 ) -> MemoryPlannerResult {
-    let empty_result = || MemoryPlannerResult { buffer_replace: HashMap::new(), memory_saved: 0, buffers_reused: 0 };
-
-    if matches!(mode, PlannerMode::Disabled) {
-        return empty_result();
-    }
-
     if schedule.is_empty() {
-        return empty_result();
+        return MemoryPlannerResult {
+            buffer_replace: HashMap::new(),
+            memory_saved: 0,
+            buffers_reused: 0,
+            metrics: MemoryPlannerMetrics { mode, ..Default::default() },
+        };
     }
 
     if matches!(mode, PlannerMode::Arena) {
@@ -644,19 +753,34 @@ pub fn memory_planner(
     }
 
     // Phase 1: Liveness analysis
-    let planner_input = analyze_liveness(schedule, item_levels, output_buffer_ids);
+    let planner_input = analyze_liveness(schedule, item_levels, output_buffer_ids, mode);
+    if matches!(mode, PlannerMode::Disabled) {
+        let mut metrics = planner_input.metrics;
+        metrics.physical_bytes = metrics.logical_bytes;
+        return MemoryPlannerResult { buffer_replace: HashMap::new(), memory_saved: 0, buffers_reused: 0, metrics };
+    }
     let liveness = planner_input.liveness;
 
     if liveness.is_empty() {
         debug!("no optimizable buffers found");
-        return empty_result();
+        return MemoryPlannerResult {
+            buffer_replace: HashMap::new(),
+            memory_saved: 0,
+            buffers_reused: 0,
+            metrics: planner_input.metrics,
+        };
     }
 
     // Phase 2: Build event timeline
     let events = build_event_timeline(&liveness);
 
     // Phase 3: Process events and compute replacements
-    let (buffer_replace, memory_saved, buffers_reused) = process_events(&events, &liveness, &planner_input.occurrences);
+    let (buffer_replace, memory_saved, buffers_reused, physical_bytes) =
+        process_events(&events, &liveness, &planner_input.occurrences);
+    let mut metrics = planner_input.metrics;
+    metrics.physical_bytes = physical_bytes;
+    metrics.reused_allocations = buffers_reused;
+    metrics.reused_bytes = metrics.logical_bytes.saturating_sub(metrics.physical_bytes);
 
     debug!(
         buffers_analyzed = liveness.len(),
@@ -665,7 +789,7 @@ pub fn memory_planner(
         "memory planner complete"
     );
 
-    MemoryPlannerResult { buffer_replace, memory_saved, buffers_reused }
+    MemoryPlannerResult { buffer_replace, memory_saved, buffers_reused, metrics }
 }
 
 /// Apply buffer replacements to the schedule.

@@ -3,7 +3,7 @@
 //! Implements: UPCAST (SIMD), LOCAL (shared memory), GROUP (two-stage reduction),
 //! UNROLL (loop unrolling), SWAP (axis reordering), NOLOCALS (disable local mem).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use smallvec::SmallVec;
@@ -101,7 +101,7 @@ fn resolve_full_axis(rng: &Arc<UOp>, amount: usize, op_name: &'static str) -> Re
 
 /// Split dimension into smaller range + UPCAST for vector operations.
 ///
-/// UPCAST is for output dimension vectorization (GLOBAL/LOCAL/LOOP).
+/// UPCAST is for output dimension vectorization (GLOBAL/LOCAL/WEAK).
 /// For reduce axis unrolling, use UNROLL instead.
 fn apply_upcast(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
     let axis_type = match rng.op() {
@@ -109,10 +109,10 @@ fn apply_upcast(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
-    // UPCAST applies to GLOBAL/LOCAL/LOOP axes only — REDUCE/GROUP_REDUCE
+    // UPCAST applies to GLOBAL/LOCAL/WEAK axes only — REDUCE/GROUP_REDUCE
     // should use UNROLL.
-    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
-        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Global/Local/Loop axes" }.fail();
+    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Weak) {
+        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Global/Local/Weak axes" }.fail();
     }
 
     if amount > scheduler.ren.upcast_max {
@@ -141,8 +141,8 @@ fn apply_local(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resul
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
-    if !matches!(axis_type, AxisType::Global | AxisType::Loop) {
-        return ValidationFailedSnafu { op: "LOCAL", reason: "can only localize Global/Loop axes" }.fail();
+    if !matches!(axis_type, AxisType::Global | AxisType::Weak) {
+        return ValidationFailedSnafu { op: "LOCAL", reason: "can only localize Global/Weak axes" }.fail();
     }
 
     scheduler.shift_to(rng, amount, AxisType::Local, false, None)?;
@@ -255,11 +255,9 @@ fn apply_unroll(scheduler: &mut Scheduler, axis: usize, amount: usize) -> Result
 ///
 /// Tinygrad's `OptOps.SWAP` (`codegen/opt/postrange.py`) tags the two replacement
 /// ranges (`tag=1`), runs the fixed-point `substitute`, then strips the tags with
-/// `graph_rewrite(remove_all_tags)`. That cannot be ported verbatim: Svod's
-/// hash-consing keys a parent on its children's *tag-blind* `content_hash`
-/// (`hash_consing::src_hashes`), so rebuilding a parent with the untagged child
-/// collides with the original tagged-child parent and `remove_all_tags` is a no-op
-/// above the tagged node — the tag never survives reconstruction.
+/// `graph_rewrite(remove_all_tags)`. Svod instead applies the swap directly;
+/// parent hash-consing keys include ordered child IDs, so tagged and untagged
+/// child variants remain distinct during reconstruction.
 ///
 /// Instead we apply the swap as a single-pass [`substitute_walk`]. The map is the
 /// simultaneous `{rng -> range(end1, axis_id2), altrng -> range(end2, axis_id1)}`;
@@ -277,11 +275,11 @@ fn apply_swap(scheduler: &mut Scheduler, axis: usize, other_axis: usize) -> Resu
         rngs.get(other_axis).ok_or_else(|| AxisOutOfBoundsSnafu { axis: other_axis, max: rngs.len() }.build())?.clone();
 
     let (end1, axis_id1, axis_type1) = match rng.op() {
-        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), *axis_id, *axis_type),
+        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), axis_id.clone(), *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
     let (end2, axis_id2, axis_type2) = match altrng.op() {
-        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), *axis_id, *axis_type),
+        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), axis_id.clone(), *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
@@ -292,7 +290,6 @@ fn apply_swap(scheduler: &mut Scheduler, axis: usize, other_axis: usize) -> Resu
     let new_rng = UOp::range_axis(end1, axis_id2, axis_type1);
     let new_altrng = UOp::range_axis(end2, axis_id1, axis_type2);
 
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(rng), new_rng);
     subst_map.insert(UOpKey(altrng), new_altrng);
@@ -340,19 +337,25 @@ fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
 ///
 /// - Only pad constant-sized axes
 /// - Cannot pad UPCAST/UNROLL/THREAD axes (already vectorized/expanded)
-/// - For REDUCE axes: only with ADD reduction and no unsafe ops before reduce
-/// - Don't add more than 4x work (padding 1→5 rejected)
+/// - Padding must add strictly less than 4x work
+///
+/// There is deliberately **no** reduce-op guard. Tinygrad used to require
+/// `reduce_op == ADD` with no `GroupOp.UnsafePad` op in the reduce's backward
+/// slice; tinygrad 5f1e2d390 ("PADTO pads Invalids", #16562) deleted both that
+/// check and `GroupOp.UnsafePad`, because the padded lanes now index through
+/// `WHERE(valid, INDEX, Invalid)` instead of reading real memory. `postrange.py`
+/// at the pinned reference checks only the three constraints above, and its
+/// `test_padto_max` / `test_padto_sum` assert MAX reduces and `exp`/`lt` above a
+/// reduce pad correctly. This port matches that shape.
 ///
 /// # Algorithm
 ///
 /// 1. Round up range size to alignment
 /// 2. Create validity condition: idx < old_size
-/// 3. Add validity gate to all INDEX ops using this range
+/// 3. Add WHERE-Invalid validity to all INDEX ops using this range
 fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Result<(), OptError> {
-    use svod_ir::ReduceOp;
-
     let (end, axis_id, axis_type) = match rng.op() {
-        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), *axis_id, *axis_type),
+        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), axis_id.clone(), *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
@@ -373,34 +376,9 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
     // Calculate new padded size
     let new_sz = old_sz.div_ceil(alignment) * alignment;
 
-    // No-op if already aligned
-    if new_sz == old_sz {
-        return Ok(());
-    }
-
-    // Constraint 4: don't add more than 4x work. Exactly 4x is admitted.
-    if old_sz * 4 < new_sz {
+    // Match Tinygrad: padding must add strictly less than 4x work.
+    if old_sz <= new_sz / 4 {
         return ValidationFailedSnafu { op: "PADTO", reason: "padding would add more than 4x work" }.fail();
-    }
-
-    // Constraint 3: for REDUCE axes, only with ADD and no unsafe ops
-    if matches!(axis_type, AxisType::Reduce | AxisType::GroupReduce)
-        && let Some(reduce_op) = scheduler.reduceop()
-    {
-        // Check reduce operation is ADD
-        if let Op::Reduce { reduce_op: op, .. } = reduce_op.op()
-            && *op != ReduceOp::Add
-        {
-            return ValidationFailedSnafu { op: "PADTO", reason: "can only pad ADD reductions (not MAX/MUL)" }.fail();
-        }
-        // Check for unsafe operations before reduce
-        if has_unsafe_ops_before_reduce(&reduce_op) {
-            return ValidationFailedSnafu {
-                op: "PADTO",
-                reason: "cannot pad with unsafe ops (EXP, LOG, DIV, comparisons) before reduce",
-            }
-            .fail();
-        }
     }
 
     // Create new padded range
@@ -414,60 +392,60 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
         .map_err(|_| ValidationFailedSnafu { op: "PADTO", reason: "failed to create validity condition" }.build())?;
 
     // Build substitution map
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(rng.clone()), new_rng.clone());
 
-    // Update INDEX operations that use this range - add validity gate.
+    let store_targets: HashSet<UOpKey> = scheduler
+        .ast()
+        .backward_slice()
+        .into_iter()
+        .filter_map(|node| match node.op() {
+            Op::Store { index, .. } => Some(UOpKey(index.clone())),
+            _ => None,
+        })
+        .collect();
+
+    // Update INDEX operations that use this range, keeping validity as
+    // WHERE(cond, index, Invalid).
     // The replacement INDEX must use the new padded range in its indices
     // (not the original range), since substitute replaces the INDEX node
     // directly without recursing into its children.
-    #[allow(clippy::mutable_key_type)]
     let range_subst: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(rng.clone()), new_rng.clone())].into_iter().collect();
 
     for buf_op in scheduler.bufs() {
         if buf_uses_range(buf_op, &rng)
-            && let Op::Index { buffer, indices, gate } = buf_op.op()
+            && let Op::Index { buffer, indices } = buf_op.op()
         {
+            if indices.len() != 1 {
+                return ValidationFailedSnafu {
+                    op: "PADTO",
+                    reason: "multi-index INDEX is unsupported; Tinygrad PADTO requires one index source",
+                }
+                .fail();
+            }
+
             // Substitute old range → new range in index expressions
             let new_indices: SmallVec<[Arc<UOp>; 4]> = indices.iter().map(|idx| idx.substitute(&range_subst)).collect();
 
-            // Encode validity gate using WHERE(cond, idx, Invalid) in the index source
-            // instead of the INDEX gate field. This prevents the expander from
-            // vectorizing the gate independently.
-            let new_index = if let Some(first_idx) = new_indices.first() {
-                // Extract any existing WHERE-encoded validity from the index
-                let existing_valid = first_idx.get_valid();
-                let real_idx = first_idx.get_idx();
-
-                // Combine PADTO validity with existing validity and gate field
-                let mut combined = valid.clone();
-                if let Some(existing_gate) = gate {
-                    combined = combined.try_and_op(existing_gate).map_err(|_| {
-                        ValidationFailedSnafu { op: "PADTO", reason: "failed to combine gates" }.build()
-                    })?;
-                }
-                if !matches!(existing_valid.op(), Op::Const(cv) if cv.0 == ConstValue::Bool(true)) {
-                    combined = combined.try_and_op(&existing_valid).map_err(|_| {
-                        ValidationFailedSnafu { op: "PADTO", reason: "failed to combine validity" }.build()
-                    })?;
-                }
-
-                // Encode combined validity in the index source
-                let encoded_idx = real_idx.valid(combined);
-                let mut remaining_indices = new_indices.clone();
-                remaining_indices[0] = encoded_idx;
-
-                UOp::index().buffer(buffer.clone()).indices(remaining_indices).call().map_err(|_| {
-                    ValidationFailedSnafu { op: "PADTO", reason: "failed to create gated INDEX" }.build()
-                })?
+            let first_idx = new_indices
+                .first()
+                .cloned()
+                .ok_or_else(|| ValidationFailedSnafu { op: "PADTO", reason: "INDEX has no index source" }.build())?;
+            let combined = valid
+                .try_and_op(&first_idx.get_valid())
+                .map_err(|_| ValidationFailedSnafu { op: "PADTO", reason: "failed to combine validity" }.build())?;
+            let mut valid_indices = new_indices;
+            valid_indices[0] = first_idx.get_idx().valid(combined);
+            let new_index =
+                UOp::index().buffer(buffer.clone()).indices(valid_indices).call().map_err(|_| {
+                    ValidationFailedSnafu { op: "PADTO", reason: "failed to create valid INDEX" }.build()
+                })?;
+            let replacement = if store_targets.contains(&UOpKey(buf_op.clone())) {
+                new_index
             } else {
-                // No indices (bare buffer reference) — use gate field as fallback
-                UOp::index().buffer(buffer.clone()).indices(new_indices).gate(valid.clone()).call().map_err(|_| {
-                    ValidationFailedSnafu { op: "PADTO", reason: "failed to create gated INDEX" }.build()
-                })?
+                new_index.valid(valid.clone())
             };
-            subst_map.insert(UOpKey(buf_op.clone()), new_index);
+            subst_map.insert(UOpKey(buf_op.clone()), replacement);
         }
     }
 
@@ -481,35 +459,12 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
 /// Check if a buffer INDEX operation uses a specific range.
 fn buf_uses_range(buf_op: &Arc<UOp>, rng: &Arc<UOp>) -> bool {
     if let Op::Index { indices, .. } = buf_op.op() {
-        // Check if the range appears in the indices dependency graph
         for idx in indices {
-            for node in idx.toposort() {
+            for node in idx.get_idx().toposort() {
                 if Arc::ptr_eq(&node, rng) {
                     return true;
                 }
             }
-        }
-    }
-    false
-}
-
-/// Check for unsafe operations before reduce that prevent PADTO.
-///
-/// Cannot pad reduce axes if these appear before reduction:
-/// - RECIPROCAL, LOG2, EXP2, IDIV, POW (non-linear ops where padding zeros changes result)
-/// - Comparisons (LT, etc.) that could mask valid data
-fn has_unsafe_ops_before_reduce(reduce_op: &Arc<UOp>) -> bool {
-    use svod_ir::types::{BinaryOp, UnaryOp};
-
-    for node in reduce_op.toposort() {
-        match node.op() {
-            // Unsafe unary ops
-            Op::Unary(UnaryOp::Reciprocal | UnaryOp::Log2 | UnaryOp::Exp2, _) => return true,
-            // Unsafe binary ops
-            Op::Binary(BinaryOp::Idiv | BinaryOp::Pow, _, _) => return true,
-            // Comparisons before sum are unsafe (padding zeros would add false comparisons)
-            Op::Binary(BinaryOp::Lt, _, _) => return true,
-            _ => {}
         }
     }
     false
@@ -562,8 +517,8 @@ fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
 
     // THREAD only applies to globalizable ranges (LOOP). GLOBAL kept for the
     // GPU dispatch model.
-    if !matches!(axis_type, AxisType::Global | AxisType::Loop) {
-        return ValidationFailedSnafu { op: "THREAD", reason: "can only thread Global/Loop axes" }.fail();
+    if !matches!(axis_type, AxisType::Global | AxisType::Weak) {
+        return ValidationFailedSnafu { op: "THREAD", reason: "can only thread Global/Weak axes" }.fail();
     }
 
     // Only ranges globalizable across all outputs can be threaded safely.

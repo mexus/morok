@@ -341,7 +341,7 @@ Program {
 
 把内核送过 `codegen/src/program_pipeline.rs` 强制的 `SINK → LINEAR →
 SOURCE → PROGRAM_BINARY` 阶段（`do_linearize`/`do_render`/`do_compile`/
-`get_program`），每一阶段填入下一字段。C/LLVM/MLIR 渲染器期望 `Op::Linear`
+`get_program`），每一阶段填入下一字段。C/LLVM 渲染器期望 `Op::Linear`
 作为输入，并通过上下文的 `pending_error` 报告 `Error::InvalidGraph`，不
 再用 panic；多索引 `INDEX` 必须先经 `pm_linearize_multi_index` 降级。
 
@@ -356,7 +356,7 @@ Linear { ops: SmallVec<[Arc<UOp>; 8]> }
 ### SOURCE / PROGRAM_BINARY — 编译产物
 
 ```rust
-Source { code: String }              // 渲染后的源码（C / LLVM-IR / MLIR）
+Source { code: String }              // 渲染后的源码（C / LLVM-IR）
 ProgramBinary { bytes: Vec<u8> }     // 编译产物
 ```
 
@@ -732,7 +732,7 @@ flowchart TD
 | 操作 | 用途 |
 |------|------|
 | `Copy` | 显式复制值 |
-| `BufferView` | `{ buffer, size, offset }` —— 现有 buffer 在某偏移处的切片 |
+| `Slice` | `{ buffer, offset, size }` —— buffer 上连续的类型化切片元数据 |
 | `MStack` | 内存栈分配 |
 | `MSelect` | 内存选择（条件内存访问） |
 | `Multi` | 多输出操作 |
@@ -754,7 +754,7 @@ flowchart TD
 |------|------|
 | **循环控制** | `RANGE`, `END` |
 | **规约** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **内存** | `BUFFER`, `BUFFER_VIEW`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
+| **内存** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE` |
 | **内核与可调用** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
 | **向量** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
 | **展开** | `UNROLL`, `CONTRACT` |

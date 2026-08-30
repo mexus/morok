@@ -1,3 +1,6 @@
+//! `transform_sources_with_bufferize` / `transform_single_source`: how a
+//! consumer's ranges are pushed into each of its sources.
+
 use svod_dtype::DType;
 use svod_ir::{AxisId, AxisType, Op, UOp};
 
@@ -60,9 +63,9 @@ fn test_transform_realizable_source() {
     // Transform
     let new_src = transform_single_source(&consumer, &x, std::slice::from_ref(&range), &mut ctx);
 
-    // Should be INDEX(BUFFERIZE(x))
+    // Should be INDEX(STAGE(x))
     if let Op::Index { buffer, .. } = new_src.op() {
-        assert!(matches!(buffer.op(), Op::Bufferize { .. }));
+        assert!(matches!(buffer.op(), Op::Stage { .. }));
     } else {
         panic!("Expected INDEX operation");
     }
@@ -90,14 +93,14 @@ fn test_transform_movement_chain_on_buffer() {
     let buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
 
     // RESHAPE(BUFFER) to 3x4 shape
-    let reshape_shape = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
+    let reshape_shape = UOp::stack(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshape = UOp::new(Op::Reshape { src: buffer.clone(), new_shape: reshape_shape }, DType::Float32);
 
     assert!(reshape.op().is_movement(), "RESHAPE should be identified as movement op");
 
     // Create an ADD that uses the reshaped buffer
     let buffer2 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
-    let reshape_shape2 = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
+    let reshape_shape2 = UOp::stack(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshape2 = UOp::new(Op::Reshape { src: buffer2.clone(), new_shape: reshape_shape2 }, DType::Float32);
     let add = reshape.try_add(&reshape2).unwrap();
 
@@ -111,28 +114,4 @@ fn test_transform_movement_chain_on_buffer() {
     // Movement ops are NOT handled here — deferred to BPM rewrite engine
     let new_sources = transform_sources_with_bufferize(&add, &mut ctx);
     assert!(new_sources.is_none(), "Movement ops should be left for BPM rewrite engine");
-}
-
-#[test]
-fn test_rangeify_with_symbolic_simplification() {
-    // This test verifies that symbolic simplification is integrated into rangeify.
-    // We create a computation with a PERMUTE operation that will create index expressions,
-    // and ensure the full pipeline (including symbolic simplification) runs successfully.
-
-    // Create a simple PERMUTE operation: swap axes (use Buffer for pre-kernel pipeline)
-    let src = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 6, DType::Float32);
-    let reshaped = src.try_reshape(&smallvec::smallvec![svod_ir::SInt::Const(2), svod_ir::SInt::Const(3)]).unwrap();
-    let permute = reshaped.try_permute(vec![1, 0]).unwrap();
-
-    // Run full rangeify pipeline (includes symbolic simplification in Step 8)
-    let (result, _ctx) = crate::rangeify::rangeify(permute).unwrap();
-
-    // Verify the pipeline completed successfully without panicking.
-    // This is primarily a smoke test to ensure symbolic simplification
-    // is integrated and doesn't break the rangeify pipeline.
-    // We don't make strong assertions about the result structure since
-    // rangeify behavior depends on the complexity of the input graph.
-
-    // At minimum, verify we got a result back
-    assert!(result.dtype() == DType::Float32);
 }

@@ -46,7 +46,6 @@ pub struct CFGContext {
     ///
     /// The predecessor is the operation that must complete before
     /// this RANGE can begin execution.
-    #[allow(clippy::mutable_key_type)]
     pub edges: HashMap<UOpKey, Arc<UOp>>,
 }
 
@@ -72,12 +71,10 @@ impl CFGContext {
         // Step 1: Build dependency sets for each node
         // RANGE and END add themselves to deps
         // deps[u] = set of RANGE/END UOps that u transitively depends on
-        #[allow(clippy::mutable_key_type)]
         let mut deps: HashMap<UOpKey, HashMap<UOpKey, ()>> = HashMap::new();
 
         for node in &nodes {
             // Get deps from sources
-            #[allow(clippy::mutable_key_type)]
             let mut node_deps: HashMap<UOpKey, ()> = HashMap::new();
             node.op().map_child(|src| {
                 if let Some(src_deps) = deps.get(&UOpKey(src.clone())) {
@@ -99,14 +96,18 @@ impl CFGContext {
         //   - u depends on x (x is in deps[u])
         //   - u is SINK, OR u's RANGE (u.src[1]) is in deps[x]
         //   - x hasn't been assigned a nesting parent yet
-        #[allow(clippy::mutable_key_type)]
         let mut nesting: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
         for node in &nodes {
             if matches!(node.op(), Op::End { .. } | Op::Sink { .. })
                 && let Some(node_deps) = deps.get(&UOpKey(node.clone()))
             {
-                for dep_key in node_deps.keys() {
+                // Python dicts preserve the original topological insertion order.
+                for dep_node in &nodes {
+                    let dep_key = UOpKey(dep_node.clone());
+                    if !node_deps.contains_key(&dep_key) {
+                        continue;
+                    }
                     // Only consider END nodes
                     if !matches!(dep_key.0.op(), Op::End { .. }) {
                         continue;
@@ -118,7 +119,7 @@ impl CFGContext {
                     }
 
                     // Skip if already assigned
-                    if nesting.contains_key(dep_key) {
+                    if nesting.contains_key(&dep_key) {
                         continue;
                     }
 
@@ -129,7 +130,7 @@ impl CFGContext {
                         // Check if node's RANGE is in dep's dependencies
                         // node.src[1] in Tinygrad is the RANGE - we get it from ranges
                         if let Some(range) = ranges.first() {
-                            deps.get(dep_key).is_some_and(|dep_deps| dep_deps.contains_key(&UOpKey(range.clone())))
+                            deps.get(&dep_key).is_some_and(|dep_deps| dep_deps.contains_key(&UOpKey(range.clone())))
                         } else {
                             false
                         }
@@ -138,17 +139,18 @@ impl CFGContext {
                     };
 
                     if is_nested {
-                        nesting.insert(dep_key.clone(), node.clone());
+                        nesting.insert(dep_key, node.clone());
                     }
                 }
             }
         }
 
         // Step 3: Group siblings by parent
-        #[allow(clippy::mutable_key_type)]
         let mut siblings: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
-        for (end_key, parent) in &nesting {
-            siblings.entry(UOpKey(parent.clone())).or_default().push(end_key.0.clone());
+        for node in &nodes {
+            if let Some(parent) = nesting.get(&UOpKey(node.clone())) {
+                siblings.entry(UOpKey(parent.clone())).or_default().push(node.clone());
+            }
         }
 
         // Step 4 & 5: Order siblings and create edges

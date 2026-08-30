@@ -125,8 +125,6 @@ pub struct WhisperTokenizer {
     bpe: CoreBPE,
     /// Special token strings → ids.
     special_tokens: HashMap<String, u32>,
-    /// Base vocabulary size (before special tokens).
-    n_vocab_base: usize,
     /// Whether this is a multilingual model.
     pub multilingual: bool,
     /// Number of languages supported.
@@ -169,7 +167,6 @@ impl WhisperTokenizer {
         Ok(Self {
             bpe,
             special_tokens,
-            n_vocab_base,
             multilingual,
             num_languages,
             language: language.map(|s| s.to_string()),
@@ -235,7 +232,7 @@ impl WhisperTokenizer {
         self.special_tokens["<|0.00|>"]
     }
 
-    /// SOT sequence: [sot, [language], [task]]
+    /// SOT sequence: `[sot, language, task]`.
     pub fn sot_sequence(&self) -> Vec<u32> {
         let mut seq = vec![self.sot()];
         if let Some(lang) = &self.language
@@ -323,54 +320,56 @@ impl WhisperTokenizer {
     /// Split tokens into words and their constituent token lists.
     /// Uses CoreBPE's `decode_bytes` for accurate per-token byte mapping.
     pub fn split_to_word_tokens(&self, tokens: &[u32]) -> (Vec<String>, Vec<Vec<u32>>) {
-        let ts_begin = self.timestamp_begin();
-        let eot = self.eot();
+        self.split_to_word_tokens_for_language(tokens, self.language.as_deref())
+    }
+
+    /// OpenAI-compatible word grouping for a resolved language. Languages
+    /// without reliable spaces split at valid Unicode boundaries instead.
+    pub fn split_to_word_tokens_for_language(
+        &self,
+        tokens: &[u32],
+        language: Option<&str>,
+    ) -> (Vec<String>, Vec<Vec<u32>>) {
+        let (subwords, subword_tokens) = self.split_tokens_on_unicode(tokens);
+        if matches!(language, Some("zh" | "ja" | "th" | "lo" | "my" | "yue")) {
+            return (subwords, subword_tokens);
+        }
 
         let mut words: Vec<String> = Vec::new();
         let mut word_tokens: Vec<Vec<u32>> = Vec::new();
-        let mut current_chars = String::new();
-        let mut current_tokens = Vec::new();
-
-        for &tok in tokens {
-            current_tokens.push(tok);
-
-            // Timestamp / EOT token: commit current word, push special as its own
-            if tok >= ts_begin || tok == eot {
-                if !current_chars.is_empty() {
-                    words.push(std::mem::take(&mut current_chars));
-                    word_tokens.push(current_tokens[..current_tokens.len() - 1].to_vec());
-                }
-                if tok < eot {
-                    words.push(format!("<|{:.2}|>", (tok - ts_begin) as f32 / super::config::TOKENS_PER_SECOND));
-                } else {
-                    words.push("<|endoftext|>".to_string());
-                }
-                word_tokens.push(vec![tok]);
-                current_tokens.clear();
-                continue;
-            }
-
-            // Decode this single token to check for word boundaries
-            if tok < self.n_vocab_base as u32
-                && let Ok(decoded) = self.bpe.decode(&[tok])
-            {
-                let starts_new = decoded.starts_with(' ') && !current_chars.is_empty();
-                if starts_new {
-                    words.push(std::mem::take(&mut current_chars));
-                    word_tokens.push(current_tokens[..current_tokens.len() - 1].to_vec());
-                    current_tokens.clear();
-                    current_tokens.push(tok);
-                    current_chars.push_str(&decoded[1..]);
-                } else {
-                    current_chars.push_str(&decoded);
-                }
+        for (subword, tokens) in subwords.into_iter().zip(subword_tokens) {
+            let special = tokens.first().is_some_and(|&token| token >= self.eot());
+            let follows_special =
+                word_tokens.last().and_then(|tokens| tokens.first()).is_some_and(|&token| token >= self.eot());
+            let punctuation =
+                !subword.trim().is_empty() && "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~".contains(subword.trim());
+            if words.is_empty() || special || follows_special || subword.starts_with(' ') || punctuation {
+                words.push(subword);
+                word_tokens.push(tokens);
+            } else {
+                words.last_mut().unwrap().push_str(&subword);
+                word_tokens.last_mut().unwrap().extend(tokens);
             }
         }
-        if !current_chars.is_empty() {
-            words.push(std::mem::take(&mut current_chars));
-            word_tokens.push(std::mem::take(&mut current_tokens));
-        }
+        (words, word_tokens)
+    }
 
+    fn split_tokens_on_unicode(&self, tokens: &[u32]) -> (Vec<String>, Vec<Vec<u32>>) {
+        let mut words = Vec::new();
+        let mut word_tokens = Vec::new();
+        let mut current = Vec::new();
+        for &token in tokens {
+            current.push(token);
+            if let Ok(decoded) = self.bpe.decode(&current) {
+                words.push(decoded);
+                word_tokens.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            let decoded = self.bpe.decode(&current).unwrap_or_default();
+            words.push(decoded);
+            word_tokens.push(current);
+        }
         (words, word_tokens)
     }
 

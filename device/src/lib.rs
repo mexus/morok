@@ -23,22 +23,30 @@
 //! // Allocation happens on first use
 //! buffer.ensure_allocated().unwrap();
 //! ```
+//!
+//! The pre-HCQ queue API is intentionally absent:
+//! ```compile_fail
+//! use svod_device::{DynQueue, HardwareQueue};
+//! ```
 
 pub mod allocator;
 pub mod amd;
 pub mod buffer;
 pub mod device;
 pub mod error;
+pub mod hcq;
+pub mod isa;
 pub mod profile;
-pub mod queue;
 pub mod registry;
 pub mod sync;
 
 pub use buffer::{Buffer, BufferId};
-pub use device::{Graph, GraphFactory, GraphKernel, PlanContext, Program};
+pub use device::{
+    CopyEndpoint, Graph, GraphFactory, GraphKernel, NativeReplayDecline, NativeReplayOutcome, PlanCall, PlanContext,
+    Program,
+};
 pub use error::{Error, Result};
 pub use profile::{CounterSet, KernelResources, PmcCounter};
-pub use queue::{DynQueue, ExecParams, HardwareQueue, QueueFactory};
 pub use sync::{CpuTimelineSignal, DispatchTimestamps, TimelineSignal};
 
 #[cfg(test)]

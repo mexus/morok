@@ -151,6 +151,40 @@ svod_tensor::codegen_tests! {
         assert_eq!(vals, vec![0, 1, 2, 3, 4]);
     }
 
+    fn test_mod_broadcasts_integer_operands(config) {
+        // fmod=1 on ints used to bypass Tensor broadcasting by calling the raw UOp.
+        let registry = OpRegistry::new();
+        let xs = [3i32, -7, 5, 9, 11, -4, 6, 8, 2, 13, -1, 10];
+        let ys = [2i32, 3, 4, 5];
+        for (fmod, y_shape) in [(1i64, vec![4isize]), (1, vec![1, 4]), (0, vec![4])] {
+            let x = Tensor::from_slice(xs).try_reshape([3isize, 4]).unwrap();
+            let y = Tensor::from_slice(ys).try_reshape(y_shape).unwrap();
+            let node = NodeProto { attribute: vec![make_attr_int("fmod", fmod)], ..Default::default() };
+
+            let mut result = registry.dispatch("Mod", "", &[x, y], &node).unwrap();
+            result.realize_with(&config).unwrap();
+            assert_eq!(
+                result.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect::<Vec<_>>(),
+                vec![3, 4]
+            );
+            let expected = xs
+                .iter()
+                .enumerate()
+                .map(|(i, x)| if fmod == 1 { x % ys[i % 4] } else { x.rem_euclid(ys[i % 4]) })
+                .collect::<Vec<_>>();
+            assert_eq!(result.as_vec::<i32>().unwrap(), expected, "fmod {fmod}");
+        }
+
+        // Rank-promoting broadcast: the result rank comes from the divisor.
+        let node = NodeProto { attribute: vec![make_attr_int("fmod", 1)], ..Default::default() };
+        let lhs = Tensor::from_slice(ys);
+        let rhs = Tensor::from_slice(xs).try_reshape([3isize, 4]).unwrap();
+        let mut result = registry.dispatch("Mod", "", &[lhs, rhs], &node).unwrap();
+        result.realize_with(&config).unwrap();
+        let expected = xs.iter().enumerate().map(|(i, x)| ys[i % 4] % x).collect::<Vec<_>>();
+        assert_eq!(result.as_vec::<i32>().unwrap(), expected);
+    }
+
     fn test_and(config) {
         let registry = OpRegistry::new();
         let a = Tensor::from_slice([true, true, false, false]);

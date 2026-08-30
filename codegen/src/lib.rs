@@ -34,8 +34,6 @@ pub mod c;
 pub mod common;
 pub mod error;
 pub mod llvm;
-#[cfg(feature = "mlir")]
-pub mod mlir;
 pub mod program_pipeline;
 pub mod traits;
 pub mod types;

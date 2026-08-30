@@ -1,4 +1,5 @@
 use super::*;
+use test_case::test_case;
 
 /// Build a Vec<Arc<UOp>> of concrete `index_const` dims for tests that only
 /// exercise the numeric grouping/splitting logic.
@@ -13,141 +14,168 @@ fn dmax(vs: &[Arc<UOp>]) -> Vec<usize> {
 }
 
 #[test]
-fn test_group_dims_already_fits() {
-    // Dims already fit, no grouping needed.
-    let result = group_dims(&d(&[4, 4]), &[16, 16, 16]);
-    assert_eq!(dmax(&result.unwrap()), vec![4, 4]);
+fn thread_extent_maps_to_exact_core_id_cardinality() {
+    let thread = UOp::range_axis(UOp::index_const(2), svod_ir::AxisId::Renumbered(0), AxisType::Thread);
+    let sink = UOp::sink(vec![thread.clone()]);
+
+    let lowered = add_gpudims(&Renderer::cpu(), &sink).expect("thread range should lower to core_id");
+    let core_id = lowered
+        .toposort()
+        .into_iter()
+        .find(|u| matches!(u.op(), Op::Param { arg, .. } if arg.name.as_deref() == Some("core_id")))
+        .expect("lowered graph should contain core_id");
+
+    assert_eq!(core_id.vmin(), &ConstValue::Int(0));
+    assert_eq!(core_id.vmax(), &ConstValue::Int(1));
+
+    let info = svod_ir::ProgramInfo::from_sink(&lowered, svod_dtype::DeviceSpec::Cpu);
+    assert_eq!(info.global_size[0].vmin(), &ConstValue::Int(2));
+    assert_eq!(info.global_size[0].vmax(), &ConstValue::Int(2));
+
+    // One core_id cannot stand in for two THREAD axes: decline, don't panic.
+    let second = UOp::range_axis(UOp::index_const(3), svod_ir::AxisId::Renumbered(1), AxisType::Thread);
+    assert!(add_gpudims(&Renderer::cpu(), &UOp::sink(vec![thread, second])).is_none());
 }
 
 #[test]
-fn test_group_dims_needs_grouping() {
-    // 4 dims need to be grouped to fit into 3 max_sizes:
-    // [4, 4, 4, 4] → [16, 4, 4].
-    let result = group_dims(&d(&[4, 4, 4, 4]), &[256, 256, 256]);
-    let result = result.unwrap();
-    assert!(result.len() <= 3);
-    assert_eq!(dmax(&result), vec![16, 4, 4]);
+fn existing_special_skips_all_gpudims_lowering() {
+    let global = UOp::range_axis(UOp::index_const(4), svod_ir::AxisId::Renumbered(0), AxisType::Global);
+    let special = UOp::special(UOp::index_const(8), "gidx0".to_string());
+    let sink = UOp::sink(vec![global, special]);
+
+    assert!(add_gpudims(&Renderer::amd_cdna3(), &sink).is_none());
+}
+
+/// Extents of the `gidx*` SPECIALs `add_gpudims` emits for the given axes,
+/// sorted so the assertion does not depend on toposort order.
+fn global_special_extents(renderer: &Renderer, global_extents: &[i64], local_extents: &[i64]) -> Vec<usize> {
+    let mut ranges = Vec::new();
+    for (extents, axis_type) in [(global_extents, AxisType::Global), (local_extents, AxisType::Local)] {
+        for &extent in extents {
+            let axis = svod_ir::AxisId::Renumbered(ranges.len());
+            ranges.push(UOp::range_axis(UOp::index_const(extent), axis, axis_type));
+        }
+    }
+    let lowered = add_gpudims(renderer, &UOp::sink(ranges)).expect("GPU ranges should lower");
+    let mut ends: Vec<usize> = lowered
+        .toposort()
+        .into_iter()
+        .filter_map(|uop| match uop.op() {
+            Op::Special { end, name } if name.starts_with("gidx") => Some(dim_max(end)),
+            _ => None,
+        })
+        .collect();
+    ends.sort_unstable();
+    ends
+}
+
+#[test_case(&[8], &[4, 1 << 28]; "one local axis divides the work item cap")]
+#[test_case(&[0], &[1 << 30]; "zero extent local axis does not divide by zero")]
+#[test_case(&[64, 64, 64, 4], &[32, 1 << 25]; "contracted locals still cap the grid")]
+fn global_product_cap_accounts_for_local_extent(local_extents: &[i64], expected: &[usize]) {
+    assert_eq!(global_special_extents(&Renderer::amd_cdna3(), &[1 << 30], local_extents), expected);
+}
+
+#[test_case(DType::Index, 4; "index dtype")]
+#[test_case(DType::Int32, 2; "int32 dtype")]
+fn device_range_becomes_device_num_and_its_end_drops_all_params(dtype: DType, extent: i64) {
+    let end = UOp::const_(dtype.clone(), ConstValue::Int(extent));
+    let device = UOp::range_axis_dtype(end, svod_ir::AxisId::Renumbered(0), AxisType::Device, dtype.clone());
+    let other = UOp::variable("other".to_string(), 0, 7, dtype.clone());
+    let computation = device.add(&UOp::const_(dtype.clone(), ConstValue::Int(1)));
+    let ended = computation.end(smallvec::smallvec![device, other]);
+    let lowered = crate::rewrite::graph_rewrite(&pm_lower_device_ranges(), ended, &mut ());
+
+    let Op::End { ranges, .. } = lowered.op() else { panic!("target keeps an empty END") };
+    assert!(ranges.is_empty(), "Tinygrad removes every PARAM when _device_num is present");
+    let device_num =
+        lowered.toposort().into_iter().find(is_device_num).expect("DEVICE range should become _device_num");
+    assert!(matches!(device_num.op(), Op::Param { arg, .. } if arg.name.as_deref() == Some("_device_num")));
+    assert_eq!(device_num.dtype(), dtype);
+    assert_eq!(device_num.vmin().try_int(), Some(0));
+    assert_eq!(device_num.vmax().try_int(), Some(extent - 1));
 }
 
 #[test]
-fn test_group_dims_no_change() {
-    // Dims already fit.
-    let result = group_dims(&d(&[8, 8, 8]), &[256, 256, 256]);
-    assert_eq!(dmax(&result.unwrap()), vec![8, 8, 8]);
+fn a_non_device_end_keeps_its_params() {
+    let other = UOp::variable("other".to_string(), 0, 7, DType::Index);
+    let ended = UOp::index_const(1).end(smallvec::smallvec![other.clone()]);
+    let lowered = crate::rewrite::graph_rewrite(&pm_add_gpudims(), ended.clone(), &mut Renderer::amd_cdna3());
+
+    assert!(Arc::ptr_eq(&lowered, &ended));
+}
+
+#[test_case(UOp::param(0, 16, DType::Float32, None); "bare global param")]
+#[test_case(UOp::param(0, 16, DType::Float32, None).after(smallvec::smallvec![UOp::noop()]); "param behind AFTER")]
+#[test_case(UOp::stack(smallvec::smallvec![
+    UOp::param(0, 16, DType::Float32, None),
+    UOp::param(1, 16, DType::Float32, None),
+]); "stack of global params")]
+fn missing_group_reduce_masks_a_structured_global_param_store(buffer: Arc<UOp>) {
+    let group = UOp::range_axis(UOp::index_const(4), svod_ir::AxisId::Renumbered(0), AxisType::GroupReduce);
+    // A symbolic offset keeps the INDEX from folding through the STACK row.
+    let offset = UOp::variable("off".to_string(), 0, 15, DType::Index);
+    let index = UOp::index().buffer(buffer).indices(vec![offset]).call().expect("index");
+    let store = index.store(group.cast(DType::Float32));
+    let sink = UOp::sink(vec![store]);
+
+    let lowered = add_gpudims(&Renderer::amd_cdna3(), &sink).expect("group range should lower");
+    let masked_index = lowered
+        .toposort()
+        .into_iter()
+        .find(|u| matches!(u.op(), Op::Index { indices, .. } if matches!(indices[0].op(), Op::Ternary(..))))
+        .expect("global store index should carry missing GroupReduce validity");
+    let Op::Index { indices, .. } = masked_index.op() else { unreachable!() };
+    assert!(indices[0].toposort().iter().any(|u| matches!(u.op(), Op::Special { name, .. } if name == "lidx0")));
+}
+
+#[test_case(|| d(&[4, 4]), &[16, 16, 16], Some(&[4, 4][..]); "two dims already fit")]
+#[test_case(|| d(&[8, 8, 8]), &[256, 256, 256], Some(&[8, 8, 8][..]); "three dims already fit")]
+#[test_case(|| d(&[4, 4, 4, 4]), &[256, 256, 256], Some(&[16, 4, 4][..]); "four dims collapse into three")]
+#[test_case(|| d(&[1000]), &[10], None; "no grouping can fit the cap")]
+// Regression: with per-axis caps equal to the product, [32,2,2] fits unchanged.
+// The old cube-root cap (10 each) made axis 0 unfittable and panicked in split_dims.
+#[test_case(|| d(&[32, 2, 2]), &[1024, 1024, 1024], Some(&[32, 2, 2][..]); "non-cubic local shape fits the product cap")]
+#[test_case(
+    || vec![UOp::variable("n".to_string(), 0, 100, DType::WeakInt), UOp::index_const(4), UOp::index_const(8), UOp::index_const(8)],
+    &[2147483647, 65535, 65535],
+    Some(&[400, 8, 8][..]);
+    "symbolic dim merges under its vmax")]
+fn group_dims_fits_the_axis_caps(dims: fn() -> Vec<Arc<UOp>>, max_sizes: &[usize], expected: Option<&[usize]>) {
+    assert_eq!(group_dims(&dims(), max_sizes).as_deref().map(dmax).as_deref(), expected);
+}
+
+#[test_case(|| d(&[100]), true; "concrete dim splits under the cap")]
+#[test_case(|| vec![UOp::variable("n".to_string(), 0, 200, DType::WeakInt)], false; "symbolic dim has no concrete factor")]
+fn split_dims_reports_failure_instead_of_a_malformed_split(dims: fn() -> Vec<Arc<UOp>>, splits: bool) {
+    let result = split_dims(&dims(), &[64, 64, 64]);
+    match result {
+        Some(split) => assert!(splits && split.iter().all(|x| dim_max(x) <= 64), "{:?}", dmax(&split)),
+        None => assert!(!splits, "expected a split"),
+    }
+}
+
+#[test_case(1, 1; "one")]
+#[test_case(2, 2; "even")]
+#[test_case(3, 1; "prime")]
+#[test_case(4, 2; "square")]
+#[test_case(9, 3; "odd square")]
+#[test_case(100, 2; "composite")]
+fn find_smallest_divisor_returns_one_for_primes(n: usize, expected: usize) {
+    assert_eq!(find_smallest_divisor(n), expected);
 }
 
 #[test]
-fn test_group_dims_impossible() {
-    // Can't fit 1000 into max 10.
-    let result = group_dims(&d(&[1000]), &[10]);
-    assert!(result.is_none());
-}
+fn symbolic_identity_dims_return_bare_specials() {
+    let n = UOp::variable("n".to_string(), 1, 1024, DType::WeakInt);
+    let out = get_grouped_dims("gidx", &[n, UOp::index_const(8)], None, true);
 
-#[test]
-fn test_non_cubic_local_dims_fit_product_cap() {
-    // Regression: a 1024-product local shape with per-axis caps = product
-    // ([1024;3]) fits [32,2,2] unchanged. The old cube-root cap (10 each)
-    // made axis 0 (32) unfittable and panicked at split_dims.
-    let result = group_dims(&d(&[32, 2, 2]), &[1024, 1024, 1024]);
-    assert_eq!(dmax(&result.unwrap()), vec![32, 2, 2]);
-}
-
-#[test]
-fn test_split_dims_simple() {
-    // 100 exceeds 64, should split.
-    let result = split_dims(&d(&[100]), &[64, 64, 64]).unwrap();
-    assert!(result.iter().all(|x| dim_max(x) <= 64));
-}
-
-#[test]
-fn test_split_dims_symbolic_too_big_returns_none() {
-    // Symbolic dim with vmax > limit and no concrete factor — must report
-    // failure rather than emit a malformed split.
-    let v = UOp::define_var("n".to_string(), 0, 200);
-    let result = split_dims(&[v], &[64, 64, 64]);
-    assert!(result.is_none());
-}
-
-#[test]
-fn test_find_smallest_divisor() {
-    assert_eq!(find_smallest_divisor(1), 1);
-    assert_eq!(find_smallest_divisor(2), 2);
-    assert_eq!(find_smallest_divisor(3), 1); // prime
-    assert_eq!(find_smallest_divisor(4), 2);
-    assert_eq!(find_smallest_divisor(9), 3);
-    assert_eq!(find_smallest_divisor(100), 2);
-}
-
-#[test]
-fn test_get_contraction_non_consecutive() {
-    // [2, 5, 2] → [10, 2]: dims 0,1 fuse to 10; dim 2 stays as 2.
-    // acc_old must hash-cons to match acc_new at positions [1, 2].
-    let two = UOp::index_const(2);
-    let five = UOp::index_const(5);
-    let ten = two.mul(&five); // exactly the limited[0] UOp
-    let result = get_contraction(&[two.clone(), five.clone(), two.clone()], &[ten, two.clone()]);
-    assert_eq!(result, Some(vec![vec![0, 1], vec![2]]));
-}
-
-#[test]
-fn test_get_contraction_identity() {
-    // [4, 4, 4] → [4, 4, 4]: no grouping (Arc-identical limited matches acc_old).
-    let four = UOp::index_const(4);
-    let dims = vec![four.clone(), four.clone(), four.clone()];
-    let result = get_contraction(&dims, &dims);
-    assert_eq!(result, Some(vec![vec![0], vec![1], vec![2]]));
-}
-
-#[test]
-fn test_get_contraction_all_fused() {
-    // [2, 3, 4] → [24]: all dims fuse to one.
-    let two = UOp::index_const(2);
-    let three = UOp::index_const(3);
-    let four = UOp::index_const(4);
-    // 2 * 3 = 6, 6 * 4 = 24 — must use the exact same hash-cons chain.
-    let twenty_four = two.mul(&three).mul(&four);
-    let result = get_contraction(&[two, three, four], &[twenty_four]);
-    assert_eq!(result, Some(vec![vec![0, 1, 2]]));
-}
-
-#[test]
-fn test_get_contraction_empty() {
-    let result = get_contraction(&[], &[]);
-    assert_eq!(result, Some(vec![]));
-}
-
-#[test]
-fn test_get_contraction_invalid() {
-    // [2, 3, 4] → [5, 4]: 2*3 = 6 != 5.
-    let two = UOp::index_const(2);
-    let three = UOp::index_const(3);
-    let four = UOp::index_const(4);
-    let five = UOp::index_const(5);
-    let result = get_contraction(&[two, three, four.clone()], &[five, four]);
-    assert_eq!(result, None);
-}
-
-#[test]
-fn test_get_contraction_partial() {
-    // [2, 4, 3] → [8, 3]: dims 0,1 fuse to 8; dim 2 stays as 3.
-    let two = UOp::index_const(2);
-    let four = UOp::index_const(4);
-    let three = UOp::index_const(3);
-    let eight = two.mul(&four);
-    let result = get_contraction(&[two, four, three.clone()], &[eight, three]);
-    assert_eq!(result, Some(vec![vec![0, 1], vec![2]]));
-}
-
-#[test]
-fn test_group_dims_symbolic_fits_under_vmax() {
-    // Symbolic dim with vmax=100 plus 3 concrete dims gets grouped down to 3
-    // since 100*4 = 400 ≤ 65535 (typical y-axis cap).
-    let v = UOp::define_var("n".to_string(), 0, 100);
-    let dims = vec![v.clone(), UOp::index_const(4), UOp::index_const(8), UOp::index_const(8)];
-    let result = group_dims(&dims, &[2147483647, 65535, 65535]).unwrap();
-    assert_eq!(result.len(), 3);
-    // First slot should hold the merged symbolic*4; vmax 400.
-    assert_eq!(dim_max(&result[0]), 400);
-    assert_eq!(dim_max(&result[1]), 8);
-    assert_eq!(dim_max(&result[2]), 8);
+    let names: Vec<&str> = out
+        .iter()
+        .map(|u| match u.op() {
+            Op::Special { name, .. } => name.as_str(),
+            _ => panic!("an ungrouped, unsplit shape must not leave a symbolic FloorDiv/FloorMod: {}", u.tree()),
+        })
+        .collect();
+    assert_eq!(names, vec!["gidx1", "gidx0"], "reverse=true names the innermost axis gidx0");
 }

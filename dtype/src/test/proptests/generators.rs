@@ -18,7 +18,9 @@ pub fn int_dtype() -> impl Strategy<Value = ScalarDType> {
 pub fn float_dtype() -> impl Strategy<Value = ScalarDType> {
     prop_oneof![
         Just(ScalarDType::FP8E4M3),
+        Just(ScalarDType::FP8E4M3FNUZ),
         Just(ScalarDType::FP8E5M2),
+        Just(ScalarDType::FP8E5M2FNUZ),
         Just(ScalarDType::Float16),
         Just(ScalarDType::BFloat16),
         Just(ScalarDType::Float32),

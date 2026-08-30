@@ -133,34 +133,27 @@ slot per kernel in a dedicated page — owning that page (rather than sharing th
 rolling kernarg arena, which concurrent per-call dispatch could lap into stale
 VAs) is what makes replay safe.
 
-Replay (`Graph::replay`) bumps the kickoff counter, waits the previous replay's
-timeline target, reserves this step's value, resolves the symbols, and submits
-the bound IB with a single `submit_dwords` doorbell — then releases the staged
-IB by setting the kick signal. It returns asynchronously; back-pressure is the
-*next* replay's wait.
+Replay (`Graph::replay`) serializes graph-owned mutable storage, waits its prior
+finalizer, acquires an exclusive compute lane, ensures lane scratch, patches the
+current kernargs and system fields, then publishes the resident PM4 IB or AQL
+submission program. It returns asynchronously; the next replay waits before
+reusing that storage.
 
 ### When capture happens
 
 Capture is gated several ways, and falls back to per-call dispatch
 (`Ok(None)`) if any fails:
 
-- **`SVOD_JIT_GRAPH` must be set.** `ExecutionPlan::build_graph`
-  (`runtime/src/execution_plan.rs`) returns `None` otherwise — per-call dispatch
-  is the safe default; the graph path is opt-in for benchmarking.
 - The chain must be **all compiled kernels with no runtime vars** — copies,
   views, and dynamic launch dims keep the host in the loop.
-- The device must be in **multi-queue mode**. In the default single-queue mode,
-  `AmdGraph::capture` returns `Ok(None)`, because the graph keeps its own
-  connector and ring (replayed with one doorbell) that the single-queue dispatch
-  lock doesn't cover.
-- The chain must be **single-device, single-XCC PM4** — AQL (multi-XCC) and
-  cross-device chains are out of scope.
+- The chain must be **single-device** and every current replay buffer must be
+  backed by that exact physical allocation owner.
+- AQL graph capture is supported. PM4 graph capture is opt-in through
+  `SVOD_PM4_GRAPH=1` because it is not a performance win on every gfx11/12 GPU.
 
-:::caution Graph capture is doubly-gated
-To get a real `AmdGraph`, you need **both** `SVOD_JIT_GRAPH` set (to any value)
-**and** `SVOD_AMD_SINGLE_QUEUE=0`. With the default single-queue mode, capture always
-returns `None` and dispatch stays per-call — which is correct and safe, just not
-graph-accelerated.
+:::note Queue ownership
+Graphs do not retain a hardware queue. Capture stores immutable templates and
+graph-owned resident/control memory; every replay leases a bounded pool lane.
 :::
 
 ---
@@ -169,6 +162,6 @@ graph-accelerated.
 
 Compilation is one `clang` subprocess and an in-process ELF load — no ROCm, no
 temp files, the same minimalism as the CPU path. Dispatch reuses the entire
-connector/timeline machinery from [Queues & Dispatch](./queues-and-dispatch.md),
+lane/timeline machinery from [Queues & Dispatch](./queues-and-dispatch.md),
 so the [JIT Graphs](../../architecture/jit-graphs.md) layer's compile-once / replay-many promise
 lands on AMD with one doorbell per replay — once the graph path is enabled.

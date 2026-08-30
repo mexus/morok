@@ -2,8 +2,9 @@ use crate::*;
 use ndarray::{Array2, array};
 use svod_dtype::DType;
 use svod_schedule::{
-    BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcSelect, testing::setup_test_tracing,
+    BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcOptLevel, TcSelect, testing::setup_test_tracing,
 };
+use test_case::test_case;
 
 fn prep_config(optimizer: OptimizerConfig) -> PrepareConfig {
     optimizer.into()
@@ -287,109 +288,41 @@ crate::codegen_tests! {
     }
 }
 
-// ========== Basic 2D x 2D Tests ==========
+// ========== Shape Tests ==========
 
-#[test]
-fn test_matmul_2d_basic() {
-    let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
-    let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
-    let c = a.dot(&b).unwrap();
-
-    let c_shape = c.shape().unwrap();
-    assert_eq!(c_shape.len(), 2);
-    assert_eq!(c_shape[0].as_const().unwrap(), 2);
-    assert_eq!(c_shape[1].as_const().unwrap(), 2);
+/// `dot` output shape per operand-rank combination. Values are validated by the
+/// `*_validated` cases above; this table pins the lazy, pre-realize shape.
+#[test_case(&[2, 2], &[2, 2], &[2, 2]; "2d square")]
+#[test_case(&[2, 3], &[3, 4], &[2, 4]; "2d non-square")]
+#[test_case(&[3], &[3], &[]; "1d dot product is scalar")]
+#[test_case(&[3], &[3, 4], &[4]; "vector times matrix")]
+#[test_case(&[2, 3], &[3], &[2]; "matrix times vector")]
+#[test_case(&[2, 3, 4], &[2, 4, 5], &[2, 3, 5]; "batched")]
+fn test_dot_output_shape(a: &[usize], b: &[usize], expected: &[usize]) {
+    let a = Tensor::zeros(a, DType::Float32).unwrap();
+    let b = Tensor::zeros(b, DType::Float32).unwrap();
+    let shape = a.dot(&b).unwrap().shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>();
+    assert_eq!(shape, expected);
 }
 
-#[test]
-fn test_matmul_2d_non_square() {
-    // [2, 3] @ [3, 4] → [2, 4]
-    let a = Tensor::from_ndarray(&Array2::<f32>::ones((2, 3)));
-    let b = Tensor::from_ndarray(&Array2::<f32>::ones((3, 4)));
-    let c = a.dot(&b).unwrap();
-
-    let c_shape = c.shape().unwrap();
-    assert_eq!(c_shape.len(), 2);
-    assert_eq!(c_shape[0].as_const().unwrap(), 2);
-    assert_eq!(c_shape[1].as_const().unwrap(), 4);
-}
-
-#[test]
-fn test_matmul_alias() {
-    let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
-    let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
-
-    // Test that matmul is an alias for dot
-    let c1 = a.dot(&b).unwrap();
-    let c2 = a.matmul(&b).unwrap();
-
-    assert_eq!(c1.shape().unwrap().len(), c2.shape().unwrap().len());
-}
-
-// ========== 1D x 1D Tests (Dot Product) ==========
-
-#[test]
-fn test_dot_product_1d() {
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = a.dot(&b).unwrap();
-
-    // Result should be scalar (0D tensor)
-    let c_shape = c.shape().unwrap();
-    assert_eq!(c_shape.len(), 0);
-}
-
-#[test]
-fn test_dot_product_orthogonal() {
-    let a = Tensor::from_slice([1.0f32, 0.0, 0.0]);
-    let b = Tensor::from_slice([0.0f32, 1.0, 0.0]);
-    let c = a.dot(&b).unwrap();
-
-    // Orthogonal vectors → dot product = 0
-    let c_shape = c.shape().unwrap();
-    assert_eq!(c_shape.len(), 0);
-}
-
-// ========== 1D x 2D and 2D x 1D Tests ==========
-
-#[test]
-fn test_vector_matrix() {
-    // [3] @ [3, 4] → [4]
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_ndarray(&Array2::<f32>::ones((3, 4)));
-    let c = a.dot(&b).unwrap();
-
-    let c_shape = c.shape().unwrap();
-    assert_eq!(c_shape.len(), 1);
-    assert_eq!(c_shape[0].as_const().unwrap(), 4);
-}
-
-#[test]
-fn test_matrix_vector() {
-    // [2, 3] @ [3] → [2]
-    let a = Tensor::from_ndarray(&Array2::<f32>::ones((2, 3)));
-    let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let c = a.dot(&b).unwrap();
-
-    let c_shape = c.shape().unwrap();
-    assert_eq!(c_shape.len(), 1);
-    assert_eq!(c_shape[0].as_const().unwrap(), 2);
-}
-
-// ========== Batched Matmul Tests ==========
-
-#[test]
-fn test_batched_matmul_3d() {
-    // [2, 3, 4] @ [2, 4, 5] → [2, 3, 5]
-    let a = Tensor::from_ndarray(&ndarray::Array3::<f32>::ones((2, 3, 4)));
-    let b = Tensor::from_ndarray(&ndarray::Array3::<f32>::ones((2, 4, 5)));
-    let c = a.dot(&b).unwrap();
-
-    let c_shape = c.shape().unwrap();
-    assert_eq!(c_shape.len(), 3);
-    assert_eq!(c_shape[0].as_const().unwrap(), 2);
-    assert_eq!(c_shape[1].as_const().unwrap(), 3);
-    assert_eq!(c_shape[2].as_const().unwrap(), 5);
+/// A 1D weight is an elementwise multiply, not a matmul.
+#[test_case(&[1, 3], &[2, 3], true, &[1, 2]; "with bias")]
+#[test_case(&[1, 3], &[2, 3], false, &[1, 2]; "without bias")]
+#[test_case(&[4, 3], &[2, 3], false, &[4, 2]; "batched")]
+#[test_case(&[3], &[3], false, &[3]; "1d weight")]
+fn test_linear_output_shape(input: &[usize], weight: &[usize], bias: bool, expected: &[usize]) {
+    let input = Tensor::zeros(input, DType::Float32).unwrap();
+    let weight = Tensor::zeros(weight, DType::Float32).unwrap();
+    let result = match bias {
+        true => {
+            let out = weight.shape().unwrap()[0].as_const().unwrap();
+            let bias = Tensor::zeros(&[out], DType::Float32).unwrap();
+            input.linear().weight(&weight).bias(&bias).call().unwrap()
+        }
+        false => input.linear().weight(&weight).call().unwrap(),
+    };
+    let shape = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>();
+    assert_eq!(shape, expected);
 }
 
 // ========== Edge Cases ==========
@@ -414,20 +347,6 @@ fn test_matmul_error_shape_mismatch() {
     assert!(result.is_err());
 }
 
-#[test]
-fn test_matmul_identity() {
-    let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
-    let identity = Tensor::from_ndarray(&array![[1.0f32, 0.0], [0.0, 1.0]]);
-
-    let result = a.dot(&identity).unwrap();
-
-    // Result shape should match input
-    let result_shape = result.shape().unwrap();
-    assert_eq!(result_shape.len(), 2);
-    assert_eq!(result_shape[0].as_const().unwrap(), 2);
-    assert_eq!(result_shape[1].as_const().unwrap(), 2);
-}
-
 // ========== Dtype Tests ==========
 
 #[test]
@@ -450,45 +369,538 @@ fn test_matmul_explicit_dtype() {
     assert_eq!(c.uop().dtype(), DType::Float64);
 }
 
+/// A wider integer accumulator must widen the operands before the product.
+/// Before the fix the MUL stayed at int8, so `127 * 2` wrapped to -2: the C
+/// backend hid it behind C integer promotion while LLVM emitted `mul i8` and
+/// produced 62 instead of 318. Assert both the IR dtype (backend independent)
+/// and the realized value.
 #[test]
-#[ignore] // Run with: cargo test -p svod-tensor test_print_matmul_ir -- --ignored --nocapture
-fn test_print_matmul_ir() {
-    // Create 4x4 matmul to see generated IR
-    let a = Tensor::from_ndarray(&Array2::from_shape_vec((4, 4), (0..16).map(|i| i as f32).collect()).unwrap());
-    let b = Tensor::from_ndarray(&Array2::from_shape_vec((4, 4), (0..16).map(|i| i as f32).collect()).unwrap());
-    let mut c = a.matmul(&b).unwrap();
+fn test_matmul_int8_widens_operands_for_int32_accumulator() {
+    use svod_ir::Op;
 
-    let plan = c.prepare().expect("prepare should succeed");
+    let a = Tensor::from_ndarray(&array![[127i8, -64, 32, 0]]);
+    let b = Tensor::from_ndarray(&array![[2i8], [-1], [0], [1]]);
 
-    println!("\n=== Generated Kernels ===\n");
-    for kernel in plan.kernels() {
-        println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
-        println!("{}", kernel.code);
-        println!();
+    let c = a.matmul_with().other(&b).dtype(DType::Int32).call().unwrap();
+    assert_eq!(c.uop().dtype(), DType::Int32);
+    for uop in c.uop().toposort() {
+        if matches!(uop.op(), Op::Binary(svod_ir::BinaryOp::Mul, ..)) {
+            assert_ne!(uop.dtype(), DType::Int8, "int8 MUL survives a wider integer accumulator");
+        }
+    }
+
+    let mut c = c;
+    c.realize().unwrap();
+    assert_eq!(c.as_vec::<i32>().unwrap(), vec![318]);
+}
+
+// =========================================================================
+// AMD tensor-core lowering. Compile-only: every test below stops at LLVM text
+// (plus an ELF check when an amdgpu target is installed) and never opens a GPU.
+// =========================================================================
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use svod_dtype::{AmdArch, DeviceSpec};
+use svod_ir::{BinaryOp, ConstValue, Op, RendererDevice, UOp};
+use svod_schedule::{OptimizerRenderer, optimize_kernel_with_config};
+
+/// The single kernel AST the scheduler produces for `a·b` accumulating in `out`.
+fn matmul_kernel_ast(a_shape: &[usize], b_shape: &[usize], in_dtype: DType, out: DType) -> Arc<UOp> {
+    let a = Tensor::empty(a_shape, in_dtype.clone());
+    let b = Tensor::empty(b_shape, in_dtype);
+    let c = a.matmul_with().other(&b).dtype(out).call().expect("tensor matmul");
+    let rangeified = svod_schedule::rangeify_with_map(UOp::sink(vec![c.uop().contiguous()])).expect("rangeify matmul");
+    let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeified.sink).expect("split kernels");
+    let pre = crate::schedule::create_pre_schedule(kernel_graph).expect("prepare tensor schedule");
+    assert_eq!(pre.items.len(), 1, "matmul must remain one tensor kernel");
+    pre.items[0].ast.clone()
+}
+
+/// `decompose_with` carries the renderer's dtype decompositor — FP8 emulation
+/// needs it, native tensor-core paths must run without it.
+fn amd_optimizer(arch: AmdArch, decompose_with: Option<&svod_codegen::llvm::LlvmTextRenderer>) -> OptimizerRenderer {
+    OptimizerRenderer::for_amd_arch(arch).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        decompose_with.and_then(svod_codegen::traits::Renderer::decompositor),
+        None,
+    )
+}
+
+fn pinned_tc_config(tc_index: usize, tc_opt: TcOptLevel) -> OptimizerConfig {
+    let heuristics =
+        HeuristicsConfig::builder().tc_opt(tc_opt).tc_select(TcSelect::Index(tc_index)).matvec_enabled(false).build();
+    OptimizerConfig::builder().strategy(OptStrategy::Heuristic).heuristics(heuristics).build()
+}
+
+fn find_wmma<'a>(nodes: impl IntoIterator<Item = &'a Arc<UOp>>) -> &'a Arc<UOp> {
+    nodes.into_iter().find(|u| matches!(u.op(), Op::Wmma { .. })).expect("lowered matmul must emit a tensor-core op")
+}
+
+/// PROGRAM → LINEAR → LLVM text for `arch`, asserting the object assembles when
+/// an amdgpu target is installed.
+fn render_amd(optimized: Arc<UOp>, arch: AmdArch, name: &str) -> (Arc<UOp>, svod_codegen::RenderedKernel) {
+    let program = svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Amd { device_id: 0 })
+        .expect("final target graph");
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("linearize");
+    let linear = linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR stage");
+    let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(arch);
+    let rendered = svod_codegen::traits::Renderer::render(&renderer, &linear, Some(name)).expect("render LLVM text");
+    if svod_runtime::amd::compile::has_amdgpu_target() {
+        let object =
+            svod_runtime::amd::compile::compile_ir_to_amd_object(&rendered.code, arch).expect("assemble amdgpu object");
+        assert_eq!(&object[..4], b"\x7fELF");
+    }
+    (linear, rendered)
+}
+
+/// RDNA4 follows Tinygrad 8c8b43de's tensor-core table: FP8 storage is emulated
+/// as bytes, arithmetic is widened to f16, and the matmul uses the f16→f32
+/// gfx12 WMMA.
+#[test]
+fn test_matmul_fp8_gfx1201_decomposes_to_f16_wmma_compile_only() {
+    use svod_dtype::ScalarDType;
+
+    for dtype in [DType::FP8E4M3, DType::FP8E5M2, DType::FP8E4M3FNUZ, DType::FP8E5M2FNUZ] {
+        let ast = matmul_kernel_ast(&[16, 16], &[16, 16], dtype.clone(), DType::Float32);
+        let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(AmdArch::Gfx1201);
+        let optimized = optimize_kernel_with_config(
+            ast,
+            &amd_optimizer(AmdArch::Gfx1201, Some(&renderer)),
+            &pinned_tc_config(0, TcOptLevel::Strict),
+        )
+        .expect("gfx1201 FP8 decomposition and TC optimization");
+
+        let nodes = optimized.toposort();
+        let Op::Wmma { metadata: wmma, .. } = find_wmma(&nodes).op() else { unreachable!() };
+        assert_eq!((wmma.dtype_in.clone(), wmma.dtype_out.clone()), (DType::Float16, DType::Float32));
+        assert_eq!((wmma.device, wmma.threads), (RendererDevice::AmdRdna4, 32));
+        assert!(
+            !nodes.iter().any(|u| u.dtype().base() == dtype.base()),
+            "{dtype:?} arithmetic must be fully decomposed"
+        );
+        assert!(
+            nodes.iter().any(|u| matches!(u.op(), Op::Param { arg, .. } if arg.dtype.base() == ScalarDType::UInt8)),
+            "{dtype:?} storage must remain byte-addressed"
+        );
+
+        let (_, rendered) = render_amd(optimized, AmdArch::Gfx1201, "matmul_fp8_gfx1201");
+        assert!(
+            rendered.code.contains("llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16"),
+            "{dtype:?} must select gfx12 f16 WMMA"
+        );
+        assert!(!rendered.code.contains("16x16x16.fp8"), "{dtype:?} must not claim native FP8 WMMA");
+        assert!(!rendered.code.contains("16x16x16.bf8"), "{dtype:?} must not alias E5M2 to native BF8 WMMA");
     }
 }
 
+/// Positive control for native OCP FP8: gfx950 keeps E4M3/E5M2 operands and
+/// selects its scaled K=128 MFMA.
 #[test]
-#[ignore] // Run with: cargo test -p svod-tensor test_print_matmul_512x512_ir -- --ignored --nocapture
-fn test_print_matmul_512x512_ir() {
-    const SIZE: usize = 512;
-    let a = Tensor::from_ndarray(
-        &Array2::from_shape_vec((SIZE, SIZE), (0..SIZE * SIZE).map(|i| (i as f32) * 0.01).collect()).unwrap(),
-    );
-    let b = Tensor::from_ndarray(
-        &Array2::from_shape_vec((SIZE, SIZE), (0..SIZE * SIZE).map(|i| (i as f32) * 0.01).collect()).unwrap(),
-    );
-    let mut c = a.matmul(&b).unwrap();
+fn test_matmul_ocp_fp8_gfx950_native_mfma_compile_only() {
+    for dtype in [DType::FP8E4M3, DType::FP8E5M2] {
+        let ast = matmul_kernel_ast(&[16, 128], &[128, 16], dtype.clone(), DType::Float32);
+        let optimizer = amd_optimizer(AmdArch::Gfx950, None);
+        let tc_index = optimizer
+            .tensor_cores
+            .iter()
+            .position(|tc| tc.dtype_in == dtype && tc.dtype_out == DType::Float32 && tc.dims == (16, 16, 128))
+            .expect("gfx950 scaled FP8 tensor core");
+        let optimized = optimize_kernel_with_config(ast, &optimizer, &pinned_tc_config(tc_index, TcOptLevel::Strict))
+            .expect("gfx950 native FP8 TC optimization");
 
-    // Use Heuristic strategy (Beam has a pre-existing bug with horizontal reduction)
-    let config = prep_config(OptimizerConfig::builder().strategy(OptStrategy::Heuristic).build());
-    let plan = c.prepare_with(&config).expect("prepare should succeed");
+        let nodes = optimized.toposort();
+        let Op::Wmma { metadata, .. } = find_wmma(&nodes).op() else { unreachable!() };
+        assert_eq!(
+            (metadata.dims, metadata.dtype_in.clone(), metadata.dtype_out.clone()),
+            ((16, 16, 128), dtype.clone(), DType::Float32)
+        );
 
-    println!("\n=== Generated Kernels (64x64 with output upcast) ===\n");
-    for kernel in plan.kernels() {
-        println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
-        println!("{}", kernel.code);
-        println!();
+        let (_, rendered) = render_amd(optimized, AmdArch::Gfx950, "matmul_fp8_gfx950");
+        assert!(rendered.code.contains("llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4"));
+        let format = if dtype == DType::FP8E5M2 { "i32 1, i32 1" } else { "i32 0, i32 0" };
+        assert!(rendered.code.contains(format), "wrong scaled format selectors for {dtype:?}");
+    }
+}
+
+fn eval_lane(u: &Arc<UOp>, lane: i64) -> i64 {
+    match u.op() {
+        Op::Const(value) => value.0.try_int().expect("integer constant"),
+        Op::Special { name, .. } if name == "lidx0" => lane,
+        Op::Cast { src, .. } => eval_lane(src, lane),
+        Op::Binary(op, a, b) => {
+            let (a, b) = (eval_lane(a, lane), eval_lane(b, lane));
+            match op {
+                BinaryOp::Add => a + b,
+                BinaryOp::Mul => a * b,
+                BinaryOp::And => a & b,
+                BinaryOp::Shl => a << b,
+                BinaryOp::Shr => a >> b,
+                _ => panic!("unexpected lane-index operation {op:?}"),
+            }
+        }
+        Op::Ternary(svod_ir::TernaryOp::MulAcc, a, b, c) => {
+            eval_lane(a, lane) * eval_lane(b, lane) + eval_lane(c, lane)
+        }
+        _ => panic!("unexpected lane-index node {}", u.op().as_ref()),
+    }
+}
+
+fn eval_gate(u: &Arc<UOp>, lane: i64) -> bool {
+    match u.op() {
+        Op::Binary(BinaryOp::Lt, lhs, rhs) => eval_lane(lhs, lane) < eval_lane(rhs, lane),
+        _ => panic!("unexpected validity gate {}", u.op().as_ref()),
+    }
+}
+
+fn memory_param_slot(index: &Arc<UOp>) -> Option<usize> {
+    let buffer = match index.op() {
+        Op::Index { buffer, .. } => buffer,
+        Op::Shrink { src, .. } => src,
+        _ => return None,
+    };
+    match buffer.op() {
+        Op::Param { arg, .. } => Some(arg.slot),
+        _ => None,
+    }
+}
+
+fn is_zero_stack(u: &Arc<UOp>, lanes: usize) -> bool {
+    let is_zero = |u: &Arc<UOp>| matches!(u.op(), Op::Const(value) if value.0 == ConstValue::Float(0.0));
+    matches!(u.op(), Op::Stack { sources } if sources.len() == lanes && sources.iter().all(is_zero))
+}
+
+fn is_lidx_lt(gate: &Arc<UOp>, bound: i64) -> bool {
+    matches!(gate.op(), Op::Binary(BinaryOp::Lt, lhs, rhs)
+        if rhs.vmin().try_int() == Some(bound)
+            && rhs.vmax().try_int() == Some(bound)
+            && lhs.toposort().iter().any(|u| matches!(u.op(), Op::Special { end, name }
+                if name == "lidx0" && end.vmax().try_int() == Some(32))))
+}
+
+struct AFragment {
+    load: Arc<UOp>,
+    index: Arc<UOp>,
+    offsets: Arc<UOp>,
+    gate: Arc<UOp>,
+    alt: Arc<UOp>,
+}
+
+/// The memory fragments of a padded WMMA kernel, collected from either the
+/// optimized graph or the linearized op list — both must describe the same
+/// bytes, so `assert_padded_5x16` runs against each.
+struct Fragments {
+    a: Vec<AFragment>,
+    /// Address expression of each scalar B load.
+    b: Vec<Arc<UOp>>,
+    c: Vec<CStore>,
+}
+
+/// One C store: (address, gate in force, WMMA result lane).
+type CStore = (Arc<UOp>, Option<Arc<UOp>>, Arc<UOp>);
+
+impl Fragments {
+    /// `store_gate` maps a store and its own gate to the gate actually in force:
+    /// the store's own before linearization, the enclosing IF condition after.
+    fn collect<'a>(
+        ops: impl IntoIterator<Item = &'a Arc<UOp>>,
+        wmma: &Arc<UOp>,
+        store_gate: impl Fn(&Arc<UOp>, &Option<Arc<UOp>>) -> Option<Arc<UOp>>,
+    ) -> Self {
+        let mut fragments = Fragments { a: Vec::new(), b: Vec::new(), c: Vec::new() };
+        for u in ops {
+            if let Op::Load { index, alt, gate } = u.op() {
+                match memory_param_slot(index) {
+                    Some(1) => {
+                        let Op::Shrink { offsets, sizes, .. } = index.op() else {
+                            panic!("every A load must use a shaped SHRINK address: {}", u.tree())
+                        };
+                        let shape = u
+                            .shape()
+                            .unwrap()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|extent| extent.as_const())
+                            .collect::<Vec<_>>();
+                        assert_eq!(shape, [4]);
+                        assert_eq!(eval_lane(sizes, 0), 4, "each pinned A access must contain four shaped lanes");
+                        let alt = alt.as_ref().expect("padded A loads require a shaped zero alternative");
+                        let gate = gate.as_ref().expect("padded A loads require a validity gate");
+                        assert!(
+                            is_zero_stack(alt, 4),
+                            "every invalid padded A lane must contribute zero: {}",
+                            alt.tree()
+                        );
+                        assert!(is_lidx_lt(gate, 5), "A loads must be guarded by row < M: {}", gate.tree());
+                        fragments.a.push(AFragment {
+                            load: u.clone(),
+                            index: index.clone(),
+                            offsets: offsets.clone(),
+                            gate: gate.clone(),
+                            alt: alt.clone(),
+                        });
+                    }
+                    Some(2) => {
+                        let Op::Index { indices, .. } = index.op() else {
+                            panic!("every B load must use a scalar INDEX address: {}", u.tree())
+                        };
+                        assert_eq!(indices.len(), 1, "B loads must have one address expression");
+                        assert!(alt.is_none() && gate.is_none(), "unpadded B fragment loads must remain ungated");
+                        assert!(u.shape().unwrap().unwrap().is_empty(), "B loads must remain scalar");
+                        fragments.b.push(indices[0].clone());
+                    }
+                    slot => panic!("unexpected or malformed load (slot {slot:?}): {}", u.tree()),
+                }
+            }
+            if let Op::Store { index, value, gate } = u.op() {
+                assert_eq!(memory_param_slot(index), Some(0), "only C stores are permitted: {}", u.tree());
+                let Op::Index { indices, .. } = index.op() else { panic!("C stores must use scalar INDEX addresses") };
+                assert_eq!(indices.len(), 1);
+                let Op::Index { buffer, indices: value_indices } = value.op() else {
+                    panic!("C store value must index the WMMA result: {}", value.tree())
+                };
+                assert!(Arc::ptr_eq(buffer, wmma), "C store must consume this graph's WMMA accumulator");
+                assert_eq!(value_indices.len(), 1);
+                fragments.c.push((indices[0].clone(), store_gate(u, gate), value_indices[0].clone()));
+            }
+        }
+        fragments
+    }
+
+    /// A 5x16 operand padded into a 16x16 tile: A[0..80] and C[0..80] are real,
+    /// A[80..256] and C[80..96] are the padded tails the gates must disable.
+    fn assert_padded_5x16(&self, stage: &str) {
+        assert_eq!(self.a.len(), 4, "{stage}: padded WMMA A fragment must contain four shaped loads");
+        let (mut loaded_a, mut padded_a) = (BTreeSet::new(), BTreeSet::new());
+        for AFragment { offsets, gate, .. } in &self.a {
+            for lane in 0..32 {
+                for shaped_lane in 0..4 {
+                    let index = eval_lane(offsets, lane) + shaped_lane;
+                    assert!((0..256).contains(&index), "{stage}: raw padded A index escaped the 16x16 tile");
+                    if eval_gate(gate, lane) {
+                        loaded_a.insert(index);
+                    } else {
+                        padded_a.insert(index);
+                    }
+                }
+            }
+        }
+        assert_eq!(loaded_a, (0..80).collect(), "{stage}: enabled A loads must cover exactly the real allocation");
+        assert_eq!(padded_a, (80..256).collect(), "{stage}: zero-fill lanes must cover exactly the padded A tail");
+
+        assert_eq!(self.b.len(), 16, "{stage}: WMMA B fragment must retain its 16 scalar column loads");
+        let mut loaded_b = BTreeMap::new();
+        for index in &self.b {
+            for lane in 0..32 {
+                *loaded_b.entry(eval_lane(index, lane)).or_insert(0usize) += 1;
+            }
+        }
+        assert_eq!(loaded_b.keys().copied().collect::<BTreeSet<_>>(), (0..256).collect());
+        assert!(
+            loaded_b.values().all(|count| *count == 2),
+            "{stage}: wave32 duplicates each B value across its two WMMA lane halves"
+        );
+
+        assert_eq!(self.c.len(), 3, "{stage}: WMMA must cover C with three per-lane output fragments");
+        assert_eq!(self.c.iter().filter(|(_, gate, _)| gate.is_some()).count(), 1);
+        let (mut stored_c, mut padded_c, mut result_lanes) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+        for (index, gate, value_index) in &self.c {
+            result_lanes.insert(eval_lane(value_index, 0));
+            if let Some(gate) = gate {
+                assert!(is_lidx_lt(gate, 16), "{stage}: the partial C fragment must be guarded by lane<16");
+            }
+            for lane in 0..32 {
+                let index = eval_lane(index, lane);
+                if gate.as_ref().is_none_or(|gate| eval_gate(gate, lane)) {
+                    assert!((0..80).contains(&index), "{stage}: enabled C store escaped the 5x16 allocation");
+                    assert!(stored_c.insert(index), "{stage}: C index {index} must be stored exactly once");
+                } else {
+                    assert!((80..96).contains(&index), "{stage}: only the final C fragment tail may be disabled");
+                    padded_c.insert(index);
+                }
+            }
+        }
+        assert_eq!(stored_c, (0..80).collect(), "{stage}: stores must cover exactly C[0..80]");
+        assert_eq!(padded_c, (80..96).collect(), "{stage}: the partial C fragment must gate exactly C[80..96]");
+        assert_eq!(result_lanes, [0, 1, 2].into_iter().collect(), "{stage}: C stores must consume WMMA lanes 0,1,2");
+    }
+}
+
+/// Compile-only regression for tinygrad 8c8b43de's padded tensor-core path:
+/// M=5 padded into gfx1151's 16-row WMMA tile. The address coverage is asserted
+/// both before and after linearization, which must lift the partial C store's
+/// gate into IF/ENDIF without moving a byte.
+#[test]
+fn test_matmul_m5_gfx1151_padded_wmma_compile_only() {
+    let ast = matmul_kernel_ast(&[5, 16], &[16, 16], DType::Float16, DType::Float32);
+    let optimized = optimize_kernel_with_config(
+        ast,
+        &amd_optimizer(AmdArch::Gfx1151, None),
+        &pinned_tc_config(0, TcOptLevel::Padded),
+    )
+    .expect("gfx1151 padded tensor-core optimization");
+
+    let nodes = optimized.toposort();
+    assert!(
+        nodes.iter().all(|u| !matches!(u.op(), Op::Reduce { .. })),
+        "pre-coalescing M=5 WMMA must not retain an operand-side range as a residual REDUCE",
+    );
+    let params = nodes
+        .iter()
+        .filter_map(|u| match u.op() {
+            Op::Param { shape, arg } => Some((arg.slot, u.dtype(), shape.vmax().try_int())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        params,
+        vec![(0, DType::Float32, Some(80)), (1, DType::Float16, Some(80)), (2, DType::Float16, Some(256))],
+        "kernel ABI must be C[5x16], A[5x16], B[16x16]",
+    );
+
+    let wmma_node = find_wmma(&nodes);
+    let Op::Wmma { metadata: wmma, c: accumulator, .. } = wmma_node.op() else { unreachable!() };
+    assert_eq!(wmma.dims, (16, 16, 16));
+    assert_eq!((wmma.dtype_in.clone(), wmma.dtype_out.clone()), (DType::Float16, DType::Float32));
+    assert_eq!((wmma.device, wmma.threads), (RendererDevice::AmdRdna3, 32));
+    assert!(wmma.upcast_axes.is_none(), "expander must consume WMMA axis metadata");
+    assert_eq!(
+        accumulator.shape().unwrap().unwrap().last().and_then(|extent| extent.as_const()),
+        Some(8),
+        "gfx1151 must retain its eight-register hardware accumulator fragment",
+    );
+    Fragments::collect(&nodes, wmma_node, |_, gate| gate.clone()).assert_padded_5x16("optimized");
+
+    let (linear, rendered) = render_amd(optimized, AmdArch::Gfx1151, "matmul_m5_gfx1151");
+    let Op::Linear { ops } = linear.op() else { unreachable!() };
+
+    let positions = |wanted: fn(&Op) -> bool| {
+        ops.iter().enumerate().filter(|(_, u)| wanted(u.op())).map(|(position, _)| position).collect::<Vec<_>>()
+    };
+    let ifs = positions(|op| matches!(op, Op::If { .. }));
+    let endifs = positions(|op| matches!(op, Op::EndIf { .. }));
+    assert_eq!((ifs.len(), endifs.len()), (1, 1), "LINEAR must contain exactly the partial C store IF/ENDIF");
+    let (if_position, if_node) = (ifs[0], &ops[ifs[0]]);
+    let Op::If { condition: if_condition, body: if_body } = if_node.op() else { unreachable!() };
+    let Op::EndIf { if_op: endif_owner } = ops[endifs[0]].op() else { unreachable!() };
+    assert!(is_lidx_lt(if_condition, 16), "partial C store IF must be lane<16");
+    assert!(Arc::ptr_eq(endif_owner, if_node), "ENDIF must reference the partial-store IF by source identity");
+    assert_eq!(if_body.len(), 1, "partial-store IF must own exactly one address dependency");
+    assert_eq!(endifs[0], if_position + 2, "ENDIF must immediately follow the partial C store");
+    let guarded_store = &ops[if_position + 1];
+    let Op::Store { index: guarded_address, value: guarded_value, .. } = guarded_store.op() else {
+        panic!("the partial C store must immediately follow its IF")
+    };
+    assert!(Arc::ptr_eq(&if_body[0], guarded_address), "IF body must own the partial store address by identity");
+
+    let linear_fragments = Fragments::collect(ops, find_wmma(ops), |store, gate| {
+        assert!(gate.is_none(), "LINEAR cleanup must move C gates to IF/ENDIF");
+        Arc::ptr_eq(store, guarded_store).then(|| if_condition.clone())
+    });
+    linear_fragments.assert_padded_5x16("linearized");
+
+    assert!(rendered.code.contains("llvm.amdgcn.wmma.f32.16x16x16.f16"), "must select gfx11 f16 WMMA");
+    assert!(!rendered.code.contains("mfma"), "gfx1151 must not select CDNA MFMA");
+    let rendered_op =
+        |id| rendered.operations.iter().find(|operation| operation.uop_id == id).expect("rendered UOp metadata");
+    let result_of = |id| rendered_op(id).result.clone().expect("rendered result name");
+    for AFragment { load, index, gate, alt, .. } in &linear_fragments.a {
+        let (load_render, index_render) = (rendered_op(load.id), rendered_op(index.id));
+        let (address_name, gate_name, alt_name) = (result_of(index.id), result_of(gate.id), result_of(alt.id));
+        assert_eq!(index_render.lines.len(), 1, "each A address must render one GEP");
+        assert!(
+            index_render.lines[0].contains("getelementptr") && index_render.lines[0].contains("half"),
+            "A address metadata must own its half-vector GEP: {:?}",
+            index_render.lines
+        );
+        assert!(load_render.lines.iter().any(|line| line.contains("br i1") && line.contains(&gate_name)));
+        assert!(load_render.lines.iter().any(|line| line.contains("load <4 x half>") && line.contains(&address_name)));
+        assert!(load_render.lines.iter().any(|line| line.contains("phi <4 x half>") && line.contains(&alt_name)));
+        assert_eq!(
+            load_render.source_ids,
+            vec![index.id, alt.id, gate.id],
+            "rendered A load sources must preserve ownership"
+        );
+    }
+
+    let (address_name, value_name) = (result_of(guarded_address.id), result_of(guarded_value.id));
+    let if_render = rendered_op(if_node.id);
+    assert_eq!(if_render.source_ids, vec![if_condition.id, guarded_address.id]);
+    assert!(if_render.lines.iter().any(|line| line.contains("br i1") && line.contains(&result_of(if_condition.id))));
+    assert!(rendered_op(guarded_address.id).lines.iter().any(|line| line.contains("getelementptr")));
+    assert!(
+        rendered_op(guarded_store.id)
+            .lines
+            .iter()
+            .any(|line| { line.contains("store float") && line.contains(&address_name) && line.contains(&value_name) })
+    );
+    assert_eq!(rendered_op(guarded_store.id).source_ids, vec![guarded_address.id, guarded_value.id]);
+    let endif_render = rendered_op(ops[endifs[0]].id);
+    assert_eq!(endif_render.source_ids, vec![if_node.id]);
+    assert!(endif_render.lines.iter().any(|line| line.contains("br label") && line.contains("if_end_")));
+}
+
+/// Hardware acceptance for the compile-only regression above. This test exits
+/// before dispatch unless the selected device is exactly AMD:0 on gfx1151.
+///
+/// Run once after a clean boot:
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tensor test_matmul_m5_gfx1151_padded_wmma_amd -- --ignored --nocapture --test-threads=1`.
+#[test]
+#[ignore = "requires AMD:0 with gfx1151; dispatches a real padded WMMA kernel"]
+fn test_matmul_m5_gfx1151_padded_wmma_amd() {
+    use svod_dtype::{AmdArch, DeviceSpec};
+
+    setup_test_tracing();
+    let device = DeviceSpec::Amd { device_id: 0 };
+    assert_eq!(svod_device::registry::resolve_amd_arch_from_topology(0).expect("AMD:0 topology"), AmdArch::Gfx1151);
+
+    let a_data = (0..5 * 16).map(|i| (i as f32 % 11.0 - 5.0) * 0.125).collect::<Vec<_>>();
+    let b_data = (0..16 * 16).map(|i| (i as f32 % 13.0 - 6.0) * 0.0625).collect::<Vec<_>>();
+    let expected = (0..5)
+        .flat_map(|m| {
+            let a_data = &a_data;
+            let b_data = &b_data;
+            (0..16).map(move |n| (0..16).map(|k| a_data[m * 16 + k] * b_data[k * 16 + n]).sum::<f32>())
+        })
+        .collect::<Vec<_>>();
+
+    let a = Tensor::from_slice(&a_data).try_reshape([5, 16]).unwrap().cast(DType::Float16).unwrap();
+    let b = Tensor::from_slice(&b_data).try_reshape([16, 16]).unwrap().cast(DType::Float16).unwrap();
+    assert_eq!(a.device(), device, "set SVOD_DEVICE=AMD:0; refusing to dispatch elsewhere");
+    assert_eq!(b.device(), device, "set SVOD_DEVICE=AMD:0; refusing to dispatch elsewhere");
+
+    let heuristics = HeuristicsConfig::builder()
+        .tc_opt(TcOptLevel::Padded)
+        .tc_select(TcSelect::Index(0))
+        .matvec_enabled(false)
+        .build();
+    let optimizer = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).heuristics(heuristics).build();
+    let config = prep_config(optimizer);
+    let mut c = a.matmul_with().other(&b).dtype(DType::Float32).call().expect("tensor matmul");
+    assert_eq!(c.device(), device);
+
+    let plan = c.prepare_with(&config).expect("prepare padded WMMA on AMD:0");
+    assert!(
+        plan.kernels().any(|kernel| kernel.code.contains("llvm.amdgcn.wmma.f32.16x16x16.f16")),
+        "prepared plan must contain gfx11 f16-to-f32 WMMA before execution"
+    );
+
+    plan.execute().expect("dispatch padded WMMA");
+    let output = plan.output_buffer().expect("matmul output buffer");
+    output.synchronize().expect("synchronize padded WMMA immediately after dispatch");
+    let mut actual = vec![0.0f32; 5 * 16];
+    output
+        .copyout(unsafe {
+            std::slice::from_raw_parts_mut(actual.as_mut_ptr().cast::<u8>(), actual.len() * std::mem::size_of::<f32>())
+        })
+        .expect("copy padded WMMA output to host");
+
+    for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 2e-2,
+            "mismatch at output {i}: GPU={actual}, CPU={expected}, diff={}",
+            (actual - expected).abs()
+        );
     }
 }
 
@@ -514,144 +926,23 @@ fn test_beam_search_matmul() {
             .build(),
     );
 
-    let plan = c.prepare_with(&beam_config).expect("beam search prepare should succeed");
-
-    println!("\n=== Beam Search Kernels ({}x{}) ===\n", size, size);
-    for kernel in plan.kernels() {
-        println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
-        println!("{}", kernel.code);
-        println!();
-    }
+    c.prepare_with(&beam_config).expect("beam search prepare should succeed");
 }
 
-// ========== Linear Layer Tests ==========
-
-#[test]
-fn test_linear_basic() {
-    // input: [1, 3], weight: [2, 3], bias: [2]
-    let input = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0]]);
-    let weight = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-    let bias = Tensor::from_slice([0.1f32, 0.2]);
-
-    let result = input.linear().weight(&weight).bias(&bias).call().unwrap();
-
-    let result_shape = result.shape().unwrap();
-    assert_eq!(result_shape.len(), 2);
-    assert_eq!(result_shape[0].as_const().unwrap(), 1);
-    assert_eq!(result_shape[1].as_const().unwrap(), 2);
-}
-
-#[test]
-fn test_linear_no_bias() {
-    let input = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0]]);
-    let weight = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-
-    let result = input.linear().weight(&weight).call().unwrap();
-
-    let result_shape = result.shape().unwrap();
-    assert_eq!(result_shape.len(), 2);
-    assert_eq!(result_shape[0].as_const().unwrap(), 1);
-    assert_eq!(result_shape[1].as_const().unwrap(), 2);
-}
-
-#[test]
-fn test_linear_batched() {
-    // input: [4, 3], weight: [2, 3] → output: [4, 2]
-    let input = Tensor::from_ndarray(&Array2::<f32>::ones((4, 3)));
-    let weight = Tensor::from_ndarray(&Array2::<f32>::ones((2, 3)));
-
-    let result = input.linear().weight(&weight).call().unwrap();
-
-    let result_shape = result.shape().unwrap();
-    assert_eq!(result_shape.len(), 2);
-    assert_eq!(result_shape[0].as_const().unwrap(), 4);
-    assert_eq!(result_shape[1].as_const().unwrap(), 2);
-}
-
-#[test]
-fn test_linear_1d_weight() {
-    // Test 1D weight case (element-wise multiply)
-    let input = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let weight = Tensor::from_slice([2.0f32, 3.0, 4.0]);
-
-    let result = input.linear().weight(&weight).call().unwrap();
-
-    let result_shape = result.shape().unwrap();
-    assert_eq!(result_shape.len(), 1);
-    assert_eq!(result_shape[0].as_const().unwrap(), 3);
-}
-
-// ========== Minimal VECTORIZE Normalization Test ==========
-
-#[test]
-fn test_vectorize_normalize_minimal() {
-    // Test 64x64 matmul with vectorization enabled
-    let a = Tensor::from_ndarray(&Array2::<f32>::ones((64, 64)));
-    let b = Tensor::from_ndarray(&Array2::<f32>::ones((64, 64)));
+/// All-ones operands: every output element is exactly `size`, so a mis-tiled
+/// vectorization or upcast shows up as a wrong sum rather than a wrong shape.
+#[test_case(64; "64x64")]
+#[test_case(512; "512x512")]
+fn test_matmul_ones_is_exactly_the_inner_dimension(size: usize) {
+    let a = Tensor::from_ndarray(&Array2::<f32>::ones((size, size)));
+    let b = Tensor::from_ndarray(&Array2::<f32>::ones((size, size)));
     let mut c = a.matmul(&b).unwrap();
+    // from_env() so SVOD_OUTPUT_UPCAST and friends still steer the kernel.
+    c.realize_with(&env_config()).unwrap();
 
-    // Explicit config to avoid test pollution from shared global state
-    let config = prep_config(OptimizerConfig::builder().strategy(OptStrategy::Heuristic).build());
-    let result = c.realize_with(&config);
-    assert!(result.is_ok(), "realize failed: {:?}", result.err());
-}
-
-// ========== 512x512 Vectorized Test (for UPCAST debugging) ==========
-
-#[test]
-fn test_matmul_512x512_vectorized() {
-    // Create 512x512 matrices filled with 1.0
-    const SIZE: usize = 512;
-    let a = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
-    let b = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
-    let mut c = a.matmul(&b).unwrap();
-
-    // Use from_env() to respect SVOD_OUTPUT_UPCAST and other env vars
-    // Note: Beam search has a pre-existing bug with horizontal reduction, using Heuristic
-    let config = env_config();
-    c.realize_with(&config).unwrap();
     let result = c.as_vec::<f32>().unwrap();
-
-    // Each element should be 512 (sum of 512 ones)
-    assert_eq!(result.len(), SIZE * SIZE);
-    assert!((result[0] - SIZE as f32).abs() < 0.01, "Expected {}, got {}", SIZE, result[0]);
-}
-
-#[test]
-fn test_matmul_64x64_vectorized() {
-    // Create 64x64 matrices filled with 1.0
-    const SIZE: usize = 64;
-    let a = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
-    let b = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
-    let mut c = a.matmul(&b).unwrap();
-
-    let config = env_config();
-    c.realize_with(&config).unwrap();
-    let result = c.as_vec::<f32>().unwrap();
-
-    // Each element should be 64 (sum of 64 ones)
-    assert_eq!(result.len(), SIZE * SIZE);
-    assert!((result[0] - SIZE as f32).abs() < 0.01, "Expected {}, got {}", SIZE, result[0]);
-}
-
-#[test]
-#[ignore] // Run with: cargo test -p svod-tensor test_print_matmul_64x64_ir -- --ignored --nocapture
-fn test_print_matmul_64x64_ir() {
-    const SIZE: usize = 64;
-    let a = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
-    let b = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
-    let mut c = a.matmul(&b).unwrap();
-
-    let config = env_config();
-    let plan = c.prepare_with(&config).expect("prepare should succeed");
-
-    println!("\n=== Generated Kernels (64x64 matmul) ===\n");
-    for kernel in plan.prepared_kernels() {
-        println!("--- {} ({}) ---", kernel.kernel.entry_point, kernel.kernel.device);
-        println!("{}", kernel.ast.tree());
-        println!("{}", kernel.kernel.code);
-        println!();
-    }
+    assert_eq!(result.len(), size * size);
+    assert!(result.iter().all(|value| (value - size as f32).abs() < 0.01), "got {}", result[0]);
 }
 
 /// gfx942 (CDNA3) MFMA tensor-core matmul: end-to-end proof + numerical
@@ -664,20 +955,17 @@ fn test_print_matmul_64x64_ir() {
 /// and the per-tile expansion. `tol` stays small because the inputs round-trip
 /// losslessly and the accumulation is in f32.
 fn validate_mfma_square(size: usize, in_dtype: DType, intrinsic: &str, tol: f32) {
-    let beam = OptimizerConfig::builder()
-        .strategy(OptStrategy::Beam { width: 2 })
-        .beam(BeamConfig::builder().disable_cache(true).build())
-        .build();
-    validate_mfma_square_with(beam, size, in_dtype, intrinsic, tol);
-}
-
-fn validate_mfma_square_with(opt: OptimizerConfig, size: usize, in_dtype: DType, intrinsic: &str, tol: f32) {
     let a_data: Vec<f32> = (0..size * size).map(|x| ((x % 7) as f32) - 3.0).collect();
     let b_data: Vec<f32> = (0..size * size).map(|x| ((x % 5) as f32) - 2.0).collect();
     let a_nd = Array2::from_shape_vec((size, size), a_data).unwrap();
     let b_nd = Array2::from_shape_vec((size, size), b_data).unwrap();
 
-    let beam = prep_config(opt);
+    let beam = prep_config(
+        OptimizerConfig::builder()
+            .strategy(OptStrategy::Beam { width: 2 })
+            .beam(BeamConfig::builder().disable_cache(true).build())
+            .build(),
+    );
     let build = || {
         let a = Tensor::from_ndarray(&a_nd).cast(in_dtype.clone()).unwrap();
         let b = Tensor::from_ndarray(&b_nd).cast(in_dtype.clone()).unwrap();
@@ -709,44 +997,6 @@ fn test_matmul_bf16_mfma_validated() {
 #[ignore]
 fn test_matmul_f16_mfma_validated() {
     validate_mfma_square(512, DType::Float16, "llvm.amdgcn.mfma.f32.16x16x16f16", 1.0);
-}
-
-/// Heuristic config pinned to the cdna3 fp32 tensor core. The core is
-/// BEAM-only (`heuristic_pick=false` — `v_mfma_f32_16x16x4_f32` matches the
-/// packed-vector fp32 rate, so an unconditional heuristic pick pessimizes), so
-/// these correctness tests force it via an explicit `tc_select` pin.
-fn f32_mfma_config() -> OptimizerConfig {
-    let renderer = svod_schedule::OptimizerRenderer::amd_cdna3();
-    let idx = renderer
-        .tensor_cores
-        .iter()
-        .position(|tc| tc.dtype_in == DType::Float32 && tc.dims == (16, 16, 4))
-        .expect("cdna3 fp32 16x16x4 tensor core");
-    OptimizerConfig::builder()
-        .strategy(OptStrategy::Heuristic)
-        .heuristics(HeuristicsConfig::builder().tc_select(TcSelect::Index(idx)).build())
-        .build()
-}
-
-/// gfx942 fp32 16×16×4 MFMA (`v_mfma_f32_16x16x4_f32`): scalar f32 A/B
-/// operands (ept 1/1), the smallest reduce tile (K=4 → 2 unroll bits), and a
-/// raw-fp32 input path with no cast prelude. Even size — every dim divides 16,
-/// so this proves the layout/swizzle and the K-tile loop; MFMA reorders the
-/// f32 accumulation but the integer inputs keep it exact.
-#[test]
-#[ignore]
-fn test_matmul_f32_mfma_validated() {
-    validate_mfma_square_with(f32_mfma_config(), 512, DType::Float32, "llvm.amdgcn.mfma.f32.16x16x4f32", 1.0);
-}
-
-/// fp32 MFMA multi-tile: 64×64 forces the 4×4 post-TC M/N tile upcasts on top
-/// of the residual K loop, the layer where the broadcast-collapse and
-/// scalar-accumulator bugs lived. (Odd non-divisible sizes don't get the fp32
-/// TC — PADTO selection is a follow-up.)
-#[test]
-#[ignore]
-fn test_matmul_f32_mfma_multitile_validated() {
-    validate_mfma_square_with(f32_mfma_config(), 64, DType::Float32, "llvm.amdgcn.mfma.f32.16x16x4f32", 1.0);
 }
 
 /// gfx942 fp8 (e4m3) 16×16×32 MFMA. The cdna3 fp8 tensor core is K=32, so this
@@ -785,8 +1035,6 @@ fn test_matmul_validated_64x64() {
 }
 
 // ========== Large Dimension Validated Tests ==========
-
-use test_case::test_case;
 
 // Square matrix tests with increasing sizes
 #[test_case(128, 0.5; "128x128")]

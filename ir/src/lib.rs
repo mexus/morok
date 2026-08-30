@@ -19,6 +19,7 @@ extern crate self as svod_ir;
 
 // Module declarations
 pub mod decompositions;
+pub mod dtype_rule;
 pub mod error;
 pub mod indexing;
 pub mod kernel_info;
@@ -40,22 +41,29 @@ pub mod rewrite;
 pub mod test;
 
 // Re-exports at crate root for ergonomic access.
+pub use dtype_rule::dtype_from_op;
 pub use error::{Error, IndexTypeMismatchSnafu, Result};
 pub use indexing::IndexSpec;
 pub use op::Op;
 pub use opt::{Opt, OptArg, OptOps};
 pub use sint::{IntoShrinkRange, SInt, ShrinkRange, sint_max, sint_min, sint_prod};
 pub use types::{
-    AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, ConstValue, ConstValueHash, ContiguousHint,
-    CustomFunctionKind, KernelInfo, ReduceOp, RendererDevice, TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes,
+    AddrSpace, AxisId, AxisType, BINARY_STAGE_IDENTITY_VERSION, BinaryOp, BinaryStageIdentity, BufferizeOpts, CallInfo,
+    ConstValue, ConstValueHash, ContiguousHint, CustomFunctionKind, InsArg, KernelInfo, ParamArg, ProgramInfo,
+    ReduceOp, RendererDevice, RendererOps, SOURCE_STAGE_IDENTITY_VERSION, SourceStageIdentity, StageAbiParam,
+    StageAbiParamKind, StageDigest, TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes, to_function_name,
 };
-pub use uop::{IntoUOp, UOp, UOpKey, compute_ops_estimate};
+pub use uop::{
+    CanonicalArg, CanonicalAxis, CanonicalConst, CanonicalDType, CanonicalGraph, CanonicalNode, CanonicalProgramValue,
+    CanonicalShapeDim, CanonicalVerboseNode, IntoUOp, OptimizerWireGraph, UOp, UOpKey, compute_ops_estimate,
+    dump_canonical_stage,
+};
 
 // Re-export pattern matching and rewriting infrastructure
 pub use pattern::{Matcher, RewriteResult, TypedPatternMatcher};
 pub use rewrite::{
     graph_rewrite, graph_rewrite_bottom_up_preserve_calls, graph_rewrite_preserve_calls,
-    graph_rewrite_with_bpm_preserve_calls,
+    graph_rewrite_walk_preserve_calls, graph_rewrite_with_bpm_preserve_calls,
 };
 
 // Re-export external types for convenience

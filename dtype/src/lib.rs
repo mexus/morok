@@ -163,28 +163,36 @@ pub enum ImageKind {
 pub enum ScalarDType {
     Bool = 0,
 
-    // Interleaved signed/unsigned for correct LUB priority (lower = more specific)
-    Int8 = 1,
-    UInt8 = 2,
-    Int16 = 3,
-    UInt16 = 4,
-    Int32 = 5,
-    UInt32 = 6,
-    Int64 = 7,
-    UInt64 = 8,
+    /// Python integer literal before a consumer commits it to a storage width.
+    WeakInt = 1,
 
-    FP8E4M3 = 9,
-    FP8E5M2 = 10,
-    Float16 = 11,
-    BFloat16 = 12,
-    Float32 = 13,
-    Float64 = 14,
+    // Interleaved signed/unsigned for correct LUB priority (lower = more specific)
+    Int8 = 2,
+    UInt8 = 3,
+    Int16 = 4,
+    UInt16 = 5,
+    Int32 = 6,
+    UInt32 = 7,
+    Int64 = 8,
+    UInt64 = 9,
+
+    /// Python floating-point literal before a consumer commits it to a storage width.
+    WeakFloat = 10,
+
+    FP8E4M3 = 11,
+    FP8E4M3FNUZ = 19,
+    FP8E5M2 = 12,
+    FP8E5M2FNUZ = 20,
+    Float16 = 13,
+    BFloat16 = 14,
+    Float32 = 15,
+    Float64 = 16,
 
     /// Void type for metadata operations (no data).
-    Void = 15,
+    Void = 17,
 
     /// Index type for array indexing and loop iteration.
-    Index = 16,
+    Index = 18,
 }
 
 /// Data type including scalars, vectors, pointers, and images.
@@ -210,6 +218,7 @@ impl ScalarDType {
     pub const fn bytes(&self) -> usize {
         match self {
             Self::Bool => 1,
+            Self::WeakInt | Self::WeakFloat => 100,
             Self::Int8 => 1,
             Self::Int16 => 2,
             Self::Int32 => 4,
@@ -218,8 +227,7 @@ impl ScalarDType {
             Self::UInt16 => 2,
             Self::UInt32 => 4,
             Self::UInt64 => 8,
-            Self::FP8E4M3 => 1,
-            Self::FP8E5M2 => 1,
+            Self::FP8E4M3 | Self::FP8E4M3FNUZ | Self::FP8E5M2 | Self::FP8E5M2FNUZ => 1,
             Self::Float16 => 2,
             Self::BFloat16 => 2,
             Self::Float32 => 4,
@@ -242,20 +250,41 @@ impl ScalarDType {
     }
 
     pub const fn is_int(&self) -> bool {
-        self.is_signed() || self.is_unsigned() || matches!(self, Self::Index)
+        self.is_signed() || self.is_unsigned() || matches!(self, Self::WeakInt | Self::Index)
     }
 
     pub const fn is_float(&self) -> bool {
-        matches!(self, Self::FP8E4M3 | Self::FP8E5M2 | Self::Float16 | Self::BFloat16 | Self::Float32 | Self::Float64)
+        matches!(
+            self,
+            Self::WeakFloat
+                | Self::FP8E4M3
+                | Self::FP8E4M3FNUZ
+                | Self::FP8E5M2
+                | Self::FP8E5M2FNUZ
+                | Self::Float16
+                | Self::BFloat16
+                | Self::Float32
+                | Self::Float64
+        )
     }
 
     pub const fn is_fp8(&self) -> bool {
-        matches!(self, Self::FP8E4M3 | Self::FP8E5M2)
+        matches!(self, Self::FP8E4M3 | Self::FP8E4M3FNUZ | Self::FP8E5M2 | Self::FP8E5M2FNUZ)
+    }
+
+    pub const fn is_fp8_fnuz(&self) -> bool {
+        matches!(self, Self::FP8E4M3FNUZ | Self::FP8E5M2FNUZ)
+    }
+
+    pub const fn is_weak(&self) -> bool {
+        matches!(self, Self::WeakInt | Self::WeakFloat)
     }
 
     pub const fn min_value(&self) -> f64 {
         match self {
             Self::Bool => 0.0,
+            Self::WeakInt => i64::MIN as f64,
+            Self::WeakFloat => f64::MIN,
             Self::Int8 => i8::MIN as f64,
             Self::Int16 => i16::MIN as f64,
             Self::Int32 => i32::MIN as f64,
@@ -266,7 +295,9 @@ impl ScalarDType {
             Self::Float32 => f32::MIN as f64,
             Self::Float64 => f64::MIN,
             Self::FP8E4M3 => -448.0,
+            Self::FP8E4M3FNUZ => -240.0,
             Self::FP8E5M2 => -57344.0,
+            Self::FP8E5M2FNUZ => -57344.0,
             Self::Void | Self::Index => 0.0,
         }
     }
@@ -274,6 +305,8 @@ impl ScalarDType {
     pub const fn max_value(&self) -> f64 {
         match self {
             Self::Bool => 1.0,
+            Self::WeakInt => i64::MAX as f64,
+            Self::WeakFloat => f64::MAX,
             Self::Int8 => i8::MAX as f64,
             Self::Int16 => i16::MAX as f64,
             Self::Int32 => i32::MAX as f64,
@@ -287,14 +320,29 @@ impl ScalarDType {
             Self::Float32 => f32::MAX as f64,
             Self::Float64 => f64::MAX,
             Self::FP8E4M3 => 448.0,
+            Self::FP8E4M3FNUZ => 240.0,
             Self::FP8E5M2 => 57344.0,
+            Self::FP8E5M2FNUZ => 57344.0,
             Self::Void | Self::Index => 0.0,
         }
+    }
+
+    /// Conservative bounds for compiler value analysis.
+    ///
+    /// Floating formats can represent infinities and NaNs, so their finite
+    /// format extrema from [`min_value`](Self::min_value) and
+    /// [`max_value`](Self::max_value) are not valid bounds for an unknown
+    /// runtime value. NaN is unordered; callers must separately decline any
+    /// proof for which NaN is possible.
+    pub const fn analysis_bounds(&self) -> (f64, f64) {
+        if self.is_float() { (f64::NEG_INFINITY, f64::INFINITY) } else { (self.min_value(), self.max_value()) }
     }
 
     pub const fn c_style(&self) -> &'static str {
         match self {
             Self::Bool => "bool",
+            Self::WeakInt => "weakint",
+            Self::WeakFloat => "weakfloat",
             Self::Int8 => "signed char",
             Self::Int16 => "short",
             Self::Int32 => "int",
@@ -304,7 +352,9 @@ impl ScalarDType {
             Self::UInt32 => "unsigned int",
             Self::UInt64 => "unsigned long",
             Self::FP8E4M3 => "float8_e4m3",
+            Self::FP8E4M3FNUZ => "float8_e4m3fnuz",
             Self::FP8E5M2 => "float8_e5m2",
+            Self::FP8E5M2FNUZ => "float8_e5m2fnuz",
             Self::Float16 => "half",
             Self::Float32 => "float",
             Self::Float64 => "double",
@@ -333,7 +383,9 @@ impl ScalarDType {
     pub const fn finfo(&self) -> Option<(u32, u32)> {
         match self {
             Self::FP8E4M3 => Some((4, 3)),
+            Self::FP8E4M3FNUZ => Some((4, 3)),
             Self::FP8E5M2 => Some((5, 2)),
+            Self::FP8E5M2FNUZ => Some((5, 2)),
             Self::Float16 => Some((5, 10)),
             Self::BFloat16 => Some((8, 7)),
             Self::Float32 => Some((8, 23)),
@@ -362,7 +414,7 @@ impl ScalarDType {
     /// context), so a non-float here signals a caller bug, not user input.
     pub const fn float_to_uint(&self) -> Option<ScalarDType> {
         match self {
-            Self::FP8E4M3 | Self::FP8E5M2 => Some(Self::UInt8),
+            Self::FP8E4M3 | Self::FP8E4M3FNUZ | Self::FP8E5M2 | Self::FP8E5M2FNUZ => Some(Self::UInt8),
             Self::Float16 | Self::BFloat16 => Some(Self::UInt16),
             Self::Float32 => Some(Self::UInt32),
             Self::Float64 => Some(Self::UInt64),
@@ -411,9 +463,8 @@ impl DType {
             Self::Ptr { vcount: 1, base, addrspace, size } => {
                 Some(Self::Ptr { base: base.clone(), addrspace: *addrspace, size: *size, vcount: count })
             }
-            // Already vectorized to target count — idempotent (transient state during
-            // graph rewrite when VECTORIZE(CAST(buf)) is reconstructed before the
-            // INDEX(VECTORIZE(CAST(...))) pattern consumes it).
+            // Already vectorized to the target count: idempotent for transient
+            // hardware-vector states reconstructed during graph rewrites.
             Self::Ptr { vcount, .. } if *vcount == count => Some(self.clone()),
             // Re-vectorizing a pointer to a different count is a construction bug.
             Self::Ptr { .. } => None,
@@ -551,16 +602,19 @@ impl DType {
     }
 
     pub fn is_int(&self) -> bool {
-        // Use base() to handle both Scalar and Vector types
-        self.base().is_int()
+        matches!(self, Self::Scalar(s) | Self::Vector { scalar: s, .. } if s.is_int())
     }
 
     pub fn is_float(&self) -> bool {
-        self.base().is_float()
+        matches!(self, Self::Scalar(s) | Self::Vector { scalar: s, .. } if s.is_float())
     }
 
     pub fn is_fp8(&self) -> bool {
         self.base().is_fp8()
+    }
+
+    pub fn is_weak(&self) -> bool {
+        self.base().is_weak()
     }
 
     pub fn min_value(&self) -> f64 {
@@ -569,6 +623,14 @@ impl DType {
 
     pub fn max_value(&self) -> f64 {
         self.base().max_value()
+    }
+
+    /// Conservative scalar bounds used by compiler analysis.
+    ///
+    /// Vector and shaped values inherit the bounds of their scalar format.
+    /// Unknown floating values always use `[-inf, +inf]`.
+    pub fn analysis_bounds(&self) -> (f64, f64) {
+        self.base().analysis_bounds()
     }
 
     pub fn c_style(&self) -> String {
@@ -595,6 +657,12 @@ impl DType {
 impl DType {
     pub const fn bool_() -> Self {
         Self::Scalar(ScalarDType::Bool)
+    }
+    pub const fn weakint() -> Self {
+        Self::Scalar(ScalarDType::WeakInt)
+    }
+    pub const fn weakfloat() -> Self {
+        Self::Scalar(ScalarDType::WeakFloat)
     }
     pub const fn int8() -> Self {
         Self::Scalar(ScalarDType::Int8)
@@ -644,6 +712,8 @@ impl DType {
 #[allow(non_upper_case_globals)]
 impl DType {
     pub const Bool: Self = Self::Scalar(ScalarDType::Bool);
+    pub const WeakInt: Self = Self::Scalar(ScalarDType::WeakInt);
+    pub const WeakFloat: Self = Self::Scalar(ScalarDType::WeakFloat);
     pub const Int8: Self = Self::Scalar(ScalarDType::Int8);
     pub const Int16: Self = Self::Scalar(ScalarDType::Int16);
     pub const Int32: Self = Self::Scalar(ScalarDType::Int32);
@@ -653,7 +723,9 @@ impl DType {
     pub const UInt32: Self = Self::Scalar(ScalarDType::UInt32);
     pub const UInt64: Self = Self::Scalar(ScalarDType::UInt64);
     pub const FP8E4M3: Self = Self::Scalar(ScalarDType::FP8E4M3);
+    pub const FP8E4M3FNUZ: Self = Self::Scalar(ScalarDType::FP8E4M3FNUZ);
     pub const FP8E5M2: Self = Self::Scalar(ScalarDType::FP8E5M2);
+    pub const FP8E5M2FNUZ: Self = Self::Scalar(ScalarDType::FP8E5M2FNUZ);
     pub const Float16: Self = Self::Scalar(ScalarDType::Float16);
     pub const BFloat16: Self = Self::Scalar(ScalarDType::BFloat16);
     pub const Float32: Self = Self::Scalar(ScalarDType::Float32);
@@ -661,6 +733,10 @@ impl DType {
     pub const Void: Self = Self::Scalar(ScalarDType::Void);
     pub const Index: Self = Self::Scalar(ScalarDType::Index);
 }
+
+/// Pinned Tinygrad defaults. Weak dtypes commit through these shared constants.
+pub const DEFAULT_INT: DType = DType::Int32;
+pub const DEFAULT_FLOAT: DType = DType::Float32;
 
 /// Trait for types that have an associated DType.
 ///

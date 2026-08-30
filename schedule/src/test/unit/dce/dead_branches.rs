@@ -1,110 +1,64 @@
-//! Tests for dead branch elimination in WHERE operations.
+//! Dead branch elimination in WHERE operations.
 
 use std::sync::Arc;
 use svod_dtype::DType;
 use svod_ir::types::TernaryOp;
 use svod_ir::{Op, UOp};
+use test_case::test_case;
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;
 
-#[test]
-fn test_where_always_true() {
-    // Create a WHERE with condition that's always true
-    let cond = UOp::native_const(true);
-    let true_branch = UOp::native_const(42i32);
-    let false_branch = UOp::native_const(0i32);
+fn undecided_condition() -> Arc<UOp> {
+    UOp::var("x", DType::Int32, 0, 100).try_cmplt(&UOp::native_const(50i32)).unwrap()
+}
 
-    let where_op = UOp::try_where(cond, true_branch.clone(), false_branch).unwrap();
+fn range_decided_condition() -> Arc<UOp> {
+    UOp::var("x", DType::Int32, 0, 10).try_cmplt(&UOp::native_const(20i32)).unwrap()
+}
 
-    let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op, &mut ());
+#[test_case(UOp::native_const(true), true; "constant true")]
+#[test_case(UOp::native_const(false), false; "constant false")]
+#[test_case(range_decided_condition(), true; "comparison the declared range decides")]
+fn decided_condition_selects_its_branch(condition: Arc<UOp>, takes_true_branch: bool) {
+    let (then_branch, else_branch) = (UOp::native_const(42i32), UOp::native_const(0i32));
+    let where_op = UOp::try_where(condition, then_branch.clone(), else_branch.clone()).unwrap();
 
-    // Should eliminate to true branch
-    assert!(Arc::ptr_eq(&result, &true_branch));
+    let result = graph_rewrite(symbolic_simple(), where_op, &mut ());
+
+    assert!(Arc::ptr_eq(&result, if takes_true_branch { &then_branch } else { &else_branch }));
 }
 
 #[test]
-fn test_where_always_false() {
-    // Create a WHERE with condition that's always false
-    let cond = UOp::native_const(false);
-    let true_branch = UOp::native_const(42i32);
-    let false_branch = UOp::native_const(0i32);
+fn undecided_condition_keeps_both_branches() {
+    let condition = undecided_condition();
+    let (then_branch, else_branch) = (UOp::native_const(1i32), UOp::native_const(0i32));
+    let where_op = UOp::try_where(condition.clone(), then_branch.clone(), else_branch.clone()).unwrap();
 
-    let where_op = UOp::try_where(cond, true_branch, false_branch.clone()).unwrap();
+    let result = graph_rewrite(symbolic_simple(), where_op, &mut ());
 
-    let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op, &mut ());
-
-    // Should eliminate to false branch
-    assert!(Arc::ptr_eq(&result, &false_branch));
-}
-
-#[test]
-fn test_where_range_based_true() {
-    // Create a comparison that's always true based on ranges
-    let x = UOp::var("x", DType::Int32, 0, 10);
-    let twenty = UOp::native_const(20i32);
-    let cond = x.try_cmplt(&twenty).expect("LT should succeed"); // 0..10 < 20 is always true
-
-    let true_branch = UOp::native_const(1i32);
-    let false_branch = UOp::native_const(0i32);
-
-    let where_op = UOp::try_where(cond, true_branch.clone(), false_branch).unwrap();
-
-    let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op, &mut ());
-
-    // The comparison should be folded to true, then WHERE should select true branch
-    assert!(Arc::ptr_eq(&result, &true_branch));
-}
-
-#[test]
-fn test_where_unknown_condition() {
-    // Create a WHERE with unknown condition
-    let x = UOp::var("x", DType::Int32, 0, 100);
-    let fifty = UOp::native_const(50i32);
-    let cond = x.try_cmplt(&fifty).expect("LT should succeed"); // Could be true or false
-
-    let true_branch = UOp::native_const(1i32);
-    let false_branch = UOp::native_const(0i32);
-
-    let where_op = UOp::try_where(cond.clone(), true_branch.clone(), false_branch.clone()).unwrap();
-
-    let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op, &mut ());
-
-    // Should not be eliminated (condition is not constant)
     match result.op() {
-        Op::Ternary(TernaryOp::Where, result_cond, result_true, result_false) => {
-            assert!(Arc::ptr_eq(result_cond, &cond));
-            assert!(Arc::ptr_eq(result_true, &true_branch));
-            assert!(Arc::ptr_eq(result_false, &false_branch));
+        Op::Ternary(TernaryOp::Where, cond, then_, else_) => {
+            assert!(Arc::ptr_eq(cond, &condition));
+            assert!(Arc::ptr_eq(then_, &then_branch));
+            assert!(Arc::ptr_eq(else_, &else_branch));
         }
-        other => panic!("Expected Op::Ternary(Where, _, _, _), got {:?}", other),
+        other => panic!("expected the WHERE to survive, got {other:?}"),
     }
 }
 
-#[test]
-fn test_nested_where_elimination() {
-    // Create nested WHERE operations that can be eliminated
-    let cond1 = UOp::native_const(true);
-    let cond2 = UOp::native_const(false);
+/// `WHERE(cond, INVALID, INVALID)` must collapse to `INVALID` instead of
+/// ping-ponging through the INVALID canonicalization
+/// (`WHERE(c, INV, x) -> WHERE(NOT c, x, INV)`), which flips the gate forever.
+#[test_case(false ; "plain condition")]
+#[test_case(true ; "negated condition")]
+fn where_with_two_invalid_branches_collapses(negate: bool) {
+    let condition = undecided_condition();
+    let condition = if negate { condition.not() } else { condition };
+    let invalid = UOp::invalid_marker();
 
-    let val1 = UOp::native_const(1i32);
-    let val2 = UOp::native_const(2i32);
-    let val3 = UOp::native_const(3i32);
-    let _val4 = UOp::native_const(4i32);
+    let where_op = UOp::try_where(condition, invalid.clone(), invalid).unwrap();
+    let result = graph_rewrite(symbolic_simple(), where_op, &mut ());
 
-    // Inner WHERE: if false then val1 else val2 → val2
-    let inner = UOp::try_where(cond2, val1, val2.clone()).unwrap();
-
-    // Outer WHERE: if true then inner else val3 → inner → val2
-    let outer = UOp::try_where(cond1, inner, val3).unwrap();
-
-    let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, outer, &mut ());
-
-    // Should eliminate to val2
-    assert!(Arc::ptr_eq(&result, &val2));
+    assert!(UOp::is_invalid_marker(&result), "expected bare INVALID, got {:?}", result.op());
 }

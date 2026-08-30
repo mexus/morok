@@ -5,9 +5,58 @@
 
 use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
+use std::sync::Arc;
 
+use smallvec::SmallVec;
 use svod_dtype::DeviceSpec;
+use svod_dtype::cast::commit_float;
 use svod_dtype::{DType, ScalarDType};
+
+/// Schema version for semantic SOURCE stage identities.
+pub const SOURCE_STAGE_IDENTITY_VERSION: u32 = 1;
+
+/// Schema version for semantic BINARY stage identities.
+pub const BINARY_STAGE_IDENTITY_VERSION: u32 = 1;
+
+/// A collision-resistant digest used by staged executable IR identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct StageDigest(pub [u8; 32]);
+
+/// ABI argument class in an executable SOURCE identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum StageAbiParamKind {
+    Storage(svod_dtype::AddrSpace),
+    Scalar,
+}
+
+/// One ordered external ABI argument in an executable SOURCE identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct StageAbiParam {
+    pub slot: usize,
+    pub kind: StageAbiParamKind,
+    pub dtype: DType,
+    pub name: Option<String>,
+}
+
+/// Semantic proof that SOURCE belongs to one exact PROGRAM and LINEAR stage.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct SourceStageIdentity {
+    pub version: u32,
+    pub abi: Vec<StageAbiParam>,
+    pub target: DeviceSpec,
+    pub entry_name: String,
+    pub linear_sha256: StageDigest,
+    pub source_sha256: StageDigest,
+}
+
+/// Semantic proof that BINARY was compiled from one exact SOURCE identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct BinaryStageIdentity {
+    pub version: u32,
+    pub source: SourceStageIdentity,
+    pub compiler_key: String,
+    pub binary_sha256: StageDigest,
+}
 
 /// Constant value that can be stored in a UOp.
 ///
@@ -18,6 +67,9 @@ use svod_dtype::{DType, ScalarDType};
 #[derive(Debug, Clone, Copy, derive_more::From)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum ConstValue {
+    /// Canonical poison value. Its UOp dtype is always bool and consumers treat
+    /// it as matching any dtype.
+    Invalid,
     Int(i64),
     UInt(u64),
     Float(f64),
@@ -27,6 +79,7 @@ pub enum ConstValue {
 impl PartialEq for ConstValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Invalid, Self::Invalid) => true,
             (Self::Int(a), Self::Int(b)) => a == b,
             (Self::UInt(a), Self::UInt(b)) => a == b,
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
@@ -66,6 +119,7 @@ impl Hash for ConstValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
         discriminant(self).hash(state);
         match self {
+            ConstValue::Invalid => {}
             ConstValue::Int(v) => v.hash(state),
             ConstValue::UInt(v) => v.hash(state),
             ConstValue::Float(v) => v.to_bits().hash(state),
@@ -85,6 +139,7 @@ macro_rules! cast_via {
 macro_rules! impl_cast {
     ($self:expr, $to:expr) => {
         match ($self, $to) {
+            (ConstValue::Invalid, _) => ConstValue::Invalid,
             (ConstValue::Bool(v), dt) => cast_bool(v, dt)?,
             (ConstValue::Int(v), dt) => cast_int(v, dt)?,
             (ConstValue::UInt(v), dt) => cast_uint(v, dt)?,
@@ -98,10 +153,12 @@ fn cast_bool(v: bool, to: ScalarDType) -> Option<ConstValue> {
     use ScalarDType::*;
     Some(match to {
         Bool => ConstValue::Bool(v),
-        Int8 | Int16 | Int32 | Int64 | Index => ConstValue::Int(v as i64),
+        WeakInt | Int8 | Int16 | Int32 | Int64 | Index => ConstValue::Int(v as i64),
         UInt8 | UInt16 | UInt32 | UInt64 => ConstValue::UInt(v as u64),
-        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as u8 as f64),
-        _ => return None,
+        WeakFloat | FP8E4M3 | FP8E4M3FNUZ | FP8E5M2 | FP8E5M2FNUZ | Float16 | BFloat16 | Float32 | Float64 => {
+            ConstValue::Float(commit_float(v as u8 as f64, to)?)
+        }
+        Void => ConstValue::Int(v as i64),
     })
 }
 
@@ -113,13 +170,15 @@ fn cast_int(v: i64, to: ScalarDType) -> Option<ConstValue> {
         Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
         Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
         Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
-        Int64 | Index => ConstValue::Int(v),
+        WeakInt | Int64 | Index => ConstValue::Int(v),
         UInt8 => ConstValue::UInt(cast_via!(v, u8, u64)),
         UInt16 => ConstValue::UInt(cast_via!(v, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v, u32, u64)),
         UInt64 => ConstValue::UInt(v as u64),
-        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as f64),
-        _ => return None,
+        WeakFloat | FP8E4M3 | FP8E4M3FNUZ | FP8E5M2 | FP8E5M2FNUZ | Float16 | BFloat16 | Float32 | Float64 => {
+            ConstValue::Float(commit_float(v as f64, to)?)
+        }
+        Void => ConstValue::Int(v),
     })
 }
 
@@ -131,13 +190,15 @@ fn cast_uint(v: u64, to: ScalarDType) -> Option<ConstValue> {
         Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
         Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
         Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
-        Int64 | Index => ConstValue::Int(v as i64),
+        WeakInt | Int64 | Index => ConstValue::Int(v as i64),
         UInt8 => ConstValue::UInt(cast_via!(v, u8, u64)),
         UInt16 => ConstValue::UInt(cast_via!(v, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v, u32, u64)),
         UInt64 => ConstValue::UInt(v),
-        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as f64),
-        _ => return None,
+        WeakFloat | FP8E4M3 | FP8E4M3FNUZ | FP8E5M2 | FP8E5M2FNUZ | Float16 | BFloat16 | Float32 | Float64 => {
+            ConstValue::Float(commit_float(v as f64, to)?)
+        }
+        Void => ConstValue::Int(v as i64),
     })
 }
 
@@ -149,20 +210,23 @@ fn cast_float(v: f64, to: ScalarDType) -> Option<ConstValue> {
         Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
         Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
         Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
-        Int64 | Index => ConstValue::Int(v as i64),
+        WeakInt | Int64 | Index => ConstValue::Int(v as i64),
         // Float-to-unsigned: route through i64 first.
         UInt8 => ConstValue::UInt(cast_via!(v as i64, u8, u64)),
         UInt16 => ConstValue::UInt(cast_via!(v as i64, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v as i64, u32, u64)),
         UInt64 => ConstValue::UInt((v as i64) as u64),
-        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v),
-        _ => return None,
+        WeakFloat | FP8E4M3 | FP8E4M3FNUZ | FP8E5M2 | FP8E5M2FNUZ | Float16 | BFloat16 | Float32 | Float64 => {
+            ConstValue::Float(commit_float(v, to)?)
+        }
+        Void => ConstValue::Int(v as i64),
     })
 }
 
 impl ConstValue {
     pub const fn dtype(&self) -> DType {
         match self {
+            ConstValue::Invalid => DType::Bool,
             ConstValue::Int(_) => DType::Int64,
             ConstValue::UInt(_) => DType::UInt64,
             ConstValue::Float(_) => DType::Float64,
@@ -174,9 +238,11 @@ impl ConstValue {
         use ScalarDType::*;
         match dtype {
             Bool => Self::Bool(false),
-            Int8 | Int16 | Int32 | Int64 => Self::Int(0),
+            WeakInt | Int8 | Int16 | Int32 | Int64 => Self::Int(0),
             UInt8 | UInt16 | UInt32 | UInt64 => Self::UInt(0),
-            FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(0.0),
+            WeakFloat | FP8E4M3 | FP8E4M3FNUZ | FP8E5M2 | FP8E5M2FNUZ | Float16 | BFloat16 | Float32 | Float64 => {
+                Self::Float(0.0)
+            }
             Void | Index => Self::Int(0), // TODO: remove this types from scalars
         }
     }
@@ -185,9 +251,11 @@ impl ConstValue {
         use ScalarDType::*;
         match dtype {
             Bool => Self::Bool(true),
-            Int8 | Int16 | Int32 | Int64 => Self::Int(1),
+            WeakInt | Int8 | Int16 | Int32 | Int64 => Self::Int(1),
             UInt8 | UInt16 | UInt32 | UInt64 => Self::UInt(1),
-            FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(1.0),
+            WeakFloat | FP8E4M3 | FP8E4M3FNUZ | FP8E5M2 | FP8E5M2FNUZ | Float16 | BFloat16 | Float32 | Float64 => {
+                Self::Float(1.0)
+            }
             Void | Index => Self::Int(1), // TODO: remove this types from scalars
         }
     }
@@ -195,8 +263,10 @@ impl ConstValue {
     pub const fn neg_one(dtype: ScalarDType) -> Option<Self> {
         use ScalarDType::*;
         Some(match dtype {
-            Int8 | Int16 | Int32 | Int64 | Index => Self::Int(-1),
-            FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(-1.0),
+            WeakInt | Int8 | Int16 | Int32 | Int64 | Index => Self::Int(-1),
+            WeakFloat | FP8E4M3 | FP8E4M3FNUZ | FP8E5M2 | FP8E5M2FNUZ | Float16 | BFloat16 | Float32 | Float64 => {
+                Self::Float(-1.0)
+            }
             _ => return None,
         })
     }
@@ -209,12 +279,15 @@ impl ConstValue {
             Int8 => Self::Int(i8::MIN as i64),
             Int16 => Self::Int(i16::MIN as i64),
             Int32 => Self::Int(i32::MIN as i64),
-            Int64 | Index => Self::Int(i64::MIN),
+            WeakInt | Int64 | Index => Self::Int(i64::MIN),
             UInt8 | UInt16 | UInt32 | UInt64 => Self::UInt(0),
-            FP8E4M3 | FP8E5M2 | Float16 => Self::Float(-65504.0),
-            BFloat16 => Self::Float(-3.38953e38),
+            FP8E4M3 => Self::Float(-448.0),
+            FP8E4M3FNUZ => Self::Float(-240.0),
+            FP8E5M2 | FP8E5M2FNUZ => Self::Float(-57344.0),
+            Float16 => Self::Float(-65504.0),
+            BFloat16 => Self::Float(-3.3895313892515355e38),
             Float32 => Self::Float(f32::MIN as f64),
-            Float64 => Self::Float(f64::MIN),
+            WeakFloat | Float64 => Self::Float(f64::MIN),
             Void => Self::Int(0),
         }
     }
@@ -227,15 +300,18 @@ impl ConstValue {
             Int8 => Self::Int(i8::MAX as i64),
             Int16 => Self::Int(i16::MAX as i64),
             Int32 => Self::Int(i32::MAX as i64),
-            Int64 | Index => Self::Int(i64::MAX),
+            WeakInt | Int64 | Index => Self::Int(i64::MAX),
             UInt8 => Self::UInt(u8::MAX as u64),
             UInt16 => Self::UInt(u16::MAX as u64),
             UInt32 => Self::UInt(u32::MAX as u64),
             UInt64 => Self::UInt(u64::MAX),
-            FP8E4M3 | FP8E5M2 | Float16 => Self::Float(65504.0),
-            BFloat16 => Self::Float(3.38953e38),
+            FP8E4M3 => Self::Float(448.0),
+            FP8E4M3FNUZ => Self::Float(240.0),
+            FP8E5M2 | FP8E5M2FNUZ => Self::Float(57344.0),
+            Float16 => Self::Float(65504.0),
+            BFloat16 => Self::Float(3.3895313892515355e38),
             Float32 => Self::Float(f32::MAX as f64),
-            Float64 => Self::Float(f64::MAX),
+            WeakFloat | Float64 => Self::Float(f64::MAX),
             Void => Self::Int(0),
         }
     }
@@ -319,55 +395,108 @@ impl ConstValue {
         }
     }
 
-    /// Truncate value to fit within dtype boundaries (two's complement wrapping).
+    /// Commit a value to the dtype grid used by typed constant folding.
     ///
     /// Used for constant folding to ensure results respect the target dtype's bit width.
     pub fn truncate(self, dtype: ScalarDType) -> Self {
-        use ScalarDType::*;
-        match (self, dtype) {
-            // Signed integers: cast to target width, then back to i64
-            (Self::Int(v), Int8) => Self::Int((v as i8) as i64),
-            (Self::Int(v), Int16) => Self::Int((v as i16) as i64),
-            (Self::Int(v), Int32) => Self::Int((v as i32) as i64),
-            (Self::Int(v), Int64 | Index) => Self::Int(v),
-
-            // Unsigned integers: cast to target width, then back to u64
-            (Self::UInt(v), UInt8) => Self::UInt((v as u8) as u64),
-            (Self::UInt(v), UInt16) => Self::UInt((v as u16) as u64),
-            (Self::UInt(v), UInt32) => Self::UInt((v as u32) as u64),
-            (Self::UInt(v), UInt64) => Self::UInt(v),
-
-            // Float/Bool: no truncation needed
-            _ => self,
-        }
+        self.cast(&DType::Scalar(dtype)).expect("typed constant evaluation produced an unsupported dtype/value pair")
     }
 }
 
 // Re-export AddrSpace from dtype to avoid duplication
 pub use svod_dtype::AddrSpace;
 
-/// Options for BUFFERIZE operation.
+/// Structured metadata for PARAM and, eventually, BUFFER definitions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ParamArg {
+    pub slot: usize,
+    pub dtype: DType,
+    pub vmin_vmax: Option<(ConstValueHash, ConstValueHash)>,
+    pub multiple_of: Option<usize>,
+    pub name: Option<String>,
+    pub addrspace: Option<AddrSpace>,
+    pub axis: Option<usize>,
+    pub device: Option<DeviceSpec>,
+    pub volatile: bool,
+}
+
+impl ParamArg {
+    pub fn buffer(slot: usize, dtype: DType, addrspace: AddrSpace, device: Option<DeviceSpec>) -> Self {
+        Self {
+            slot,
+            dtype,
+            vmin_vmax: None,
+            multiple_of: None,
+            name: None,
+            addrspace: Some(addrspace),
+            axis: None,
+            device,
+            volatile: false,
+        }
+    }
+
+    pub fn variable(name: String, dtype: DType, min_val: i64, max_val: i64) -> Self {
+        Self {
+            slot: usize::MAX,
+            dtype,
+            vmin_vmax: Some((ConstValueHash(ConstValue::Int(min_val)), ConstValueHash(ConstValue::Int(max_val)))),
+            multiple_of: Some(1),
+            name: Some(name),
+            addrspace: None,
+            axis: None,
+            device: None,
+            volatile: false,
+        }
+    }
+
+    /// Positional scalar PARAM used by FUNCTION bodies.
+    pub fn scalar(slot: usize, name: Option<String>, dtype: DType, min_val: i64, max_val: i64) -> Self {
+        Self {
+            slot,
+            dtype,
+            vmin_vmax: Some((ConstValueHash(ConstValue::Int(min_val)), ConstValueHash(ConstValue::Int(max_val)))),
+            multiple_of: Some(1),
+            name,
+            addrspace: None,
+            axis: None,
+            device: None,
+            volatile: false,
+        }
+    }
+}
+
+/// Options for STAGE operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct BufferizeOpts {
-    /// Device specification or None for local buffers.
+    /// Source device for ordinary stages; grouped LOCAL stages use `local_axis`.
     pub device: Option<DeviceSpec>,
+    /// GROUP_REDUCE axis that owns a LOCAL staging buffer.
+    ///
+    /// Tinygrad stores this identity in `device` for LOCAL STAGEs. Keep it
+    /// typed so nested axis paths cannot alias device names or scalar axes.
+    pub local_axis: Option<AxisId>,
     /// Address space (GLOBAL or LOCAL).
     pub addrspace: AddrSpace,
-    /// Whether buffer_removal may inline this BUFFERIZE.
+    /// Whether buffer_removal may inline this STAGE.
     /// Multi-consumer realize boundaries set this to `false` so that
-    /// `dead_axis_removal` (which creates new BUFFERIZE nodes) preserves
+    /// `dead_axis_removal` (which creates new STAGE nodes) preserves
     /// the protection across mega-pass fixpoint iterations.
     pub removable: bool,
 }
 
 impl BufferizeOpts {
     pub fn new(device: DeviceSpec) -> Self {
-        Self { device: Some(device), addrspace: AddrSpace::Global, removable: true }
+        Self { device: Some(device), local_axis: None, addrspace: AddrSpace::Global, removable: true }
     }
 
     pub fn local() -> Self {
-        Self { device: None, addrspace: AddrSpace::Local, removable: true }
+        Self { device: None, local_axis: None, addrspace: AddrSpace::Local, removable: true }
+    }
+
+    pub fn local_for_axis(axis: AxisId) -> Self {
+        Self { device: None, local_axis: Some(axis), addrspace: AddrSpace::Local, removable: true }
     }
 }
 
@@ -404,9 +533,8 @@ pub struct CallInfo {
 
 /// Explicit runtime custom-function kinds.
 ///
-/// Both variants are reserved: the IR can construct them and the schedule
-/// lowers them, but the runtime returns an `Unsupported` error until backends
-/// implement them.
+/// Reserved helpers remain typed `Unsupported` at runtime; `AllReduce` is the
+/// correctness-first host implementation used by collective schedule items.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum CustomFunctionKind {
@@ -414,6 +542,8 @@ pub enum CustomFunctionKind {
     EncDec,
     /// JIT graph-capture hook.
     Graph,
+    /// Correctness-first host-staged collective over explicit shard buffers.
+    AllReduce { reduce_op: ReduceOp },
 }
 
 /// Structural marker carried in `Op::Sink::info` indicating the SINK is a
@@ -434,6 +564,10 @@ pub struct KernelInfo {
     ///   kernel).
     /// - `Some(non-empty)` — apply exactly these opts, in order.
     pub opts_to_apply: Option<Vec<crate::opt::Opt>>,
+    /// Optimizations actually applied by the production scheduler.
+    pub applied_opts: Vec<crate::opt::Opt>,
+    /// Final optimizer decision to avoid local/shared-memory transforms.
+    pub dont_use_locals: bool,
     /// Author-supplied kernel name carried on the SINK itself (set by hand-lowered
     /// tile-DSL kernels via their `Kernel::finish`). The optimizer-scheduled path
     /// names kernels through its own metadata channel and leaves this `None`; the
@@ -443,18 +577,291 @@ pub struct KernelInfo {
     pub name: Option<String>,
 }
 
+/// Target-defined instruction identity. Operands remain ordinary UOp sources;
+/// target-specific encoding facts live in sorted, deterministic attributes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct InsArg {
+    pub opcode: String,
+    pub attributes: Vec<(String, String)>,
+}
+
+impl InsArg {
+    pub fn new(opcode: impl Into<String>) -> Self {
+        Self { opcode: opcode.into(), attributes: Vec::new() }
+    }
+
+    pub fn with_attributes(opcode: impl Into<String>, mut attributes: Vec<(String, String)>) -> Self {
+        attributes.sort();
+        Self { opcode: opcode.into(), attributes }
+    }
+}
+
+/// Structural PROGRAM argument, ported from tinygrad's `ProgramInfo` at 8c8b43de.
+///
+/// Representation differences are limited to existing IR types: Tinygrad's
+/// `Target` is [`DeviceSpec`] and launch values are [`UOp`](crate::UOp)s rather
+/// than Python `int | float`.
+#[derive(Debug, Clone)]
+pub struct ProgramInfo {
+    pub name: String,
+    pub global_size: [Arc<crate::UOp>; 3],
+    pub local_size: Option<[Arc<crate::UOp>; 3]>,
+    pub vars: Vec<Arc<crate::UOp>>,
+    pub globals: Vec<usize>,
+    pub outs: Vec<usize>,
+    pub ins: Vec<usize>,
+    pub target: DeviceSpec,
+}
+
+impl Default for ProgramInfo {
+    fn default() -> Self {
+        let one = || crate::UOp::index_const(1);
+        Self {
+            name: "test".to_string(),
+            global_size: [one(), one(), one()],
+            local_size: None,
+            vars: Vec::new(),
+            globals: Vec::new(),
+            outs: Vec::new(),
+            ins: Vec::new(),
+            target: DeviceSpec::Cpu,
+        }
+    }
+}
+
+impl PartialEq for ProgramInfo {
+    fn eq(&self, other: &Self) -> bool {
+        fn same_uops(a: &[Arc<crate::UOp>], b: &[Arc<crate::UOp>]) -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.content_hash == b.content_hash)
+        }
+
+        self.name == other.name
+            && same_uops(&self.global_size, &other.global_size)
+            && match (&self.local_size, &other.local_size) {
+                (Some(a), Some(b)) => same_uops(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+            && same_uops(&self.vars, &other.vars)
+            && self.globals == other.globals
+            && self.outs == other.outs
+            && self.ins == other.ins
+            && self.target == other.target
+    }
+}
+
+impl Eq for ProgramInfo {}
+
+impl Hash for ProgramInfo {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.global_size.iter().for_each(|u| u.content_hash.hash(state));
+        self.local_size.as_ref().map(|dims| dims.iter().for_each(|u| u.content_hash.hash(state))).hash(state);
+        self.vars.iter().for_each(|u| u.content_hash.hash(state));
+        self.globals.hash(state);
+        self.outs.hash(state);
+        self.ins.hash(state);
+        self.target.hash(state);
+    }
+}
+
+/// Convert a diagnostic kernel name to Tinygrad's renderer-safe identifier.
+pub fn to_function_name(name: &str) -> String {
+    let chars = name.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] == '\x1b' && chars.get(index + 1) == Some(&'[') {
+            let end = if chars.get(index + 2) == Some(&'K') {
+                Some(index + 2)
+            } else {
+                (index + 2..chars.len()).find(|&candidate| chars[candidate] == 'm')
+            };
+            if let Some(end) = end {
+                index = end + 1;
+                continue;
+            }
+        }
+
+        let character = chars[index];
+        if character.is_ascii_alphanumeric() || character == '_' {
+            output.push(character);
+        } else {
+            output.push_str(&format!("{:02X}", character as u32));
+        }
+        index += 1;
+    }
+
+    output
+}
+
+impl ProgramInfo {
+    pub fn function_name(&self) -> String {
+        to_function_name(&self.name)
+    }
+
+    fn ssimplify(uop: &Arc<crate::UOp>) -> Arc<crate::UOp> {
+        use crate::{BinaryOp, Op};
+
+        fn const_value(uop: &Arc<crate::UOp>) -> Option<ConstValue> {
+            match uop.op() {
+                Op::Const(value) => Some(value.0),
+                _ => None,
+            }
+        }
+        fn is_int(uop: &Arc<crate::UOp>, value: i64) -> bool {
+            matches!(const_value(uop), Some(ConstValue::Int(v)) if v == value)
+                || matches!(const_value(uop), Some(ConstValue::UInt(v)) if value >= 0 && v == value as u64)
+        }
+
+        let sources = uop.op().sources();
+        let rewritten_sources: Vec<_> = sources.iter().map(Self::ssimplify).collect();
+        let rewritten = if sources.iter().zip(&rewritten_sources).all(|(old, new)| Arc::ptr_eq(old, new)) {
+            uop.clone()
+        } else {
+            uop.with_sources(rewritten_sources)
+        };
+
+        match rewritten.op() {
+            Op::Cast { src, dtype } if src.dtype() == *dtype => src.clone(),
+            Op::Binary(op, lhs, rhs) => {
+                if let (Some(a), Some(b)) = (const_value(lhs), const_value(rhs))
+                    && let Some(value) = crate::uop::eval::eval_binary_op(*op, a, b)
+                {
+                    return crate::UOp::const_(rewritten.dtype(), value);
+                }
+                match op {
+                    BinaryOp::Add if is_int(rhs, 0) => lhs.clone(),
+                    BinaryOp::Add if is_int(lhs, 0) => rhs.clone(),
+                    BinaryOp::Sub if is_int(rhs, 0) => lhs.clone(),
+                    BinaryOp::Mul if is_int(rhs, 1) => lhs.clone(),
+                    BinaryOp::Mul if is_int(lhs, 1) => rhs.clone(),
+                    BinaryOp::FloorDiv if is_int(rhs, 1) => lhs.clone(),
+                    _ => rewritten,
+                }
+            }
+            _ => rewritten,
+        }
+    }
+
+    /// Derive PROGRAM identity from the final SINK using Tinygrad's traversal,
+    /// ordering, deduplication, and SPECIAL extent simplification rules.
+    pub fn from_sink(sink: &Arc<crate::UOp>, target: DeviceSpec) -> Self {
+        use crate::Op;
+
+        let one = || crate::UOp::index_const(1);
+        let mut vars = Vec::new();
+        let mut globals = Vec::new();
+        let mut outs = Vec::new();
+        let mut ins = Vec::new();
+        let mut global_size = [one(), one(), one()];
+        let mut local_size = Some([one(), one(), one()]);
+
+        fn buf_param_slot(mut uop: &Arc<crate::UOp>) -> Option<usize> {
+            loop {
+                match uop.op() {
+                    Op::Param { arg, .. } => return Some(arg.slot),
+                    Op::Index { buffer, .. } => uop = buffer,
+                    Op::Shrink { src, .. } | Op::Cast { src, .. } => uop = src,
+                    Op::After { passthrough, .. } => uop = passthrough,
+                    _ => return None,
+                }
+            }
+        }
+
+        fn param_slot(index: &Arc<crate::UOp>) -> Option<usize> {
+            let index = match index.op() {
+                Op::Index { .. } | Op::Shrink { .. } => index,
+                Op::Cast { src, .. } if matches!(src.op(), Op::Index { .. } | Op::Shrink { .. }) => src,
+                _ => return None,
+            };
+            let buffer_or_value = match index.op() {
+                Op::Index { buffer, .. } => buffer,
+                Op::Shrink { src, .. } => src,
+                _ => return None,
+            };
+            buf_param_slot(buffer_or_value)
+        }
+
+        // CALL/FUNCTION bodies define a separate PARAM namespace. Only call
+        // arguments belong to the enclosing executable PROGRAM ABI.
+        for u in sink.toposort_call_aware(false) {
+            match u.op() {
+                Op::Param { arg, .. } if arg.addrspace.is_none() => {
+                    vars.push(u.clone());
+                    if arg.name.as_deref() == Some("core_id")
+                        && let Some((_, ConstValueHash(ConstValue::Int(max_val)))) = arg.vmin_vmax
+                    {
+                        global_size[0] = crate::UOp::index_const(max_val + 1);
+                    }
+                }
+                Op::Param { arg, .. } => globals.push(arg.slot),
+                Op::Store { index, .. } => {
+                    if let Some(slot) = param_slot(index) {
+                        outs.push(slot);
+                    }
+                }
+                Op::Load { index, .. } => {
+                    if let Some(slot) = param_slot(index) {
+                        ins.push(slot);
+                    }
+                }
+                Op::Special { end, name } => {
+                    let Some(axis) = name.chars().last().and_then(|c| c.to_digit(10)).map(|axis| axis as usize) else {
+                        continue;
+                    };
+                    if axis >= global_size.len() {
+                        continue;
+                    }
+                    if name.starts_with('i') {
+                        local_size = None;
+                    }
+                    let special_size = if name.starts_with('l') { local_size.as_mut() } else { Some(&mut global_size) };
+                    if let Some(special_size) = special_size {
+                        special_size[axis] = Self::ssimplify(end);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        vars.sort_by_key(|u| match u.op() {
+            Op::Param { arg, .. } => arg.slot,
+            _ => usize::MAX,
+        });
+        vars.dedup_by_key(|u| u.content_hash);
+        globals.sort_unstable();
+        globals.dedup();
+        outs.sort_unstable();
+        outs.dedup();
+        ins.sort_unstable();
+        ins.dedup();
+
+        let name = match sink.op() {
+            Op::Sink { info: Some(info), .. } => info.name.clone().unwrap_or_else(|| "test".to_string()),
+            _ => "test".to_string(),
+        };
+        Self { name, global_size, local_size, vars, globals, outs, ins, target }
+    }
+}
+
 /// Axis type for loop ranges and reductions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum AxisType {
+    /// Device-selection dimension, bound per device at launch.
+    Device,
     /// GPU grid dimension.
     Global,
     /// Warp/wavefront dimension.
     Warp,
     /// GPU block/workgroup dimension (local memory scope).
     Local,
-    /// Regular loop — default axis type produced by rangeify. Schedule-level
-    /// loop wrappers are distinguished structurally by `END(Call)` pairing.
+    /// Unparallelized range produced by rangeify.
+    Weak,
+    /// Explicit regular loop.
     Loop,
     /// Grouped reduction.
     GroupReduce,
@@ -477,7 +884,7 @@ impl AxisType {
     /// Lower values are outer loops, higher values are inner loops.
     ///
     /// **Priority Order:**
-    /// - Loop: -1 (not yet parallelized; rangeify default)
+    /// - Weak/Loop: -1 (not yet parallelized)
     /// - Global/Thread: 0 (outer parallelism)
     /// - Warp: 1 (sub-group parallelism)
     /// - Local/GroupReduce: 2 (workgroup parallelism + synchronization)
@@ -486,7 +893,8 @@ impl AxisType {
     /// - Unroll: 5 (unrolled loops, innermost)
     pub const fn priority(self) -> i32 {
         match self {
-            Self::Loop => -1,
+            Self::Device => -2,
+            Self::Weak | Self::Loop => -1,
             Self::Global | Self::Thread => 0,
             Self::Warp => 1,
             Self::Local | Self::GroupReduce => 2,
@@ -513,7 +921,8 @@ impl AxisType {
     /// - r: Unroll
     pub const fn letter(self) -> char {
         match self {
-            Self::Loop => 'L',
+            Self::Device => 'd',
+            Self::Weak | Self::Loop => 'L',
             Self::Global => 'g',
             Self::Thread => 't',
             Self::Warp => 'w',
@@ -566,13 +975,17 @@ impl std::fmt::Display for AxisType {
 ///
 /// The enum makes the renumber_range pattern naturally idempotent:
 /// it only matches `Unrenumbered` variants and produces `Renumbered` variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Eq)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum AxisId {
     /// Range created during rangeify, not yet renumbered.
     Unrenumbered(usize),
     /// Range renumbered for kernel deduplication.
     Renumbered(usize),
+    /// Range identity derived structurally from an unrenumbered parent.
+    UnrenumberedPath(SmallVec<[usize; 4]>),
+    /// Range identity derived structurally from a renumbered parent.
+    RenumberedPath(SmallVec<[usize; 4]>),
 }
 
 impl AxisId {
@@ -580,12 +993,70 @@ impl AxisId {
     pub fn value(&self) -> usize {
         match self {
             AxisId::Unrenumbered(n) | AxisId::Renumbered(n) => *n,
+            AxisId::UnrenumberedPath(path) | AxisId::RenumberedPath(path) => path[0],
         }
+    }
+
+    /// Full Tinygrad RANGE axis argument excluding its trailing axis type.
+    pub fn path(&self) -> &[usize] {
+        match self {
+            AxisId::Unrenumbered(n) | AxisId::Renumbered(n) => std::slice::from_ref(n),
+            AxisId::UnrenumberedPath(path) | AxisId::RenumberedPath(path) => path,
+        }
+    }
+
+    /// Append a structural split component without allocating a new axis id.
+    pub fn child(&self, component: usize) -> Self {
+        let mut path = SmallVec::from_slice(self.path());
+        path.push(component);
+        if self.is_renumbered() { AxisId::RenumberedPath(path) } else { AxisId::UnrenumberedPath(path) }
+    }
+
+    /// Identity of the serial REDUCE loop derived from a GROUP_REDUCE axis.
+    ///
+    /// This is a child axis, not a new root axis: retaining the parent path is
+    /// required when grouped reduction follows one or more range splits. Range
+    /// splitting owns child components 0 and 1; component 2 is the derived-loop
+    /// branch and therefore cannot alias either structural split child.
+    pub fn group_reduce_loop(&self) -> Self {
+        self.child(2)
+    }
+
+    /// Renderer spelling used by Tinygrad's `range_str` (`0`, `0_1`, ...).
+    pub fn name(&self) -> String {
+        self.path().iter().map(usize::to_string).collect::<Vec<_>>().join("_")
     }
 
     /// Check if this range has been renumbered.
     pub fn is_renumbered(&self) -> bool {
-        matches!(self, AxisId::Renumbered(_))
+        matches!(self, AxisId::Renumbered(_) | AxisId::RenumberedPath(_))
+    }
+}
+
+/// `Ord`, `PartialEq` and `Hash` share the `(is_renumbered, path)` key so that the
+/// single-component and path spellings of one axis are one value everywhere.
+impl PartialEq for AxisId {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_renumbered() == other.is_renumbered() && self.path() == other.path()
+    }
+}
+
+impl std::hash::Hash for AxisId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.is_renumbered().hash(state);
+        self.path().hash(state);
+    }
+}
+
+impl PartialOrd for AxisId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AxisId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.is_renumbered().cmp(&other.is_renumbered()).then_with(|| self.path().cmp(other.path()))
     }
 }
 
@@ -594,6 +1065,8 @@ impl std::fmt::Display for AxisId {
         match self {
             AxisId::Unrenumbered(n) => write!(f, "U{}", n),
             AxisId::Renumbered(n) => write!(f, "R{}", n),
+            AxisId::UnrenumberedPath(_) => write!(f, "U{}", self.name()),
+            AxisId::RenumberedPath(_) => write!(f, "R{}", self.name()),
         }
     }
 }
@@ -615,7 +1088,7 @@ pub enum ReduceOp {
 /// Unary operation types.
 ///
 /// All unary operations preserve the input dtype.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames, strum::VariantArray)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     /// Negation: -x
@@ -662,10 +1135,10 @@ pub enum UnaryOp {
 
 /// Binary operation types.
 ///
-/// Arithmetic operations (Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv) preserve the LHS dtype.
+/// Arithmetic operations preserve the LHS dtype.
 /// Comparison operations (Lt, Eq, Ne) always return DType::Bool.
 /// Bitwise operations (And, Or, Xor, Shl, Shr) preserve dtype and require int/bool types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames, strum::VariantArray)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum BinaryOp {
     // Arithmetic operations
@@ -675,23 +1148,18 @@ pub enum BinaryOp {
     Mul,
     /// Subtraction: a - b
     Sub,
-    /// Modulo: a % b (C-style remainder)
-    ///
-    /// Uses C/Rust semantics where the result has the sign of the dividend.
-    /// **NOT** Python's modulo (which has sign of the divisor).
-    ///
-    /// Examples: -9 % 5 = -4 (Python: 1), 9 % -5 = 4 (Python: -1).
-    Mod,
+    /// Floor modulo: `a - floor(a / b) * b` (sign of divisor).
+    FloorMod,
+    /// C-style remainder (sign of dividend).
+    CMod,
     /// Maximum: max(a, b)
     Max,
     /// Power: a^b
     Pow,
-    /// Integer division: a / b (C-style truncation toward zero).
-    ///
-    /// **NOT** Python's `//` floor division (which rounds toward -∞).
-    ///
-    /// Examples: -9 / 5 = -1 (Python's `//`: -2), 9 / -5 = -1 (Python's `//`: -2).
-    Idiv,
+    /// Integer floor division (rounds toward negative infinity).
+    FloorDiv,
+    /// C-style integer division (truncates toward zero).
+    CDiv,
     /// Float division: a / b — exact IEEE 754 division. Float dtypes only.
     Fdiv,
 
@@ -734,7 +1202,19 @@ impl BinaryOp {
 
     /// Returns true if this is an arithmetic operation.
     pub fn is_arithmetic(self) -> bool {
-        matches!(self, Self::Add | Self::Mul | Self::Sub | Self::Mod | Self::Max | Self::Pow | Self::Idiv | Self::Fdiv)
+        matches!(
+            self,
+            Self::Add
+                | Self::Mul
+                | Self::Sub
+                | Self::FloorMod
+                | Self::CMod
+                | Self::Max
+                | Self::Pow
+                | Self::FloorDiv
+                | Self::CDiv
+                | Self::Fdiv
+        )
     }
 
     /// Returns true if this is a bitwise operation.
@@ -781,7 +1261,7 @@ impl BinaryOp {
             }
             Self::Max => {
                 if dtype.is_float() {
-                    ConstValue::Float(dtype.min_value())
+                    ConstValue::Float(dtype.analysis_bounds().0)
                 } else {
                     ConstValue::Int(dtype.min_value() as i64)
                 }
@@ -792,13 +1272,46 @@ impl BinaryOp {
 }
 
 /// Ternary operation types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames, strum::VariantArray)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum TernaryOp {
     /// Conditional selection: condition ? true_val : false_val
     Where,
     /// Multiply-accumulate: a * b + c (fused operation)
     MulAcc,
+}
+
+/// ALU operations accepted directly by a renderer. This is the Rust equivalent
+/// of tinygrad's `code_for_op.keys()`; decomposition must be derived from this
+/// set rather than from a backend-independent assumption.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RendererOps {
+    pub unary: std::collections::HashSet<UnaryOp>,
+    pub binary: std::collections::HashSet<BinaryOp>,
+    pub ternary: std::collections::HashSet<TernaryOp>,
+}
+
+impl RendererOps {
+    pub fn all() -> Self {
+        use strum::VariantArray;
+        Self {
+            unary: UnaryOp::VARIANTS.iter().copied().collect(),
+            binary: BinaryOp::VARIANTS.iter().copied().collect(),
+            ternary: TernaryOp::VARIANTS.iter().copied().collect(),
+        }
+    }
+
+    pub fn supports_unary(&self, op: UnaryOp) -> bool {
+        self.unary.contains(&op)
+    }
+
+    pub fn supports_binary(&self, op: BinaryOp) -> bool {
+        self.binary.contains(&op)
+    }
+
+    pub fn supports_ternary(&self, op: TernaryOp) -> bool {
+        self.ternary.contains(&op)
+    }
 }
 
 /// Per-source upcast axes for WMMA operations.
@@ -810,24 +1323,25 @@ pub enum TernaryOp {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct WmmaUpcastAxes {
     /// A operand upcast axes (input matrix).
-    pub a: Vec<(usize, usize)>,
+    pub a: Vec<(AxisId, usize)>,
     /// B operand upcast axes (input matrix).
-    pub b: Vec<(usize, usize)>,
+    pub b: Vec<(AxisId, usize)>,
     /// C operand upcast axes (output/accumulator).
-    pub c: Vec<(usize, usize)>,
+    pub c: Vec<(AxisId, usize)>,
 }
 
 impl WmmaUpcastAxes {
     /// Returns deduplicated axis IDs from all three operands.
-    pub fn all_axis_ids(&self) -> Vec<usize> {
-        let mut ids: Vec<usize> = self.a.iter().chain(self.b.iter()).chain(self.c.iter()).map(|(id, _)| *id).collect();
-        ids.sort_unstable();
+    pub fn all_axis_ids(&self) -> Vec<AxisId> {
+        let mut ids: Vec<AxisId> =
+            self.a.iter().chain(self.b.iter()).chain(self.c.iter()).map(|(id, _)| id.clone()).collect();
+        ids.sort();
         ids.dedup();
         ids
     }
 
     /// Returns the axes for operand at the given index (0=A, 1=B, 2=C).
-    pub fn by_index(&self, index: usize) -> &[(usize, usize)] {
+    pub fn by_index(&self, index: usize) -> &[(AxisId, usize)] {
         match index {
             0 => &self.a,
             1 => &self.b,
@@ -928,10 +1442,11 @@ pub struct WmmaMetadata {
     pub device: RendererDevice,
     /// Thread count.
     pub threads: usize,
-    /// Per-source upcast axes for vectorization (A, B, C each have their own).
-    pub upcast_axes: WmmaUpcastAxes,
+    /// Per-source expansion axes `(A contract, B contract, output unroll)`.
+    /// Cleared after `expander2` shapes the WMMA sources and output.
+    pub upcast_axes: Option<WmmaUpcastAxes>,
     /// TC reduce axis IDs (used for exclude_args in expansion).
-    pub reduce_axes: Vec<usize>,
+    pub reduce_axes: Vec<AxisId>,
     /// Tile grid for multi-FMA batching (tile_y_count, tile_x_count).
     ///
     /// When > (1, 1), uses load-pair mode and emits multiple FMAs per K iteration
@@ -954,6 +1469,7 @@ pub struct ConstValueHash(pub ConstValue);
 impl PartialEq for ConstValueHash {
     fn eq(&self, other: &Self) -> bool {
         match (self.0, other.0) {
+            (ConstValue::Invalid, ConstValue::Invalid) => true,
             (ConstValue::Int(a), ConstValue::Int(b)) => a == b,
             (ConstValue::UInt(a), ConstValue::UInt(b)) => a == b,
             (ConstValue::Float(a), ConstValue::Float(b)) => a.to_bits() == b.to_bits(),
@@ -969,6 +1485,7 @@ impl Hash for ConstValueHash {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (discriminant(&self.0)).hash(state);
         match self.0 {
+            ConstValue::Invalid => {}
             ConstValue::Int(v) => v.hash(state),
             ConstValue::UInt(v) => v.hash(state),
             ConstValue::Float(v) => v.to_bits().hash(state),

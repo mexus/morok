@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::allocator::RawBuffer;
 use crate::amd::am::regs::{self, RegDef};
+use crate::amd::connector::SubmissionFinalizer;
 use crate::amd::signal::AmdSignal;
 use crate::amd::sys::pm4;
 use crate::amd::topology::AmdNode;
@@ -168,9 +169,10 @@ pub fn build_streams(counters: &[PmcCounter], grid: &PmcGrid, buf_va: u64) -> (V
 
 /// A profiled-dispatch handle that also carries PMC counters. Holds the GTT
 /// readback buffer alive until [`counters`](Self::counters) is read after sync,
-/// and delegates timestamps to the dispatch's completion signal.
+/// and delegates timestamps to the dispatch's timestamp signal.
 pub struct PmcHandle {
     ts: Arc<AmdSignal>,
+    finalizer: Arc<SubmissionFinalizer>,
     _buf: RawBuffer,
     host: NonNull<u8>,
     counters: Vec<PmcCounter>,
@@ -183,14 +185,31 @@ unsafe impl Send for PmcHandle {}
 unsafe impl Sync for PmcHandle {}
 
 impl PmcHandle {
-    pub fn new(
+    pub(crate) fn new(
         ts: Arc<AmdSignal>,
+        finalizer: Arc<SubmissionFinalizer>,
         buf: RawBuffer,
         host: NonNull<u8>,
         counters: Vec<PmcCounter>,
         instances: u32,
     ) -> Self {
-        Self { ts, _buf: buf, host, counters, instances }
+        Self { ts, finalizer, _buf: buf, host, counters, instances }
+    }
+}
+
+impl Drop for PmcHandle {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        if let Err(error) = self.finalizer.wait(30_000) {
+            if let RawBuffer::AmdDevice { device, .. } = &self._buf {
+                device.core().poison(&error.to_string());
+            }
+            tracing::warn!(?error, "PmcHandle drop: readback allocation quarantined");
+            return;
+        }
+        self._buf.free_amd_device_in_place();
     }
 }
 

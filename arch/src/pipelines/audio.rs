@@ -28,7 +28,7 @@ use snafu::{ResultExt, Snafu};
 pub use svod_runtime::RunProfile;
 use svod_runtime::StageProfile;
 
-pub use crate::rnnt::Word;
+pub use crate::rnnt::{Segment, Word};
 use crate::vad::{AudioChunk, ChunkerOpts, chunks_from_probs, strict_chunk_sample_bound};
 
 // ─── Results ────────────────────────────────────────────────────────────────
@@ -38,19 +38,32 @@ use crate::vad::{AudioChunk, ChunkerOpts, chunks_from_probs, strict_chunk_sample
 /// pipeline crops these to the chunk's core before emitting.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Transcript {
+    /// Uncropped text decoded for this window.
     pub text: String,
+    /// Word timings relative to the decode-window start.
     pub words: Vec<Word>,
+    /// Phrase-level segments from timestamp-token splitting (Whisper). Empty for
+    /// models that don't produce segments. Like `words`, times are
+    /// window-relative.
+    pub segments: Vec<Segment>,
+    /// Detected/source language code (e.g. `"ru"`) when the transcriber resolves
+    /// one, `None` otherwise. Populated by models that run language detection
+    /// (Whisper); left empty by models that don't.
+    pub language: Option<String>,
 }
 
 /// One speech region's final transcript. `start_sec`/`end_sec` reference the
 /// original audio; `words` (when present) are core-relative — add `start_sec`
 /// for an absolute timeline.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChunkResult {
     pub start_sec: f32,
     pub end_sec: f32,
     pub text: String,
     pub words: Option<Vec<Word>>,
+    /// Phrase-level segments (when `RunOptions::segments` is set), cropped to
+    /// the chunk's core. Times are core-relative (add `start_sec` for absolute).
+    pub segments: Option<Vec<Segment>>,
 }
 
 /// Aggregated pipeline output: chunk texts joined by single spaces (empties
@@ -65,14 +78,19 @@ pub struct Transcription {
 }
 
 /// Per-call run switches, orthogonal to a [`Transcriber`]'s construction config
-/// (sizing, decoder choice). Both default to `false`, so one built [`Asr`]
-/// serves profiled/unprofiled and words-on/words-off runs without rebuilding.
+/// (sizing, decoder choice). All default to `false`, so one built [`Asr`]
+/// serves profiled/unprofiled, words-on/off, and segments-on/off runs without
+/// rebuilding.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RunOptions {
     /// Surface per-word timestamps on [`ChunkResult::words`]. The core-crop runs
     /// regardless (it owns each chunk's text); this only decides whether the
     /// cropped words are returned.
     pub words: bool,
+    /// Surface phrase-level [`Segment`]s on [`ChunkResult::segments`]. Like
+    /// `words`, the split runs regardless; this only decides whether the cropped
+    /// segments are returned.
+    pub segments: bool,
     /// Collect a per-stage [`RunProfile`] on [`Transcription::profile`].
     pub profile: bool,
 }
@@ -103,10 +121,36 @@ pub fn crop_words_to_core(words: Vec<Word>, core_offset_sec: f32, core_duration:
         .collect()
 }
 
-/// Join word texts with single spaces (empties dropped). Reconstructs a chunk's
-/// transcript from its (possibly cropped) words.
+/// Crop decoded segments back to a chunk's core and drop the rest. Same
+/// midpoint-keep logic as [`crop_words_to_core`], applied to [`Segment`]s.
+pub fn crop_segments_to_core(segments: Vec<Segment>, core_offset_sec: f32, core_duration: f32) -> Vec<Segment> {
+    segments
+        .into_iter()
+        .filter_map(|mut s| {
+            let rel_start = s.start - core_offset_sec;
+            let rel_end = s.end - core_offset_sec;
+            let mid = 0.5 * (rel_start + rel_end);
+            if !(0.0..core_duration).contains(&mid) {
+                return None;
+            }
+            s.start = rel_start.clamp(0.0, core_duration);
+            s.end = rel_end.clamp(s.start, core_duration);
+            Some(s)
+        })
+        .collect()
+}
+
+/// Concatenate exact word fragments and trim only the complete text boundary.
+/// Whitespace-only fragments are ignored; meaningful internal whitespace stays
+/// exactly where the producing tokenizer placed it.
 pub fn words_to_text(words: &[Word]) -> String {
-    words.iter().map(|w| w.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ")
+    let mut text = String::new();
+    for word in words {
+        if !word.text.trim().is_empty() {
+            text.push_str(&word.text);
+        }
+    }
+    text.trim().to_string()
 }
 
 // ─── VAD ─────────────────────────────────────────────────────────────────────
@@ -124,7 +168,7 @@ pub trait Vad {
     /// Per-frame speech probabilities for one waveform.
     fn probs(&mut self, waveform: &[f32]) -> Result<Vec<f32>, Self::Error>;
 
-    /// Probabilities for several waveforms. Defaults to looping [`probs`];
+    /// Probabilities for several waveforms. Defaults to looping [`Self::probs`];
     /// override when a VAD can batch whole clips for throughput (e.g. tuning
     /// sweeps).
     fn probs_batch(&mut self, waveforms: &[&[f32]]) -> Result<Vec<Vec<f32>>, Self::Error> {
@@ -288,7 +332,7 @@ pub trait Transcriber {
     /// returning uncropped per-window transcripts plus the per-stage
     /// [`RunProfile`] — populated only when `profile` is set (a per-call choice,
     /// so the same transcriber serves profiled and unprofiled runs). Defaults to
-    /// looping [`transcribe_window`] and **merging** its per-window profiles (via
+    /// looping [`Self::transcribe_window`] and **merging** its per-window profiles (via
     /// [`RunProfile::merge`]); override for a model that batches the encoder and
     /// profiles the batch as a whole.
     fn transcribe_windows(
@@ -309,7 +353,7 @@ pub trait Transcriber {
     }
 
     /// Transcribe one window + its optional profile (sequential fallback).
-    /// Implement this OR [`transcribe_windows`].
+    /// Implement this OR [`Self::transcribe_windows`].
     fn transcribe_window(
         &mut self,
         window: &[f32],
@@ -321,7 +365,7 @@ pub trait Transcriber {
 
     /// Decode each chunk's window, crop its words back to the core, stitch, and
     /// carry the profile (per [`RunOptions`]). Pure host machinery over
-    /// [`transcribe_windows`]; models don't override.
+    /// [`Self::transcribe_windows`]; models don't override.
     fn transcribe_chunks(
         &mut self,
         waveform: &[f32],
@@ -353,14 +397,25 @@ pub trait Transcriber {
         let (transcripts, prof) = self.transcribe_windows(&windows, opts.profile)?;
 
         let want_words = opts.words;
+        let want_segments = opts.segments;
         let chunk_results: Vec<ChunkResult> = transcripts
             .into_iter()
             .zip(&metas)
             .map(|(t, m)| {
-                let cropped = crop_words_to_core(t.words, m.core_offset_sec, m.end_sec - m.start_sec);
-                // Prefer the transcriber's text; reconstruct from words only as fallback.
-                let text = if !t.text.is_empty() { t.text } else { words_to_text(&cropped) };
-                ChunkResult { start_sec: m.start_sec, end_sec: m.end_sec, text, words: want_words.then_some(cropped) }
+                let core_dur = m.end_sec - m.start_sec;
+                let cropped_words = crop_words_to_core(t.words, m.core_offset_sec, core_dur);
+                let cropped_segments = crop_segments_to_core(t.segments, m.core_offset_sec, core_dur);
+                // Cropped fragments own the core text when available; otherwise
+                // retain models that only provide complete-window text.
+                let text =
+                    if cropped_words.is_empty() { t.text.trim().to_string() } else { words_to_text(&cropped_words) };
+                ChunkResult {
+                    start_sec: m.start_sec,
+                    end_sec: m.end_sec,
+                    text,
+                    words: want_words.then_some(cropped_words),
+                    segments: want_segments.then_some(cropped_segments),
+                }
             })
             .collect();
 
@@ -370,7 +425,7 @@ pub trait Transcriber {
     }
 
     /// [`transcribe_chunks`](Self::transcribe_chunks) with default
-    /// [`RunOptions`] (no words, no profile).
+    /// [`RunOptions`] (no words, segments, or profile).
     fn transcribe_chunks_default(
         &mut self,
         waveform: &[f32],
@@ -426,10 +481,11 @@ impl<S: Splitter, T: Transcriber> Asr<S, T> {
     }
 
     /// Split → transcribe → crop → stitch. [`RunOptions`] are per-call switches:
-    /// the same `Asr` serves profiled/unprofiled and words-on/words-off runs
-    /// without rebuilding. When `opts.profile` is set, the splitter's wall is
-    /// timed and recorded under its [`profile_label`](Splitter::profile_label)
-    /// ahead of the transcriber's stages.
+    /// the same `Asr` serves profiled/unprofiled, words-on/off, and
+    /// segments-on/off runs without rebuilding. When `opts.profile` is set,
+    /// the splitter's wall is timed and recorded under its
+    /// [`profile_label`](Splitter::profile_label) ahead of the transcriber's
+    /// stages.
     pub fn transcribe(
         &mut self,
         waveform: &[f32],
@@ -452,7 +508,7 @@ impl<S: Splitter, T: Transcriber> Asr<S, T> {
     }
 
     /// [`transcribe`](Self::transcribe) with default [`RunOptions`] (no words,
-    /// no profile) — the common case, without spelling out the struct.
+    /// segments, or profile) — the common case, without spelling out the struct.
     pub fn transcribe_default(&mut self, waveform: &[f32]) -> Result<Transcription, AsrError<S::Error, T::Error>> {
         self.transcribe(waveform, RunOptions::default())
     }

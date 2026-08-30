@@ -5,7 +5,7 @@
 //! - [`data`] - Constants, buffers, device specifications
 //! - [`compute`] - Arithmetic, transcendental, bitwise, comparison operations
 //! - [`shape`] - Shape manipulation (reshape, permute, expand, pad, shrink, flip)
-//! - [`memory`] - Memory operations (load, store, index, copy, bufferize)
+//! - [`memory`] - Memory operations (load, store, index, copy, stage)
 //! - [`control`] - Control flow (range, if/end, barrier, var)
 //! - [`reduce`] - Reduction operations
 //! - [`hardware`] - Hardware-specific (WMMA, vectorize, call, program)
@@ -55,13 +55,33 @@ impl UOp {
             return Err(Error::VoidTypeInOp);
         }
 
-        // Try to find common type
-        let target_dtype = DType::least_upper_dtype(&[lhs_dtype.clone(), rhs_dtype.clone()])
-            .ok_or(Error::TypePromotionFailed { lhs: lhs_dtype.clone(), rhs: rhs_dtype.clone() })?;
+        // Invalid matches any consumer dtype while remaining the canonical bool
+        // node. It does not participate in promotion or receive an implicit cast.
+        let target_dtype = if Self::is_invalid_marker(&lhs) {
+            rhs_dtype.clone()
+        } else if Self::is_invalid_marker(&rhs) {
+            lhs_dtype.clone()
+        } else {
+            DType::least_upper_dtype(&[lhs_dtype.clone(), rhs_dtype.clone()])
+                .ok_or(Error::TypePromotionFailed { lhs: lhs_dtype.clone(), rhs: rhs_dtype.clone() })?
+        };
 
-        // Cast if needed
-        let lhs = if lhs_dtype != target_dtype { lhs.cast(target_dtype.clone()) } else { lhs };
-        let rhs = if rhs_dtype != target_dtype { rhs.cast(target_dtype.clone()) } else { rhs };
+        fn cast_strong_source(source: Arc<UOp>, source_dtype: &DType, target_dtype: &DType) -> Arc<UOp> {
+            if source_dtype.is_weak() && !target_dtype.is_weak() { source } else { source.cast(target_dtype.clone()) }
+        }
+
+        // Weak sources remain mathematical until pm_commit_weak consumes the
+        // concrete dtype demand. Strong promotions are explicit immediately.
+        let lhs = if lhs_dtype != target_dtype && !Self::is_invalid_marker(&lhs) {
+            cast_strong_source(lhs, &lhs_dtype, &target_dtype)
+        } else {
+            lhs
+        };
+        let rhs = if rhs_dtype != target_dtype && !Self::is_invalid_marker(&rhs) {
+            cast_strong_source(rhs, &rhs_dtype, &target_dtype)
+        } else {
+            rhs
+        };
 
         Ok((lhs, rhs, target_dtype))
     }
@@ -73,8 +93,14 @@ impl UOp {
     /// # Errors
     /// Returns `InvalidDTypeForOp` if dtype is not int or bool
     pub(crate) fn check_bitwise_dtype(dtype: DType, operation: BinaryOp) -> Result<()> {
-        // Allow bool and all integer types (signed, unsigned, AND Index for loop counters)
         let is_valid = dtype.is_bool() || dtype.is_int();
+        if !is_valid { Err(Error::InvalidDTypeForBinaryOp { operation, dtypes: smallvec![dtype] }) } else { Ok(()) }
+    }
+
+    /// Shifts require mathematical or concrete integers. Unlike AND/OR/XOR,
+    /// Tinygrad does not accept bool operands for SHL/SHR.
+    pub(crate) fn check_shift_dtype(dtype: DType, operation: BinaryOp) -> Result<()> {
+        let is_valid = dtype.is_int();
         if !is_valid { Err(Error::InvalidDTypeForBinaryOp { operation, dtypes: smallvec![dtype] }) } else { Ok(()) }
     }
 
@@ -93,6 +119,7 @@ impl UOp {
         // Only check if divisor is a constant
         if let Op::Const(const_hash) = divisor.op() {
             let is_zero = match const_hash.0 {
+                ConstValue::Invalid => false,
                 ConstValue::Int(v) => v == 0,
                 ConstValue::UInt(v) => v == 0,
                 ConstValue::Float(v) => v == 0.0,
@@ -104,10 +131,7 @@ impl UOp {
         Ok(())
     }
 
-    /// Validate that binary operation operands have compatible shapes.
-    ///
-    /// This enforces exact shape matching (no broadcasting). Both operands must have
-    /// the same shape, or at least one must be shapeless (None).
+    /// Validate that binary operation operands have broadcast-compatible shapes.
     ///
     /// # Arguments
     /// * `lhs` - Left-hand side operand
@@ -115,22 +139,20 @@ impl UOp {
     /// * `op` - Binary operation type (for error reporting)
     ///
     /// # Errors
-    /// Returns `BinaryShapeMismatch` if both operands have shapes and they differ
+    /// Returns `BinaryShapeMismatch` if both operands have incompatible shapes.
     pub(crate) fn validate_binary_shapes(lhs: &Arc<Self>, rhs: &Arc<Self>, op: crate::BinaryOp) -> Result<()> {
         use crate::error::BinaryShapeMismatchSnafu;
-        use crate::shape::shapes_equal;
+        use crate::shape::broadcast_shapes;
 
         // Get shapes from both operands
         let lhs_shape = lhs.shape()?;
         let rhs_shape = rhs.shape()?;
 
-        // Validate: either shapes match or at least one is None
         match (lhs_shape, rhs_shape) {
-            (Some(ls), Some(rs)) if !shapes_equal(ls, rs) => {
-                // Both have shapes but they differ - ERROR
+            (Some(ls), Some(rs)) if broadcast_shapes(&[ls.clone(), rs.clone()]).is_err() => {
                 BinaryShapeMismatchSnafu { op, lhs: Box::new(ls.clone()), rhs: Box::new(rs.clone()) }.fail()
             }
-            _ => Ok(()), // Either shapes match or at least one is None
+            _ => Ok(()),
         }
     }
 

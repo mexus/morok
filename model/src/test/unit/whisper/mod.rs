@@ -1,4 +1,14 @@
+mod attention_internal;
+mod batched_step;
+mod batched_transcribe;
+mod beam;
+mod blocks_internal;
+mod decode_internal;
 mod dtw;
+mod encoder_internal;
 mod language;
 mod model;
 mod parity;
+mod profile_internal;
+mod segments;
+mod tokenizer;

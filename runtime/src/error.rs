@@ -46,6 +46,11 @@ pub enum Error {
     #[snafu(display("Execution error: {reason}"))]
     Execution { reason: String },
 
+    /// A prior committed HCQ epoch failed after reserving timeline values.
+    /// Retrying could wait forever on a completion that was never published.
+    #[snafu(display("Execution plan is poisoned after a failed HCQ epoch: {reason}"))]
+    PlanPoisoned { reason: String },
+
     /// Execution failed while dispatching a specific operation; carries the
     /// underlying device error and the offending op for context.
     #[snafu(display("Execution failed ({context}): {source}"))]

@@ -1,8 +1,8 @@
 //! Kernel dispatch via libffi.
 //!
 //! `KernelCif` wraps libffi's `Cif` with Send+Sync so it can be stored on
-//! kernel structs and shared across rayon threads. A thread-local buffer
-//! avoids per-call allocation for the packed u64 args.
+//! kernel structs and shared across rayon threads. Thread-local buffers avoid
+//! per-call allocation for the packed arguments.
 
 use std::cell::RefCell;
 
@@ -17,28 +17,40 @@ use smallvec::SmallVec;
 /// `Cif` is `!Send + !Sync` due to raw pointer fields (conservative auto-trait).
 /// Once prepared, a CIF is immutable — `Cif::call(&self)` only reads the
 /// descriptor and `ffi_call` does not mutate it for non-closure calls.
-/// All our CIFs describe stateless kernel signatures (N × u64 → void).
+/// All our CIFs describe stateless kernel signatures (pointers + i32 → void).
 pub(crate) struct KernelCif {
     cif: Cif,
     arg_count: usize,
+    abi: Vec<svod_device::device::AbiParamKind>,
 }
 
 unsafe impl Send for KernelCif {}
 unsafe impl Sync for KernelCif {}
 
 impl KernelCif {
-    /// Create a CIF for a kernel with `arg_count` u64 arguments returning void.
-    pub fn new(arg_count: usize) -> Self {
-        let types = (0..arg_count).map(|_| Type::u64()).collect::<Vec<_>>();
-        Self { cif: Cif::new(types, Type::void()), arg_count }
+    pub fn from_abi(abi: &[svod_device::device::AbiParamDescriptor]) -> Self {
+        let types =
+            abi.iter().map(|arg| if arg.is_storage() { Type::pointer() } else { Type::i32() }).collect::<Vec<_>>();
+        Self {
+            cif: Cif::new(types, Type::void()),
+            arg_count: abi.len(),
+            abi: abi.iter().map(|arg| arg.kind.clone()).collect(),
+        }
     }
 
-    /// Call the kernel, packing buffers + vals as u64 args.
+    /// Call the kernel, packing buffers and scalars into slots that match the
+    /// CIF's declared argument types.
     ///
-    /// Uses a thread-local buffer for the packed args — zero allocation
-    /// after warmup. The `SmallVec<[Arg; 32]>` avoids heap allocation for
-    /// kernels with ≤32 arguments (the common case); kernels above that cap
-    /// fall back to a heap allocation per dispatch.
+    /// libffi reads each argument through a pointer using the declared type's
+    /// width, so a `Type::i32()` argument must point at an `i32`. Packing every
+    /// slot into a `u64` happened to work only because a little-endian read of
+    /// the low four bytes is the truncation we want; on a big-endian host it
+    /// reads the high half and every scalar arrives as 0.
+    ///
+    /// Uses thread-local buffers for the packed args — zero allocation after
+    /// warmup. The `SmallVec<[Arg; 32]>` avoids heap allocation for kernels
+    /// with ≤32 arguments (the common case); kernels above that cap fall back
+    /// to a heap allocation per dispatch.
     ///
     /// `var_patch`: if `Some((var_idx, value))`, patches
     /// `vals[var_idx]` to `value` before calling.
@@ -49,44 +61,82 @@ impl KernelCif {
         buffers: &[*mut u8],
         vals: &[i64],
         var_patch: Option<(usize, usize)>,
-    ) {
-        assert_eq!(
-            buffers.len() + vals.len(),
-            self.arg_count,
-            "kernel dispatch: expected {} args, got {} bufs + {} vals",
-            self.arg_count,
-            buffers.len(),
-            vals.len()
-        );
+    ) -> svod_device::Result<()> {
+        let expected_buffers =
+            self.abi.iter().filter(|kind| matches!(kind, svod_device::device::AbiParamKind::Storage(_))).count();
+        let expected_vals = self.arg_count - expected_buffers;
+        if buffers.len() != expected_buffers || vals.len() != expected_vals {
+            return Err(svod_device::Error::ProgramAbiMismatch {
+                reason: format!(
+                    "kernel dispatch expected {expected_buffers} buffers/{expected_vals} scalars, got {}/{}",
+                    buffers.len(),
+                    vals.len()
+                ),
+            });
+        }
 
         thread_local! {
-            static PACKED: RefCell<SmallVec<[u64; 32]>> = RefCell::new(SmallVec::new());
+            static PACKED: RefCell<PackedArgs> = RefCell::new(PackedArgs::default());
         }
 
         PACKED.with_borrow_mut(|packed| {
-            if packed.len() != self.arg_count {
-                packed.resize(self.arg_count, 0);
-            }
-
-            for (idx, &ptr) in buffers.iter().enumerate() {
-                packed[idx] = ptr as u64;
-            }
-            for (idx, &val) in vals.iter().enumerate() {
-                packed[buffers.len() + idx] = val as u64;
+            packed.ptrs.clear();
+            packed.scalars.clear();
+            let (mut buffer_idx, mut var_idx) = (0usize, 0usize);
+            for kind in &self.abi {
+                match kind {
+                    svod_device::device::AbiParamKind::Storage(_) => {
+                        packed.ptrs.push(buffers[buffer_idx]);
+                        buffer_idx += 1;
+                    }
+                    svod_device::device::AbiParamKind::Scalar => {
+                        packed.scalars.push(vals[var_idx] as i32);
+                        var_idx += 1;
+                    }
+                }
             }
 
             if let Some((var_idx, value)) = var_patch {
-                packed[buffers.len() + var_idx] = value as u64;
+                let Some(slot) = packed.scalars.get_mut(var_idx) else { return };
+                *slot = value as i32;
             }
 
             let mut ffi_args: SmallVec<[middle::Arg; 32]> = SmallVec::with_capacity(self.arg_count);
-            for value in packed.iter() {
-                ffi_args.push(middle::arg(value));
+            let (mut buffer_idx, mut var_idx) = (0usize, 0usize);
+            for kind in &self.abi {
+                match kind {
+                    svod_device::device::AbiParamKind::Storage(_) => {
+                        ffi_args.push(middle::arg(&packed.ptrs[buffer_idx]));
+                        buffer_idx += 1;
+                    }
+                    svod_device::device::AbiParamKind::Scalar => {
+                        ffi_args.push(middle::arg(&packed.scalars[var_idx]));
+                        var_idx += 1;
+                    }
+                }
             }
 
             unsafe {
                 self.cif.call::<()>(CodePtr(fn_ptr as *mut _), &ffi_args);
             }
         });
+        if let Some((var_idx, _)) = var_patch
+            && var_idx >= expected_vals
+        {
+            return Err(svod_device::Error::ProgramAbiMismatch {
+                reason: format!(
+                    "kernel dispatch scalar patch index {var_idx} out of range for {expected_vals} scalars"
+                ),
+            });
+        }
+        Ok(())
     }
+}
+
+/// Typed argument slots. libffi dereferences each slot with the width the CIF
+/// declares, so pointers and `i32` scalars need their own storage.
+#[derive(Default)]
+struct PackedArgs {
+    ptrs: SmallVec<[*mut u8; 16]>,
+    scalars: SmallVec<[i32; 16]>,
 }

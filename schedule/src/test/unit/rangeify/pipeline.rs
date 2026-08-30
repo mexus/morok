@@ -1,19 +1,12 @@
-//! Full pipeline integration tests for RANGEIFY transformation.
-//!
-//! Tests verify the complete transformation pipeline from tensor operations
-//! to executable kernels:
-//! - Phase 1-4: run_rangeify (movement ops → BUFFERIZE+INDEX)
-//! - Phase 5: try_get_kernel_graph (BUFFERIZE → CALL wrappers)
-//! - End-to-end scenarios
-//!
-//! Based on Tinygrad's test_schedule.py integration tests.
+//! End-to-end behaviour of `run_rangeify` / `rangeify` / `try_get_kernel_graph`.
 
 use std::{f32::consts::PI, sync::Arc};
 
 use smallvec::smallvec;
 use svod_device::DeviceSpec;
 use svod_dtype::DType;
-use svod_ir::{AxisId, AxisType, BufferizeOpts, CallInfo, ConstValue, Op, ReduceOp, UOp};
+use svod_ir::{AxisId, AxisType, CallInfo, ConstValue, Op, ReduceOp, SInt, UOp};
+use test_case::test_case;
 
 use crate::rangeify::{rangeify, run_rangeify, try_get_kernel_graph};
 
@@ -36,33 +29,51 @@ impl svod_ir::Matcher<()> for StripDetach {
     }
 }
 
-// ===== Helper Function =====
-
-/// Helper to unwrap full rangeify pipeline (includes all optimizations)
 fn rangeify_unwrap(uop: Arc<UOp>) -> Arc<UOp> {
-    match rangeify(uop) {
-        Ok((rangeified, _ctx)) => rangeified,
-        Err(_) => panic!("rangeify failed"),
-    }
+    rangeify(uop).expect("rangeify").0
 }
 
-// ===== Phase 1-4 Pipeline Tests (run_rangeify) =====
+fn store_at_index(value: Arc<UOp>) -> Arc<UOp> {
+    UOp::index_const(0).store(value)
+}
+
+// ===== run_rangeify =====
 
 #[test]
-fn test_run_rangeify_simple_const() {
-    // Test: CONST should pass through unchanged
-    let const_val = UOp::native_const(42.0f32);
+fn tensor_reduce_becomes_a_loop_reduce_over_ranges() {
+    let source = UOp::new_buffer(DeviceSpec::Cpu, 6, DType::Float32)
+        .try_reshape(&smallvec![SInt::Const(2), SInt::Const(3)])
+        .expect("reshape");
+    let tensor_reduce = source.try_reduce_axis(ReduceOp::Add, vec![1]).expect("reduce axis");
+    let (rangeified, _ctx) = run_rangeify(UOp::sink(vec![tensor_reduce.contiguous()])).expect("run_rangeify");
 
-    let result = run_rangeify(const_val);
-    assert!(result.is_ok(), "rangeify should succeed");
-    let (rangeified, _ctx) = result.unwrap();
+    let reductions: Vec<_> =
+        rangeified.toposort().into_iter().filter(|node| matches!(node.op(), Op::Reduce { .. })).collect();
+    assert!(!reductions.is_empty());
+    assert!(
+        reductions.iter().all(|node| matches!(node.op(), Op::Reduce { ranges, num_axes: 0, .. } if !ranges.is_empty())),
+        "every REDUCE must carry explicit ranges and no tensor axes"
+    );
+}
 
-    // CONST has no movement ops, should remain unchanged
-    assert!(matches!(rangeified.op(), Op::Const(_)));
+#[test_case(&[(0, 0), (0, 0)]; "no padding")]
+#[test_case(&[(1, 1), (2, 2)]; "symmetric")]
+#[test_case(&[(3, 0), (0, 5)]; "one sided")]
+fn run_rangeify_lowers_every_pad(pads: &[(usize, usize)]) {
+    let dims: smallvec::SmallVec<[SInt; 4]> = smallvec![SInt::Const(4), SInt::Const(5)];
+    let source = UOp::new_buffer(DeviceSpec::Cpu, 20, DType::Float32).try_reshape(&dims).expect("reshape");
+    let padded = source.try_pad(&pads.iter().map(|&(lo, hi)| (lo.into(), hi.into())).collect::<Vec<_>>()).expect("pad");
+
+    let (rangeified, _ctx) = run_rangeify(UOp::sink(vec![padded.contiguous()])).expect("run_rangeify");
+    assert!(
+        !rangeified.toposort().iter().any(|node| matches!(node.op(), Op::Pad { .. } | Op::ReduceAxis { .. })),
+        "rangeify must lower every PAD:\n{}",
+        rangeified.tree()
+    );
 }
 
 #[test]
-fn test_run_rangeify_preserves_call_and_function_bodies_by_default() {
+fn run_rangeify_preserves_call_and_function_bodies_by_default() {
     let p0 = UOp::param(0, 8, DType::Float32, None);
     let reduced = p0.try_reduce_axis(ReduceOp::Add, vec![0]).expect("reduce axis should construct");
     let arg = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
@@ -73,7 +84,7 @@ fn test_run_rangeify_preserves_call_and_function_bodies_by_default() {
         panic!("expected CALL root after run_rangeify")
     };
     assert!(
-        call_body.toposort().iter().any(|u| matches!(u.op(), Op::ReduceAxis { .. })),
+        call_body.toposort().iter().any(|u| matches!(u.op(), Op::Reduce { num_axes: 1, .. })),
         "run_rangeify should not rewrite CALL body by default"
     );
 
@@ -83,630 +94,119 @@ fn test_run_rangeify_preserves_call_and_function_bodies_by_default() {
         panic!("expected FUNCTION root after run_rangeify")
     };
     assert!(
-        function_body.toposort().iter().any(|u| matches!(u.op(), Op::ReduceAxis { .. })),
+        function_body.toposort().iter().any(|u| matches!(u.op(), Op::Reduce { num_axes: 1, .. })),
         "run_rangeify should not rewrite FUNCTION body by default"
     );
 }
 
 #[test]
-fn test_graph_rewrite_with_bpm_preserve_calls_only_rewrites_with_explicit_full_traversal() {
+fn only_an_explicit_full_traversal_rewrites_inside_call_and_function_bodies() {
     let detached = UOp::native_const(1.0f32).detach();
     let arg = UOp::native_const(2.0f32);
-    let call = detached.call(smallvec![arg.clone()], CallInfo::default());
-    let function = detached.function(smallvec![arg], CallInfo::default());
+    let has_detach = |body: &Arc<UOp>| body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. }));
 
-    let preserved_call =
-        svod_ir::rewrite::graph_rewrite_with_bpm_preserve_calls(&NoRewrite, &StripDetach, call, &mut ());
-    let Op::Call { body: preserved_call_body, .. } = preserved_call.op() else { panic!("expected CALL root") };
-    assert!(
-        preserved_call_body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
-        "preserve-calls rewrite should keep CALL body unchanged"
-    );
+    for opaque in [
+        detached.call(smallvec![arg.clone()], CallInfo::default()),
+        detached.function(smallvec![arg], CallInfo::default()),
+    ] {
+        let preserved =
+            svod_ir::rewrite::graph_rewrite_with_bpm_preserve_calls(&NoRewrite, &StripDetach, opaque, &mut ());
+        let body = match preserved.op() {
+            Op::Call { body, .. } | Op::Function { body, .. } => body,
+            op => panic!("expected an opaque root, got {op:?}"),
+        };
+        assert!(has_detach(body), "preserve-calls rewrite must leave the body alone");
 
-    let full_call = svod_ir::rewrite::graph_rewrite_with_bpm(&NoRewrite, &StripDetach, preserved_call.clone(), &mut ());
-    let Op::Call { body: full_call_body, .. } = full_call.op() else { panic!("expected CALL root") };
-    assert!(
-        !full_call_body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
-        "explicit full rewrite should rewrite inside CALL body"
-    );
-
-    let preserved_function =
-        svod_ir::rewrite::graph_rewrite_with_bpm_preserve_calls(&NoRewrite, &StripDetach, function, &mut ());
-    let Op::Function { body: preserved_function_body, .. } = preserved_function.op() else {
-        panic!("expected FUNCTION root")
-    };
-    assert!(
-        preserved_function_body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
-        "preserve-calls rewrite should keep FUNCTION body unchanged"
-    );
-
-    let full_function =
-        svod_ir::rewrite::graph_rewrite_with_bpm(&NoRewrite, &StripDetach, preserved_function.clone(), &mut ());
-    let Op::Function { body: full_function_body, .. } = full_function.op() else { panic!("expected FUNCTION root") };
-    assert!(
-        !full_function_body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
-        "explicit full rewrite should rewrite inside FUNCTION body"
-    );
+        let full = svod_ir::rewrite::graph_rewrite_with_bpm(&NoRewrite, &StripDetach, Arc::clone(&preserved), &mut ());
+        let body = match full.op() {
+            Op::Call { body, .. } | Op::Function { body, .. } => body,
+            op => panic!("expected an opaque root, got {op:?}"),
+        };
+        assert!(!has_detach(body), "an explicit full rewrite must reach into the body");
+    }
 }
 
+// ===== Full pipeline =====
+
+/// DETACH and CONTIGUOUS_BACKWARD are stripped by `earliest_rewrites`, ahead of
+/// `run_rangeify`. Pattern-level coverage lives in `patterns.rs`.
 #[test]
-fn test_run_rangeify_detach_removal() {
-    // Test: DETACH should be removed by early_rewrites (runs before run_rangeify in pipeline)
+fn autograd_markers_are_gone_after_the_full_pipeline() {
     let x = UOp::native_const(1.0f32);
-    let detach = x.detach();
-
-    // Use full pipeline — DETACH removal is in earliest_rewrites, before run_rangeify
-    let rangeified = rangeify_unwrap(detach);
-
-    // DETACH should be removed, leaving only the constant
-    match rangeified.op() {
-        Op::Const(_) => {
-            assert!(Arc::ptr_eq(&rangeified, &x) || matches!(rangeified.op(), Op::Const(_)));
-        }
-        _ => {
-            assert!(!matches!(rangeified.op(), Op::Detach { .. }));
-        }
+    for marked in [x.detach(), x.contiguous_backward()] {
+        assert!(Arc::ptr_eq(&rangeify_unwrap(marked), &x));
     }
 }
 
-#[test]
-fn test_run_rangeify_contiguous_backward_removal() {
-    // Test: CONTIGUOUS_BACKWARD should be removed
-    let x = UOp::native_const(PI);
-    let contiguous = x.contiguous_backward();
-
-    let rangeified = rangeify_unwrap(contiguous);
-
-    // CONTIGUOUS_BACKWARD should be removed
-    match rangeified.op() {
-        Op::Const(_) => {
-            assert!(Arc::ptr_eq(&rangeified, &x) || matches!(rangeified.op(), Op::Const(_)));
-        }
-        _ => {
-            assert!(!matches!(rangeified.op(), Op::ContiguousBackward { .. }));
-        }
-    }
+#[test_case(store_at_index(UOp::native_const(1.0f32)) ; "store")]
+#[test_case(store_at_index(UOp::native_const(2.0f32)).end(smallvec![UOp::range_axis(UOp::index_const(100), AxisId::Renumbered(0), AxisType::Loop)]) ; "end of store")]
+#[test_case(store_at_index(UOp::native_const(2.0f32).try_add(&UOp::native_const(3.0f32)).expect("add")) ; "store of arithmetic")]
+fn rangeify_then_kernel_split_produces_a_void_kernel_graph(root: Arc<UOp>) {
+    let (kernel, _ctx) = try_get_kernel_graph(rangeify_unwrap(root)).expect("kernel split");
+    assert_eq!(kernel.dtype(), DType::Void);
 }
 
-#[test]
-fn test_run_rangeify_binary_op() {
-    // Test: Binary operations should be processed
-    let a = UOp::native_const(1.0f32);
-    let b = UOp::native_const(2.0f32);
-    let add = a.try_add(&b).unwrap();
+/// LOADs feeding a STORE stay inside one kernel; the CALL owns every buffer.
+#[test_case(1 ; "one load")]
+#[test_case(2 ; "two loads")]
+fn loads_feeding_one_store_split_into_one_kernel(loads: usize) {
+    let buffer = || UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let at = UOp::index_const(0);
+    let load =
+        |buf| UOp::load().index(UOp::index().buffer(buf).indices(vec![at.clone()]).call().expect("index")).call();
 
-    let rangeified = rangeify_unwrap(add);
+    let value = (1..loads).fold(load(buffer()), |acc, _| acc.try_add(&load(buffer())).expect("add"));
+    let store = UOp::index().buffer(buffer()).indices(vec![at]).call().expect("index").store(value);
 
-    // Binary op may remain or be transformed, but should be valid
-    assert!(rangeified.dtype() == DType::Float32);
+    let (result, _ctx) = try_get_kernel_graph(store).expect("kernel split");
+    assert_eq!(super::helpers::count_kernels(&result), 1);
 }
 
-#[test]
-fn test_run_rangeify_preserves_structure() {
-    // Test: Complex computation structure should be preserved
-    let a = UOp::native_const(1.0f32);
-    let b = UOp::native_const(2.0f32);
-    let c = UOp::native_const(3.0f32);
-
-    // (a + b) * c
-    let sum = a.try_add(&b).unwrap();
-    let product = sum.try_mul(&c).unwrap();
-
-    let rangeified = rangeify_unwrap(product);
-
-    // Should preserve dtype
-    assert_eq!(rangeified.dtype(), DType::Float32);
-
-    // Structure may change but computation should be equivalent
-    match rangeified.op() {
-        Op::Binary { .. } | Op::Const(_) | Op::Bufferize { .. } | Op::Index { .. } => {
-            // All acceptable transformations
-        }
-        _ => {}
-    }
-}
-
-// ===== Phase 5 Pipeline Tests (try_get_kernel_graph) =====
-
-#[test]
-fn test_kernel_split_pipeline_simple_store() {
-    // Test: Simple STORE should create a CALL wrapper
-    let _buffer = UOp::buffer_id(Some(0));
-    let index = UOp::index_const(0);
-    let value = UOp::native_const(1.0f32);
-    let store = index.store(value);
-
-    let (result, _context) =
-        try_get_kernel_graph(store).expect("kernel split pipeline should succeed for simple store");
-
-    // Should produce a CALL operation or transformation
-    // Note: Exact output depends on split_store implementation
-    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Call { .. }));
-}
-
-#[test]
-fn test_kernel_split_pipeline_with_end() {
-    // Test: END(STORE) should be processed correctly
-    let _buffer = UOp::buffer_id(Some(0));
-    let index = UOp::index_const(0);
-    let value = UOp::native_const(1.0f32);
-    let store = index.store(value);
-
-    let range_end = UOp::index_const(10);
-    let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = store.end(vec![range].into());
-
-    let (result, _context) = try_get_kernel_graph(end).expect("kernel split pipeline should succeed for end(store)");
-
-    // Should handle END wrapper correctly
-    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Call { .. }));
-}
-
-#[test]
-fn test_kernel_split_pipeline_load_store() {
-    // Test: LOAD + STORE pattern
-    let in_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let _out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
-
-    let load = UOp::load().buffer(in_buf).index(index.clone()).call();
-    let store = index.store(load);
-
-    let (result, _context) = try_get_kernel_graph(store).expect("kernel split pipeline should succeed for load/store");
-
-    // Should create valid callable wrapper or passthrough
-    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Call { .. }));
-}
-
-#[test]
-fn test_kernel_split_pipeline_multiple_loads() {
-    // Test: Multiple LOADs feeding into STORE
-    let buf1 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let buf2 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let _out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
-
-    let load1 = UOp::load().buffer(buf1).index(index.clone()).call();
-    let load2 = UOp::load().buffer(buf2).index(index.clone()).call();
-    let sum = load1.try_add(&load2).unwrap();
-    let store = index.store(sum);
-
-    let (result, _context) =
-        try_get_kernel_graph(store).expect("kernel split pipeline should succeed for multiple loads");
-
-    // Should handle multiple inputs correctly
-    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Call { .. }));
-}
-
-// ===== End-to-End Scenario Tests =====
-
-#[test]
-fn test_end_to_end_simple_computation() {
-    // Test: Full pipeline from computation to callable graph
-
-    // Step 1: Create computation
-    let a = UOp::native_const(1.0f32);
-    let b = UOp::native_const(2.0f32);
-    let sum = a.try_add(&b).unwrap();
-
-    // Step 2: Wrap in STORE
-    let _buffer = UOp::buffer_id(Some(0));
-    let index = UOp::index_const(0);
-    let store = index.store(sum);
-
-    // Step 3: Apply rangeify
-    let rangeified = rangeify_unwrap(store);
-
-    // Step 4: Apply kernel split
-    let (kernel, _context) =
-        try_get_kernel_graph(rangeified).expect("kernel split pipeline should succeed after rangeify");
-
-    // Should produce valid output
-    assert!(kernel.dtype() == DType::Void || matches!(kernel.op(), Op::Call { .. }));
-}
-
-#[test]
-fn test_end_to_end_with_ranges() {
-    // Test: Pipeline with explicit range operations
-
-    let _buffer = UOp::buffer_id(Some(0));
-    let index = UOp::index_const(0);
-    let value = UOp::native_const(1.0f32);
-    let store = index.store(value);
-
-    // Wrap in END with ranges
-    let range_end = UOp::index_const(100);
-    let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = store.end(vec![range].into());
-
-    let rangeified = rangeify_unwrap(end);
-    let (kernel, _context) =
-        try_get_kernel_graph(rangeified).expect("kernel split pipeline should succeed with ranges");
-
-    assert!(kernel.dtype() == DType::Void || matches!(kernel.op(), Op::Call { .. }));
-}
-
-// ===== Regression Tests =====
-
-#[test]
-fn test_pipeline_idempotent() {
-    // Test: Applying pipeline twice should be safe
-    let x = UOp::native_const(1.0f32);
-
-    let rangeified1 = rangeify_unwrap(x.clone());
-    let rangeified2 = rangeify_unwrap(rangeified1);
-
-    // Second application should not break anything
-    assert!(rangeified2.dtype() == x.dtype());
-}
-
-#[test]
-fn test_pipeline_preserves_dtype() {
-    // Test: Pipeline should preserve data types
-    let test_cases = vec![
-        (DType::Float32, UOp::native_const(1.0f32)),
-        (DType::Float64, UOp::native_const(1.0f64)),
-        (DType::Int32, UOp::native_const(42i32)),
-        (DType::Int64, UOp::native_const(42i64)),
-        (DType::Bool, UOp::native_const(true)),
-    ];
-
-    for (dtype, value) in test_cases {
-        let rangeified = rangeify_unwrap(value.clone());
-
-        // Should preserve dtype (or transform to compatible type)
-        if let Op::Const(_) = rangeified.op() {
-            assert_eq!(rangeified.dtype(), dtype)
-        }
-    }
-}
-
-#[test]
-fn test_pipeline_handles_noop() {
-    // Test: Pipeline should handle NOOP operations
-    let noop = UOp::noop();
-    let rangeified = rangeify_unwrap(noop);
-
-    // NOOP should remain or be transformed safely
-    assert!(rangeified.dtype() == DType::Void || matches!(rangeified.op(), Op::Noop));
-}
-
-// ===== Error Handling Tests =====
-
-#[test]
-fn test_pipeline_complex_nested_structure() {
-    // Test: Pipeline should handle deeply nested operations
-    let mut current = UOp::native_const(1.0f32);
-
-    // Build a deep tree: ((((x + 1) + 1) + 1) + 1)
-    for _ in 0..10 {
-        let one = UOp::native_const(1.0f32);
-        current = current.try_add(&one).unwrap();
-    }
-
-    let rangeified = rangeify_unwrap(current);
-
-    // Should handle deep nesting without stack overflow
-    assert_eq!(rangeified.dtype(), DType::Float32);
-}
-
-#[test]
-fn test_pipeline_wide_tree() {
-    // Test: Pipeline should handle wide trees (many branches)
-    let mut operands = Vec::new();
-
-    for i in 0..20 {
-        operands.push(UOp::native_const(i as f32));
-    }
-
-    // Sum all operands
-    let mut sum = operands[0].clone();
-    for operand in &operands[1..] {
-        sum = sum.try_add(operand).unwrap();
-    }
-
-    let rangeified = rangeify_unwrap(sum);
-
-    // Should handle wide trees
-    assert_eq!(rangeified.dtype(), DType::Float32);
-}
-
-// ===== Pattern Application Order Tests =====
-
-#[test]
-fn test_pipeline_applies_early_rewrites_first() {
-    // Test: early_rewrites should be applied before other patterns
-    let x = UOp::native_const(1.0f32);
-    let detach = x.detach();
-
-    let rangeified = rangeify_unwrap(detach);
-
-    // DETACH should be removed (early rewrite)
-    if let Op::Detach { .. } = rangeified.op() {
-        panic!("DETACH should have been removed by early_rewrites")
-    }
-}
-
-#[test]
-fn test_pipeline_applies_buffer_folding() {
-    // Test: buffer_folding patterns should be applied
-
-    // Create BUFFERIZE(CONST) which should be folded
-    let const_val = UOp::native_const(42.0f32);
-    let range_end = UOp::index_const(10);
-    let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let bufferize = UOp::bufferize(const_val.clone(), vec![range], BufferizeOpts::local());
-
-    let rangeified = rangeify_unwrap(bufferize);
-
-    // BUFFERIZE(CONST) may be folded to CONST
-    // Or may remain as BUFFERIZE depending on pipeline phase
-    match rangeified.op() {
-        Op::Const(_) | Op::Bufferize { .. } => {} // Both acceptable
-        _ => {}
-    }
-}
-
-// ===== Correctness Tests =====
-
-#[test]
-fn test_pipeline_maintains_computation_semantics() {
-    // Test: Transformation should not change computation semantics
-
-    // Original: a * b + c
-    let a = UOp::native_const(2.0f32);
-    let b = UOp::native_const(3.0f32);
-    let c = UOp::native_const(4.0f32);
-
-    let product = a.try_mul(&b).unwrap();
-    let sum = product.try_add(&c).unwrap();
-
-    let rangeified = rangeify_unwrap(sum);
-
-    // Should preserve dtype
-    assert_eq!(rangeified.dtype(), DType::Float32);
-
-    // Structure may change but computation should be equivalent
-    // (Hard to verify without evaluation, but we check it doesn't panic)
-}
-
-// ===== Reduction Optimization Tests =====
-
-#[test]
-fn test_pipeline_reduce_unparented_add() {
-    // Test: reduce_unparented optimization for ADD
-    // REDUCE(CONST(5), [range(10)], ADD) should become CONST(50)
-    use svod_ir::ReduceOp;
-
-    let const_val = UOp::native_const(5i32);
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = const_val.reduce(vec![range].into(), ReduceOp::Add);
-
-    let rangeified = rangeify_unwrap(reduce);
-
-    // Should be optimized to a multiplication or constant
-    // REDUCE(5, [10], ADD) → 5 * 10 = 50
-    match rangeified.op() {
-        Op::Binary(svod_ir::BinaryOp::Mul, _, _) => {
-            // Optimized to multiplication
-        }
-        Op::Const(cv_hash) => {
-            // May be folded further to constant 50
-            if let ConstValue::Int(n) = cv_hash.0 {
-                assert_eq!(n, 50, "reduce_unparented should optimize to 50");
-            }
-        }
-        _ => {
-            // If not optimized, should at least not panic
-            // (Optimization may not apply if patterns don't match)
-        }
-    }
-}
-
-#[test]
-fn test_pipeline_reduce_unparented_max() {
-    // Test: reduce_unparented optimization for MAX
-    // REDUCE(CONST(42), [range(5)], MAX) should become CONST(42)
-    use svod_ir::ReduceOp;
-
-    let const_val = UOp::native_const(42i32);
-    let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = const_val.clone().reduce(vec![range].into(), ReduceOp::Max);
-
-    let rangeified = rangeify_unwrap(reduce);
-
-    // Should be optimized to just the constant
-    match rangeified.op() {
-        Op::Const(cv_hash) => {
-            if let ConstValue::Int(n) = cv_hash.0 {
-                assert_eq!(n, 42, "reduce_unparented MAX should preserve constant");
-            }
-        }
-        _ => {
-            // May remain as REDUCE if pattern doesn't match
-        }
-    }
-}
-
-#[test]
-fn test_pipeline_split_reduceop_large_reduction() {
-    // Test: split_reduceop should split large REDUCE_AXIS operations
-    use svod_device::DeviceSpec;
-    use svod_ir::ReduceOp;
-
-    // Create a tensor with shape (100000,) - large enough to trigger split
-    let total_size = 100000;
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, total_size, DType::Float32);
-
-    // REDUCE_AXIS on this tensor
-    let reduce = buffer.try_reduce_axis(ReduceOp::Add, vec![0]).unwrap();
-
-    let rangeified = rangeify_unwrap(reduce);
-
-    // Verify: split_reduceop should have applied, creating CONTIGUOUS node
-    let has_contiguous = rangeified.toposort().iter().any(|node| matches!(node.op(), Op::Contiguous { .. }));
-
-    assert!(
-        has_contiguous,
-        "split_reduceop should have split large reduction (100000 > 32768 threshold), creating CONTIGUOUS node"
-    );
-
-    // Should preserve output dtype
-    assert_eq!(rangeified.dtype(), DType::Float32);
-}
-
-#[test]
-fn test_pipeline_split_reduceop_below_threshold() {
-    // Test: split_reduceop should NOT split small REDUCE_AXIS operations
-    use svod_device::DeviceSpec;
-    use svod_ir::ReduceOp;
-
-    // Create a tensor with shape (1000,) - below threshold (32768)
-    let total_size = 1000;
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, total_size, DType::Float32);
-
-    // REDUCE_AXIS on this tensor
-    let reduce = buffer.try_reduce_axis(ReduceOp::Add, vec![0]).unwrap();
-
-    let rangeified = rangeify_unwrap(reduce);
-
-    // Verify: split_reduceop should NOT have applied (below threshold)
-    let has_contiguous = rangeified.toposort().iter().any(|node| matches!(node.op(), Op::Contiguous { .. }));
-
-    assert!(!has_contiguous, "split_reduceop should NOT split small reduction (1000 < 32768 threshold)");
-
-    // Should preserve output dtype
-    assert_eq!(rangeified.dtype(), DType::Float32);
-}
-
-#[test]
-fn test_pipeline_reduction_optimizations_dont_break_graph() {
-    // Test: Reduction optimizations preserve graph validity
-    use svod_ir::ReduceOp;
-
-    // Create a realistic reduction scenario
-    let data = UOp::native_const(PI);
-    let range1 = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Reduce);
-    let range2 = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(1), AxisType::Reduce);
-
-    // Create a multi-range reduction
-    let reduce = data.reduce(vec![range1, range2].into(), ReduceOp::Add);
-
-    // Apply full pipeline
-    let result = run_rangeify(reduce);
-
-    // Should succeed without panicking
-    assert!(result.is_ok(), "Pipeline should handle multi-range reduction");
-
-    let (rangeified, _ctx) = result.unwrap();
-
-    // Result should have valid dtype
-    assert_eq!(rangeified.dtype(), DType::Float32);
-}
-
-// ===== reduce_collapse Integration Tests =====
-
-#[test]
-fn test_pipeline_reduce_collapse_constant() {
-    // Test: REDUCE(const, [range], ADD) should be simplified by reduce_collapse
-    // after symbolic simplification eliminates range dependency
-    let const_val = UOp::native_const(42i32);
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = const_val.reduce(vec![range].into(), ReduceOp::Add);
+/// Reductions over a range-independent source lose the loop entirely: ADD scales
+/// the value by the extent, MAX leaves it untouched. MIN is deliberately absent
+/// upstream — see `reduce_simplify::min_is_not_an_unparented_fold`.
+#[test_case(ReduceOp::Add, 10, ConstValue::Int(50) ; "add scales by the extent")]
+#[test_case(ReduceOp::Max, 5, ConstValue::Int(5) ; "max is idempotent")]
+fn unparented_reductions_collapse_to_a_constant(op: ReduceOp, extent: i64, expected: ConstValue) {
+    let range = UOp::range_axis(UOp::index_const(extent), AxisId::Renumbered(0), AxisType::Reduce);
+    let reduce = UOp::native_const(5i32).reduce(vec![range].into(), op);
 
     let result = rangeify_unwrap(reduce);
-
-    // After reduce_collapse, the constant reduction should be simplified
-    // The result should no longer be a REDUCE operation
-    // (it will be transformed to the constant itself or a simpler form)
-    assert_ne!(result.dtype(), DType::Void, "Result should have valid dtype after reduce_collapse");
+    assert!(matches!(result.op(), Op::Const(c) if c.0 == expected), "got {}", result.tree());
 }
 
+/// A source that reads the range cannot be collapsed — the REDUCE survives.
 #[test]
-fn test_pipeline_reduce_collapse_multiple_ranges() {
-    // Test: REDUCE with multiple independent ranges
-    let const_val = UOp::native_const(PI);
-    let range1 = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
-    let range2 = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(1), AxisType::Reduce);
-
-    let reduce = const_val.reduce(vec![range1, range2].into(), ReduceOp::Add);
-
-    let result = rangeify_unwrap(reduce);
-
-    // Should successfully process through pipeline
-    assert_eq!(result.dtype(), DType::Float32, "Result should preserve Float32 dtype");
-}
-
-#[test]
-fn test_pipeline_reduce_collapse_with_algebraic_simplification() {
-    // Test: reduce_collapse combined with algebraic patterns (x + 0)
-    let x = UOp::native_const(100i32);
-    let zero = UOp::native_const(0i32);
-    let x_plus_0 = x.try_add(&zero).unwrap();
-
-    let range = UOp::range_axis(UOp::index_const(20), AxisId::Renumbered(0), AxisType::Reduce);
-
-    let reduce = x_plus_0.reduce(vec![range].into(), ReduceOp::Add);
-
-    let result = rangeify_unwrap(reduce);
-
-    // Symbolic simplification should eliminate x+0 → x,
-    // then reduce_collapse should simplify REDUCE(x, [range], ADD)
-    assert_eq!(result.dtype(), DType::Int32);
-}
-
-#[test]
-fn test_pipeline_reduce_collapse_preserves_dependent_reductions() {
-    // Test: Reductions with actual range dependencies should NOT be collapsed
+fn range_dependent_reductions_are_kept() {
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-
-    // Create expression that depends on range: range + 1
-    let one = UOp::native_const(1i32);
-    let range_int = range.cast(DType::Int32);
-    let src = range_int.try_add(&one).unwrap();
-
+    let src = range.cast(DType::Int32).try_add(&UOp::native_const(1i32)).expect("add");
     let reduce = src.reduce(vec![range].into(), ReduceOp::Add);
 
     let result = rangeify_unwrap(reduce);
+    assert!(result.toposort().iter().any(|n| matches!(n.op(), Op::Reduce { .. })), "got {}", result.tree());
+}
 
-    // Should NOT collapse since src depends on range
-    // Result should still be a valid Int32 value
-    assert_eq!(result.dtype(), DType::Int32);
+/// `split_reduceop` materialises an intermediate (a CONTIGUOUS) only once the
+/// reduced extent passes its threshold. Threshold arithmetic: `split_reduceop.rs`.
+#[test_case(1_000, false ; "below threshold")]
+#[test_case(100_000, true ; "above threshold")]
+fn large_reductions_are_split_in_two_stages(size: usize, split: bool) {
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, size, DType::Float32);
+    let reduce = buffer.try_reduce_axis(ReduceOp::Add, vec![0]).expect("reduce axis");
+
+    let rangeified = rangeify_unwrap(reduce);
+    let has_contiguous = rangeified.toposort().iter().any(|node| matches!(node.op(), Op::Contiguous { .. }));
+    assert_eq!(has_contiguous, split);
+    assert_eq!(rangeified.dtype(), DType::Float32);
 }
 
 #[test]
-fn test_pipeline_reduce_collapse_different_ops() {
-    // Test: reduce_collapse works with different ReduceOp types through pipeline
-    let const_val = UOp::native_const(2.5f32);
-    let range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Reduce);
+fn a_multi_range_reduction_survives_the_pipeline() {
+    let ranges = (0..2)
+        .map(|i| UOp::range_axis(UOp::index_const(8 >> i), AxisId::Renumbered(i), AxisType::Reduce))
+        .collect::<Vec<_>>();
+    let (rangeified, _ctx) =
+        run_rangeify(UOp::native_const(PI).reduce(ranges.into(), ReduceOp::Add)).expect("run_rangeify");
 
-    // Test with MAX
-    let reduce_max = const_val.clone().reduce(vec![range.clone()].into(), ReduceOp::Max);
-    let result_max = rangeify_unwrap(reduce_max);
-    assert_eq!(result_max.dtype(), DType::Float32, "MAX reduce should work");
-
-    // Test with MIN
-    let reduce_min = const_val.reduce(vec![range].into(), ReduceOp::Min);
-    let result_min = rangeify_unwrap(reduce_min);
-    assert_eq!(result_min.dtype(), DType::Float32, "MIN reduce should work");
-}
-
-#[test]
-fn test_pipeline_reduce_collapse_integration_with_unparented() {
-    // Test: reduce_collapse and reduce_unparented should work together
-    // Create a scenario where both optimizations could apply
-    let const_val = UOp::native_const(7i32);
-
-    // Create two ranges: one will be unparented, one could be collapsed
-    let range1 = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
-    let range2 = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(1), AxisType::Reduce);
-
-    // Const doesn't depend on either range
-    let reduce = const_val.reduce(vec![range1, range2].into(), ReduceOp::Add);
-
-    let result = rangeify_unwrap(reduce);
-
-    // Both reduce_unparented and reduce_collapse could apply
-    // Result should be simplified significantly
-    assert_eq!(result.dtype(), DType::Int32);
+    assert_eq!(rangeified.dtype(), DType::Float32);
 }

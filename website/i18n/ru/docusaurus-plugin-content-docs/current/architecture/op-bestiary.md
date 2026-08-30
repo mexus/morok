@@ -345,7 +345,7 @@ Program {
 Проводит ядро через стадии `SINK → LINEAR → SOURCE → PROGRAM_BINARY`,
 которые жёстко выстроены в `codegen/src/program_pipeline.rs`
 (`do_linearize`/`do_render`/`do_compile`/`get_program`). Каждая стадия
-заполняет следующее поле. Рендерeры C/LLVM/MLIR ожидают вход `Op::Linear`
+заполняет следующее поле. Рендерeры C/LLVM ожидают вход `Op::Linear`
 и сообщают `Error::InvalidGraph` через `pending_error` контекста, не падая
 с panic; многоиндексные `INDEX` должны быть приведены к одноиндексным
 через `pm_linearize_multi_index` до рендера.
@@ -362,7 +362,7 @@ Linear { ops: SmallVec<[Arc<UOp>; 8]> }
 ### SOURCE / PROGRAM_BINARY — артефакты компиляции
 
 ```rust
-Source { code: String }              // отрендеренный исходник (C / LLVM-IR / MLIR)
+Source { code: String }              // отрендеренный исходник (C / LLVM-IR)
 ProgramBinary { bytes: Vec<u8> }     // скомпилированный артефакт
 ```
 
@@ -741,7 +741,7 @@ flowchart TD
 | Операция | Назначение |
 |----------|------------|
 | `Copy` | Явное копирование значения |
-| `BufferView` | `{ buffer, size, offset }` — срез существующего буфера со смещением |
+| `Slice` | `{ buffer, offset, size }` — метаданные непрерывного типизированного среза буфера |
 | `MStack` | Аллокация стека в памяти |
 | `MSelect` | Выбор в памяти (условный доступ) |
 | `Multi` | Операция с множественными выходами |
@@ -763,7 +763,7 @@ flowchart TD
 |-----------|----------|
 | **Управление циклами** | `RANGE`, `END` |
 | **Редукция** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **Память** | `BUFFER`, `BUFFER_VIEW`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
+| **Память** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE` |
 | **Ядро и callable** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
 | **Векторные** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
 | **Расширение** | `UNROLL`, `CONTRACT` |

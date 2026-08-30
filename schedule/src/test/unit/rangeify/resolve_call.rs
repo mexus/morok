@@ -3,6 +3,7 @@ use std::sync::Arc;
 use smallvec::smallvec;
 use svod_dtype::{DType, DeviceSpec};
 use svod_ir::{BinaryOp, CallInfo, Error, Op, UOp};
+use test_case::test_case;
 
 use crate::rangeify::{rangeify, transforms::resolve_calls};
 
@@ -38,53 +39,51 @@ fn test_resolve_call_inlines_function() {
     assert!(!resolved.toposort().iter().any(|u| matches!(u.op(), Op::Function { .. })));
 }
 
-#[test]
-fn test_resolve_call_preserves_opaque_call() {
+fn value_body() -> Arc<UOp> {
     let p0 = UOp::param(0, 8, DType::Float32, None);
-    let p1 = UOp::param(1, 8, DType::Float32, None);
-    let body = p0.try_add(&p1).unwrap();
-
-    let a0 = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
-    let a1 = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
-    let call = body.call(smallvec![a0.clone(), a1.clone()], CallInfo::default());
-
-    let resolved = resolve_calls(call).expect("resolve_calls should succeed");
-    match resolved.op() {
-        Op::Call { body: call_body, args, .. } => {
-            assert!(matches!(call_body.op(), Op::Binary(BinaryOp::Add, _, _)));
-            assert_eq!(args.len(), 2);
-            assert!(Arc::ptr_eq(&args[0], &a0));
-            assert!(Arc::ptr_eq(&args[1], &a1));
-        }
-        op => panic!("expected opaque CALL, got {op:?}"),
-    }
+    p0.try_add(&UOp::param(1, 8, DType::Float32, None)).unwrap()
 }
 
-/// PROGRAM is in tinygrad's `_OPAQUE_CALL_BODIES` (`ops.py:933`) — opaque bodies
-/// belong in CALL, not FUNCTION. CALL is preserved by resolve_calls.
-#[test]
-fn test_resolve_call_preserves_program_call() {
-    let program = UOp::program(UOp::sink(vec![]), UOp::device(DeviceSpec::Cpu), None, None, None);
-    let call = program.call(smallvec![], CallInfo::default());
-
-    let resolved = resolve_calls(call).expect("resolve_calls should succeed");
-    match resolved.op() {
-        Op::Call { body, .. } => assert!(matches!(body.op(), Op::Program { .. })),
-        op => panic!("expected CALL(PROGRAM), got {op:?}"),
-    }
+/// PROGRAM and SINK are in tinygrad's `_OPAQUE_CALL_BODIES` (`ops.py:933`); a
+/// plain value body is opaque too once it is wrapped in CALL rather than
+/// FUNCTION, and a nested CALL stays nested.
+fn program_body() -> Arc<UOp> {
+    let sink = UOp::sink(vec![]);
+    let info = svod_ir::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
+    UOp::program(sink, info, None, None, None)
 }
 
-/// SINK is in tinygrad's `_OPAQUE_CALL_BODIES` — wrap with CALL.
-#[test]
-fn test_resolve_call_preserves_sink_call() {
-    let body = UOp::sink_with_info(vec![UOp::native_const(1.0f32)], svod_ir::KernelInfo::default());
-    let call = body.call(smallvec![], CallInfo::default());
+fn kernel_sink_body() -> Arc<UOp> {
+    UOp::sink_with_info(vec![UOp::native_const(1.0f32)], svod_ir::KernelInfo::default())
+}
+
+fn sink_with_unrelated_metadata() -> Arc<UOp> {
+    #[derive(Debug)]
+    struct UnrelatedMarker;
+    UOp::sink(vec![UOp::param(0, 8, DType::Float32, None)]).with_metadata(UnrelatedMarker)
+}
+
+fn nested_call_body() -> Arc<UOp> {
+    UOp::native_const(1.0f32).call(smallvec![], CallInfo::default())
+}
+
+#[test_case(super::value_body ; "arithmetic body")]
+#[test_case(super::program_body ; "program body")]
+#[test_case(super::kernel_sink_body ; "kernel sink body")]
+#[test_case(super::sink_with_unrelated_metadata ; "sink carrying unrelated metadata")]
+#[test_case(super::nested_call_body ; "nested call body")]
+fn a_call_body_is_never_inlined(build: fn() -> Arc<UOp>) {
+    let body = build();
+    let args: smallvec::SmallVec<[Arc<UOp>; 4]> =
+        (0..2).map(|_| UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32)).collect();
+    let call = body.clone().call(args.clone(), CallInfo::default());
 
     let resolved = resolve_calls(call).expect("resolve_calls should succeed");
-    match resolved.op() {
-        Op::Call { body, .. } => assert!(matches!(body.op(), Op::Sink { .. })),
-        op => panic!("expected CALL(SINK), got {op:?}"),
-    }
+    let Op::Call { body: resolved_body, args: resolved_args, .. } = resolved.op() else {
+        panic!("expected the CALL to survive, got {}", resolved.tree())
+    };
+    assert!(Arc::ptr_eq(resolved_body, &body), "the body must be untouched");
+    assert!(resolved_args.iter().zip(&args).all(|(a, b)| Arc::ptr_eq(a, b)));
 }
 
 #[test]
@@ -112,6 +111,36 @@ fn test_resolve_call_preserves_precompile_function() {
     }
 }
 
+#[test]
+fn test_resolve_call_preserves_precompile_gettuple_and_actual() {
+    let formal = UOp::param(0, 8, DType::Float32, None);
+    let actual = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
+    let info = CallInfo { precompile: true, ..CallInfo::default() };
+    let function = formal.function(smallvec![actual.clone()], info);
+    let gettuple = function.try_gettuple(0).unwrap();
+
+    let resolved = resolve_calls(gettuple).expect("precompiled FUNCTION must remain opaque");
+    let Op::GetTuple { src, index: 0 } = resolved.op() else { panic!("expected GETTUPLE root") };
+    let Op::Function { args, info, .. } = src.op() else { panic!("expected preserved FUNCTION source") };
+    assert!(info.precompile);
+    assert_eq!(args.len(), 1);
+    assert!(Arc::ptr_eq(&args[0], &actual));
+}
+
+#[test]
+fn test_resolve_call_keeps_nested_function_under_opaque_outer_function() {
+    let nested_formal = UOp::param(0, 8, DType::Float32, None);
+    let nested_actual = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
+    let nested = nested_formal.function(smallvec![nested_actual], CallInfo::default());
+    let outer_info = CallInfo { precompile: true, ..CallInfo::default() };
+    let outer = nested.function(smallvec![], outer_info);
+
+    let resolved = resolve_calls(outer).expect("opaque outer FUNCTION must preserve its body");
+    let Op::Function { body, info, .. } = resolved.op() else { panic!("expected outer FUNCTION") };
+    assert!(info.precompile);
+    assert!(body.toposort().iter().any(|node| matches!(node.op(), Op::Function { info, .. } if !info.precompile)));
+}
+
 /// Tinygrad parity: BIND is value-producing (not in `_OPAQUE_CALL_BODIES`), so a
 /// FUNCTION wrapping it gets inlined like any value body. With no PARAMs the
 /// substitution is a no-op and the resolved value is the TUPLE-wrapped body.
@@ -127,43 +156,7 @@ fn test_resolve_call_inlines_bind_body_function() {
     assert!(!resolved.toposort().iter().any(|u| matches!(u.op(), Op::Function { .. })));
 }
 
-/// CALL is opaque: a FUNCTION wrapping a CALL is unusual — express the same
-/// preservation intent by wrapping with CALL outermost. resolve_calls preserves
-/// the outer CALL and leaves the inner CALL alone.
-#[test]
-fn test_resolve_call_preserves_nested_call_body() {
-    let inner_call = UOp::native_const(1.0f32).call(smallvec![], CallInfo::default());
-    let outer_call = inner_call.call(smallvec![], CallInfo::default());
-
-    let resolved = resolve_calls(outer_call).expect("resolve_calls should succeed");
-    match resolved.op() {
-        Op::Call { body, .. } => assert!(matches!(body.op(), Op::Call { .. })),
-        op => panic!("expected CALL(CALL), got {op:?}"),
-    }
-}
-
 /// SINK with non-kernel metadata still requires CALL (opaque body).
-#[test]
-fn test_resolve_call_preserves_sink_call_with_unrelated_metadata() {
-    #[derive(Debug)]
-    struct UnrelatedMarker;
-
-    let p0 = UOp::param(0, 8, DType::Float32, None);
-    let body = UOp::sink(vec![p0.clone()]).with_metadata(UnrelatedMarker);
-    let arg = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
-    let call = body.call(smallvec![arg.clone()], CallInfo::default());
-
-    let resolved = resolve_calls(call).expect("resolve_calls should succeed");
-    match resolved.op() {
-        Op::Call { body, args, .. } => {
-            assert!(matches!(body.op(), Op::Sink { .. }));
-            assert_eq!(args.len(), 1);
-            assert!(Arc::ptr_eq(&args[0], &arg));
-        }
-        op => panic!("expected CALL(SINK), got {op:?}"),
-    }
-}
-
 #[test]
 fn test_resolve_call_allows_non_contiguous_param_slots_with_unused_args() {
     let p0 = UOp::param(0, 8, DType::Float32, None);
@@ -181,41 +174,25 @@ fn test_resolve_call_allows_non_contiguous_param_slots_with_unused_args() {
     assert!(resolved.toposort().iter().any(|u| Arc::ptr_eq(u, &a2)));
 }
 
+/// Every actual argument must line up with its formal PARAM: a missing slot, a
+/// different extent and a different dtype are all typed errors.
 #[test]
-fn test_resolve_call_error_arg_count_mismatch() {
-    let p0 = UOp::param(0, 8, DType::Float32, None);
-    let p1 = UOp::param(1, 8, DType::Float32, None);
-    let body = p0.try_add(&p1).unwrap();
+fn a_mismatched_actual_argument_is_a_typed_error() {
+    let two_params =
+        value_body().function(smallvec![UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32)], CallInfo::default());
+    let sqrt = |buffer| {
+        UOp::param(0, 8, DType::Float32, None).try_sqrt().unwrap().function(smallvec![buffer], CallInfo::default())
+    };
+    let wrong_shape = sqrt(UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32));
+    let wrong_dtype = sqrt(UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Int32));
 
-    let a0 = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
-    let function = body.function(smallvec![a0], CallInfo::default());
-
-    let err = resolve_calls(function).expect_err("resolve_calls should fail");
-    assert!(matches!(err, Error::CallArgCountMismatch { expected: 2, got: 1 }));
-}
-
-#[test]
-fn test_resolve_call_error_shape_mismatch() {
-    let p0 = UOp::param(0, 8, DType::Float32, None);
-    let body = p0.try_sqrt().unwrap();
-
-    let a0 = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let function = body.function(smallvec![a0], CallInfo::default());
-
-    let err = resolve_calls(function).expect_err("resolve_calls should fail");
-    assert!(matches!(err, Error::CallArgShapeMismatch { arg_index: 0, .. }));
-}
-
-#[test]
-fn test_resolve_call_error_dtype_mismatch() {
-    let p0 = UOp::param(0, 8, DType::Float32, None);
-    let body = p0.try_sqrt().unwrap();
-
-    let a0 = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Int32);
-    let function = body.function(smallvec![a0], CallInfo::default());
-
-    let err = resolve_calls(function).expect_err("resolve_calls should fail");
-    assert!(matches!(err, Error::CallArgDTypeMismatch { arg_index: 0, .. }));
+    let err = |f| match resolve_calls(f) {
+        Err(err) => err,
+        Ok(resolved) => panic!("expected a typed error, got {}", resolved.tree()),
+    };
+    assert!(matches!(err(two_params), Error::CallFormalSlotMissing { slot: 1, arg_count: 1 }));
+    assert!(matches!(err(wrong_shape), Error::CallArgShapeMismatch { arg_index: 0, .. }));
+    assert!(matches!(err(wrong_dtype), Error::CallArgDTypeMismatch { arg_index: 0, .. }));
 }
 
 #[test]
@@ -230,6 +207,22 @@ fn test_rangeify_pipeline_runs_resolve_call() {
 
     let (out, _ctx) = rangeify(function).expect("rangeify should succeed");
     assert!(!out.toposort().iter().any(|u| matches!(u.op(), Op::Function { .. })));
+}
+
+#[test]
+fn test_rangeify_consumes_expression_valued_function_result_shape() {
+    let p1 = UOp::scalar_param(1, Some("p1".into()), DType::WeakInt, 1, 8);
+    let extent = p1.try_add(&p1).unwrap();
+    let formal = UOp::param_with_shape(0, &smallvec![svod_ir::SInt::Symbolic(extent)], DType::Float32, None);
+    let actual_dim = UOp::define_var("actual".into(), 1, 8);
+    let actual_extent = actual_dim.try_add(&actual_dim).unwrap();
+    let actual =
+        UOp::param_with_shape(7, &smallvec![svod_ir::SInt::Symbolic(actual_extent.clone())], DType::Float32, None);
+    let output = formal.function(smallvec![actual, actual_dim], CallInfo::default()).try_gettuple(0).unwrap();
+
+    assert_eq!(output.shape().unwrap().unwrap().as_slice(), &[svod_ir::SInt::Symbolic(actual_extent)]);
+    let (resolved, _) = rangeify(output).expect("rangeify should consume substituted call shape");
+    assert!(resolved.toposort().iter().all(|node| !matches!(node.op(), Op::Function { .. })));
 }
 
 #[test]

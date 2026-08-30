@@ -1,0 +1,2 @@
+# UOp caches derived properties behind OnceLock; its hash/eq are by identity, so it is a sound map key.
+ignore-interior-mutability = ["svod_ir::uop::core::UOp"]

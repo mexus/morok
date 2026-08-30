@@ -46,7 +46,7 @@ fn test_knn_score_graph_shape() {
         // The c_sq input is the last (4th) Param; its load reads PARAM slot 3.
         let loads_param3 = topo.iter().any(|u| {
             let Op::Load { .. } = u.op() else { return false };
-            u.toposort().iter().any(|s| matches!(s.op(), Op::Param { slot: 3, .. }))
+            u.toposort().iter().any(|s| matches!(s.op(), Op::Param { arg, .. } if arg.slot == 3))
         });
         assert!(loads_param3, "{arch:?}: a Load reads the c_sq input (Param slot 3)");
 
@@ -202,7 +202,7 @@ fn test_knn_topk_graph_shape() {
         let stores_to = |slot: usize| {
             topo.iter().any(|u| {
                 let Op::Store { .. } = u.op() else { return false };
-                u.toposort().iter().any(|s| matches!(s.op(), Op::Param { slot: p, .. } if *p == slot))
+                u.toposort().iter().any(|s| matches!(s.op(), Op::Param { arg, .. } if arg.slot == slot))
             })
         };
         assert!(stores_to(0), "{arch:?}: store into the idx output (Param 0)");

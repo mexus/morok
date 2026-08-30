@@ -37,8 +37,12 @@ pub fn render_wmma_amd(
     // we need `base()`, which unwraps both `Scalar` and `Vector` to the inner
     // ScalarDType. svod's `.scalar()` is stricter than that, so we use
     // `.base()` here. Wrapping in `Some` keeps the downstream API uniform.
-    let in_scalar = Some(a.dtype().base());
-    let acc_scalar = Some(uop.dtype().base());
+    let a_dtype = hardware_dtype(a);
+    let b_dtype = hardware_dtype(b);
+    let c_dtype = hardware_dtype(c);
+    let out_dtype = hardware_dtype(uop);
+    let in_scalar = Some(a_dtype.base());
+    let acc_scalar = Some(out_dtype.base());
 
     let intrinsic = match resolve_intrinsic(arch, in_scalar, acc_scalar, (n, m, k)) {
         Some(s) => s,
@@ -62,42 +66,81 @@ pub fn render_wmma_amd(
     // so this only flips the wire type on the gfx950 path.
     let bf16_native = arch.is_cdna() && k == 32;
 
-    let a_op = bitcast_operand(kernel, &dst, "a", &a.dtype(), &a_name, bf16_native);
-    let b_op = bitcast_operand(kernel, &dst, "b", &b.dtype(), &b_name, bf16_native);
-    let c_op = bitcast_operand(kernel, &dst, "c", &c.dtype(), &c_name, bf16_native);
+    let scaled_fp8 = matches!(arch, AmdArch::Gfx950)
+        && k == 128
+        && matches!(in_scalar, Some(ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2));
+    let rdna_int8 = !arch.is_cdna() && !arch.is_rdna4() && in_scalar == Some(ScalarDType::Int8);
+    let a_op = bitcast_operand(kernel, &dst, "a", &a_dtype, &a_name, bf16_native, scaled_fp8, rdna_int8);
+    let b_op = bitcast_operand(kernel, &dst, "b", &b_dtype, &b_name, bf16_native, scaled_fp8, rdna_int8);
+    let c_op = bitcast_operand(kernel, &dst, "c", &c_dtype, &c_name, bf16_native, false, false);
 
-    let (acc_wire, acc_reinterpreted) = wmma_wire_type(&uop.dtype(), bf16_native);
+    let (acc_wire, acc_reinterpreted) = wmma_wire_type(&out_dtype, bf16_native);
     let call_dst = if acc_reinterpreted { format!("{dst}.r") } else { dst.clone() };
 
-    let tail = if arch.is_cdna() {
+    let tail = if scaled_fp8 {
+        let format = if matches!(in_scalar, Some(ScalarDType::FP8E5M2)) { 1 } else { 0 };
+        format!(", i32 {format}, i32 {format}, i32 0, i32 127, i32 0, i32 127")
+    } else if arch.is_cdna() {
         // MFMA: trailing cbsz/abid/blgp immediates.
-        ", i32 0, i32 0, i32 0"
+        ", i32 0, i32 0, i32 0".to_string()
     } else if matches!(acc_scalar, Some(ScalarDType::Float32)) {
         // f32-accumulating WMMAs take (A, B, C) only.
-        ""
+        String::new()
     } else {
         // Any other accumulator (f16/bf16/int) takes a trailing `i1 false`
         // (the clamp/opsel bit).
-        ", i1 false"
+        ", i1 false".to_string()
     };
 
-    kernel.push(format!("  {call_dst} = call {acc_wire} @{intrinsic}({a_op}, {b_op}, {c_op}{tail})"));
+    let args = if rdna_int8 {
+        // The `iu8` intrinsic carries one signedness flag before each packed
+        // operand. Int8 inputs set both flags; the trailing flag is opsel.
+        format!("i1 true, {a_op}, i1 true, {b_op}, {c_op}, i1 false")
+    } else {
+        format!("{a_op}, {b_op}, {c_op}{tail}")
+    };
+    kernel.push(format!("  {call_dst} = call {acc_wire} @{intrinsic}({args})"));
 
     if acc_reinterpreted {
         // bf16→bf16: the call returns `<N x i16>`; reinterpret it back to bf16.
-        kernel.push(format!("  {dst} = bitcast {acc_wire} {call_dst} to {}", ldt(&uop.dtype())));
+        kernel.push(format!("  {dst} = bitcast {acc_wire} {call_dst} to {}", ldt(&out_dtype)));
     }
     Some(())
+}
+
+fn hardware_dtype(uop: &Arc<UOp>) -> DType {
+    let dtype = uop.dtype();
+    let count = uop
+        .shape()
+        .ok()
+        .flatten()
+        .and_then(|shape| shape.iter().try_fold(1usize, |count, dim| Some(count * dim.as_const()?)))
+        .unwrap_or(1);
+    if count > 1 { dtype.scalar_dtype().vec(count).expect("WMMA shape must be vectorizable") } else { dtype }
 }
 
 /// The LLVM type a WMMA/MFMA operand must be passed as, plus whether that
 /// differs from its natural `ldt` type (a bitcast is then required). bf16 lanes
 /// go as `i16` (the `bf16.1k`/RDNA `.bf16` intrinsics), except for the CDNA4
-/// K=32 `.bf16` form which takes native `<N x bfloat>` (`bf16_native`); fp8
-/// lanes pack into one `iN`; every other dtype passes as-is.
+/// K=32 `.bf16` form which takes native `<N x bfloat>` (`bf16_native`); K=32
+/// fp8 lanes pack into one `iN`, scaled K=128 uses packed i32 vectors, and
+/// RDNA3 int8 lanes pack four-at-a-time into i32 vectors.
 fn wmma_wire_type(dtype: &DType, bf16_native: bool) -> (String, bool) {
+    wmma_wire_type_with_scaled_fp8(dtype, bf16_native, false, false)
+}
+
+fn wmma_wire_type_with_scaled_fp8(
+    dtype: &DType,
+    bf16_native: bool,
+    scaled_fp8: bool,
+    rdna_int8: bool,
+) -> (String, bool) {
     match dtype {
         DType::Vector { scalar: ScalarDType::BFloat16, count } if !bf16_native => (format!("<{count} x i16>"), true),
+        DType::Vector { scalar: ScalarDType::Int8, count } if rdna_int8 => (format!("<{} x i32>", count / 4), true),
+        DType::Vector { scalar: ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2, count } if scaled_fp8 => {
+            (format!("<{} x i32>", count / 4), true)
+        }
         DType::Vector { scalar: ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2, count } => {
             (format!("i{}", count * 8), true)
         }
@@ -109,6 +152,7 @@ fn wmma_wire_type(dtype: &DType, bf16_native: bool) -> (String, bool) {
 /// and return the `"<wire-ty> <value>"` fragment for the call's argument list.
 /// The temp name is derived from the unique `dst` (`%vN.a` …) so no fresh-name
 /// counter is needed.
+#[allow(clippy::too_many_arguments)]
 fn bitcast_operand(
     kernel: &mut Vec<String>,
     dst: &str,
@@ -116,8 +160,10 @@ fn bitcast_operand(
     dtype: &DType,
     name: &str,
     bf16_native: bool,
+    scaled_fp8: bool,
+    rdna_int8: bool,
 ) -> String {
-    let (wire_ty, reinterpreted) = wmma_wire_type(dtype, bf16_native);
+    let (wire_ty, reinterpreted) = wmma_wire_type_with_scaled_fp8(dtype, bf16_native, scaled_fp8, rdna_int8);
     if !reinterpreted {
         return format!("{wire_ty} {name}");
     }
@@ -132,9 +178,9 @@ fn bitcast_operand(
 /// (the optimizer is expected to decompose those upstream).
 ///
 /// Naming scheme:
-/// - RDNA3/RDNA4: `llvm.amdgcn.wmma.<acc>.16x16x16.<in>` (with optional
-///   `.tied` for vec(8) accumulators on gfx1100/1151 — we leave that to a
-///   future pre-rewrite pass).
+/// - RDNA3: `llvm.amdgcn.wmma.<acc>.16x16x16.<in>`.
+/// - RDNA4: the same base name plus LLVM's overloaded result/input vector
+///   suffixes, for example `.v8f32.v8f16`.
 /// - CDNA: `llvm.amdgcn.mfma.<acc>.<N>x<M>x<K><in>`.
 /// - RDNA2 and other non-matrix-core arches: `None` — the optimizer must
 ///   decompose WMMA UOps to scalar/vector loops before rendering.
@@ -152,12 +198,17 @@ fn resolve_intrinsic(
     let in_dt = in_dt?;
     let acc_dt = acc_dt?;
 
+    if (n, m) != (16, 16) {
+        return None;
+    }
+
     if arch.is_cdna() {
         // Verified with `llc -mcpu=gfx942|gfx950` (ROCm 7.2): the f16/bf16 K=16
         // forms (`f16`/`bf16.1k`) select on both CDNA3 (gfx942) and CDNA4
         // (gfx950); the dotted K=32 double-rate forms (`.f16`/`.bf16`) select on
-        // gfx950 only; fp8/bf8 select only at K=32; f32 selects only at K=4
-        // (`v_mfma_f32_16x16x4_f32`, scalar A/B operands). Anything else has no
+        // gfx950 only; fp8/bf8 select at K=32 on both and scaled K=128 on
+        // gfx950; f32 selects only at K=4 (`v_mfma_f32_16x16x4_f32`, scalar
+        // A/B operands). Anything else has no
         // MFMA intrinsic — return `None` so the caller raises `InvalidGraph`
         // (and the optimizer decomposes it) instead of emitting a name LLVM
         // silently lowers to a no-op extern call.
@@ -165,11 +216,11 @@ fn resolve_intrinsic(
         let in_suffix = match (in_dt, k) {
             (ScalarDType::Float16, 32) if is_cdna4 => ".f16",
             (ScalarDType::BFloat16, 32) if is_cdna4 => ".bf16",
-            (ScalarDType::Float16 | ScalarDType::BFloat16, 32) => return None,
-            (ScalarDType::Float16, _) => "f16",
-            (ScalarDType::BFloat16, _) => "bf16.1k",
+            (ScalarDType::Float16, 16) => "f16",
+            (ScalarDType::BFloat16, 16) => "bf16.1k",
             (ScalarDType::Float32, 4) => "f32",
-            (ScalarDType::Float32, _) => return None,
+            (ScalarDType::FP8E4M3, 128) | (ScalarDType::FP8E5M2, 128) if is_cdna4 => ".f8f6f4",
+            (ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2, 128) => return None,
             (ScalarDType::FP8E4M3, 32) => ".fp8.fp8",
             (ScalarDType::FP8E5M2, 32) => ".bf8.bf8",
             _ => return None,
@@ -180,18 +231,22 @@ fn resolve_intrinsic(
             ScalarDType::Int32 => "i32",
             _ => return None,
         };
-        return Some(format!("llvm.amdgcn.mfma.{acc_suffix}.{n}x{m}x{k}{in_suffix}"));
+        // Only the K=128 `.f8f6f4` form is a scaled MFMA; keying on K alone would
+        // mint `mfma.scale.*` names for any K=128 input dtype.
+        let scale = if in_suffix == ".f8f6f4" { "scale." } else { "" };
+        return Some(format!("llvm.amdgcn.mfma.{scale}{acc_suffix}.{n}x{m}x{k}{in_suffix}"));
     }
 
     // RDNA3 / RDNA4 WMMA — both families use 16x16x16 matmul; differ in input
     // dtype packing (handled by upstream pre-rewrites at the renderer level
     // when present; here we just name the intrinsic).
+    if k != 16 {
+        return None;
+    }
     let in_suffix = match in_dt {
         ScalarDType::Float16 => "f16",
         ScalarDType::BFloat16 => "bf16",
-        ScalarDType::Int8 => "iu8",
-        ScalarDType::FP8E4M3 => "fp8.fp8",
-        ScalarDType::FP8E5M2 => "bf8.bf8",
+        ScalarDType::Int8 if !arch.is_rdna4() => "iu8",
         _ => return None,
     };
     let acc_suffix = match acc_dt {
@@ -201,7 +256,23 @@ fn resolve_intrinsic(
         ScalarDType::Int32 => "i32",
         _ => return None,
     };
-    Some(format!("llvm.amdgcn.wmma.{acc_suffix}.{n}x{m}x{k}.{in_suffix}"))
+    let base = format!("llvm.amdgcn.wmma.{acc_suffix}.{n}x{m}x{k}.{in_suffix}");
+    if !arch.is_rdna4() {
+        return Some(base);
+    }
+    let acc_overload = match acc_dt {
+        ScalarDType::Float32 => "v8f32",
+        ScalarDType::Float16 => "v8f16",
+        ScalarDType::BFloat16 => "v8i16",
+        ScalarDType::Int32 => "v8i32",
+        _ => return None,
+    };
+    let in_overload = match in_dt {
+        ScalarDType::Float16 => "v8f16",
+        ScalarDType::BFloat16 => "v8i16",
+        _ => return None,
+    };
+    Some(format!("{base}.{acc_overload}.{in_overload}"))
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ impl ComparisonAnalyzer {
     /// or None if it could be either true or false.
     pub fn analyze(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> Option<bool> {
         use crate::uop::cached_property::CachedProperty;
-        use crate::uop::properties::VminVmaxProperty;
+        use crate::uop::properties::SoundVminVmaxProperty;
 
         // Fast path: self-comparison for non-float types
         if Arc::ptr_eq(x, y) && !x.dtype().is_float() {
@@ -31,14 +31,10 @@ impl ComparisonAnalyzer {
             };
         }
 
-        // Check if comparison can be eliminated (handles float NaN cases)
-        if !Self::can_eliminate_comparison(x, y) {
-            return None;
-        }
-
-        // Get ranges for both operands
-        let (x_min, x_max) = VminVmaxProperty::get(x);
-        let (y_min, y_max) = VminVmaxProperty::get(y);
+        // A sound floating range also proves that NaN is impossible. Unknown
+        // loads/parameters and NaN-capable operations deliberately return None.
+        let (x_min, x_max) = SoundVminVmaxProperty::get(x).as_ref()?;
+        let (y_min, y_max) = SoundVminVmaxProperty::get(y).as_ref()?;
 
         // Analyze based on ranges
         Self::analyze_with_ranges(op, *x_min, *x_max, *y_min, *y_max)
@@ -103,27 +99,6 @@ impl ComparisonAnalyzer {
             Some(false) => (ConstValue::Bool(false), ConstValue::Bool(false)),
             None => (ConstValue::Bool(false), ConstValue::Bool(true)),
         }
-    }
-
-    /// Check if a comparison can be safely eliminated based on types.
-    fn can_eliminate_comparison(x: &Arc<UOp>, y: &Arc<UOp>) -> bool {
-        let dtype = x.dtype();
-
-        // For non-float types, always safe to eliminate
-        if !dtype.is_float() {
-            return true;
-        }
-
-        // For floats, check if NaN is possible
-        use crate::uop::cached_property::CachedProperty;
-        use crate::uop::properties::VminVmaxProperty;
-
-        let check_nan = |uop: &Arc<UOp>| {
-            let (min, max) = VminVmaxProperty::get(uop);
-            matches!(min, ConstValue::Float(f) if f.is_nan()) || matches!(max, ConstValue::Float(f) if f.is_nan())
-        };
-
-        !check_nan(x) && !check_nan(y)
     }
 
     /// Analyze x < y

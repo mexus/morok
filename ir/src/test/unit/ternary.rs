@@ -81,10 +81,10 @@ fn test_where_nested() {
 #[test]
 fn test_where_with_different_dtypes() {
     // Branches should have compatible types
-    // Result takes dtype from true branch (first non-condition arg)
+    // Current Tinygrad promotes WHERE value branches.
     assert_eq!(
         UOp::try_where(UOp::native_const(true), UOp::native_const(5i32), UOp::native_const(5.0f32)).unwrap().dtype(),
-        DType::Int32
+        DType::Float32
     );
 }
 

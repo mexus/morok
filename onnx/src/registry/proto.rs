@@ -25,8 +25,10 @@ pub fn convert_onnx_dtype(onnx_dtype: i32) -> Result<DType> {
         Ok(DataType::Uint32) => ScalarDType::UInt32,
         Ok(DataType::Uint64) => ScalarDType::UInt64,
         Ok(DataType::Bfloat16) => ScalarDType::BFloat16,
-        Ok(DataType::Float8e4m3fn) | Ok(DataType::Float8e4m3fnuz) => ScalarDType::FP8E4M3,
-        Ok(DataType::Float8e5m2) | Ok(DataType::Float8e5m2fnuz) => ScalarDType::FP8E5M2,
+        Ok(DataType::Float8e4m3fn) => ScalarDType::FP8E4M3,
+        Ok(DataType::Float8e4m3fnuz) => ScalarDType::FP8E4M3FNUZ,
+        Ok(DataType::Float8e5m2) => ScalarDType::FP8E5M2,
+        Ok(DataType::Float8e5m2fnuz) => ScalarDType::FP8E5M2FNUZ,
         _ => return UnsupportedDTypeSnafu { dtype: onnx_dtype }.fail(),
     };
 

@@ -42,8 +42,8 @@ impl KernelInfo {
 
     /// Get the function name (ASCII-only version of name).
     ///
-    /// Converts special characters (including ANSI color codes) to hex
-    /// codes for valid function identifiers in generated code.
+    /// Strips ANSI color sequences and converts other special characters to
+    /// hexadecimal code points for valid generated identifiers.
     ///
     /// Based on Tinygrad's `to_function_name()`.
     ///
@@ -55,13 +55,10 @@ impl KernelInfo {
     ///
     /// // With ANSI colors
     /// let info = KernelInfo::new("r\x1b[34mg16\x1b[0m", vec![], false);
-    /// assert!(info.function_name().contains("1B")); // ESC = 0x1B
+    /// assert_eq!(info.function_name(), "rg16");
     /// ```
     pub fn function_name(&self) -> String {
-        self.name
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c.to_string() } else { format!("{:02X}", c as u32) })
-            .collect()
+        svod_ir::to_function_name(&self.name)
     }
 }
 

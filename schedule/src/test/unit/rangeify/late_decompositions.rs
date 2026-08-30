@@ -1,420 +1,192 @@
-//! Tests for late decomposition patterns (get_late_rewrite_patterns).
-//!
-//! Based on Tinygrad's decompositions.py:321-367.
+//! Late decomposition patterns — tinygrad `decompositions.py:321-367`.
 
+use std::sync::Arc;
+
+use svod_dtype::DType;
 use svod_ir::types::ConstValue;
 use svod_ir::{BinaryOp, Op, UOp, UnaryOp};
+use test_case::test_case;
 
 use crate::rangeify::patterns::{
     pm_comparison_negations, pm_div_to_shr, pm_fdiv_to_mul, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul,
 };
 use crate::rewrite::graph_rewrite;
+use crate::symbolic::{pm_fold_cast_const, symbolic_simple};
 
-// ============================================================================
-// MOD → AND PATTERNS
-// ============================================================================
+fn x() -> Arc<UOp> {
+    UOp::variable("x".into(), 0, 9999, DType::Int32)
+}
 
-#[test]
-fn test_mod_power_of_two_becomes_and() {
-    let matcher = pm_mod_to_and();
+fn late_rewrite(matcher: &'static crate::TypedPatternMatcher, root: Arc<UOp>) -> Arc<UOp> {
+    graph_rewrite(&(symbolic_simple() + pm_fold_cast_const() + matcher), root, &mut ())
+}
 
-    // x % 8 → x & 7
-    let x = UOp::range(UOp::index_const(100), 0);
-    let modulo = x.mod_(&UOp::index_const(8));
+/// Assert `result` is `op(x, rhs)`.
+fn assert_strength_reduced(result: &Arc<UOp>, op: BinaryOp, rhs: i64) {
+    let Op::Binary(actual, lhs, actual_rhs) = result.op() else { panic!("expected {op:?}, got {}", result.tree()) };
+    assert_eq!(*actual, op, "{}", result.tree());
+    assert!(Arc::ptr_eq(lhs, &x()), "LHS must be the original operand");
+    assert!(matches!(actual_rhs.op(), Op::Const(c) if c.0 == ConstValue::Int(rhs)), "{}", result.tree());
+}
 
-    let result = graph_rewrite(&matcher, modulo, &mut ());
+/// Power-of-two `%`, `*` and `//` become bit ops on the same operand.
+#[test_case(2, 1 ; "modulo 2")]
+#[test_case(8, 7 ; "modulo 8")]
+#[test_case(1024, 1023 ; "modulo 1024")]
+fn modulo_by_a_power_of_two_becomes_a_mask(divisor: i64, mask: i64) {
+    assert_strength_reduced(&late_rewrite(pm_mod_to_and(), x().mod_(&UOp::index_const(divisor))), BinaryOp::And, mask);
+}
 
-    // Should be And(x, 7)
-    if let Op::Binary(BinaryOp::And, lhs, rhs) = result.op() {
-        assert!(std::sync::Arc::ptr_eq(lhs, &x), "LHS should be x");
-        if let Op::Const(c) = rhs.op() {
-            assert_eq!(c.0, ConstValue::Int(7), "RHS should be 7");
-        } else {
-            panic!("Expected constant 7, got {:?}", rhs.op());
-        }
-    } else {
-        panic!("Expected And operation, got {:?}", result.op());
-    }
+#[test_case(2, 1 ; "times 2")]
+#[test_case(8, 3 ; "times 8")]
+#[test_case(256, 8 ; "times 256")]
+fn multiply_by_a_power_of_two_becomes_a_left_shift(factor: i64, shift: i64) {
+    assert_strength_reduced(&late_rewrite(pm_mul_to_shl(), x().mul(&UOp::index_const(factor))), BinaryOp::Shl, shift);
+}
+
+#[test_case(2, 1 ; "over 2")]
+#[test_case(8, 3 ; "over 8")]
+#[test_case(256, 8 ; "over 256")]
+fn divide_by_a_power_of_two_becomes_a_right_shift(divisor: i64, shift: i64) {
+    assert_strength_reduced(&late_rewrite(pm_div_to_shr(), x().cdiv(&UOp::index_const(divisor))), BinaryOp::Shr, shift);
+}
+
+/// Non-powers of two, and the trivial identities, are left for the backend.
+#[test_case(pm_mod_to_and, |c| x().mod_(&c), 7, BinaryOp::FloorMod ; "modulo 7")]
+#[test_case(pm_mul_to_shl, |c| x().mul(&c), 7, BinaryOp::Mul ; "times 7")]
+#[test_case(pm_div_to_shr, |c| x().cdiv(&c), 7, BinaryOp::CDiv ; "over 7")]
+#[test_case(pm_div_to_shr, |c| x().cdiv(&c), 1, BinaryOp::CDiv ; "over 1 is not a zero shift")]
+#[test_case(pm_neg_from_mul, |c| x().mul(&c), 1, BinaryOp::Mul ; "times positive one is not a negation")]
+fn no_strength_reduction_without_a_power_of_two(
+    matcher: fn() -> &'static crate::TypedPatternMatcher,
+    build: fn(Arc<UOp>) -> Arc<UOp>,
+    operand: i64,
+    expected: BinaryOp,
+) {
+    let root = build(UOp::index_const(operand));
+    let result = graph_rewrite(matcher(), root, &mut ());
+    assert!(matches!(result.op(), Op::Binary(op, _, _) if *op == expected), "{}", result.tree());
 }
 
 #[test]
-fn test_mod_non_power_of_two_unchanged() {
-    let matcher = pm_mod_to_and();
+fn multiply_by_one_is_the_identity() {
+    let result = late_rewrite(pm_mul_to_shl(), x().mul(&UOp::index_const(1)));
+    assert!(Arc::ptr_eq(&result, &x()));
+}
 
-    // x % 7 should NOT change (7 is not power of two)
-    let x = UOp::range(UOp::index_const(100), 0);
-    let modulo = x.mod_(&UOp::index_const(7));
+/// `x * -1 → NEG(x)`: the codegen-facing form of the canonical MUL.
+#[test]
+fn multiply_by_minus_one_becomes_a_negation() {
+    let result = late_rewrite(pm_neg_from_mul(), x().mul(&UOp::index_const(-1)));
+    let Op::Unary(UnaryOp::Neg, inner) = result.op() else { panic!("expected NEG, got {}", result.tree()) };
+    assert!(Arc::ptr_eq(inner, &x()));
+}
 
-    let result = graph_rewrite(&matcher, modulo.clone(), &mut ());
+// ===== FDIV → MUL by reciprocal (decompositions.py:364-366) =====
 
-    // Should still be Mod
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mod, _, _)), "x % 7 should remain Mod");
+#[test_case(2.0, 0.5 ; "half")]
+#[test_case(4.0, 0.25 ; "quarter")]
+#[test_case(5.0, 0.2 ; "fifth")]
+#[test_case(0.5, 2.0 ; "reciprocal below one")]
+fn dividing_by_a_float_constant_becomes_a_reciprocal_multiply(divisor: f32, reciprocal: f32) {
+    let div = UOp::native_const(100.0f32).try_div(&UOp::native_const(divisor)).expect("div");
+    let result = graph_rewrite(pm_fdiv_to_mul(), div, &mut ());
+
+    let Op::Binary(BinaryOp::Mul, _, rhs) = result.op() else { panic!("expected MUL, got {}", result.tree()) };
+    let Op::Const(c) = rhs.op() else { panic!("expected a constant reciprocal, got {}", result.tree()) };
+    let ConstValue::Float(f) = c.0 else { panic!("expected a float reciprocal, got {:?}", c.0) };
+    assert!((f - reciprocal as f64).abs() < 1e-6, "expected {reciprocal}, got {f}");
 }
 
 #[test]
-fn test_mod_power_of_two_various_sizes() {
-    let matcher = pm_mod_to_and();
-
-    for power in [2, 4, 16, 32, 64, 128, 256, 512, 1024] {
-        let x = UOp::range(UOp::index_const(10000), 0);
-        let modulo = x.mod_(&UOp::index_const(power));
-
-        let result = graph_rewrite(&matcher, modulo, &mut ());
-
-        if let Op::Binary(BinaryOp::And, _, rhs) = result.op() {
-            if let Op::Const(c) = rhs.op() {
-                assert_eq!(c.0, ConstValue::Int(power - 1), "Expected mask {} for modulus {}", power - 1, power);
-            }
-        } else {
-            panic!("Expected And for x % {}, got {:?}", power, result.op());
-        }
-    }
+fn dividing_by_zero_is_rejected_at_construction() {
+    assert!(UOp::native_const(10.0f32).try_div(&UOp::native_const(0.0f32)).is_err());
 }
 
-// ============================================================================
-// MUL → SHL PATTERNS
-// ============================================================================
+// ===== comparison negations (decompositions.py:354-361) =====
 
+/// Negating an integer `<` flips it to the complementary `<` with a shifted
+/// bound; a two-sided band collapses to an equality.
 #[test]
-fn test_mul_power_of_two_becomes_shl() {
-    let matcher = pm_mul_to_shl();
-
-    // x * 8 → x << 3
-    let x = UOp::range(UOp::index_const(100), 0);
-    let mul = x.mul(&UOp::index_const(8));
-
-    let result = graph_rewrite(&matcher, mul, &mut ());
-
-    // Should be Shl(x, 3)
-    if let Op::Binary(BinaryOp::Shl, lhs, rhs) = result.op() {
-        assert!(std::sync::Arc::ptr_eq(lhs, &x), "LHS should be x");
-        if let Op::Const(c) = rhs.op() {
-            assert_eq!(c.0, ConstValue::Int(3), "RHS should be 3 (log2(8))");
-        } else {
-            panic!("Expected constant 3, got {:?}", rhs.op());
-        }
-    } else {
-        panic!("Expected Shl operation, got {:?}", result.op());
-    }
-}
-
-#[test]
-fn test_mul_non_power_of_two_unchanged() {
-    let matcher = pm_mul_to_shl();
-
-    // x * 7 should NOT change (7 is not power of two)
-    let x = UOp::range(UOp::index_const(100), 0);
-    let mul = x.mul(&UOp::index_const(7));
-
-    let result = graph_rewrite(&matcher, mul.clone(), &mut ());
-
-    // Should still be Mul
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)), "x * 7 should remain Mul");
-}
-
-#[test]
-fn test_mul_by_one_returns_identity() {
-    let matcher = pm_mul_to_shl();
-
-    // x * 1 → x (handled specially, not converted to shift)
-    let x = UOp::range(UOp::index_const(100), 0);
-    let mul = x.mul(&UOp::index_const(1));
-
-    let result = graph_rewrite(&matcher, mul, &mut ());
-
-    assert!(std::sync::Arc::ptr_eq(&result, &x), "x * 1 should return x");
-}
-
-// ============================================================================
-// NEG FROM MUL PATTERNS
-// ============================================================================
-
-#[test]
-fn test_mul_neg_one_becomes_neg() {
-    let matcher = pm_neg_from_mul();
-
-    // x * -1 → NEG(x)
-    let x = UOp::range(UOp::index_const(100), 0);
-    let mul = x.mul(&UOp::index_const(-1));
-
-    let result = graph_rewrite(&matcher, mul, &mut ());
-
-    // Should be Neg(x)
-    if let Op::Unary(UnaryOp::Neg, inner) = result.op() {
-        assert!(std::sync::Arc::ptr_eq(inner, &x), "Inner should be x");
-    } else {
-        panic!("Expected Neg operation, got {:?}", result.op());
-    }
-}
-
-#[test]
-fn test_mul_pos_one_unchanged_by_neg_pattern() {
-    let matcher = pm_neg_from_mul();
-
-    // x * 1 should NOT match the neg pattern
-    let x = UOp::range(UOp::index_const(100), 0);
-    let mul = x.mul(&UOp::index_const(1));
-
-    let result = graph_rewrite(&matcher, mul.clone(), &mut ());
-
-    // Should still be Mul
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)), "x * 1 should remain Mul");
-}
-
-// ============================================================================
-// DIV → SHR PATTERNS (Tinygrad: decompositions.py:340-344)
-// ============================================================================
-
-#[test]
-fn test_div_power_of_two_becomes_shr() {
-    let matcher = pm_div_to_shr();
-
-    // x // 8 → x >> 3 (for non-negative x)
-    // Use a range with non-negative vmin
-    let x = UOp::range(UOp::index_const(100), 0);
-    let div = x.idiv(&UOp::index_const(8));
-
-    let result = graph_rewrite(&matcher, div, &mut ());
-
-    // Should be Shr(x, 3)
-    if let Op::Binary(BinaryOp::Shr, lhs, rhs) = result.op() {
-        assert!(std::sync::Arc::ptr_eq(lhs, &x), "LHS should be x");
-        if let Op::Const(c) = rhs.op() {
-            assert_eq!(c.0, ConstValue::Int(3), "RHS should be 3 (log2(8))");
-        } else {
-            panic!("Expected constant 3, got {:?}", rhs.op());
-        }
-    } else {
-        panic!("Expected Shr operation, got {:?}", result.op());
-    }
-}
-
-#[test]
-fn test_div_non_power_of_two_unchanged() {
-    let matcher = pm_div_to_shr();
-
-    // x // 7 should NOT change (7 is not power of two)
-    let x = UOp::range(UOp::index_const(100), 0);
-    let div = x.idiv(&UOp::index_const(7));
-
-    let result = graph_rewrite(&matcher, div.clone(), &mut ());
-
-    // Should still be Idiv
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Idiv, _, _)), "x // 7 should remain Idiv");
-}
-
-#[test]
-fn test_div_by_one_unchanged() {
-    let matcher = pm_div_to_shr();
-
-    // x // 1 should NOT be converted to shift (guard in pattern)
-    let x = UOp::range(UOp::index_const(100), 0);
-    let div = x.idiv(&UOp::index_const(1));
-
-    let result = graph_rewrite(&matcher, div.clone(), &mut ());
-
-    // Should still be Idiv (trivial case skipped)
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Idiv, _, _)), "x // 1 should remain Idiv");
-}
-
-#[test]
-fn test_div_power_of_two_various_sizes() {
-    let matcher = pm_div_to_shr();
-
-    for (power, shift) in [(2, 1), (4, 2), (16, 4), (32, 5), (64, 6), (128, 7), (256, 8)] {
-        let x = UOp::range(UOp::index_const(10000), 0);
-        let div = x.idiv(&UOp::index_const(power));
-
-        let result = graph_rewrite(&matcher, div, &mut ());
-
-        if let Op::Binary(BinaryOp::Shr, _, rhs) = result.op() {
-            if let Op::Const(c) = rhs.op() {
-                assert_eq!(c.0, ConstValue::Int(shift), "Expected shift {} for divisor {}", shift, power);
-            }
-        } else {
-            panic!("Expected Shr for x // {}, got {:?}", power, result.op());
-        }
-    }
-}
-
-// ============================================================================
-// FDIV → MUL PATTERNS (Tinygrad: decompositions.py:364-366)
-// ============================================================================
-
-#[test]
-fn test_fdiv_constant_becomes_mul_reciprocal() {
-    let matcher = pm_fdiv_to_mul();
-
-    // x / 2.0 → x * 0.5
-    let x = UOp::native_const(10.0f32);
-    let div = x.try_div(&UOp::native_const(2.0f32)).unwrap();
-
-    let result = graph_rewrite(&matcher, div, &mut ());
-
-    // Should be Mul(x, 0.5)
-    if let Op::Binary(BinaryOp::Mul, _, rhs) = result.op() {
-        if let Op::Const(c) = rhs.op() {
-            match c.0 {
-                ConstValue::Float(f) => assert!((f - 0.5).abs() < 1e-6, "Expected 0.5, got {}", f),
-                _ => panic!("Expected float constant"),
-            }
-        } else {
-            panic!("Expected constant, got {:?}", rhs.op());
-        }
-    } else {
-        panic!("Expected Mul operation, got {:?}", result.op());
-    }
-}
-
-#[test]
-fn test_fdiv_by_zero_prevented_at_construction() {
-    // Division by zero is prevented at UOp construction time
-    let x = UOp::native_const(10.0f32);
-    let result = x.try_div(&UOp::native_const(0.0f32));
-
-    // Should return error, not create a div-by-zero operation
-    assert!(result.is_err(), "Division by zero should fail at construction");
-}
-
-#[test]
-fn test_fdiv_various_constants() {
-    let matcher = pm_fdiv_to_mul();
-
-    for (divisor, expected_recip) in [(4.0f32, 0.25f32), (5.0, 0.2), (10.0, 0.1), (0.5, 2.0)] {
-        let x = UOp::native_const(100.0f32);
-        let div = x.try_div(&UOp::native_const(divisor)).unwrap();
-
-        let result = graph_rewrite(&matcher, div, &mut ());
-
-        if let Op::Binary(BinaryOp::Mul, _, rhs) = result.op() {
-            if let Op::Const(c) = rhs.op() {
-                match c.0 {
-                    ConstValue::Float(f) => {
-                        assert!((f - expected_recip as f64).abs() < 1e-6, "Expected {}, got {}", expected_recip, f);
-                    }
-                    _ => panic!("Expected float constant"),
-                }
-            }
-        } else {
-            panic!("Expected Mul for x / {}, got {:?}", divisor, result.op());
-        }
-    }
-}
-
-// ============================================================================
-// COMPARISON NEGATION PATTERNS (Tinygrad: decompositions.py:354-361)
-// ============================================================================
-
-#[test]
-fn test_not_lt_becomes_reversed_lt() {
-    let matcher = pm_comparison_negations();
-
-    // !(x < 5) → (4 < x)
-    let x = UOp::range(UOp::index_const(100), 0);
-    let five = UOp::index_const(5);
-    let lt = x.try_cmplt(&five).unwrap();
-    let not_lt = lt.not();
-
-    let result = graph_rewrite(&matcher, not_lt, &mut ());
-
-    // Should be Lt(4, x)
-    if let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() {
-        // LHS should be constant 4
-        if let Op::Const(c) = lhs.op() {
-            assert_eq!(c.0, ConstValue::Int(4), "LHS should be 4");
-        } else {
-            panic!("Expected constant 4, got {:?}", lhs.op());
-        }
-        // RHS should be x
-        assert!(std::sync::Arc::ptr_eq(rhs, &x), "RHS should be x");
-    } else {
-        panic!("Expected Lt operation, got {:?}", result.op());
-    }
-}
-
-#[test]
-fn test_not_reversed_lt_becomes_lt() {
-    let matcher = pm_comparison_negations();
-
-    // !(5 < x) → (x < 6)
-    let x = UOp::range(UOp::index_const(100), 0);
-    let five = UOp::index_const(5);
-    let lt = five.try_cmplt(&x).unwrap();
-    let not_lt = lt.not();
-
-    let result = graph_rewrite(&matcher, not_lt, &mut ());
-
-    // Should be Lt(x, 6)
-    if let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() {
-        // LHS should be x
-        assert!(std::sync::Arc::ptr_eq(lhs, &x), "LHS should be x");
-        // RHS should be constant 6
-        if let Op::Const(c) = rhs.op() {
-            assert_eq!(c.0, ConstValue::Int(6), "RHS should be 6");
-        } else {
-            panic!("Expected constant 6, got {:?}", rhs.op());
-        }
-    } else {
-        panic!("Expected Lt operation, got {:?}", result.op());
-    }
-}
-
-#[test]
-fn test_range_compression() {
-    let matcher = pm_comparison_negations();
-
-    // (3 < x) & (x < 5) → x == 4
-    let x = UOp::range(UOp::index_const(100), 0);
-    let three = UOp::index_const(3);
+fn negated_integer_comparisons_become_the_complementary_bound() {
     let five = UOp::index_const(5);
 
-    let gt_three = three.try_cmplt(&x).unwrap(); // 3 < x
-    let lt_five = x.try_cmplt(&five).unwrap(); // x < 5
-    let combined = gt_three.try_and_op(&lt_five).unwrap();
+    let not_lt = late_rewrite(pm_comparison_negations(), x().try_cmplt(&five).expect("cmplt").not());
+    let Op::Binary(BinaryOp::Lt, lhs, rhs) = not_lt.op() else { panic!("expected LT, got {}", not_lt.tree()) };
+    assert!(matches!(lhs.op(), Op::Const(c) if c.0 == ConstValue::Int(4)), "!(x < 5) is 4 < x");
+    assert!(Arc::ptr_eq(rhs, &x()));
 
-    let result = graph_rewrite(&matcher, combined, &mut ());
-
-    // Should be Eq(x, 4)
-    if let Op::Binary(BinaryOp::Eq, lhs, rhs) = result.op() {
-        // One side should be x, other should be 4
-        let (var_side, const_side) = if matches!(lhs.op(), Op::Const(_)) { (rhs, lhs) } else { (lhs, rhs) };
-
-        assert!(std::sync::Arc::ptr_eq(var_side, &x), "Variable side should be x");
-        if let Op::Const(c) = const_side.op() {
-            assert_eq!(c.0, ConstValue::Int(4), "Constant should be 4");
-        } else {
-            panic!("Expected constant 4, got {:?}", const_side.op());
-        }
-    } else {
-        panic!("Expected Eq operation, got {:?}", result.op());
-    }
+    let not_gt = late_rewrite(pm_comparison_negations(), five.try_cmplt(&x()).expect("cmplt").not());
+    let Op::Binary(BinaryOp::Lt, lhs, rhs) = not_gt.op() else { panic!("expected LT, got {}", not_gt.tree()) };
+    assert!(Arc::ptr_eq(lhs, &x()));
+    assert!(matches!(rhs.op(), Op::Const(c) if c.0 == ConstValue::Int(6)), "!(5 < x) is x < 6");
 }
 
 #[test]
-fn test_negated_mul_comparison() {
-    let matcher = pm_comparison_negations();
+fn a_one_wide_band_collapses_to_an_equality() {
+    let above = UOp::index_const(3).try_cmplt(&x()).expect("cmplt");
+    let below = x().try_cmplt(&UOp::index_const(5)).expect("cmplt");
 
-    // x*-1 < 5 → -5 < x
-    let x = UOp::range(UOp::index_const(100), 0);
-    let neg_one = UOp::index_const(-1);
-    let five = UOp::index_const(5);
+    let result = late_rewrite(pm_comparison_negations(), above.try_and_op(&below).expect("and"));
 
-    let neg_x = x.mul(&neg_one);
-    let lt = neg_x.try_cmplt(&five).unwrap();
+    let Op::Binary(BinaryOp::Eq, lhs, rhs) = result.op() else { panic!("expected EQ, got {}", result.tree()) };
+    let (var, konst) = if matches!(lhs.op(), Op::Const(_)) { (rhs, lhs) } else { (lhs, rhs) };
+    assert!(Arc::ptr_eq(var, &x()));
+    assert!(matches!(konst.op(), Op::Const(c) if c.0 == ConstValue::Int(4)));
+}
 
-    let result = graph_rewrite(&matcher, lt, &mut ());
+/// `x * -1 < 5` moves the negation onto the bound: `-5 < x`.
+#[test]
+fn a_negated_operand_moves_the_bound_instead() {
+    let lt = x().mul(&UOp::index_const(-1)).try_cmplt(&UOp::index_const(5)).expect("cmplt");
+    let result = late_rewrite(pm_comparison_negations(), lt);
 
-    // Should be Lt(-5, x)
-    if let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() {
-        // LHS should be constant -5
-        if let Op::Const(c) = lhs.op() {
-            assert_eq!(c.0, ConstValue::Int(-5), "LHS should be -5");
-        } else {
-            panic!("Expected constant -5, got {:?}", lhs.op());
-        }
-        // RHS should be x
-        assert!(std::sync::Arc::ptr_eq(rhs, &x), "RHS should be x");
-    } else {
-        panic!("Expected Lt operation, got {:?}", result.op());
-    }
+    let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() else { panic!("expected LT, got {}", result.tree()) };
+    assert!(matches!(lhs.op(), Op::Const(c) if c.0 == ConstValue::Int(-5)), "{}", result.tree());
+    assert!(Arc::ptr_eq(rhs, &x()));
+}
+
+// ===== renderer-gated late rewrites =====
+
+/// Fast integer division for a non-power-of-two divisor is opt-in; the
+/// power-of-two shift is not gated.
+#[test]
+fn fast_integer_division_is_explicitly_opt_in() {
+    let renderer = crate::optimizer::Renderer::cpu().with_rewrite_capabilities(svod_ir::RendererOps::all(), None, None);
+    let division = x().cdiv(&UOp::native_const(7i32));
+    let modulo = x().cmod(&UOp::native_const(7i32));
+
+    let disabled =
+        crate::optimizer::apply_late_rewrites(UOp::sink(vec![division.clone(), modulo.clone()]), &renderer, true);
+    assert!(disabled.toposort().iter().any(|node| matches!(node.op(), Op::Binary(BinaryOp::CDiv, ..))));
+    assert!(disabled.toposort().iter().any(|node| matches!(node.op(), Op::Binary(BinaryOp::CMod, ..))));
+
+    let enabled = crate::optimizer::apply_late_rewrites(UOp::sink(vec![division, modulo]), &renderer, false);
+    assert!(
+        !enabled.toposort().iter().any(|node| matches!(node.op(), Op::Binary(BinaryOp::CDiv | BinaryOp::CMod, ..))),
+        "{}",
+        enabled.tree()
+    );
+
+    let power_of_two = crate::optimizer::apply_late_rewrites(x().cdiv(&UOp::native_const(8i32)), &renderer, true);
+    assert!(matches!(power_of_two.op(), Op::Binary(BinaryOp::Shr, ..)), "{}", power_of_two.tree());
+}
+
+/// Weak lanes must be concretised before the final render, or the renderer mints
+/// weak scalar constants it cannot type.
+#[test]
+fn weak_lowering_concretizes_a_weak_vconst_before_the_final_rewrite() {
+    let lanes = UOp::vconst((0..4).map(ConstValue::Int).collect(), DType::WeakInt);
+
+    let lowered = graph_rewrite(
+        &crate::symbolic::pm_lower_index_dtype(),
+        UOp::sink(vec![lanes]),
+        &mut crate::symbolic::WeakMemo::default(),
+    );
+    let result = graph_rewrite(crate::optimizer::final_rewrite_patterns(), lowered, &mut ());
+
+    assert!(result.toposort().iter().all(|u| !u.dtype().is_weak()), "{}", result.tree());
+    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
+    assert!(matches!(sources[0].op(), Op::VConst { values } if values.len() == 4));
+    assert_eq!(sources[0].dtype(), DType::Int32.vec(4).expect("vector dtype"));
 }

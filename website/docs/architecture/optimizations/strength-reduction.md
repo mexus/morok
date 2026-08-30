@@ -11,7 +11,7 @@ Svod source: `schedule/src/rangeify/patterns.rs` (late decomposition group) + `s
 
 *Cycle estimates throughout this page are approximate for modern x86-64. Actual latencies vary by microarchitecture and pipeline state.*
 
-All patterns are combined into a single fixed-point rewrite pass (`PM_FINAL`) together with `symbolic_simple()` (algebraic cleanup) and `pm_render()` (CONST vectorization, CAT-to-VECTORIZE).
+All patterns are combined into a single fixed-point rewrite pass (`PM_FINAL`) together with `symbolic_simple()` (algebraic cleanup).
 
 ---
 
@@ -264,7 +264,6 @@ Stage 18-19 (PM_FINAL fixed-point rewrite):
   + pm_neg_from_mul              -- x * -1 -> NEG(x)
   + pm_comparison_negations      -- !(x<c) -> (c-1)<x, etc.
   + fast_division_patterns       -- x // d -> (x * M) >> S
-  + pm_render()                  -- CONST vectorization, CAT->VECTORIZE
 ```
 
 Because the rewriter runs to a fixed point, patterns can feed into each other. For example:

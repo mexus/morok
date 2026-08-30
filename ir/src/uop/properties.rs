@@ -96,7 +96,6 @@ cached_property! {
     InScopeRangesProperty: HashSet<UOpKey> {
         cache_field: in_scope_ranges_cache,
         compute: |uop| {
-            #[allow(clippy::mutable_key_type)]
             let mut result: HashSet<UOpKey> = HashSet::new();
 
             // Step 1: Merge from all sources' cached in_scope_ranges
@@ -185,8 +184,8 @@ cached_property! {
     VminVmaxProperty: (ConstValue, ConstValue) {
         cache_field: vmin_vmax_cache,
         compute: |uop| {
-            crate::uop::range_eval::compute_sound_vmin_vmax(uop)
-                .unwrap_or_else(|| crate::uop::range_eval::dtype_bounds(&uop.dtype))
+            crate::uop::range_eval::compute_vmin_vmax(uop)
+                .unwrap_or_else(|| crate::uop::range_eval::analysis_bounds(&uop.dtype))
         }
     }
 }
@@ -197,5 +196,53 @@ cached_property! {
     SoundVminVmaxProperty: Option<(ConstValue, ConstValue)> {
         cache_field: sound_vmin_vmax_cache,
         compute: |uop| crate::uop::range_eval::compute_sound_vmin_vmax(uop)
+    }
+}
+
+// ============================================================================
+// Weak Float Property
+// ============================================================================
+
+cached_property! {
+    /// Cached "backward slice contains a weak-float dtype" predicate.
+    ///
+    /// Equivalent to `uop.toposort().iter().any(|n| n.dtype().base() == WeakFloat)`,
+    /// but memoised per node: O(N) once over the whole graph instead of O(N) per
+    /// query. Value-sensitive symbolic rewrites use it as a match guard, so it is
+    /// evaluated on every pattern attempt.
+    HasWeakFloatProperty: bool {
+        cache_field: has_weak_float_cache,
+        compute: |uop| {
+            if uop.dtype.base() == svod_dtype::ScalarDType::WeakFloat {
+                return true;
+            }
+            let mut result = false;
+            uop.op.map_child(|src| result |= *HasWeakFloatProperty::get(src));
+            result
+        }
+    }
+}
+
+// ============================================================================
+// Device / Address Space Properties
+// ============================================================================
+
+cached_property! {
+    /// Cached device specification carried by a node's backward slice.
+    ///
+    /// Tinygrad memoises the equivalent walk with `@functools.cached_property`
+    /// (`ops.py` `UOp.device`). Without the memo the plain recursion revisits
+    /// every shared node once per path, which is exponential on diamond DAGs.
+    DeviceSpecProperty: Option<svod_dtype::DeviceSpec> {
+        cache_field: device_spec_cache,
+        compute: |uop| uop.compute_device_spec()
+    }
+}
+
+cached_property! {
+    /// Cached storage address space (Tinygrad: `UOp.addrspace`, also memoised).
+    AddrSpaceProperty: Option<svod_dtype::AddrSpace> {
+        cache_field: addrspace_cache,
+        compute: |uop| uop.compute_addrspace()
     }
 }

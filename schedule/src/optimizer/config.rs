@@ -5,6 +5,17 @@
 
 use bon::bon;
 
+fn beam_min_progress_from_env() -> u64 {
+    parse_beam_min_progress(std::env::var("BEAM_MIN_PROGRESS").ok().as_deref())
+}
+
+fn parse_beam_min_progress(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|microseconds| (microseconds * 1_000.0).max(0.0).min(u64::MAX as f64) as u64)
+        .unwrap_or(10)
+}
+
 // ============================================================================
 // OPTIMIZATION STRATEGY
 // ============================================================================
@@ -91,14 +102,14 @@ impl TcUsage {
 /// Tensor core optimization level.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum TcOpt {
-    /// Strict matching (TC_OPT=0).
+    /// Strict matching (TC_OPT=0, default).
+    #[default]
     Strict,
 
     /// Relaxed matching (TC_OPT=1).
     Relaxed,
 
-    /// Padded matching (TC_OPT=2, default).
-    #[default]
+    /// Padded matching (TC_OPT=2).
     Padded,
 }
 
@@ -142,9 +153,9 @@ impl TcSelect {
 ///
 /// No total search timeout — the loop terminates only on the `min_progress`
 /// floor or an empty candidate set. `BEAM_TIMEOUT_SEC` is a per-candidate
-/// compile alarm enforced in `compile_and_time`'s thread+timeout machinery,
+/// compile alarm enforced inside the BEAM compile worker,
 /// not a global search budget.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BeamConfig {
     /// Beam width - number of candidates to keep at each step.
     pub beam_width: usize,
@@ -156,13 +167,35 @@ pub struct BeamConfig {
     pub max_uops: usize,
     /// Number of benchmark runs per kernel.
     pub num_runs: usize,
+    /// Minimum improvement in nanoseconds required to continue searching.
+    pub min_progress_ns: u64,
+    /// Whether the NOLOCALS action is part of the search space.
+    pub enable_nolocals: bool,
+    /// Maximum number of candidates compiled concurrently.
+    pub compile_workers: usize,
+    /// Per-candidate backend compilation timeout in seconds.
+    pub compile_timeout_secs: u64,
+    /// Tasks handled before replacing a clean spawned worker.
+    pub max_tasks_per_child: usize,
     /// Disable disk cache.
     pub disable_cache: bool,
 }
 
 impl Default for BeamConfig {
     fn default() -> Self {
-        Self { beam_width: 4, max_upcast: 256, max_local: 1024, max_uops: 3000, num_runs: 3, disable_cache: false }
+        Self {
+            beam_width: 4,
+            max_upcast: 256,
+            max_local: 1024,
+            max_uops: 3000,
+            num_runs: 3,
+            min_progress_ns: 10,
+            enable_nolocals: false,
+            compile_workers: 0,
+            compile_timeout_secs: 10,
+            max_tasks_per_child: 16,
+            disable_cache: false,
+        }
     }
 }
 
@@ -183,9 +216,30 @@ impl BeamConfig {
         #[builder(default = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000))]
         max_uops: usize,
         #[builder(default = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3))] num_runs: usize,
+        #[builder(default = beam_min_progress_from_env())] min_progress_ns: u64,
+        #[builder(default = std::env::var("NOLOCALS").is_ok() || std::env::var("SVOD_NOLOCALS").is_ok())]
+        enable_nolocals: bool,
+        #[builder(default = std::env::var("PARALLEL").ok().and_then(|s| s.parse().ok()).unwrap_or(0))]
+        compile_workers: usize,
+        #[builder(default = std::env::var("BEAM_TIMEOUT_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(10))]
+        compile_timeout_secs: u64,
+        #[builder(default = std::env::var("BEAM_MAX_TASKS_PER_CHILD").ok().and_then(|s| s.parse().ok()).unwrap_or(16))]
+        max_tasks_per_child: usize,
         #[builder(default = std::env::var("IGNORE_BEAM_CACHE").is_ok())] disable_cache: bool,
     ) -> Self {
-        Self { beam_width, max_upcast, max_local, max_uops, num_runs, disable_cache }
+        Self {
+            beam_width,
+            max_upcast,
+            max_local,
+            max_uops,
+            num_runs,
+            min_progress_ns,
+            enable_nolocals,
+            compile_workers,
+            compile_timeout_secs,
+            max_tasks_per_child,
+            disable_cache,
+        }
     }
 
     /// Create configuration from environment variables.
@@ -197,6 +251,10 @@ impl BeamConfig {
     /// * `BEAM_LOCAL_MAX` - Max local memory elements (default: 1024)
     /// * `BEAM_UOPS_MAX` - Max UOps before rejecting (default: 3000)
     /// * `BEAM_RUNS` - Benchmark runs per kernel (default: 3)
+    /// * `BEAM_MIN_PROGRESS` - Minimum progress in microseconds (default: 0.01)
+    /// * `NOLOCALS` / `SVOD_NOLOCALS` - Include the NOLOCALS action if set
+    /// * `PARALLEL` - Maximum concurrent candidate compilations (default: 0 for CPU; GPU resolves to host parallelism)
+    /// * `BEAM_TIMEOUT_SEC` - Per-candidate compile timeout in seconds (default: 10)
     /// * `IGNORE_BEAM_CACHE` - Bypass disk cache if set
     pub fn from_env() -> Self {
         let beam_width = std::env::var("BEAM").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
@@ -204,9 +262,27 @@ impl BeamConfig {
         let max_local = std::env::var("BEAM_LOCAL_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
         let max_uops = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
         let num_runs = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let min_progress_ns = beam_min_progress_from_env();
+        let enable_nolocals = std::env::var("NOLOCALS").is_ok() || std::env::var("SVOD_NOLOCALS").is_ok();
+        let compile_workers = std::env::var("PARALLEL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let compile_timeout_secs = std::env::var("BEAM_TIMEOUT_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+        let max_tasks_per_child =
+            std::env::var("BEAM_MAX_TASKS_PER_CHILD").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
         let disable_cache = std::env::var("IGNORE_BEAM_CACHE").is_ok();
 
-        Self { beam_width, max_upcast, max_local, max_uops, num_runs, disable_cache }
+        Self {
+            beam_width,
+            max_upcast,
+            max_local,
+            max_uops,
+            num_runs,
+            min_progress_ns,
+            enable_nolocals,
+            compile_workers,
+            compile_timeout_secs,
+            max_tasks_per_child,
+            disable_cache,
+        }
     }
 
     /// Get beam width from strategy if applicable.
@@ -229,6 +305,13 @@ pub struct HeuristicsConfig {
     /// Tensor core usage level.
     pub tc_enabled: TcUsage,
     /// Tensor core optimization level.
+    ///
+    /// Defaults to [`TcOpt::Strict`] (`TC_OPT=0`), matching tinygrad
+    /// `helpers.py:238` (`ContextVar("TC_OPT", 0)`), which `heuristic.py:28-32`
+    /// reads on the hand-coded path. `TC_OPT=2` is only the *BEAM action space*
+    /// default (`search.py:22`), so the heuristic path must not inherit it —
+    /// tensor cores would silently PADTO a shape the author did not ask to pad.
+    /// Benchmarks that want the padded behaviour set it explicitly.
     pub tc_opt: TcOpt,
     /// Tensor core selection mode.
     pub tc_select: TcSelect,
@@ -294,7 +377,10 @@ impl HeuristicsConfig {
     /// * `SVOD_MV_ROWS_PER_THREAD` / `MV_ROWS_PER_THREAD` - Matvec output split
     /// * `SVOD_K_VECTORIZE` - Enable K-axis vectorization (default: disabled)
     /// * `SVOD_NO_OUTPUT_UPCAST` - Disable output dimension upcasting (default: enabled)
+    /// * `SVOD_NOLOCALS` - Disable LOCAL axis selection after grouped-reduction matching
     /// * `SVOD_TC` - Tensor-core usage: `0` disables, `2` shape-only, else enabled
+    /// * `TC_OPT` / `SVOD_TC_OPT` - Strict (`0`), relaxed (`1`), or padded (`2`)
+    /// * `TC_SELECT` / `SVOD_TC_SELECT` - Auto (`-1`) or a tensor-core index
     pub fn from_env() -> Self {
         let parse_usize = |keys: &[&str], default: usize| {
             keys.iter().find_map(|k| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok())).unwrap_or(default)
@@ -309,6 +395,7 @@ impl HeuristicsConfig {
         let k_vectorize = std::env::var("SVOD_K_VECTORIZE").is_ok();
         // Default enabled, use SVOD_NO_OUTPUT_UPCAST to disable
         let output_upcast = std::env::var("SVOD_NO_OUTPUT_UPCAST").is_err();
+        let disable_locals = std::env::var("SVOD_NOLOCALS").is_ok();
         // Tensor-core usage: `SVOD_TC=0` disables (vector matmul), `2` is
         // shape-only, anything else (or unset) keeps the default Enabled. Lets
         // bit-identity tests pin the numerics to the non-MFMA path.
@@ -317,6 +404,17 @@ impl HeuristicsConfig {
             Some("2") => TcUsage::ShapeOnly,
             _ => TcUsage::Enabled,
         };
+        let tc_opt = match parse_usize(&["SVOD_TC_OPT", "TC_OPT"], 0) {
+            1 => TcOpt::Relaxed,
+            2 => TcOpt::Padded,
+            _ => TcOpt::Strict,
+        };
+        let tc_select = ["SVOD_TC_SELECT", "TC_SELECT"]
+            .iter()
+            .find_map(|key| std::env::var(key).ok().and_then(|value| value.parse::<i32>().ok()))
+            .and_then(|value| usize::try_from(value).ok())
+            .map(TcSelect::Index)
+            .unwrap_or(TcSelect::Auto);
 
         Self {
             matvec_enabled,
@@ -326,7 +424,10 @@ impl HeuristicsConfig {
             thread_count,
             k_vectorize,
             output_upcast,
+            disable_locals,
             tc_enabled,
+            tc_opt,
+            tc_select,
             ..Default::default()
         }
     }
@@ -336,7 +437,7 @@ impl Default for HeuristicsConfig {
     fn default() -> Self {
         Self {
             tc_enabled: TcUsage::Enabled,
-            tc_opt: TcOpt::Padded,
+            tc_opt: TcOpt::Strict,
             tc_select: TcSelect::Auto,
             matvec_enabled: true,
             matvec_blocksize: 4,
@@ -399,7 +500,7 @@ impl HeuristicsConfig {
 /// Top-level optimizer configuration.
 ///
 /// Combines strategy selection, beam search settings, and heuristic parameters.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OptimizerConfig {
     /// Optimization strategy (None, Heuristic, or Beam).
     pub strategy: OptStrategy,
@@ -407,6 +508,26 @@ pub struct OptimizerConfig {
     pub beam: BeamConfig,
     /// Heuristics configuration (used when strategy is Heuristic).
     pub heuristics: HeuristicsConfig,
+    /// Tinygrad-compatible transcendental mode. Values >= 2 force decomposition.
+    pub transcendental: i32,
+    /// Disable non-power-of-two magic integer division rewrites.
+    ///
+    /// Defaults to `true`, matching tinygrad `helpers.py:245`
+    /// (`DISABLE_FAST_IDIV = ContextVar("DISABLE_FAST_IDIV", 1)`); its own tests
+    /// opt in with `Context(DISABLE_FAST_IDIV=0)`.
+    pub disable_fast_idiv: bool,
+}
+
+impl Default for OptimizerConfig {
+    fn default() -> Self {
+        Self {
+            strategy: OptStrategy::default(),
+            beam: BeamConfig::default(),
+            heuristics: HeuristicsConfig::default(),
+            transcendental: 1,
+            disable_fast_idiv: true,
+        }
+    }
 }
 
 #[bon]
@@ -422,8 +543,13 @@ impl OptimizerConfig {
         #[builder(default)] strategy: OptStrategy,
         #[builder(default = BeamConfig::from_env())] beam: BeamConfig,
         #[builder(default = HeuristicsConfig::from_env())] heuristics: HeuristicsConfig,
+        #[builder(default = std::env::var("TRANSCENDENTAL").ok().and_then(|value| value.parse().ok()).unwrap_or(1))]
+        transcendental: i32,
+        #[builder(default = std::env::var("DISABLE_FAST_IDIV").ok().and_then(|value| value.parse::<i32>().ok()).unwrap_or(1) != 0)]
+        disable_fast_idiv: bool,
     ) -> Self {
-        Self { strategy, beam, heuristics }
+        let beam = beam.with_strategy_width(&strategy);
+        Self { strategy, beam, heuristics, transcendental, disable_fast_idiv }
     }
 
     /// Create configuration from environment variables.
@@ -438,8 +564,11 @@ impl OptimizerConfig {
         let strategy = OptStrategy::from_env();
         let beam = BeamConfig::from_env().with_strategy_width(&strategy);
         let heuristics = HeuristicsConfig::from_env();
+        let transcendental = std::env::var("TRANSCENDENTAL").ok().and_then(|value| value.parse().ok()).unwrap_or(1);
+        let disable_fast_idiv =
+            std::env::var("DISABLE_FAST_IDIV").ok().and_then(|value| value.parse::<i32>().ok()).unwrap_or(1) != 0;
 
-        Self { strategy, beam, heuristics }
+        Self { strategy, beam, heuristics, transcendental, disable_fast_idiv }
     }
 }
 

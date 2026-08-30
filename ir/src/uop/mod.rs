@@ -16,6 +16,7 @@
 //! - [`comparison_analysis`] - Unified comparison analysis for optimizations
 
 pub mod cached_property;
+pub mod canonical;
 pub mod comparison_analysis;
 pub mod constructors;
 pub mod core;
@@ -26,8 +27,14 @@ pub mod helpers;
 pub mod properties;
 pub mod range_eval;
 pub mod tree;
+pub mod wire;
 
 // Re-export the main types
+pub use canonical::{
+    CanonicalArg, CanonicalAxis, CanonicalConst, CanonicalDType, CanonicalGraph, CanonicalNode, CanonicalProgramValue,
+    CanonicalShapeDim, CanonicalVerboseNode, dump_canonical_stage,
+};
 pub use core::{IntoUOp, UOp, UOpKey};
 pub use cost::compute_ops_estimate;
 pub use hash_consing::{gc_dead_refs, live_uop_ids};
+pub use wire::OptimizerWireGraph;

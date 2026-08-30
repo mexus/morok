@@ -88,6 +88,8 @@ fn convert_dtype(dt: safetensors::Dtype) -> Result<DType> {
         ST::F32 => Ok(DType::Float32),
         ST::F16 => Ok(DType::Float16),
         ST::BF16 => Ok(DType::BFloat16),
+        ST::F8_E4M3 => Ok(DType::FP8E4M3),
+        ST::F8_E5M2 => Ok(DType::FP8E5M2),
         ST::F64 => Ok(DType::Float64),
         ST::I32 => Ok(DType::Int32),
         ST::I64 => Ok(DType::Int64),

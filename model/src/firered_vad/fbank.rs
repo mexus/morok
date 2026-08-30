@@ -58,7 +58,7 @@ impl FireRedFbank {
         let mut outdata = self.r2c.make_output_vec();
         let mut power = vec![0.0f32; N_FFT / 2 + 1];
 
-        for (frame_idx, out) in feat.chunks_exact_mut(N_MELS).enumerate() {
+        for (frame_idx, out) in feat.as_chunks_mut::<N_MELS>().0.iter_mut().enumerate() {
             let frame = &waveform[frame_idx * FRAME_SHIFT..frame_idx * FRAME_SHIFT + FRAME_LENGTH];
             let buf = &mut indata[..FRAME_LENGTH];
             for (d, &s) in buf.iter_mut().zip(frame) {

@@ -1,48 +1,26 @@
 use super::*;
 
-#[test]
-fn test_llvm_kernel_no_args() {
-    let ir = r#"
-        define void @test_kernel() {
-            ret void
-        }
-    "#;
-
-    let kernel = LlvmKernel::compile_ir(ir, "test_kernel", "test_kernel", vec![], 0).unwrap();
-    assert_eq!(kernel.name(), "test_kernel");
-
-    unsafe {
-        kernel.execute_with_vals(&[], &[]).unwrap();
-    }
+fn storage_abi(count: usize) -> Vec<svod_device::device::AbiParamDescriptor> {
+    (0..count)
+        .map(|slot| svod_device::device::AbiParamDescriptor {
+            slot,
+            kind: svod_device::device::AbiParamKind::Storage(svod_dtype::AddrSpace::Global),
+            dtype: svod_dtype::DType::Float32,
+            name: None,
+        })
+        .collect()
 }
 
-#[test]
-fn test_llvm_kernel_with_args() {
-    let ir = r#"
-        define void @add_kernel(ptr noalias %data0, ptr noalias %data1) {
-            ret void
-        }
-    "#;
+/// A JIT'd LLVM module runs through the declared storage ABI, with or without
+/// pointer arguments, and unloads cleanly when the kernel handle is dropped.
+#[test_case::test_case("define void @kernel() {\n  ret void\n}\n", 0; "no arguments")]
+#[test_case::test_case("define void @kernel(ptr noalias %data0, ptr noalias %data1) {\n  ret void\n}\n", 2; "two buffers")]
+fn llvm_kernel_compiles_and_executes(ir: &str, buffers: usize) {
+    let kernel = LlvmKernel::compile_ir_with_abi(ir, "kernel", "kernel", vec![], &storage_abi(buffers)).unwrap();
+    assert_eq!(kernel.name(), "kernel");
 
-    let kernel = LlvmKernel::compile_ir(ir, "add_kernel", "add_kernel", vec![], 2).unwrap();
-
-    let mut data1 = vec![0u8; 16];
-    let mut data2 = vec![0u8; 16];
-    let buffers = vec![data1.as_mut_ptr(), data2.as_mut_ptr()];
-
-    unsafe {
-        kernel.execute_with_vals(&buffers, &[]).unwrap();
-    }
-}
-
-#[test]
-fn test_kernel_drop_order() {
-    let ir = r#"
-        define void @test() {
-            ret void
-        }
-    "#;
-
-    let kernel = LlvmKernel::compile_ir(ir, "test", "test", vec![], 0).unwrap();
-    drop(kernel); // Should not crash
+    let mut storage = vec![vec![0u8; 16]; buffers];
+    let pointers = storage.iter_mut().map(|buffer| buffer.as_mut_ptr()).collect::<Vec<_>>();
+    unsafe { kernel.execute_with_vals(&pointers, &[]).unwrap() };
+    drop(kernel);
 }

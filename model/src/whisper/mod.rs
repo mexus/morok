@@ -1,9 +1,9 @@
 //! OpenAI Whisper: encoder-decoder transformer for speech recognition.
 //!
-//! Architecture: Conv-BN frontend → sinusoidal position embeddings → standard
-//! pre-norm transformer encoder; learned-position decoder with self-attention +
-//! cross-attention to encoder output.  Supports DTW word-level alignment via
-//! cross-attention weight extraction.
+//! Architecture: convolutional frontend, sinusoidal encoder positions, and a
+//! pre-norm transformer encoder; the learned-position decoder uses cached
+//! self-attention and cross-attention over encoder features. Selected
+//! cross-attention heads provide DTW word alignment.
 //!
 //! # Quick start
 //!
@@ -14,6 +14,7 @@
 //! let model = Whisper::empty(dims);
 //! ```
 
+pub mod aligner;
 pub mod attention;
 pub mod blocks;
 pub mod config;
@@ -25,27 +26,36 @@ pub mod error;
 pub mod jit;
 pub mod mel;
 pub mod model;
+pub mod plan;
 pub mod tokenizer;
 pub mod transcribe;
 
 mod loader;
+pub(crate) mod profile;
 
+pub use aligner::{WhisperAligner, WhisperAlignmentInput};
 pub use attention::{MultiHeadAttention, causal_mask};
 pub use blocks::{Conv1dWeights, LayerNormWeights, LinearWeights, sinusoids};
 pub use config::{ModelDimensions, WhisperSize};
 pub use decode::{
-    DecodeOptions, DecodeResult, LanguageDetection, beam_decode_cached, decode_with_fallback_cached, detect_language,
-    greedy_decode_cached, greedy_decode_with_alignment,
+    DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, LanguageDetection, WhisperTask, detect_language,
+    split_into_segments,
 };
 pub use decoder::{DecoderBlock, TextDecoder};
-pub use dtw::{WordTiming, dtw, find_alignment_path, median_filter, path_to_word_timings};
+pub use dtw::{
+    WordTiming, dtw, find_alignment_path, find_alignment_path_selected, median_filter, path_to_word_timings,
+};
 pub use encoder::{AudioEncoder, EncoderBlock};
 pub use error::{Error, Result};
-pub use jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit};
+pub use jit::{
+    WhisperAlignmentJit, WhisperAlignmentModel, WhisperCrossKvJit, WhisperDecoderJit, WhisperDecoderStepJit,
+    WhisperEncoderJit, WhisperPrefillJit,
+};
 pub use mel::WhisperMel;
 pub use model::Whisper;
+pub use plan::WhisperPlan;
 pub use tokenizer::WhisperTokenizer;
-pub use transcribe::{TranscribeError, WhisperTranscriber};
+pub use transcribe::{TranscribeError, WhisperAlignedTranscriber, WhisperRecognizer};
 
 // Re-export audio constants
 pub use config::{

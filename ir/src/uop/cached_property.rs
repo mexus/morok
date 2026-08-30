@@ -153,6 +153,16 @@ pub trait CachedProperty: Sized + 'static {
             return val;
         }
 
+        // Warm-children path: `compute` only reads children, so when every child
+        // is already cached the toposort machinery (visited set + result Vec +
+        // stack Vec) is pure overhead. This is the common case — cold gets walk
+        // ~2 nodes on average.
+        let mut children_cached = true;
+        uop.op.map_child(|child| children_cached &= Self::cache(child).get().is_some());
+        if children_cached {
+            return Self::cache(uop).get_or_init(|| Self::compute(uop));
+        }
+
         // Slow path: filtered toposort + bottom-up computation
         // Only traverse nodes that don't have this property cached yet
         let uncached = uop.toposort_filtered(|node| Self::cache(node).get().is_none());

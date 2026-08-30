@@ -11,7 +11,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
 use super::types::{c_cast, c_dtype, c_math_fn};
-use crate::common::format_custom_template_strict;
+use crate::common::{access_dtype, format_custom_template_strict, shaped_dtype};
 
 /// Context for C code generation, tracking variable names and SSA inlining.
 pub struct CContext {
@@ -131,8 +131,55 @@ impl CContext {
             self.register(uop.id, expr.clone());
             expr
         } else {
+            let dtype = shaped_dtype(uop);
+            self.emit_expr_dtype(uop, expr, prefix, kernel, &dtype, false)
+        }
+    }
+
+    /// Register an address (INDEX/SHRINK/pointer CAST) expression.
+    ///
+    /// Addresses are inlined like tinygrad's `cstyle.py` INDEX rendering, which
+    /// is safe there because its linearizer never places a node inside a range
+    /// that is consumed outside it. Morok's can, so an escaping address is
+    /// hoisted to function scope and assigned at its declaration depth —
+    /// otherwise the inlined text references a loop variable that is out of
+    /// scope at the use site.
+    pub fn emit_address(&mut self, uop: &Arc<UOp>, expr: String, kernel: &mut Vec<String>) -> String {
+        if !self.scope_escaping.contains(&uop.id) {
+            self.register(uop.id, expr.clone());
+            return expr;
+        }
+        let declared = if is_address_value(uop) {
+            match uop.dtype() {
+                dtype @ DType::Ptr { .. } => c_dtype(&dtype),
+                dtype => format!("{}*", c_dtype(&dtype)),
+            }
+        } else {
+            c_dtype(&shaped_dtype(uop))
+        };
+        let name = self.next_name("bidx");
+        let indent = self.indent();
+        self.hoisted_declarations.push(format!("  {declared} {name};"));
+        kernel.push(format!("{indent}{name} = {expr};"));
+        self.register(uop.id, name.clone());
+        name
+    }
+
+    fn emit_expr_dtype(
+        &mut self,
+        uop: &Arc<UOp>,
+        expr: String,
+        prefix: &str,
+        kernel: &mut Vec<String>,
+        dtype: &DType,
+        allow_inline: bool,
+    ) -> String {
+        if allow_inline && self.should_inline(uop.id) {
+            self.register(uop.id, expr.clone());
+            expr
+        } else {
             let name = self.next_name(prefix);
-            let dtype = c_dtype(&uop.dtype());
+            let dtype = c_dtype(dtype);
             let indent = self.indent();
             if self.scope_escaping.contains(&uop.id) {
                 // Hoist: declare at function scope, assign at current depth
@@ -155,26 +202,18 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         // Meta-ops: no code emitted
         Op::Const(_)
         | Op::VConst { .. }
-        | Op::Param { device: None, .. }
-        | Op::DefineLocal(_)
+        | Op::Param { .. }
         | Op::DefineVar { .. }
         | Op::Noop
         | Op::Sink { .. }
         | Op::Group { .. }
-        | Op::Buffer { .. }
         | Op::Unique(_)
-        | Op::Device(_)
         | Op::Call { .. }
         | Op::Barrier { .. } => None,
 
-        Op::DefineReg { .. } => {
-            // Read base type and size from dtype (matching Tinygrad's x.dtype.base/x.dtype.size).
-            // After devectorize's no_vectorized_buf, the dtype is the canonical source of truth:
-            // e.g. Ptr(base=Float32, size=35) instead of the Op's original size field.
-            let (base_dtype, alloc_size) = match uop.dtype() {
-                DType::Ptr { base, size, .. } => (base.as_ref().clone(), size.unwrap_or(1)),
-                other => (other, 1),
-            };
+        Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => {
+            let base_dtype = arg.dtype.clone();
+            let alloc_size = uop.buffer_size().unwrap_or(1);
             let name = ctx.next_name("reg");
             let indent = ctx.indent();
             kernel.push(format!("{indent}{} {name}[{alloc_size}];", c_dtype(&base_dtype)));
@@ -182,12 +221,14 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
+        Op::Buffer { .. } => None,
+
         Op::Index { buffer, indices, .. } => {
             let buf = ctx.get(buffer).to_string();
 
             if indices.is_empty() {
                 // No index - just alias the buffer pointer
-                ctx.register(uop.id, buf);
+                ctx.emit_address(uop, buf, kernel);
             } else {
                 let idx = if indices.len() == 1 {
                     ctx.get(&indices[0]).to_string()
@@ -199,70 +240,79 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                     ));
                     return None;
                 };
-                let expr = format!("{buf} + {idx}");
-                ctx.emit_expr(uop, expr, "idx", kernel);
+                // Tinygrad render_index: ALU values use lane extraction; values
+                // carrying an address space remain addresses for LOAD/STORE.
+                let expr =
+                    if buffer.addrspace().is_none() { format!("({buf})[{idx}]") } else { format!("{buf} + {idx}") };
+                ctx.emit_address(uop, expr, kernel);
             }
             Some(())
         }
 
-        Op::PointerIndex { ptr, offset } => {
-            let ptr_val = ctx.get(ptr).to_string();
-            let off_val = ctx.get(offset).to_string();
-            let expr = format!("{ptr_val} + {off_val}");
-            ctx.emit_expr(uop, expr, "pidx", kernel);
+        Op::Shrink { src, offsets, sizes: _ } => {
+            let expr = format!("{} + {}", ctx.get(src), ctx.get(offsets));
+            ctx.emit_address(uop, expr, kernel);
             Some(())
         }
 
-        Op::Load { index, alt, .. } => {
-            let idx = ctx.get(index).to_string();
-            let load_dtype = uop.dtype();
-            // Gated LOAD follows Tinygrad semantics: conditional load with explicit alt value.
-            // The gate is carried by INDEX, possibly behind one CAST wrapper.
-            let actual_index = match index.op() {
-                Op::Cast { src, .. } => src,
-                _ => index,
-            };
-            let gate_expr = if let Op::Index { gate: Some(gate_uop), .. } = actual_index.op() {
-                Some(ctx.get(gate_uop).to_string())
-            } else {
-                None
-            };
-            let deref_expr = if load_dtype.vcount() > 1 {
-                let cast_type = c_dtype(&load_dtype);
-                format!("*(({cast_type}*)({idx}))")
-            } else {
-                format!("*({idx})")
-            };
-            let expr = if let Some(gate) = gate_expr {
-                let Some(alt_uop) = alt.as_ref() else {
+        Op::Load { index, alt, gate } => {
+            // Defense-in-depth: `UOp::new` (ir hash_consing.rs `new_tagged`) already
+            // asserts the alt/gate pairing, the bool gate and the alt dtype, so no
+            // legal construction path reaches these branches.
+            if alt.is_some() != gate.is_some() {
+                ctx.set_invalid_graph(format!("LOAD on uop {} must have either neither or both alt and gate", uop.id));
+                return None;
+            }
+            if let (Some(alt), Some(gate)) = (alt, gate) {
+                if gate.dtype() != DType::Bool {
+                    ctx.set_invalid_graph(format!("gated LOAD on uop {} requires a scalar bool gate", uop.id));
+                    return None;
+                }
+                if alt.dtype() != uop.dtype() {
                     ctx.set_invalid_graph(format!(
-                        "gated LOAD on uop {} has no alt value; line_rewrite_cleanups must lift gated LOADs",
+                        "gated LOAD on uop {} requires alt dtype to match the load dtype",
                         uop.id
                     ));
                     return None;
-                };
-                let alt_expr = ctx.get(alt_uop).to_string();
-                format!("({gate} ? {deref_expr} : {alt_expr})")
-            } else {
-                deref_expr
+                }
+            }
+            let idx = ctx.get(index).to_string();
+            let load_dtype = shaped_dtype(uop);
+            let deref_expr = render_access(index, &load_dtype, &idx);
+            let expr = match (alt, gate) {
+                (None, None) => deref_expr,
+                (Some(alt), Some(gate)) => {
+                    format!("({} ? {deref_expr} : {})", ctx.get(gate), ctx.get(alt))
+                }
+                _ => unreachable!(),
             };
-            ctx.emit_expr(uop, expr, "val", kernel);
+            // Tinygrad materializes non-register loads even when they have one
+            // consumer. This keeps address expressions from being duplicated
+            // through later aliases.
+            ctx.emit_expr_dtype(
+                uop,
+                expr,
+                "val",
+                kernel,
+                &load_dtype,
+                index.addrspace() == Some(svod_ir::AddrSpace::Reg),
+            );
             Some(())
         }
 
-        Op::Store { index, value, .. } => {
+        Op::Store { index, value, gate } => {
+            if gate.is_some() {
+                ctx.set_invalid_graph(format!(
+                    "gated STORE on uop {} reached C codegen; linear cleanup must rewrite it to IF/STORE/ENDIF",
+                    uop.id
+                ));
+                return None;
+            }
             let idx = ctx.get(index).to_string();
             let val = ctx.get(value).to_string();
             let indent = ctx.indent();
-            let val_dtype = value.dtype();
-            // Buffer pointers are declared as scalar types (e.g., float*) in C,
-            // so vector stores need an explicit pointer cast.
-            if val_dtype.vcount() > 1 {
-                let cast_type = c_dtype(&val_dtype);
-                kernel.push(format!("{indent}*(({cast_type}*)({idx})) = {val};"));
-            } else {
-                kernel.push(format!("{indent}*({idx}) = {val};"));
-            }
+            let val_dtype = access_dtype(index, value);
+            kernel.push(format!("{indent}{} = {val};", render_access(index, &val_dtype, &idx)));
             Some(())
         }
 
@@ -286,7 +336,10 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             let tv = ctx.get(t).to_string();
             let fv = ctx.get(f).to_string();
             let expr = format!("({c} ? {tv} : {fv})");
-            ctx.emit_expr(uop, expr, "alu", kernel);
+            // WHERE is always an SSA boundary in Tinygrad's C renderer. Inlining
+            // nested Threefry selects causes exponential expression growth.
+            let dtype = shaped_dtype(uop);
+            ctx.emit_expr_dtype(uop, expr, "alu", kernel, &dtype, false);
             Some(())
         }
 
@@ -305,28 +358,32 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
 
         Op::Cast { src, dtype } => {
             let s = ctx.get(src).to_string();
-
-            // INDEX to Ptr is a no-op in C (INDEX already produces a pointer)
-            if matches!(src.op(), Op::Index { .. }) && matches!(dtype, DType::Ptr { .. }) {
-                ctx.register(uop.id, s);
+            if is_address_value(src) {
+                let target = c_dtype(dtype);
+                let pointer_type = if matches!(dtype, DType::Ptr { .. }) { target } else { format!("{target}*") };
+                let expr = format!("(({pointer_type})({s}))");
+                ctx.emit_address(uop, expr, kernel);
                 return Some(());
             }
+            let rendered_dtype = shaped_dtype(uop);
 
             // Vector casts use __builtin_convertvector for element-wise conversion
             // (a plain C cast would reinterpret bits, not convert values)
-            let expr = if dtype.vcount() > 1 && !matches!(dtype, DType::Ptr { .. }) {
-                format!("__builtin_convertvector({s}, {})", c_dtype(dtype))
+            let expr = if rendered_dtype.vcount() > 1 && !matches!(rendered_dtype, DType::Ptr { .. }) {
+                format!("__builtin_convertvector({s}, {})", c_dtype(&rendered_dtype))
             } else {
                 c_cast(&s, &src.dtype(), dtype)
             };
-            ctx.emit_expr(uop, expr, "cast", kernel);
+            let allow_inline = rendered_dtype.vcount() == 1;
+            ctx.emit_expr_dtype(uop, expr, "cast", kernel, &rendered_dtype, allow_inline);
             Some(())
         }
 
-        Op::BitCast { src, dtype } => {
+        Op::BitCast { src, dtype: _ } => {
             let s = ctx.get(src).to_string();
-            let from_type = c_dtype(&src.dtype());
-            let to_type = c_dtype(dtype);
+            let from_type = c_dtype(&shaped_dtype(src));
+            let rendered_dtype = shaped_dtype(uop);
+            let to_type = c_dtype(&rendered_dtype);
             if from_type == to_type {
                 ctx.register(uop.id, s);
             } else {
@@ -344,7 +401,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
 
         Op::Range { end, axis_id, .. } => {
             let end_val = ctx.get(end).to_string();
-            let id = axis_id.value();
+            let id = axis_id.name();
             let range_dtype = c_dtype(&uop.dtype());
             let var_name = format!("ridx{id}");
             let indent = ctx.indent();
@@ -375,7 +432,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Reduce { src, ranges, reduce_op } => {
+        Op::Reduce { src, ranges, reduce_op, .. } => {
             let src_val = ctx.get(src).to_string();
             let dtype = &uop.dtype();
 
@@ -396,47 +453,22 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Gep { vector, indices } => {
-            let vec = ctx.get(vector).to_string();
-            if indices.len() == 1 {
-                // Parenthesize to handle precedence: *((float4*)ptr)[i] → (*((float4*)ptr))[i]
-                let expr = format!("({vec})[{}]", indices[0]);
-                ctx.emit_expr(uop, expr, "gep", kernel);
-            } else {
-                // Multi-element GEP: build a new vector from extracted elements
-                let out_dtype = c_dtype(&uop.dtype());
-                let elements: Vec<String> = indices.iter().map(|&i| format!("({vec})[{i}]")).collect();
-                let expr = format!("({out_dtype}){{{}}}", elements.join(", "));
-                ctx.emit_expr(uop, expr, "gep", kernel);
+        Op::Stack { sources } => {
+            if sources.is_empty() {
+                return None;
             }
-            Some(())
-        }
-
-        Op::Vectorize { elements } => {
-            let vals: Vec<String> = elements.iter().map(|e| ctx.get(e).to_string()).collect();
+            let vals: Vec<String> = sources.iter().map(|source| ctx.get(source).to_string()).collect();
             if matches!(uop.dtype(), DType::Ptr { .. }) {
                 // Ptr types can't be vectorized in C (no compound literal for pointers).
                 // All elements should be the same scalar pointer — use the first one.
                 ctx.emit_expr(uop, vals[0].clone(), "vec", kernel);
             } else {
-                let out_dtype = c_dtype(&uop.dtype());
+                let packed_dtype = uop.dtype().scalar_dtype().vec(sources.len()).expect("STACK source dtype is scalar");
+                let out_dtype = c_dtype(&packed_dtype);
                 let expr = format!("({out_dtype}){{{}}}", vals.join(", "));
-                ctx.emit_expr(uop, expr, "vec", kernel);
+                ctx.emit_expr_dtype(uop, expr, "vec", kernel, &packed_dtype, true);
             }
             Some(())
-        }
-
-        Op::Cat { sources } => {
-            render_cat(uop, sources, ctx, kernel);
-            Some(())
-        }
-
-        Op::PtrCat { .. } => {
-            ctx.set_invalid_graph(format!(
-                "PtrCat on uop {} reached C codegen; devectorize should distribute it into scalar loads/stores",
-                uop.id
-            ));
-            None
         }
 
         Op::Wmma { a, b, c, metadata } => {
@@ -444,7 +476,8 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             let b_val = ctx.get(b).to_string();
             let c_val = ctx.get(c).to_string();
             let expr = format!("__{name}({a_val}, {b_val}, {c_val})", name = metadata.name);
-            ctx.emit_expr(uop, expr, "wmma", kernel);
+            let dtype = shaped_dtype(uop);
+            ctx.emit_expr_dtype(uop, expr, "wmma", kernel, &dtype, false);
             Some(())
         }
 
@@ -491,7 +524,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Contract { src, .. } | Op::Unroll { src, .. } | Op::Detach { src } => {
+        Op::Detach { src } => {
             let s = ctx.get(src).to_string();
             ctx.register(uop.id, s);
             None
@@ -540,15 +573,31 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
     }
 }
 
+/// Direct equivalent of Tinygrad CStyleLanguage.render_access.
+fn render_access(index: &Arc<UOp>, access_dtype: &DType, address: &str) -> String {
+    let source_dtype = match index.op() {
+        Op::Index { buffer, .. } => buffer.dtype(),
+        Op::Shrink { src, .. } => src.dtype(),
+        Op::Cast { src, .. } => src.dtype(),
+        _ => index.dtype(),
+    };
+    if access_dtype.vcount() > 1 || *access_dtype != source_dtype {
+        format!("*(({}*)({address}))", c_dtype(access_dtype))
+    } else {
+        format!("*({address})")
+    }
+}
+
 /// Render a binary operation as a C expression.
 fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
     match op {
+        BinaryOp::FloorDiv | BinaryOp::FloorMod => unreachable!("floor div/mod must be decomposed before C rendering"),
         BinaryOp::Add => format!("({l} + {r})"),
         BinaryOp::Sub => format!("({l} - {r})"),
         BinaryOp::Mul => format!("({l} * {r})"),
         BinaryOp::Fdiv => format!("({l} / {r})"),
-        BinaryOp::Idiv => format!("({l} / {r})"),
-        BinaryOp::Mod => {
+        BinaryOp::CDiv => format!("({l} / {r})"),
+        BinaryOp::CMod => {
             if dtype.is_float() {
                 format!("{}({l}, {r})", c_math_fn("__builtin_fmod", dtype))
             } else {
@@ -660,25 +709,16 @@ fn render_reduce_accumulate(op: ReduceOp, acc: &str, val: &str, dtype: &DType) -
     }
 }
 
-/// Render a Cat operation (concatenate vectors).
-fn render_cat(uop: &Arc<UOp>, sources: &[Arc<UOp>], ctx: &mut CContext, kernel: &mut Vec<String>) {
-    let out_dtype = c_dtype(&uop.dtype());
-    let mut elements = Vec::new();
-
-    for src in sources {
-        let src_val = ctx.get(src).to_string();
-        let src_vcount = src.dtype().vcount();
-        if src_vcount == 1 {
-            elements.push(src_val);
-        } else {
-            for i in 0..src_vcount {
-                elements.push(format!("{src_val}[{i}]"));
-            }
+fn is_address_value(uop: &Arc<UOp>) -> bool {
+    match uop.op() {
+        Op::Param { arg, .. } | Op::Buffer { arg, .. } => arg.addrspace.is_some(),
+        Op::Slice { .. } => true,
+        Op::Index { buffer, .. } => is_address_value(buffer),
+        Op::Shrink { src, .. } | Op::Cast { src, .. } | Op::After { passthrough: src, .. } | Op::Precast { src } => {
+            is_address_value(src)
         }
+        _ => false,
     }
-
-    let expr = format!("({out_dtype}){{{}}}", elements.join(", "));
-    ctx.emit_expr(uop, expr, "cat", kernel);
 }
 
 /// Count references for each UOp ID in the linearized stream.

@@ -8,6 +8,7 @@ use svod_runtime::CpuBackend;
 use svod_schedule::OptimizerConfig;
 
 use crate::error::{DeviceFactorySnafu, DeviceSnafu};
+use crate::memory_planner::PlannerMode;
 
 /// Resolves a `DeviceSpec` into a concrete `Device` for compilation.
 ///
@@ -35,9 +36,7 @@ struct CpuBackendResolver(CpuBackend);
 impl DeviceResolver for CpuBackendResolver {
     fn resolve(&self, spec: &DeviceSpec, registry: &DeviceRegistry) -> crate::Result<Arc<Device>> {
         match spec {
-            DeviceSpec::Cpu => {
-                Ok(Arc::new(svod_runtime::create_cpu_device_with_backend(registry, self.0).context(DeviceSnafu)?))
-            }
+            DeviceSpec::Cpu => svod_runtime::cpu_device_with_backend(registry, self.0).context(DeviceSnafu),
             _ => svod_runtime::DEVICE_FACTORIES.device(spec, registry).context(DeviceFactorySnafu),
         }
     }
@@ -53,6 +52,10 @@ impl DeviceResolver for CpuBackendResolver {
 pub struct PrepareConfig {
     pub optimizer: OptimizerConfig,
     pub(crate) resolver: Arc<dyn DeviceResolver>,
+    /// Memory planning policy for this preparation. Keeping this in the config
+    /// makes planner-on/off comparisons deterministic without process-global
+    /// environment mutation.
+    pub planner_mode: PlannerMode,
     /// When `true`, force the cache-cold rangeify/scheduling path even if
     /// `SVOD_DISABLE_SCHEDULE_CACHE` is unset. Primarily useful in tests
     /// that need to compare cache-warm vs cache-cold outputs without mutating
@@ -69,6 +72,7 @@ impl std::fmt::Debug for PrepareConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrepareConfig")
             .field("optimizer", &self.optimizer)
+            .field("planner_mode", &self.planner_mode)
             .field("disable_schedule_cache", &self.disable_schedule_cache)
             .field("device_local_outputs", &self.device_local_outputs)
             .finish_non_exhaustive()
@@ -80,6 +84,7 @@ impl Default for PrepareConfig {
         Self {
             optimizer: OptimizerConfig::default(),
             resolver: Arc::new(EnvResolver),
+            planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
         }
@@ -87,11 +92,12 @@ impl Default for PrepareConfig {
 }
 
 impl PrepareConfig {
-    /// Read both `SVOD_CPU_BACKEND` and optimizer env vars.
+    /// Read `SVOD_MEMORY_PLANNER`, `SVOD_CPU_BACKEND`, and optimizer env vars.
     pub fn from_env() -> Self {
         Self {
             optimizer: OptimizerConfig::from_env(),
             resolver: Arc::new(EnvResolver),
+            planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
         }
@@ -106,30 +112,18 @@ impl PrepareConfig {
         Self {
             optimizer: OptimizerConfig::from_env(),
             resolver: Arc::new(CpuBackendResolver(backend)),
+            planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
         }
     }
 
-    /// AMD variant for the `codegen_tests!` macro: returns `Some(_)` only
-    /// when this host has a [supported](svod_dtype::AmdArch) AMD GPU
-    /// (RDNA3 + CDNA). On other hosts the macro's `amd::*` tests skip with
-    /// a clear message.
-    ///
-    /// **Status**: the AMD realize pipeline (CPU→VRAM staging + dispatch +
-    /// result copy-back) is not yet wired in `realize.rs`; until it is, this
-    /// function returns `None` even on supported hardware. The macro
-    /// scaffold is in place so that flipping the pipeline integration is a
-    /// one-line change here.
+    /// AMD variant for the `codegen_tests!` macro. The test runs only when the
+    /// active default is a topology-supported AMD device; otherwise it skips.
     pub fn for_amd_if_available() -> Option<Self> {
-        // Detect supported AMD device. Returns None when the host has no
-        // /dev/kfd, no GPU nodes, or only unsupported gfx targets.
-        let _arch = amd_test_arch()?;
-        // TODO(phase 7.1): swap to an AmdBackendResolver once realize.rs
-        // supports cross-device buffer staging. Returning None for now means
-        // the codegen_tests!::amd variant always skips on this host — by
-        // design, not a bug.
-        None
+        let DeviceSpec::Amd { device_id } = svod_dtype::default_device::default_device() else { return None };
+        svod_device::registry::resolve_amd_arch_from_topology(device_id).ok()?;
+        Some(Self::from_env())
     }
 }
 
@@ -151,7 +145,13 @@ impl PrepareConfig {
 
 impl From<OptimizerConfig> for PrepareConfig {
     fn from(optimizer: OptimizerConfig) -> Self {
-        Self { optimizer, resolver: Arc::new(EnvResolver), disable_schedule_cache: false, device_local_outputs: false }
+        Self {
+            optimizer,
+            resolver: Arc::new(EnvResolver),
+            planner_mode: crate::memory_planner::mode_from_env(),
+            disable_schedule_cache: false,
+            device_local_outputs: false,
+        }
     }
 }
 
@@ -362,3 +362,7 @@ macro_rules! codegen_tests {
         $crate::codegen_tests!($($rest)*);
     };
 }
+
+#[cfg(test)]
+#[path = "test/unit/config.rs"]
+mod tests;

@@ -1,7 +1,7 @@
 //! Global tensor registry for atomic graph substitution.
 //!
 //! This module implements Tinygrad's `all_tensors` pattern using papaya's lock-free HashMap.
-//! When rangeify transforms a UOp (e.g., NEG → BUFFERIZE(NEG)), the `becomes_map` must be
+//! When rangeify transforms a UOp (e.g., NEG → STAGE(NEG)), the `becomes_map` must be
 //! applied to ALL tensors that reference it - not just the one being realized.
 //!
 //! Without this, diamond patterns (like argmin's NEG feeding both MAX and EQ) fail because
@@ -277,7 +277,6 @@ pub fn gc_unused_tensors() {
 ///
 /// This function acquires write locks on affected tensors during the update phase.
 /// Other tensors can still be read/written concurrently.
-#[allow(clippy::mutable_key_type)]
 pub fn apply_map_to_tensors(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
     apply_map_to_tensors_inner(becomes_map, false);
 }
@@ -286,12 +285,10 @@ pub fn apply_map_to_tensors(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
 ///
 /// Use when a replacement may contain the original key, such as the
 /// view-assign case `Buffer → After(Buffer, [Store(...)])`.
-#[allow(clippy::mutable_key_type)]
 pub fn apply_map_to_tensors_walk(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
     apply_map_to_tensors_inner(becomes_map, true);
 }
 
-#[allow(clippy::mutable_key_type)]
 fn apply_map_to_tensors_inner(becomes_map: &HashMap<UOpKey, Arc<UOp>>, walk: bool) {
     if becomes_map.is_empty() {
         return;

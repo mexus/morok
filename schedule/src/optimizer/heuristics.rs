@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use svod_dtype::DType;
 use svod_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, TernaryOp};
 
 use crate::optimizer::config::HeuristicsConfig;
@@ -77,9 +76,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     apply_unroll(scheduler);
 
     // 7. Default upcast
-    if scheduler.axes_of(&[AxisType::Upcast]).is_empty() {
-        apply_default_upcast(scheduler);
-    }
+    apply_default_upcast(scheduler);
 
     // 8. Local dims
     apply_local_dims(scheduler, config);
@@ -220,7 +217,12 @@ pub fn apply_image_upcasts(scheduler: &mut Scheduler) -> bool {
         let Op::Index { buffer, indices, .. } = buf.op() else {
             continue;
         };
-        if !matches!(buffer.dtype(), DType::Image { .. }) {
+        // The rank-3-with-4-channels shape is only an image when the buffer says so;
+        // an ordinary rank-3 tensor must not be upcast on this path.
+        if !buffer.dtype().is_image() {
+            continue;
+        }
+        if !buffer.shape().ok().flatten().is_some_and(|shape| shape.len() == 3 && shape[2].as_const() == Some(4)) {
             continue;
         }
 
@@ -262,33 +264,26 @@ pub fn apply_image_upcasts(scheduler: &mut Scheduler) -> bool {
     applied
 }
 
-/// Default upcast fallback: 4x vectorization on first upcastable axis.
+/// Default upcast fallback: 4x vectorization on the innermost upcastable axis.
+///
+/// Tinygrad `hand_coded_optimizations` (codegen/opt/heuristic.py:155-158):
+/// `if not k.upcasted and k.upcastable_dims and full_shape[upcastable_dims[-1]] % 4 == 0`.
+/// `upcasted` counts UPCAST *and* UNROLL axes, so an unrolled reduce already
+/// suppresses this fallback.
 pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
-    use svod_ir::Op;
     use tracing::debug;
 
-    if !scheduler.axes_of(&[AxisType::Upcast]).is_empty() {
-        debug!("apply_default_upcast: skipping (already upcasted)");
+    if scheduler.upcasted() {
+        debug!("apply_default_upcast: skipping (already upcasted or unrolled)");
         return false;
     }
-    let upcastable = scheduler.upcastable_dims();
-    debug!(upcastable_dims = ?upcastable, "apply_default_upcast: checking upcastable dims");
-    if upcastable.is_empty() {
+    let Some(axis_idx) = scheduler.upcastable_dims().last().copied() else {
         debug!("apply_default_upcast: no upcastable dims");
         return false;
-    }
+    };
 
-    // Innermost upcastable axis.
-    let axis_idx = *upcastable.last().unwrap();
-    let rngs = scheduler.rngs();
-
-    // Get axis size and check divisibility.
-    if axis_idx < rngs.len()
-        && let Op::Range { end, .. } = rngs[axis_idx].op()
-        && let Op::Const(cv) = end.op()
-        && let svod_ir::ConstValue::Int(size) = cv.0
-        && size % DEFAULT_UPCAST_FACTOR as i64 != 0
-    {
+    let size = scheduler.full_shape()[axis_idx];
+    if size % DEFAULT_UPCAST_FACTOR as i64 != 0 {
         debug!(axis_idx, size, factor = DEFAULT_UPCAST_FACTOR, "apply_default_upcast: skipping (size not divisible)");
         return false;
     }
@@ -422,10 +417,10 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
 /// Grouped reduction for small output dimensions.
 ///
 /// When the product of upcastable output dimensions is small (<= 2048,
-/// or 240 under `SVOD_NOLOCALS`), apply GROUPTOP on output axes to enable
+/// or 240 when local selection is disabled), apply GROUPTOP on output axes to enable
 /// local reduction.
 pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
-    if !scheduler.renderer().has_local || config.disable_locals || !scheduler.renderer().has_shared {
+    if !scheduler.renderer().has_local || !scheduler.renderer().has_shared {
         return false;
     }
 
@@ -434,7 +429,7 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
     let full_shape = scheduler.full_shape();
     let group_for_reduces: i64 = upcastable.iter().map(|&i| full_shape.get(i).copied().unwrap_or(1)).product();
 
-    let threshold: i64 = if std::env::var("SVOD_NOLOCALS").is_ok() { 240 } else { 2048 };
+    let threshold: i64 = if config.disable_locals { 240 } else { 2048 };
     if group_for_reduces > threshold {
         return false;
     }
@@ -478,7 +473,7 @@ pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig)
 
     // Output axes are GLOBAL/LOCAL/LOOP. After the OUTER→LOOP migration,
     // matmul output axes arrive as Loop, so no Outer arm is needed.
-    let output_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Local, AxisType::Loop]);
+    let output_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Local, AxisType::Weak]);
     debug!(output_axes = ?output_axes, "apply_matmul_tiling: output axes");
 
     // Need at least 2 output axes for 2D tiling
@@ -536,7 +531,7 @@ pub fn apply_matmul_output_upcasting(scheduler: &mut Scheduler, config: &Heurist
 fn find_axis_by_axis_id(scheduler: &Scheduler, axis_id: AxisId) -> Option<usize> {
     scheduler.rngs().iter().enumerate().find_map(|(i, rng)| {
         if let Op::Range { axis_id: id, .. } = rng.op()
-            && *id == axis_id
+            && id == &axis_id
         {
             return Some(i);
         }
@@ -640,7 +635,7 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
         let axis_id = trial
             .rngs()
             .get(current_axis)
-            .and_then(|rng| if let Op::Range { axis_id, .. } = rng.op() { Some(*axis_id) } else { None });
+            .and_then(|rng| if let Op::Range { axis_id, .. } = rng.op() { Some(axis_id.clone()) } else { None });
 
         if block_size > 1 {
             if apply_opt(&mut trial, &Opt::local(current_axis, block_size), true).is_err() {
@@ -695,7 +690,7 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
         }
 
         // Only thread LOOP axes.
-        let loop_axes = scheduler.axes_of(&[AxisType::Loop]);
+        let loop_axes = scheduler.axes_of(&[AxisType::Weak]);
         let mut thread_applied = false;
         for &axis_idx in &loop_axes {
             let rngs = scheduler.rngs();
@@ -883,7 +878,7 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
 
     // Rank axes by (has_expand_pattern, axis_index) — expand axes (stride-0 in
     // some buffer = broadcast) first, then higher axis indices.
-    let eligible_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Loop]);
+    let eligible_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Weak]);
     let full_shape = scheduler.full_shape();
 
     let mut local_axis_ranking: Vec<(bool, usize)> = Vec::new();
@@ -1020,47 +1015,6 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
                 continue;
             }
         };
-
-        // Rate-neutral cores (`heuristic_pick=false`, e.g. CDNA3 fp32 MFMA ==
-        // packed-vector FLOP rate) only pay off on big tiles, where the rigid
-        // lane layout buys operand reuse; on small matmuls they pessimize.
-        // Auto-pick them only when every (pre-split) axis is large or symbolic
-        // (symbolic = the unbounded data axis). An explicit tc_select pin
-        // overrides — the caller asked for that core.
-        if config.tc_select.as_i32() < 0
-            && let Some(idx) = trial.selected_tc_index
-            && !trial.renderer().tensor_cores[idx].heuristic_pick
-        {
-            // Total MACs decide: tile reuse needs the working set to dwarf the
-            // caches (FFN-sized 6.5e9 wins ~5x; 512³ = 1.3e8 still loses to
-            // the vector path). Symbolic extents are the unbounded data axes —
-            // treat them as large.
-            const MIN_MACS: i64 = 2_000_000_000;
-            let (n, m, k) = &pattern.axis_choices[axis_choice];
-            let macs = [n, m, k]
-                .iter()
-                .map(|axis| match axis.op() {
-                    Op::Range { end, .. } => match end.op() {
-                        Op::Const(cv) => match cv.0 {
-                            svod_ir::ConstValue::Int(sz) => sz,
-                            _ => 4096,
-                        },
-                        _ => 4096, // symbolic
-                    },
-                    _ => 4096,
-                })
-                .fold(1i64, i64::saturating_mul);
-            if macs < MIN_MACS {
-                tracing::debug!(
-                    axis_choice,
-                    tc_index = idx,
-                    macs,
-                    "try_tensor_cores: rate-neutral core, too little work"
-                );
-                rejections.push((axis_choice, "rate-neutral tensor core: too little work".to_string()));
-                continue;
-            }
-        }
 
         // Record the TC opt with explicit axis choice.
         let opt = Opt::tc(

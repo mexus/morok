@@ -9,7 +9,7 @@ use std::sync::Arc;
 use svod_dtype::DType;
 use svod_ir::types::{BinaryOp, ConstValue};
 use svod_ir::uop::cached_property::CachedProperty;
-use svod_ir::uop::properties::VminVmaxProperty;
+use svod_ir::uop::properties::SoundVminVmaxProperty;
 use svod_ir::{Op, UOp, UOpKey};
 
 use crate::TypedPatternMatcher;
@@ -18,7 +18,7 @@ use crate::TypedPatternMatcher;
 ///
 /// - `X < c` -> `(X, true, c-1)` meaning X <= c-1
 /// - `NOT(X < c)` encoded as `(X < c).ne(true)` -> `(X, false, c)` meaning X >= c
-fn parse_valid(v: &Arc<UOp>) -> Option<(Arc<UOp>, bool, i64)> {
+pub(crate) fn parse_valid(v: &Arc<UOp>) -> Option<(Arc<UOp>, bool, i64)> {
     // Pattern: (X < c).ne(True) -> X >= c
     if let Op::Binary(BinaryOp::Ne, lhs, rhs) = v.op()
         && let Op::Const(cv) = rhs.op()
@@ -26,28 +26,36 @@ fn parse_valid(v: &Arc<UOp>) -> Option<(Arc<UOp>, bool, i64)> {
         && let Op::Binary(BinaryOp::Lt, x, c) = lhs.op()
         && x.dtype().is_int()
     {
-        let (_, c_vmax) = VminVmaxProperty::get(c);
-        if let ConstValue::Int(c_val) = c_vmax {
+        let (c_vmin, _) = SoundVminVmaxProperty::get(c).as_ref()?;
+        if let ConstValue::Int(c_val) = c_vmin {
             return Some((x.clone(), false, *c_val));
         }
     }
 
-    // Pattern: NOT(X < c) -> X >= c
+    // Pattern: NOT(X < c) -> X >= c. Only `c`'s lower bound is a sound lower bound
+    // on X (tinygrad `uop/symbolic.py:308` uses vmin for the same clause).
     if let Op::Unary(svod_ir::types::UnaryOp::Not, inner) = v.op()
         && let Op::Binary(BinaryOp::Lt, x, c) = inner.op()
         && x.dtype().is_int()
     {
-        let (_, c_vmax) = VminVmaxProperty::get(c);
-        if let ConstValue::Int(c_val) = c_vmax {
+        let (c_vmin, _) = SoundVminVmaxProperty::get(c).as_ref()?;
+        if let ConstValue::Int(c_val) = c_vmin {
             return Some((x.clone(), false, *c_val));
         }
     }
 
-    // Pattern: X < c -> X <= c-1
+    // Pattern: c < X -> X >= c+1
     if let Op::Binary(BinaryOp::Lt, x, c) = v.op()
         && x.dtype().is_int()
     {
-        let (_, c_vmax) = VminVmaxProperty::get(c);
+        if let Op::Const(value) = x.op()
+            && let ConstValue::Int(value) = value.0
+        {
+            return Some((c.clone(), false, value + 1));
+        }
+
+        // Pattern: X < c -> X <= c-1
+        let (_, c_vmax) = SoundVminVmaxProperty::get(c).as_ref()?;
         if let ConstValue::Int(c_val) = c_vmax {
             return Some((x.clone(), true, *c_val - 1));
         }
@@ -58,7 +66,7 @@ fn parse_valid(v: &Arc<UOp>) -> Option<(Arc<UOp>, bool, i64)> {
 
 /// Check if a UOp is irreducible (upstream: GroupOp.Irreducible = {CONST, DEFINE_VAR, SPECIAL, RANGE}).
 fn is_irreducible(op: &Op) -> bool {
-    matches!(op, Op::Const(..) | Op::DefineVar { .. } | Op::Special { .. } | Op::Range { .. })
+    matches!(op, Op::Const(..) | Op::Param { .. } | Op::Special { .. } | Op::Range { .. })
 }
 
 /// Split an ADD-chain into individual addends.
@@ -105,11 +113,6 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     let mut clauses = split_and(valid);
 
-    // Early exit: if no clause can be parsed into bounds, nothing to simplify.
-    if !clauses.iter().any(|c| parse_valid(c).is_some()) {
-        return None;
-    }
-
     // Sort by priority
     let clauses_snapshot = clauses.clone();
     let backward_slices: Vec<&HashSet<u64>> = clauses_snapshot.iter().map(|c| c.backward_slice_ids()).collect();
@@ -117,10 +120,7 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
         let Some((expr, _, _)) = parse_valid(v) else { return 0i32 };
         let expr_id = expr.id;
         let mut priority = 0i32;
-        for (i, other) in clauses_snapshot.iter().enumerate() {
-            if other.id == v.id {
-                continue;
-            }
+        for (i, _other) in clauses_snapshot.iter().enumerate() {
             if backward_slices[i].contains(&expr_id) {
                 priority -= 1;
             }
@@ -163,27 +163,17 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
 ///
 /// When `try_simplex` is true (called from `simplify_valid`), also tries per-addend
 /// simplex decomposition for constraints like `X0 + X1 + ... >= 1`.
-fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<UOp> {
-    use svod_ir::rewrite::graph_rewrite;
-
+pub(crate) fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<UOp> {
     // Parse valid into {expr: [lower_bound, upper_bound]}
     type BoundsEntry = (Arc<UOp>, Option<i64>, Option<i64>);
-    let mut bounds: HashMap<u64, BoundsEntry> = HashMap::new();
+    let mut bounds: indexmap::IndexMap<u64, BoundsEntry> = indexmap::IndexMap::new();
     for stmt in split_and(valid) {
         if let Some((expr, is_upper, c)) = parse_valid(&stmt) {
             let entry = bounds.entry(expr.id).or_insert_with(|| (expr.clone(), None, None));
             if is_upper {
-                match entry.2 {
-                    None => entry.2 = Some(c),
-                    Some(existing) if c < existing => entry.2 = Some(c),
-                    _ => {}
-                }
+                entry.2 = Some(c);
             } else {
-                match entry.1 {
-                    None => entry.1 = Some(c),
-                    Some(existing) if c > existing => entry.1 = Some(c),
-                    _ => {}
-                }
+                entry.1 = Some(c);
             }
         }
     }
@@ -198,19 +188,11 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<U
     let mut uop = uop.clone();
 
     for (i, (_id, (expr, lower, upper))) in bounds.iter().enumerate() {
-        let (expr_vmin, expr_vmax) = VminVmaxProperty::get(expr);
+        let Some((expr_vmin, expr_vmax)) = SoundVminVmaxProperty::get(expr) else { continue };
         let v0 = lower.unwrap_or_else(|| if let ConstValue::Int(v) = expr_vmin { *v } else { i64::MIN });
         let v1 = upper.unwrap_or_else(|| if let ConstValue::Int(v) = expr_vmax { *v } else { i64::MAX });
 
-        // Skip if bounds didn't actually tighten
-        let orig_min = if let ConstValue::Int(v) = expr_vmin { *v } else { i64::MIN };
-        let orig_max = if let ConstValue::Int(v) = expr_vmax { *v } else { i64::MAX };
-        if v0 == orig_min && v1 == orig_max {
-            continue;
-        }
-
-        let fake_var = UOp::define_var(format!("_valid_fake{i}"), v0, v1);
-        let fake_var = if expr.dtype() != fake_var.dtype() { fake_var.cast(expr.dtype()) } else { fake_var };
+        let fake_var = UOp::variable(format!("fake{i}"), v0, v1, expr.dtype());
         all_candidates.push((expr.clone(), fake_var));
 
         // Per-candidate simplex logic
@@ -222,21 +204,13 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<U
                 && v0 == 1
             {
                 let addends = split_add(expr);
-                let all_irreducible_nonneg = addends.iter().all(|u| {
-                    is_irreducible(u.op()) && {
-                        let (vmin, _) = VminVmaxProperty::get(u);
-                        matches!(vmin, ConstValue::Int(v) if *v >= 0)
-                    }
-                });
-                if all_irreducible_nonneg {
+                if addends.iter().all(|u| is_irreducible(u.op()) && SoundVminVmaxProperty::get(u).is_some()) {
                     let simplex_candidates: Vec<(Arc<UOp>, Arc<UOp>)> = addends
                         .iter()
-                        .enumerate()
-                        .map(|(j, xi)| {
-                            let (_, xi_vmax) = VminVmaxProperty::get(xi);
+                        .map(|xi| {
+                            let (_, xi_vmax) = SoundVminVmaxProperty::get(xi).as_ref().unwrap();
                             let max_val = if let ConstValue::Int(v) = xi_vmax { *v } else { i64::MAX };
-                            let fake = UOp::define_var(format!("_simplex_fake{j}"), 1, max_val);
-                            let fake = if xi.dtype() != fake.dtype() { fake.cast(xi.dtype()) } else { fake };
+                            let fake = UOp::variable(format!("fake{i}"), 1, max_val, xi.dtype());
                             (xi.clone(), fake)
                         })
                         .collect();
@@ -245,35 +219,45 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<U
             }
 
             for candidates in &candidate_sets {
-                // Substitute each candidate independently
-                let new_uops: Vec<Arc<UOp>> = candidates
-                    .iter()
-                    .map(|(x, new_x)| {
-                        #[allow(clippy::mutable_key_type)]
-                        let map: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(x.clone()), new_x.clone())].into();
-                        uop.substitute(&map)
-                    })
-                    .collect();
-                // Skip if any branch doesn't contain the expression
-                if new_uops.iter().any(|u| Arc::ptr_eq(u, &uop)) {
+                // `if any(X not in uop.backward_slice_with_self for X,_ in candidate): continue`
+                // — upstream skips the branch before substituting, not after.
+                if candidates.iter().any(|(x, _)| !uop.backward_slice_ids().contains(&x.id)) {
                     continue;
                 }
-                // Simplify each branch, substitute back, simplify again
+                // Substitute each candidate, simplify, substitute back, simplify again
                 let simplified: Vec<Arc<UOp>> = candidates
                     .iter()
-                    .zip(new_uops.iter())
-                    .map(|((x, new_x), u)| {
-                        let s = graph_rewrite(crate::symbolic::patterns::symbolic(), u.clone(), &mut ());
-                        #[allow(clippy::mutable_key_type)]
+                    .map(|(x, new_x)| {
+                        let map: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(x.clone()), new_x.clone())].into();
+                        let s = simplify(uop.substitute(&map));
                         let rev: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(new_x.clone()), x.clone())].into();
-                        graph_rewrite(crate::symbolic::patterns::symbolic(), s.substitute(&rev), &mut ())
+                        simplify(s.substitute(&rev))
                     })
                     .collect();
                 // If all branches produce the same result, accept it
                 if simplified.windows(2).all(|w| w[0].id == w[1].id) {
                     uop = simplified[0].clone();
+                } else if let Op::Stack { sources } = uop.op()
+                    && sources.len() == 2
+                    && simplified
+                        .iter()
+                        .all(|new_uop| matches!(new_uop.op(), Op::Stack { sources } if sources.len() == 2))
+                {
+                    let mut new_sources = sources.clone();
+                    for lane in 0..2 {
+                        let lane_sources: Vec<_> = simplified
+                            .iter()
+                            .filter_map(|new_uop| match new_uop.op() {
+                                Op::Stack { sources } => Some(sources[lane].clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        if lane_sources.windows(2).all(|w| Arc::ptr_eq(&w[0], &w[1])) {
+                            new_sources[lane] = lane_sources[0].clone();
+                        }
+                    }
+                    uop = UOp::stack(new_sources);
                 }
-                // TODO: VECTORIZE partial simplification (upstream) — add when needed
             }
         }
     }
@@ -283,7 +267,6 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<U
     }
 
     // Combined all-candidates substitution
-    #[allow(clippy::mutable_key_type)]
     let sub_map: HashMap<UOpKey, Arc<UOp>> =
         all_candidates.iter().map(|(x, f)| (UOpKey(x.clone()), f.clone())).collect();
     let substituted = uop.substitute(&sub_map);
@@ -292,14 +275,31 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<U
     }
 
     // Simplify with full symbolic (tier 2) including divmod rules
-    let simplified = graph_rewrite(crate::symbolic::patterns::symbolic(), substituted, &mut ());
+    let simplified = simplify(substituted);
 
     // Substitute back and simplify again
-    #[allow(clippy::mutable_key_type)]
     let reverse_map: HashMap<UOpKey, Arc<UOp>> =
         all_candidates.iter().map(|(x, f)| (UOpKey(f.clone()), x.clone())).collect();
-    let result = simplified.substitute(&reverse_map);
-    graph_rewrite(crate::symbolic::patterns::symbolic(), result, &mut ())
+    simplify(simplified.substitute(&reverse_map))
+}
+
+/// `UOp.simplify` (tinygrad/uop/ops.py:527-532), including its two fast-outs:
+/// `if self.op is Ops.CONST: return self` and `if self.op is Ops.SINK and all(s.op is
+/// Ops.CONST or (s.op is Ops.STACK and len(s.src) == 0) for s in self.src): return self`.
+fn simplify(uop: Arc<UOp>) -> Arc<UOp> {
+    let settled = match uop.op() {
+        Op::Const(_) => true,
+        Op::Sink { sources, .. } => sources.iter().all(|s| match s.op() {
+            Op::Const(_) => true,
+            Op::Stack { sources } => sources.is_empty(),
+            _ => false,
+        }),
+        _ => false,
+    };
+    if settled {
+        return uop;
+    }
+    svod_ir::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic(), uop, &mut ())
 }
 
 /// Simplify WHERE(cond, x, Invalid) using cond as bounds context
@@ -307,8 +307,17 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<U
 ///
 /// Rewrites `x` using tighter bounds derived from the condition `cond`.
 pub fn gated_given_valid(cond: &Arc<UOp>, x: &Arc<UOp>, invalid: &Arc<UOp>) -> Option<Arc<UOp>> {
+    if x.dtype() != DType::WeakInt {
+        return None;
+    }
+    let image_enabled = std::env::var("IMAGE").ok().and_then(|value| value.parse::<i64>().ok()).unwrap_or(0) > 0;
+    if image_enabled
+        && x.any_in_subtree(|uop| matches!(uop.op(), Op::Binary(BinaryOp::FloorDiv | BinaryOp::FloorMod, ..)))
+    {
+        return None;
+    }
     let new_x = uop_given_valid(cond, x, false);
-    if new_x.id == x.id {
+    if Arc::ptr_eq(&new_x, x) {
         return None;
     }
     UOp::try_where(cond.clone(), new_x, invalid.clone()).ok()
@@ -322,7 +331,7 @@ pub fn pm_simplify_valid() -> &'static TypedPatternMatcher {
             => |valid| simplify_valid(valid),
 
         // Simplify WHERE(cond, x, Invalid) using bounds from cond
-        Where(cond, x, inv) if matches!(inv.op(), Op::Invalid)
+        Where(cond, x, inv) if UOp::is_invalid_marker(inv)
             => |cond, x, inv| gated_given_valid(cond, x, inv),
     }
 }
@@ -384,7 +393,7 @@ fn drop_and_clauses(cond: &Arc<UOp>, x: &Arc<UOp>, invalid: &Arc<UOp>) -> Option
 /// pm_drop_and_clauses`.
 pub fn pm_drop_and_clauses() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        Where(cond, x, inv) if matches!(inv.op(), Op::Invalid)
+        Where(cond, x, inv) if UOp::is_invalid_marker(inv)
             => |cond, x, inv| drop_and_clauses(cond, x, inv),
     }
 }

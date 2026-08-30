@@ -25,8 +25,9 @@
 //! let output = plan.output_buffer();
 //! ```
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use smallvec::SmallVec;
@@ -38,9 +39,84 @@ use svod_ir::{CustomFunctionKind, Op, UOp};
 
 use crate::error::{ExecSnafu, Result};
 use crate::kernel_cache::CachedKernel;
-use crate::profiler::{KernelProfile, KernelStaticInfo, ProfileOptions, RunProfile, StageProfile};
+use crate::profiler::{
+    KernelProfile, KernelStaticInfo, ProfileOptions, RunProfile, StageProfile, SubmissionProfileFinalizer,
+};
 
 type RuntimeLaunchSizes = (Option<[usize; 3]>, Option<[usize; 3]>);
+
+static NEXT_HCQ_SIGNAL_ADDRESS: AtomicU64 = AtomicU64::new(0x1000);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BufferAccess {
+    storage: BufferId,
+    owner: DeviceSpec,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Debug)]
+struct HcqPreparedOperation {
+    operation: usize,
+    device: DeviceSpec,
+    queue: svod_device::hcq::QueueKind,
+    reads: Vec<BufferAccess>,
+    writes: Vec<BufferAccess>,
+    is_copy: bool,
+}
+
+struct HcqLinkedPlan {
+    semantic: svod_device::hcq::SemanticLinkedPlan,
+}
+
+impl HcqLinkedPlan {
+    fn capture(operations: Vec<HcqPreparedOperation>) -> Result<Self> {
+        let topology = operations
+            .iter()
+            .map(|operation| {
+                let resource = |access: &BufferAccess| svod_device::hcq::TopologyResource {
+                    id: access.storage.0,
+                    owner: access.owner.clone(),
+                    start: access.start,
+                    end: access.end,
+                };
+                let reads = operation.reads.iter().map(resource).collect::<Vec<_>>();
+                let writes = operation.writes.iter().map(resource).collect::<Vec<_>>();
+                let kind = if operation.is_copy && !reads.is_empty() && !writes.is_empty() {
+                    svod_device::hcq::TopologyOperationKind::Copy {
+                        src: reads[0].clone(),
+                        dst: writes[0].clone(),
+                        bytes: operation.reads[0].end.saturating_sub(operation.reads[0].start),
+                    }
+                } else {
+                    svod_device::hcq::TopologyOperationKind::Execute
+                };
+                svod_device::hcq::TopologyOperation {
+                    operation: operation.operation,
+                    lane: svod_device::hcq::DeviceQueue { device: operation.device.clone(), queue: operation.queue },
+                    reads,
+                    writes,
+                    kind,
+                }
+            })
+            .collect::<Vec<_>>();
+        // No backend currently reports verified peer mappings. Cross-device
+        // resources therefore stage rather than assuming family-wide access.
+        let lanes = svod_device::hcq::schedule_device_lanes(
+            &topology,
+            svod_device::hcq::QueueMergeLimits::NO_MERGE,
+            |executor, owner| executor == owner,
+        );
+        let semantic = svod_device::hcq::SemanticLinkedPlan::from_lane_submissions(lanes, |_| {
+            [
+                NEXT_HCQ_SIGNAL_ADDRESS.fetch_add(8, Ordering::Relaxed),
+                NEXT_HCQ_SIGNAL_ADDRESS.fetch_add(8, Ordering::Relaxed),
+            ]
+        })
+        .context(ExecSnafu { context: "link semantic HCQ topology" })?;
+        Ok(Self { semantic })
+    }
+}
 
 // ============================================================================
 // Core Structures
@@ -70,6 +146,9 @@ pub struct PreparedKernel {
     /// Indices of output buffers within `buffer_indices`.
     pub output_indices: Vec<usize>,
 
+    /// Indices of input buffers within `buffer_indices`.
+    pub input_indices: Vec<usize>,
+
     /// Variable values in positional order (matches `var_names` in CachedKernel).
     pub vals: Vec<i64>,
 
@@ -82,9 +161,9 @@ pub struct PreparedKernel {
     /// Kernel IDs that must complete before this one (dependencies).
     pub dependencies: Vec<u64>,
 
-    /// Pre-computed raw buffer addresses for low-allocation execution.
-    /// Computed once during prepare(), stable for the lifetime of ExecutionPlan.
-    /// SAFETY: Pointers are valid as long as ExecutionPlan owns the buffers.
+    /// Preparation-time raw buffer addresses retained for diagnostics and graph
+    /// hazard metadata. Normal and graph replay resolve the current plan buffers
+    /// again, so replacing a buffer does not leave a stale invocation address.
     pub buffer_ptrs: Vec<usize>,
 
     /// Pre-computed buffer IDs for dependency tracking.
@@ -96,6 +175,26 @@ pub struct PreparedKernel {
     pub runtime_vars: Vec<RuntimeVar>,
 }
 
+impl PreparedKernel {
+    /// Hazard read-set positions: every buffer slot the kernel does not write.
+    ///
+    /// Tinygrad's `DepsTracker.access_resources` (`device.py:280-296`, called
+    /// from `graph/hcq.py:224` with `outs` as the write list) takes the whole
+    /// buffer list and treats every slot outside `write` as a read.
+    /// `input_indices` is only `ProgramSpec.ins` — the declared LOAD slots —
+    /// which misses buffers the kernel reads through an alias or an
+    /// undeclared global, so it must not drive dependency edges.
+    fn read_positions(&self) -> impl Iterator<Item = usize> + '_ {
+        debug_assert!(
+            self.input_indices.iter().all(|position| *position < self.buffer_indices.len()),
+            "kernel {} declares an input position outside its {} buffers",
+            self.id,
+            self.buffer_indices.len()
+        );
+        (0..self.buffer_indices.len()).filter(|position| !self.output_indices.contains(position))
+    }
+}
+
 /// Bound description for one `DefineVar` consumed by a kernel.
 #[derive(Clone, Debug)]
 pub struct RuntimeVar {
@@ -104,15 +203,29 @@ pub struct RuntimeVar {
     pub max_val: i64,
 }
 
-/// Walk `root` and collect bounds for every reachable `DefineVar`.
+/// Walk `root` and collect bounds for every reachable runtime variable, in
+/// either spelling: a `DefineVar`, or the bounded scalar `Param` a
+/// `svod_tensor::Variable` lowers to.
 pub fn collect_runtime_vars(root: &Arc<UOp>) -> Vec<RuntimeVar> {
     let mut vars = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for node in root.toposort() {
-        if let Op::DefineVar { name, min_val, max_val } = node.op()
+        let bounds = match node.op() {
+            Op::DefineVar { name, min_val, max_val } => Some((name.clone(), *min_val, *max_val)),
+            Op::Param { arg, .. }
+                if arg.addrspace.is_none()
+                    && let Some(name) = arg.name.as_deref()
+                    && let Some((min, max)) = &arg.vmin_vmax
+                    && let (Some(min), Some(max)) = (min.0.try_int(), max.0.try_int()) =>
+            {
+                Some((name.to_string(), min, max))
+            }
+            _ => None,
+        };
+        if let Some((name, min_val, max_val)) = bounds
             && seen.insert(name.clone())
         {
-            vars.push(RuntimeVar { name: name.clone(), min_val: *min_val, max_val: *max_val });
+            vars.push(RuntimeVar { name, min_val, max_val });
         }
     }
     vars
@@ -128,26 +241,6 @@ pub struct PreparedCopy {
     pub buffer_indices: Vec<usize>,
 
     /// Operation IDs that must complete before this copy.
-    pub dependencies: Vec<u64>,
-}
-
-/// Prepared zero-copy buffer view operation.
-#[derive(Clone, Debug)]
-pub struct PreparedBufferView {
-    /// Unique operation identifier.
-    pub id: u64,
-
-    /// Output and base buffer indices in ExecutionPlan order.
-    /// `buffer_indices[0]` is output view, `buffer_indices[1]` is base source.
-    pub buffer_indices: Vec<usize>,
-
-    /// Expected byte offset into base for the view.
-    pub byte_offset: usize,
-
-    /// Expected byte size of the view.
-    pub byte_size: usize,
-
-    /// Operation IDs that must complete before this view is consumed.
     pub dependencies: Vec<u64>,
 }
 
@@ -187,9 +280,6 @@ pub enum PreparedOp {
     /// Direct buffer copy operation.
     BufferCopy(PreparedCopy),
 
-    /// Zero-copy view aliasing operation.
-    BufferView(PreparedBufferView),
-
     /// Runtime custom function operation.
     CustomFunction(PreparedCustomFunction),
 }
@@ -198,7 +288,6 @@ fn op_identity(op: &PreparedOp) -> (u64, Vec<u64>) {
     match op {
         PreparedOp::CompiledProgram(kernel) => (kernel.id, kernel.dependencies.clone()),
         PreparedOp::BufferCopy(copy) => (copy.id, copy.dependencies.clone()),
-        PreparedOp::BufferView(view) => (view.id, view.dependencies.clone()),
         PreparedOp::CustomFunction(custom) => (custom.id, custom.dependencies.clone()),
     }
 }
@@ -297,6 +386,12 @@ pub struct ExecutionPlan {
     /// plans → distinct queues for cross-plan parallelism). `Some(None)` means
     /// the backend has no reusable context (CPU) → per-call `Program::execute`.
     plan_ctx: std::sync::OnceLock<Option<Box<dyn svod_device::PlanContext>>>,
+
+    hcq_executor: Mutex<svod_device::hcq::CpuQueueExecutor>,
+    hcq_linked: std::sync::OnceLock<HcqLinkedPlan>,
+    /// First failure after a semantic HCQ epoch reserved timeline points.
+    /// Such an epoch may be partially executed and must never be retried.
+    hcq_poison: std::sync::OnceLock<String>,
 }
 
 // ============================================================================
@@ -304,6 +399,305 @@ pub struct ExecutionPlan {
 // ============================================================================
 
 impl ExecutionPlan {
+    fn check_hcq_poison(&self) -> Result<()> {
+        if let Some(reason) = self.hcq_poison.get() {
+            return Err(crate::error::Error::PlanPoisoned { reason: reason.clone() });
+        }
+        Ok(())
+    }
+
+    fn poison_hcq<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            let _ = self.hcq_poison.set(error.to_string());
+        }
+        result
+    }
+
+    fn replay_native_linked_plan(&self) -> Result<svod_device::device::NativeReplayOutcome> {
+        use svod_device::device::{CopyEndpoint, NativeReplayDecline, NativeReplayOutcome};
+
+        let semantic = &self.hcq_linked.get().expect("HCQ plan linked by builder").semantic;
+        if let Some(operation) = semantic.staged_copy() {
+            return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::StagedCopy { operation }));
+        }
+        if let Some(expected) = semantic.lanes().first().map(|submission| &submission.lane.device)
+            && let Some(actual) =
+                semantic.lanes().iter().map(|submission| &submission.lane.device).find(|d| d != &expected)
+        {
+            return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::MixedComputeDevices {
+                expected: expected.clone(),
+                actual: actual.clone(),
+            }));
+        }
+
+        enum CallValues<'a> {
+            Program {
+                program: &'a dyn svod_device::Program,
+                buffers: Vec<u64>,
+                vals: &'a [i64],
+                global_size: Option<[usize; 3]>,
+                local_size: Option<[usize; 3]>,
+            },
+            Copy {
+                dst: u64,
+                src: u64,
+                bytes: usize,
+            },
+            Unsupported,
+        }
+
+        let devices = self
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                PreparedOp::CompiledProgram(kernel) => Some(&kernel.device),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        // A PlanContext owns one physical device. Cross-device linked replay is
+        // retained independently by each backend context; until a backend
+        // exposes that context set, never publish another device's addresses on
+        // the first device's queue.
+        if devices.len() > 1 {
+            let mut devices = devices.into_iter();
+            let expected = devices.next().unwrap().clone();
+            let actual = devices.next().unwrap().clone();
+            return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::MixedComputeDevices { expected, actual }));
+        }
+        let Some(owner) = devices.into_iter().next() else {
+            return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::NoCompiledProgram));
+        };
+
+        // One walk over the plan's endpoints. Native linked replay submits every
+        // kernel argument AND every copy endpoint through this context's
+        // queues; until peer mappings are explicit, all of them must belong to
+        // that exact physical device. Rechecked on every replay so a
+        // replacement buffer cannot patch a foreign VA into a cached plan —
+        // hence the single up-front `NativeDevice::resolve`, which keeps the
+        // process-global AMD device-cache lock out of the per-buffer path.
+        let native = svod_device::buffer::NativeDevice::resolve(owner);
+        for op in &self.ops {
+            let (id, endpoints): (u64, Vec<(usize, Option<CopyEndpoint>)>) = match op {
+                PreparedOp::CompiledProgram(kernel) => {
+                    (kernel.id, kernel.buffer_indices.iter().map(|&index| (index, None)).collect())
+                }
+                PreparedOp::BufferCopy(copy) => (
+                    copy.id,
+                    [CopyEndpoint::Destination, CopyEndpoint::Source]
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(position, endpoint)| {
+                            copy.buffer_indices.get(position).map(|&index| (index, Some(endpoint)))
+                        })
+                        .collect(),
+                ),
+                PreparedOp::CustomFunction(_) => continue,
+            };
+            for (argument, (buffer_index, endpoint)) in endpoints.into_iter().enumerate() {
+                let Some(buffer) = self.buffers.get(buffer_index) else { continue };
+                let actual = buffer.device_spec();
+                if &actual != owner {
+                    return Ok(NativeReplayOutcome::Declined(match endpoint {
+                        Some(endpoint) => NativeReplayDecline::ForeignCopyEndpoint {
+                            operation: id,
+                            endpoint,
+                            expected: owner.clone(),
+                            actual,
+                        },
+                        None => NativeReplayDecline::ForeignProgramEndpoint {
+                            operation: id,
+                            argument,
+                            expected: owner.clone(),
+                            actual,
+                        },
+                    }));
+                }
+                if !buffer
+                    .matches_native(&native)
+                    .context(ExecSnafu { context: format!("validate native operation {id} endpoint {argument}") })?
+                {
+                    return Ok(NativeReplayOutcome::Declined(match endpoint {
+                        Some(endpoint) => NativeReplayDecline::IncompatibleCopyAllocation {
+                            operation: id,
+                            endpoint,
+                            expected: owner.clone(),
+                        },
+                        None => NativeReplayDecline::IncompatibleProgramAllocation {
+                            operation: id,
+                            argument,
+                            expected: owner.clone(),
+                        },
+                    }));
+                }
+            }
+        }
+        let Some(first) = self.op_levels.iter().flatten().find_map(|&index| match &self.ops[index] {
+            PreparedOp::CompiledProgram(kernel) => Some(kernel.kernel.program.as_ref()),
+            _ => None,
+        }) else {
+            return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::NoCompiledProgram));
+        };
+        let Some(ctx) = self.plan_ctx(first)? else {
+            return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::NoPlanContext));
+        };
+        let mut values = Vec::with_capacity(self.ops.len());
+        for op in &self.ops {
+            values.push(match op {
+                PreparedOp::CompiledProgram(kernel) => {
+                    let buffers = kernel
+                        .buffer_indices
+                        .iter()
+                        .map(|&index| {
+                            self.buffers[index].device_address().context(ExecSnafu {
+                                context: format!("resolve linked replay buffer for kernel {}", kernel.id),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
+                    CallValues::Program {
+                        program: kernel.kernel.program.as_ref(),
+                        buffers,
+                        vals: &kernel.vals,
+                        global_size,
+                        local_size,
+                    }
+                }
+                PreparedOp::BufferCopy(copy) if copy.buffer_indices.len() >= 2 => {
+                    match (self.buffers.get(copy.buffer_indices[0]), self.buffers.get(copy.buffer_indices[1])) {
+                        (Some(dst), Some(src)) if dst.size() == src.size() => CallValues::Copy {
+                            dst: dst
+                                .device_address()
+                                .context(ExecSnafu { context: format!("resolve linked copy {} dst", copy.id) })?,
+                            src: src
+                                .device_address()
+                                .context(ExecSnafu { context: format!("resolve linked copy {} src", copy.id) })?,
+                            bytes: dst.size(),
+                        },
+                        _ => CallValues::Unsupported,
+                    }
+                }
+                _ => CallValues::Unsupported,
+            });
+        }
+        let calls = values
+            .iter()
+            .map(|call| match call {
+                CallValues::Program { program, buffers, vals, global_size, local_size } => {
+                    svod_device::PlanCall::Program {
+                        program: *program,
+                        buffers,
+                        vals,
+                        global_size: *global_size,
+                        local_size: *local_size,
+                    }
+                }
+                CallValues::Copy { dst, src, bytes } => {
+                    svod_device::PlanCall::Copy { dst: *dst, src: *src, bytes: *bytes }
+                }
+                CallValues::Unsupported => svod_device::PlanCall::Unsupported,
+            })
+            .collect::<Vec<_>>();
+        ctx.replay_linked_plan(semantic, &calls).context(ExecSnafu { context: "replay native linked HCQ plan" })
+    }
+
+    fn buffer_access(&self, index: usize) -> Result<BufferAccess> {
+        let buffer = self.buffers.get(index).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("HCQ buffer index {index} out of range ({} buffers)", self.buffers.len()),
+        })?;
+        Ok(BufferAccess {
+            storage: buffer.storage_id(),
+            owner: buffer.device_spec(),
+            start: buffer.offset(),
+            end: buffer.offset().saturating_add(buffer.size()),
+        })
+    }
+
+    fn graph_endpoints_match_device(&self) -> Result<bool> {
+        // Resolve once per distinct kernel device instead of once per buffer:
+        // a captured chain is single-device, so this is one resolve per plan.
+        let mut resolved: Option<(DeviceSpec, svod_device::buffer::NativeDevice)> = None;
+        for op in &self.ops {
+            let PreparedOp::CompiledProgram(kernel) = op else { continue };
+            if resolved.as_ref().is_none_or(|(spec, _)| spec != &kernel.device) {
+                resolved = Some((kernel.device.clone(), svod_device::buffer::NativeDevice::resolve(&kernel.device)));
+            }
+            let native = &resolved.as_ref().expect("resolved above").1;
+            for &index in &kernel.buffer_indices {
+                if self.buffers[index].device_spec() != kernel.device
+                    || !self.buffers[index]
+                        .matches_native(native)
+                        .context(ExecSnafu { context: format!("validate graph kernel {} endpoint", kernel.id) })?
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn hcq_operations(&self) -> Result<Vec<HcqPreparedOperation>> {
+        use svod_device::hcq::QueueKind;
+
+        let mut operations = Vec::with_capacity(self.ops.len());
+        for &operation in self.op_levels.iter().flatten() {
+            let (device, queue, read_indices, write_indices, is_copy) = match &self.ops[operation] {
+                PreparedOp::CompiledProgram(kernel) => {
+                    let reads = kernel.read_positions().map(|position| kernel.buffer_indices[position]).collect();
+                    let writes =
+                        kernel.output_indices.iter().map(|&position| kernel.buffer_indices[position]).collect();
+                    (kernel.device.clone(), QueueKind::Compute(0), reads, writes, false)
+                }
+                PreparedOp::BufferCopy(copy) => {
+                    let device = copy
+                        .buffer_indices
+                        .first()
+                        .and_then(|&index| self.buffers.get(index))
+                        .map(Buffer::device_spec)
+                        .unwrap_or_else(|| self.device.clone());
+                    if copy.buffer_indices.len() < 2 {
+                        (device, QueueKind::Copy(0), Vec::new(), Vec::new(), true)
+                    } else {
+                        (device, QueueKind::Copy(0), vec![copy.buffer_indices[1]], vec![copy.buffer_indices[0]], true)
+                    }
+                }
+                PreparedOp::CustomFunction(custom) => {
+                    // Custom functions do not expose an outs list. Conservatively
+                    // model every argument as both read and written.
+                    (
+                        self.device.clone(),
+                        QueueKind::Compute(0),
+                        custom.buffer_indices.clone(),
+                        custom.buffer_indices.clone(),
+                        false,
+                    )
+                }
+            };
+            let map_access = |index| -> Result<BufferAccess> {
+                // Keep malformed calls capturable so their established typed
+                // execution errors are still reported when the call runs.
+                Ok(self.buffer_access(index).unwrap_or(BufferAccess {
+                    storage: BufferId(u64::MAX - index as u64),
+                    owner: self.device.clone(),
+                    start: 0,
+                    end: 1,
+                }))
+            };
+            let reads = read_indices.into_iter().map(map_access).collect::<Result<Vec<_>>>()?;
+            let writes = write_indices.into_iter().map(map_access).collect::<Result<Vec<_>>>()?;
+            operations.push(HcqPreparedOperation { operation, device, queue, reads, writes, is_copy });
+        }
+        Ok(operations)
+    }
+
+    fn submission_error(error: svod_device::hcq::SubmissionExecutionError<crate::error::Error>) -> crate::error::Error {
+        match error {
+            svod_device::hcq::SubmissionExecutionError::Queue(source) => {
+                crate::error::Error::Exec { source, context: "CPU HCQ submission".into() }
+            }
+            svod_device::hcq::SubmissionExecutionError::Execute(error) => error,
+        }
+    }
+
     fn kernel_launch_sizes(kernel: &PreparedKernel) -> Result<RuntimeLaunchSizes> {
         let mut vars: HashMap<&str, i64> =
             HashMap::with_capacity(kernel.kernel.var_names.len() + kernel.fixedvars.len());
@@ -346,8 +740,9 @@ impl ExecutionPlan {
         // (below). Non-graphable plans (runtime vars, no graph factory, chains the
         // backend declines to capture, mixed devices) fall back to per-call via
         // the `Ok(None)` returns below.
-        let all_static_kernels =
-            self.ops.iter().all(|op| matches!(op, PreparedOp::CompiledProgram(k) if k.runtime_vars.is_empty()));
+        let all_static_kernels = self.ops.iter().all(
+            |op| matches!(op, PreparedOp::CompiledProgram(k) if k.runtime_vars.is_empty() && k.device == self.device),
+        );
         if !all_static_kernels || self.ops.is_empty() {
             tracing::debug!(
                 target: "svod_runtime::graph",
@@ -356,7 +751,7 @@ impl ExecutionPlan {
                 with_runtime_vars =
                     self.ops.iter().filter(|o| matches!(o, PreparedOp::CompiledProgram(k) if !k.runtime_vars.is_empty())).count(),
                 custom = self.ops.iter().filter(|o| matches!(o, PreparedOp::CustomFunction(_))).count(),
-                copies = self.ops.iter().filter(|o| matches!(o, PreparedOp::BufferCopy(_) | PreparedOp::BufferView(_))).count(),
+                copies = self.ops.iter().filter(|o| matches!(o, PreparedOp::BufferCopy(_))).count(),
                 "graph: per-call fallback (not all-static-compiled)"
             );
             return Ok(None);
@@ -400,11 +795,19 @@ impl ExecutionPlan {
                 let (global_size, local_size) = Self::kernel_launch_sizes(k)?;
                 let e = kernels.len();
 
-                let write_pos: std::collections::HashSet<usize> = k.output_indices.iter().copied().collect();
+                let current_addresses = k
+                    .buffer_indices
+                    .iter()
+                    .map(|&buffer| {
+                        self.buffers[buffer]
+                            .device_address()
+                            .context(ExecSnafu { context: format!("resolve graph buffer for kernel {}", k.id) })
+                            .map(|address| address as usize)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let writes: Vec<usize> =
-                    k.output_indices.iter().filter_map(|&j| k.buffer_ptrs.get(j).copied()).collect();
-                let reads: Vec<usize> =
-                    (0..k.buffer_ptrs.len()).filter(|j| !write_pos.contains(j)).map(|j| k.buffer_ptrs[j]).collect();
+                    k.output_indices.iter().filter_map(|&j| current_addresses.get(j).copied()).collect();
+                let reads: Vec<usize> = k.read_positions().filter_map(|j| current_addresses.get(j).copied()).collect();
 
                 let mut deps: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 for &b in &reads {
@@ -435,7 +838,7 @@ impl ExecutionPlan {
 
                 kernels.push(svod_device::GraphKernel {
                     program: k.kernel.program.as_ref(),
-                    buffers: k.buffer_ptrs.iter().map(|&p| p as *mut u8).collect(),
+                    buffers: current_addresses.iter().map(|&p| p as *mut u8).collect(),
                     vals: k.vals.clone(),
                     global_size,
                     local_size,
@@ -475,13 +878,24 @@ impl ExecutionPlan {
         kernel: &PreparedKernel,
         profile: bool,
     ) -> Result<Option<Arc<dyn svod_device::DispatchTimestamps>>> {
-        let buffer_ptrs: SmallVec<[*mut u8; 8]> = kernel.buffer_ptrs.iter().map(|&ptr| ptr as *mut u8).collect();
+        let buffer_ptrs: SmallVec<[*mut u8; 8]> = kernel
+            .buffer_indices
+            .iter()
+            .map(|&index| {
+                self.buffers[index]
+                    .device_address()
+                    .map(|address| address as *mut u8)
+                    .context(ExecSnafu { context: format!("resolve replay buffer for kernel {}", kernel.id) })
+            })
+            .collect::<Result<_>>()?;
         let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
         let program = kernel.kernel.program.as_ref();
         // Backends that expose a reusable context dispatch through it so all the
         // plan's kernels share one queue. Others (CPU) return `None` and fall
         // back to per-call `Program::execute`.
-        if let Some(ctx) = self.plan_ctx(program)? {
+        if kernel.device == self.device
+            && let Some(ctx) = self.plan_ctx(program)?
+        {
             return unsafe { ctx.dispatch(program, &buffer_ptrs, &kernel.vals, global_size, local_size, profile) }
                 .context(ExecSnafu { context: format!("dispatch kernel {}", kernel.id) });
         }
@@ -504,7 +918,17 @@ impl ExecutionPlan {
                         if kernel.fixedvars.contains_key(&var.name) || var.name == "core_id" {
                             continue;
                         }
-                        if let Some(&value) = vals_map.get(var.name.as_str()) {
+                        // A variable left unbound at prepare time still carries a
+                        // placeholder in `vals`; validate that too, so a binding
+                        // that never arrives is caught here rather than at prepare.
+                        let current = kernel
+                            .kernel
+                            .var_names
+                            .iter()
+                            .position(|name| name == &var.name)
+                            .and_then(|index| kernel.vals.get(index))
+                            .copied();
+                        if let Some(value) = vals_map.get(var.name.as_str()).copied().or(current) {
                             validate_var_bound(&var.name, value, var.min_val, var.max_val)?;
                         }
                     }
@@ -519,7 +943,7 @@ impl ExecutionPlan {
                         }
                     }
                 }
-                PreparedOp::BufferCopy(_) | PreparedOp::BufferView(_) => {}
+                PreparedOp::BufferCopy(_) => {}
             }
         }
         Ok(())
@@ -591,52 +1015,63 @@ impl ExecutionPlan {
         dst.copy_from(src).context(ExecSnafu { context: format!("copy op {}", copy.id) })
     }
 
-    #[inline]
-    fn execute_buffer_view(&self, view: &PreparedBufferView) -> Result<()> {
-        if view.buffer_indices.len() < 2 {
+    fn copy_buffers(&self, operation: usize) -> Result<(&Buffer, &Buffer)> {
+        let PreparedOp::BufferCopy(copy) = self.ops.get(operation).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("HCQ copy operation {operation} is out of range"),
+        })?
+        else {
             return Err(crate::error::Error::Execution {
-                reason: format!(
-                    "BufferView op {} requires at least two buffer indices (out, base), got {}",
-                    view.id,
-                    view.buffer_indices.len()
-                ),
+                reason: format!("HCQ copy leg references non-copy operation {operation}"),
+            });
+        };
+        if copy.buffer_indices.len() < 2 {
+            return Err(crate::error::Error::Execution {
+                reason: format!("Copy op {} requires at least two buffer indices", copy.id),
             });
         }
-        let out_idx = view.buffer_indices[0];
-        let base_idx = view.buffer_indices[1];
-
-        if out_idx >= self.buffers.len() || base_idx >= self.buffers.len() {
+        let dst = self.buffers.get(copy.buffer_indices[0]).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("Copy op {} destination buffer is out of range", copy.id),
+        })?;
+        let src = self.buffers.get(copy.buffer_indices[1]).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("Copy op {} source buffer is out of range", copy.id),
+        })?;
+        if dst.size() != src.size() {
             return Err(crate::error::Error::Execution {
-                reason: format!(
-                    "BufferView op {} buffer index out of range: out={}, base={}, total_buffers={}",
-                    view.id,
-                    out_idx,
-                    base_idx,
-                    self.buffers.len()
-                ),
+                reason: format!("Copy op {} size mismatch: dst={}, src={}", copy.id, dst.size(), src.size()),
             });
         }
+        Ok((dst, src))
+    }
 
-        let out = &self.buffers[out_idx];
-        let base = &self.buffers[base_idx];
-        let expected_offset = base.offset() + view.byte_offset;
+    fn execute_topology_command(
+        &self,
+        command: &svod_device::hcq::TopologyCommand,
+        staging: &mut HashMap<usize, Vec<u8>>,
+    ) -> Result<()> {
+        use svod_device::hcq::CopyLeg;
 
-        if out.storage_id() != base.storage_id() || out.offset() != expected_offset || out.size() != view.byte_size {
-            return Err(crate::error::Error::Execution {
-                reason: format!(
-                    "BufferView op {} mismatch: out(storage={:?},off={},size={}) base(storage={:?},off={}) expected(off={},size={})",
-                    view.id,
-                    out.storage_id(),
-                    out.offset(),
-                    out.size(),
-                    base.storage_id(),
-                    base.offset(),
-                    expected_offset,
-                    view.byte_size,
-                ),
-            });
+        match command.copy_leg {
+            None => self.execute_op(&self.ops[command.operation]),
+            Some(CopyLeg::Direct) => {
+                let PreparedOp::BufferCopy(copy) = &self.ops[command.operation] else { unreachable!() };
+                self.execute_copy(copy)
+            }
+            Some(CopyLeg::ToHost) => {
+                let (_, src) = self.copy_buffers(command.operation)?;
+                let mut bytes = vec![0; src.size()];
+                src.copyout(&mut bytes).context(ExecSnafu { context: "HCQ staged copy to host" })?;
+                staging.insert(command.operation, bytes);
+                Ok(())
+            }
+            Some(CopyLeg::FromHost) => {
+                let (dst, _) = self.copy_buffers(command.operation)?;
+                let bytes = staging.remove(&command.operation).ok_or_else(|| crate::error::Error::Execution {
+                    reason: format!("HCQ staged copy {} has no host epoch buffer", command.operation),
+                })?;
+                let mut dst = dst.clone();
+                dst.copyin(&bytes).context(ExecSnafu { context: "HCQ staged copy from host" })
+            }
         }
-        Ok(())
     }
 
     #[inline]
@@ -677,7 +1112,6 @@ impl ExecutionPlan {
         match op {
             PreparedOp::CompiledProgram(kernel) => self.execute_kernel(kernel, /*profile=*/ false).map(|_| ()),
             PreparedOp::BufferCopy(copy) => self.execute_copy(copy),
-            PreparedOp::BufferView(view) => self.execute_buffer_view(view),
             PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom),
         }
     }
@@ -723,7 +1157,13 @@ impl ExecutionPlan {
         let src_index = *self.output_buffer_indices.get(out_pos).ok_or_else(|| crate::error::Error::Execution {
             reason: format!("copy_output_region_to_buffer: output {out_pos} out of range"),
         })?;
-        if src_index == dst_index {
+        let src = self.buffers.get(src_index).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("copy_output_region_to_buffer: source buffer {src_index} out of range"),
+        })?;
+        let dst = self.buffers.get(dst_index).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("copy_output_region_to_buffer: destination buffer {dst_index} out of range"),
+        })?;
+        if src.storage_id() == dst.storage_id() {
             return Err(crate::error::Error::Execution {
                 reason: "copy_output_region_to_buffer: output aliases destination".into(),
             });
@@ -803,17 +1243,70 @@ impl ExecutionPlan {
     /// whose codegen is sensitive to within-level scheduling order — see
     /// `test_execute_walks_op_levels_in_level_order`.
     pub fn execute(&self) -> Result<()> {
-        // Fast path: one captured graph submit instead of per-kernel dispatch.
-        // Built once, then every call just replays.
-        if let Some(graph) = self.graph().as_deref() {
-            return graph.replay(&[]).context(ExecSnafu { context: "graph replay" });
-        }
-        for level in &self.op_levels {
-            for &idx in level {
-                self.execute_op(&self.ops[idx])?;
+        self.check_hcq_poison()?;
+        // One plan has one mutable replay epoch regardless of backend path.
+        // Native, graph, direct, and profiled execution share this lock.
+        let mut executor = self
+            .hcq_executor
+            .lock()
+            .map_err(|_| crate::error::Error::Execution { reason: "CPU HCQ executor lock poisoned".into() })?;
+        let mut graph_replayed = false;
+        // Both pre-flight checks run inside the poisoning closure: a failed
+        // endpoint validation or native submit leaves the plan's timelines in
+        // an unknown state, so it must not stay retryable.
+        let result = (|| {
+            let graph = self.graph_endpoints_match_device()?.then(|| self.graph()).and_then(|graph| graph.as_deref());
+            if graph.is_none()
+                && matches!(self.replay_native_linked_plan()?, svod_device::device::NativeReplayOutcome::Executed)
+            {
+                return Ok(());
             }
+            let linked = self.hcq_linked.get().expect("HCQ plan linked by builder");
+            let mut staging = HashMap::new();
+            // SAFETY: semantic plan submissions contain only waits, callback
+            // execution, and timeline stores; copies are resolved by Buffer.
+            unsafe {
+                linked.semantic.execute_cpu(&mut executor, |_, command| {
+                    if let Some(graph) = graph {
+                        if !graph_replayed {
+                            let mut buffers = Vec::new();
+                            let mut vals = Vec::new();
+                            for level in &self.op_levels {
+                                for &index in level {
+                                    if let PreparedOp::CompiledProgram(kernel) = &self.ops[index] {
+                                        for &buffer in &kernel.buffer_indices {
+                                            buffers.push(self.buffers[buffer].device_address().context(ExecSnafu {
+                                                context: format!(
+                                                    "resolve graph replay buffer for kernel {}",
+                                                    kernel.id
+                                                ),
+                                            })?);
+                                        }
+                                        vals.extend_from_slice(&kernel.vals);
+                                    }
+                                }
+                            }
+                            graph.replay(&buffers, &vals).context(ExecSnafu { context: "graph replay" })?;
+                            graph_replayed = true;
+                        }
+                    } else {
+                        self.execute_topology_command(command, &mut staging)?;
+                    }
+                    Ok(())
+                })
+            }
+            .map_err(Self::submission_error)?;
+            if let Some(ctx) = self.plan_ctx.get().and_then(|context| context.as_deref()) {
+                ctx.finish_replay().context(ExecSnafu { context: "finish direct HCQ replay" })?;
+            }
+            Ok(())
+        })();
+        if result.is_err()
+            && let Some(ctx) = self.plan_ctx.get().and_then(|context| context.as_deref())
+        {
+            let _ = ctx.finish_replay();
         }
-        Ok(())
+        self.poison_hcq(result)
     }
 
     /// Execute the plan with per-kernel timing.
@@ -833,60 +1326,125 @@ impl ExecutionPlan {
     ///     println!("{:>8.3}ms  {}", p.wall.as_secs_f64() * 1000.0, p.kernel.entry_point);
     /// }
     /// ```
-    /// Always dispatches per-kernel (never the captured graph): a graph replay
-    /// has one signal per batch, so per-dispatch stamps don't exist there.
-    /// Profiled timings reflect per-dispatch execution, not graph replay.
+    /// Uses a captured graph's linked profiling variant when the backend exposes
+    /// per-dispatch stamps; otherwise falls back to profiled per-call submissions.
     pub fn execute_profiled(&self) -> Result<Vec<KernelProfile>> {
-        let mut profiles = Vec::with_capacity(self.op_order.len());
-        // Per-dispatch HW timestamp handles, harvested after the drain below
-        // (the GPU stamps a dispatch's signal only on retirement).
-        let mut handles: Vec<Option<Arc<dyn svod_device::DispatchTimestamps>>> =
-            Vec::with_capacity(self.op_order.len());
-        for level in &self.op_levels {
-            for &idx in level {
-                match &self.ops[idx] {
-                    PreparedOp::CompiledProgram(kernel) => {
-                        let start = Instant::now();
-                        let handle = self.execute_kernel(kernel, /*profile=*/ true)?;
-                        handles.push(handle);
-                        profiles.push(KernelProfile {
-                            kernel: Arc::clone(&kernel.kernel),
-                            device: kernel.device.clone(),
-                            num_buffers: kernel.buffer_ptrs.len(),
-                            wall: start.elapsed(),
-                            gpu_start_ns: None,
-                            gpu_end_ns: None,
-                            static_info: None,
-                            counters: None,
+        self.check_hcq_poison()?;
+        let mut finalizer = SubmissionProfileFinalizer::with_capacity(self.op_order.len());
+        let mut executor = self
+            .hcq_executor
+            .lock()
+            .map_err(|_| crate::error::Error::Execution { reason: "CPU HCQ executor lock poisoned".into() })?;
+        let result = (|| {
+            let linked = self.hcq_linked.get().expect("HCQ plan linked by builder");
+
+            if let Some(graph) =
+                self.graph_endpoints_match_device()?.then(|| self.graph()).and_then(|graph| graph.as_deref())
+            {
+                let mut buffers = Vec::new();
+                let mut vals = Vec::new();
+                let mut kernels = Vec::new();
+                for &index in self.op_levels.iter().flatten() {
+                    if let PreparedOp::CompiledProgram(kernel) = &self.ops[index] {
+                        for &buffer in &kernel.buffer_indices {
+                            buffers.push(self.buffers[buffer].device_address().context(ExecSnafu {
+                                context: format!("resolve profiled graph replay buffer for kernel {}", kernel.id),
+                            })?);
+                        }
+                        vals.extend_from_slice(&kernel.vals);
+                        kernels.push(kernel);
+                    }
+                }
+                let start = Instant::now();
+                if let Some(handles) =
+                    graph.replay_profiled(&buffers, &vals).context(ExecSnafu { context: "profiled graph replay" })?
+                {
+                    if handles.len() != kernels.len() {
+                        return Err(crate::error::Error::Execution {
+                            reason: format!(
+                                "profiled graph returned {} timestamps for {} kernels",
+                                handles.len(),
+                                kernels.len()
+                            ),
                         });
                     }
-                    PreparedOp::BufferCopy(copy) => self.execute_copy(copy)?,
-                    PreparedOp::BufferView(view) => self.execute_buffer_view(view)?,
-                    PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom)?,
+                    let wall = start.elapsed();
+                    for (kernel, handle) in kernels.into_iter().zip(handles) {
+                        finalizer.push(
+                            KernelProfile {
+                                kernel: Arc::clone(&kernel.kernel),
+                                device: kernel.device.clone(),
+                                num_buffers: kernel.buffer_ptrs.len(),
+                                wall,
+                                gpu_start_ns: None,
+                                gpu_end_ns: None,
+                                static_info: None,
+                                counters: None,
+                            },
+                            Some(handle),
+                        );
+                    }
+                    // Keep neutral lane timelines coherent without replaying the graph.
+                    unsafe {
+                        linked
+                            .semantic
+                            .execute_cpu(&mut executor, |_, _| Ok::<_, crate::error::Error>(()))
+                            .map_err(Self::submission_error)?;
+                    }
+                    return finalizer.finish(|| Ok(()));
                 }
             }
-        }
-        if handles.iter().any(Option::is_some) {
-            // Handles exist only when a backend stamps dispatches, which means a
-            // context was minted; drain it so the GPU has written back the
-            // per-dispatch timestamps before we read them.
-            if let Some(ctx) = self.plan_ctx.get().and_then(|s| s.as_deref()) {
-                ctx.synchronize().context(ExecSnafu { context: "profiled drain" })?;
+
+            let mut staging = HashMap::new();
+            unsafe {
+                linked.semantic.execute_cpu(&mut executor, |_, command| {
+                    if command.copy_leg.is_some() {
+                        self.execute_topology_command(command, &mut staging)?;
+                    } else {
+                        match &self.ops[command.operation] {
+                            PreparedOp::CompiledProgram(kernel) => {
+                                let start = Instant::now();
+                                let handle = self.execute_kernel(kernel, /*profile=*/ true)?;
+                                finalizer.push(
+                                    KernelProfile {
+                                        kernel: Arc::clone(&kernel.kernel),
+                                        device: kernel.device.clone(),
+                                        num_buffers: kernel.buffer_ptrs.len(),
+                                        wall: start.elapsed(),
+                                        gpu_start_ns: None,
+                                        gpu_end_ns: None,
+                                        static_info: None,
+                                        counters: None,
+                                    },
+                                    handle,
+                                );
+                            }
+                            PreparedOp::BufferCopy(copy) => self.execute_copy(copy)?,
+                            PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom)?,
+                        }
+                    }
+                    Ok(())
+                })
             }
-            for (profile, handle) in profiles.iter_mut().zip(&handles) {
-                if let Some((start, end)) = handle.as_ref().and_then(|h| h.timestamps_ns()) {
-                    profile.gpu_start_ns = Some(start);
-                    profile.gpu_end_ns = Some(end);
+            .map_err(Self::submission_error)?;
+            finalizer.finish(|| {
+                if let Some(ctx) = self.plan_ctx.get().and_then(|context| context.as_deref()) {
+                    ctx.synchronize().context(ExecSnafu { context: "profiled HCQ finalizer" })?;
                 }
-                profile.counters = handle.as_ref().and_then(|h| h.counters());
-            }
+                Ok(())
+            })
+        })();
+        if result.is_err()
+            && let Some(ctx) = self.plan_ctx.get().and_then(|context| context.as_deref())
+        {
+            let _ = ctx.finish_replay();
         }
-        Ok(profiles)
+        self.poison_hcq(result)
     }
 
-    /// Profile the plan: run the per-dispatch path `opts.iters` times, keeping
-    /// each kernel's minimum device time (robust to outliers). Returns a
-    /// single-stage [`RunProfile`]; render it with [`RunProfile::render_table`].
+    /// Profile the plan: run the per-dispatch path `opts.iters.max(1)` times,
+    /// keeping each kernel's minimum device time (robust to outliers). Returns
+    /// a single-stage [`RunProfile`]; render it with [`RunProfile::render_table`].
     ///
     /// Tier-2/3 static analysis (`opts.static_analysis`) and Tier-4 hardware
     /// counters (`opts.counters`) attach to each [`KernelProfile`] when enabled.
@@ -921,16 +1479,21 @@ impl ExecutionPlan {
             }
         };
         // Each pass is one "profile" stage; merge passes by per-kernel min time.
-        let run = |kernels| RunProfile { stages: vec![StageProfile::gpu("profile", start.elapsed(), kernels)] };
-        let mut report = run(self.execute_profiled()?);
-        for _ in 1..opts.iters {
-            report.merge_min(run(self.execute_profiled()?));
-        }
+        // Match from_env(): zero iterations still means one profiling pass.
+        let result: Result<RunProfile> = (|| {
+            let run = |kernels| RunProfile { stages: vec![StageProfile::gpu("profile", start.elapsed(), kernels)] };
+            let mut report = run(self.execute_profiled()?);
+            for _ in 1..opts.iters.max(1) {
+                report.merge_min(run(self.execute_profiled()?));
+            }
+            Ok(report)
+        })();
         // Disarm so later non-profiled executions on this context don't pay for
         // (or perturb from) counter programming.
         if let Some(ctx) = armed_ctx {
             ctx.set_pmc(&[]);
         }
+        let mut report = result?;
         if opts.static_analysis {
             // Profiles are in dispatch order; the compiled kernels in op_levels
             // order line up one-to-one, so zip attaches each kernel's analysis.
@@ -1059,6 +1622,7 @@ impl std::fmt::Debug for ExecutionPlan {
             .field("op_order", &self.op_order.len())
             .field("kernels", &kernel_count)
             .field("buffers", &self.buffers.len())
+            .field("hcq_lanes", &self.hcq_linked.get().map(|linked| linked.semantic.lanes().len()))
             .field("device", &self.device)
             .finish()
     }
@@ -1071,6 +1635,7 @@ impl std::fmt::Debug for PreparedKernel {
             .field("device", &self.device)
             .field("buffer_indices", &self.buffer_indices)
             .field("output_indices", &self.output_indices)
+            .field("input_indices", &self.input_indices)
             .field("vals", &self.vals)
             .field("fixedvars", &self.fixedvars)
             .field("dependencies", &self.dependencies)
@@ -1125,11 +1690,6 @@ impl ExecutionPlanBuilder {
         self.ast_to_buffer.insert(ast_id, idx);
     }
 
-    /// Replace a buffer at the given index (for BUFFER_VIEW sub-buffer views).
-    pub fn replace_buffer(&mut self, idx: usize, buffer: Buffer) {
-        self.buffers[idx] = buffer;
-    }
-
     /// Set single output buffer index.
     pub fn set_output_buffer(&mut self, idx: usize) {
         self.output_buffer_indices = vec![idx];
@@ -1170,8 +1730,21 @@ impl ExecutionPlanBuilder {
     /// for zero-allocation execution.
     pub fn build(mut self) -> Result<ExecutionPlan> {
         for op in &mut self.ops {
-            let PreparedOp::CompiledProgram(kernel) = op else {
-                continue;
+            let kernel = match op {
+                PreparedOp::CompiledProgram(kernel) => kernel,
+                // `execute_copy`, `copy_buffers` and `hcq_operations` all need
+                // the (dst, src) pair; a shorter copy degrades to a no-op edge
+                // in the hazard graph. Reject it here instead of at execute.
+                PreparedOp::BufferCopy(copy) if copy.buffer_indices.len() < 2 => {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!(
+                            "BufferCopy {} requires two buffer indices (dst, src), got {}",
+                            copy.id,
+                            copy.buffer_indices.len()
+                        ),
+                    });
+                }
+                PreparedOp::BufferCopy(_) | PreparedOp::CustomFunction(_) => continue,
             };
 
             if kernel.output_indices.is_empty() {
@@ -1186,6 +1759,18 @@ impl ExecutionPlanBuilder {
                             "CompiledProgram {} output index out of range: output_idx={}, kernel_buffers={}",
                             kernel.id,
                             out_idx,
+                            kernel.buffer_indices.len()
+                        ),
+                    });
+                }
+            }
+            for &input_idx in &kernel.input_indices {
+                if input_idx >= kernel.buffer_indices.len() {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!(
+                            "CompiledProgram {} input index out of range: input_idx={}, kernel_buffers={}",
+                            kernel.id,
+                            input_idx,
                             kernel.buffer_indices.len()
                         ),
                     });
@@ -1206,7 +1791,11 @@ impl ExecutionPlanBuilder {
                         ),
                     });
                 };
-                buffer_ptrs.push(unsafe { buffer.as_raw_ptr() } as usize);
+                // Resolve GETADDR on the host after allocation, at the same
+                // PROGRAM -> ExecutionPlan boundary where globals are ordered.
+                buffer_ptrs.push(buffer.device_address().context(ExecSnafu {
+                    context: format!("resolve HCQ GETADDR for kernel {} buffer {}", kernel.id, idx),
+                })? as usize);
                 buffer_ids.push(buffer.id());
             }
 
@@ -1223,7 +1812,7 @@ impl ExecutionPlanBuilder {
         let op_order = compute_mixed_op_order_with_instance_dependencies(&self.ops, &self.op_instance_dependencies)?;
         let op_levels = compute_execution_levels_with_instance_dependencies(&self.ops, &self.op_instance_dependencies)?;
 
-        Ok(ExecutionPlan {
+        let plan = ExecutionPlan {
             ops: self.ops,
             op_instance_dependencies: self.op_instance_dependencies,
             op_order,
@@ -1236,7 +1825,15 @@ impl ExecutionPlanBuilder {
             alias_ids: self.alias_ids,
             graph: std::sync::OnceLock::new(),
             plan_ctx: std::sync::OnceLock::new(),
-        })
+            hcq_executor: Mutex::new(svod_device::hcq::CpuQueueExecutor::default()),
+            hcq_linked: std::sync::OnceLock::new(),
+            hcq_poison: std::sync::OnceLock::new(),
+        };
+        let linked = HcqLinkedPlan::capture(plan.hcq_operations()?)?;
+        plan.hcq_linked.set(linked).map_err(|_| crate::error::Error::Execution {
+            reason: "HCQ plan linked twice during preparation".into(),
+        })?;
+        Ok(plan)
     }
 }
 

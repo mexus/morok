@@ -161,6 +161,8 @@ impl Z3Context {
             }
             ConstValue::Bool(v) => Ok(Dynamic::from_ast(&Bool::from_bool(*v))),
             ConstValue::Float(_) => UnsupportedTypeSnafu { detail: "Float constants not fully supported" }.fail(),
+            // The validity marker has no arithmetic value to encode.
+            ConstValue::Invalid => UnsupportedTypeSnafu { detail: "Invalid marker has no Z3 encoding" }.fail(),
         }
     }
 
@@ -219,16 +221,31 @@ impl Z3Context {
                 let r = rhs.as_int().context(TypeMismatchSnafu { detail: "MUL: expected int" })?;
                 Ok(Dynamic::from_ast(&(l * r)))
             }
-            BinaryOp::Idiv => {
-                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "IDIV: expected int" })?;
-                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "IDIV: expected int" })?;
-                // Use truncated division (C-style)
+            BinaryOp::FloorDiv => {
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "FLOORDIV: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "FLOORDIV: expected int" })?;
+                let q = z3_cdiv(&l, &r);
+                let rem = z3_cmod(&l, &r);
+                let zero = Int::from_i64(0);
+                let adjust = Bool::and(&[rem.eq(&zero).not(), (&l * &r).lt(&zero)]);
+                Ok(Dynamic::from_ast(&adjust.ite(&(q.clone() - 1), &q)))
+            }
+            BinaryOp::FloorMod => {
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "FLOORMOD: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "FLOORMOD: expected int" })?;
+                let rem = z3_cmod(&l, &r);
+                let zero = Int::from_i64(0);
+                let adjust = Bool::and(&[rem.eq(&zero).not(), (&l * &r).lt(&zero)]);
+                Ok(Dynamic::from_ast(&(rem + adjust.ite(&r, &zero))))
+            }
+            BinaryOp::CDiv => {
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "CDIV: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "CDIV: expected int" })?;
                 Ok(Dynamic::from_ast(&z3_cdiv(&l, &r)))
             }
-            BinaryOp::Mod => {
-                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "MOD: expected int" })?;
-                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "MOD: expected int" })?;
-                // Use C-style modulo
+            BinaryOp::CMod => {
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "CMOD: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "CMOD: expected int" })?;
                 Ok(Dynamic::from_ast(&z3_cmod(&l, &r)))
             }
             BinaryOp::Max => {
@@ -301,7 +318,7 @@ fn const_value_to_i64(cv: &ConstValue) -> Option<i64> {
         ConstValue::Int(v) => Some(*v),
         ConstValue::UInt(v) => i64::try_from(*v).ok(),
         ConstValue::Bool(b) => Some(*b as i64),
-        ConstValue::Float(_) => None,
+        ConstValue::Float(_) | ConstValue::Invalid => None,
     }
 }
 

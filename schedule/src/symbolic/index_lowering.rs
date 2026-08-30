@@ -1,287 +1,257 @@
-//! Index dtype lowering patterns.
-//!
-//! Converts abstract Index dtype to concrete integer types (i32 or i64)
-//! based on value bounds analysis. Follows Tinygrad's cascade approach.
-//!
-//! ## Cascade Pattern (from Tinygrad)
-//!
-//! Phase 1 - Create wrappers:
-//!   CONST(Index) → CONST(concrete).cast(Index)
-//!   DEFINE_VAR(Index) → DEFINE_VAR(concrete).cast(Index)
-//!
-//! Phase 2 - Process wrapped values:
-//!   Binary(x.cast(Index), y.cast(Index)) → Binary(x, y, concrete).cast(Index)
-//!   RANGE(end.cast(Index)) → RANGE(end, concrete).cast(Index)
-//!
-//! Phase 3 - Strip at terminals:
-//!   INDEX(idx.cast(Index)) → INDEX(idx)
-//!   SINK/END strip .cast(Index)
+//! Weak dtype lowering, ported from Tinygrad `tinygrad/uop/weak.py`.
 
 use std::sync::Arc;
 
-use svod_dtype::{DType, ScalarDType};
-use svod_ir::types::ConstValue;
+use svod_dtype::DType;
 use svod_ir::uop::cached_property::CachedProperty;
 use svod_ir::uop::properties::VminVmaxProperty;
-use svod_ir::{Op, UOp};
+use svod_ir::{ConstValue, Op, TernaryOp, UOp};
 
 use crate::TypedPatternMatcher;
 
-/// Select concrete dtype based on bounds analysis.
-fn select_dtype(uop: &Arc<UOp>) -> DType {
-    let (vmin, vmax) = VminVmaxProperty::get(uop);
+pub fn select_dtype(u: &Arc<UOp>) -> DType {
+    if u.dtype().base() == svod_dtype::ScalarDType::WeakFloat {
+        return DType::default_float().vec(u.dtype().vcount()).expect("default dtype is scalar");
+    }
+    let (vmin, vmax) = VminVmaxProperty::get(u);
     let fits_i32 = match (vmin, vmax) {
-        (ConstValue::Int(min), ConstValue::Int(max)) => *min >= i32::MIN as i64 && *max <= i32::MAX as i64,
-        (ConstValue::UInt(min), ConstValue::UInt(max)) => *min <= i32::MAX as u64 && *max <= i32::MAX as u64,
+        (ConstValue::Int(lo), ConstValue::Int(hi)) => *lo >= i32::MIN as i64 && *hi <= i32::MAX as i64,
+        (ConstValue::UInt(lo), ConstValue::UInt(hi)) => *lo <= i32::MAX as u64 && *hi <= i32::MAX as u64,
         (ConstValue::Bool(_), ConstValue::Bool(_)) => true,
         _ => false,
     };
-    if fits_i32 { DType::Scalar(ScalarDType::Int32) } else { DType::Scalar(ScalarDType::Int64) }
+    (if fits_i32 { DType::default_int() } else { DType::Int64 })
+        .vec(u.dtype().vcount())
+        .expect("selected dtype is scalar")
 }
 
-/// Compute least upper dtype for integer types.
-fn least_upper_dtype(a: &DType, b: &DType) -> DType {
-    match (a, b) {
-        (DType::Scalar(ScalarDType::Int64), _) | (_, DType::Scalar(ScalarDType::Int64)) => {
-            DType::Scalar(ScalarDType::Int64)
+fn is_lower_weak_node(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Unary(..)
+            | Op::Binary(..)
+            | Op::Ternary(TernaryOp::Where, ..)
+            | Op::Range { .. }
+            | Op::Stack { .. }
+            | Op::Special { .. }
+    )
+}
+
+pub fn lower_weak_node(u: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let start = usize::from(matches!(u.op(), Op::Ternary(TernaryOp::Where, ..)));
+    let old_src = u.op().sources();
+    let src: Vec<_> = old_src
+        .iter()
+        .map(|s| match s.op() {
+            Op::Cast { src, dtype } if dtype.is_weak() => src.clone(),
+            _ => s.clone(),
+        })
+        .collect();
+    let unwrapped = src.iter().zip(&old_src).any(|(a, b)| !Arc::ptr_eq(a, b));
+    if (!u.dtype().is_weak() && !unwrapped) || src[start..].iter().any(|s| s.dtype().is_weak()) {
+        return None;
+    }
+
+    let mut dt = if matches!(u.op(), Op::Binary(..)) {
+        let mut dtypes = Vec::with_capacity(src.len() + 1);
+        dtypes.push(select_dtype(u).scalar_dtype());
+        dtypes.extend(src.iter().map(|s| s.dtype().scalar_dtype()));
+        let scalar = DType::least_upper_dtype(&dtypes)?.strong_dtype();
+        let vcount = if matches!(u.op(), Op::Binary(op, ..) if op.is_comparison()) {
+            src.iter().map(|s| s.dtype().vcount()).max().unwrap_or(1)
+        } else {
+            u.dtype().vcount()
+        };
+        scalar.vec(vcount)?
+    } else {
+        svod_ir::dtype_from_op(u.with_sources(src.clone()).op())?.strong_dtype()
+    };
+    if matches!(u.op(), Op::Stack { .. }) {
+        dt = dt.scalar_dtype();
+    }
+    let lowered = src[..start]
+        .iter()
+        .cloned()
+        .chain(src[start..].iter().map(|s| {
+            if UOp::is_invalid_marker(s) {
+                s.clone()
+            } else if dt.vcount() == 1 && s.dtype().vcount() > 1 {
+                UOp::stack((0..s.dtype().vcount()).map(|lane| s.index_axes(vec![lane]).cast(dt.clone())).collect())
+            } else {
+                s.cast(dt.clone())
+            }
+        }))
+        .collect();
+    let lowered = u.with_sources(lowered);
+    let lowered = lowered.with_dtype(svod_ir::dtype_from_op(lowered.op())?.strong_dtype());
+    // STACK derives its promoted scalar dtype from its lanes. Keeping an outer
+    // weak CAST reconstructs the original STACK during cast folding and cycles.
+    let lowered = if matches!(u.op(), Op::Stack { .. }) || !unwrapped || u.dtype().vcount() > 1 {
+        lowered
+    } else {
+        lowered.cast(u.dtype())
+    };
+    (!Arc::ptr_eq(&lowered, u)).then_some(lowered)
+}
+
+pub fn pm_lower_weak() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
+        u @const(value) if u.dtype().is_weak() => |u, value| {
+            Some(UOp::const_(select_dtype(u), value).cast(u.dtype()))
+        },
+        u @ VConst { values } if u.dtype().is_weak() => |u, values| {
+            Some(UOp::try_vconst(values.clone(), select_dtype(u).scalar_dtype()).ok()?.cast(u.dtype()))
+        },
+        u @ Cast { src: inner, dtype } if dtype.is_weak() => |u, inner| {
+            let Op::Cast { src: x, dtype: inner_dtype } = inner.op() else { return None };
+            if !inner_dtype.is_weak() || x.dtype().is_weak() { return None; }
+            Some(x.cast(select_dtype(u)).cast(u.dtype()))
+        },
+        u @ Index { buffer, indices } if u.dtype().is_weak() => |u, buffer, indices| {
+            let buffer = buffer.cast(select_dtype(u));
+            let indices = indices.iter().map(|index| {
+                if index.dtype().is_weak() { commit_weak(index, select_dtype(index)) } else { index.clone() }
+            });
+            Some(u.with_sources(std::iter::once(buffer).chain(indices).collect()))
+        },
+        u if is_lower_weak_node(u.op()) => |u| lower_weak_node(u),
+        u @ Param { shape, arg } if u.dtype() == DType::WeakInt => |u, shape, arg| {
+            if arg.addrspace.is_some() { return None; }
+            let mut arg = arg.clone();
+            arg.dtype = select_dtype(u);
+            Some(UOp::new(Op::Param { shape: shape.clone(), arg }, select_dtype(u)).cast(DType::WeakInt))
+        },
+    }
+}
+
+/// The `ctx:dict[UOp, UOp]` upstream threads through `pm_lower_index_dtype`
+/// (`tinygrad/uop/weak.py:29-40`, `:70`), created once per `to_program` by the
+/// single `ctx={}` at `tinygrad/codegen/__init__.py:349`. Keyed by source
+/// identity: hash-consing makes `s.id` the same key `UOp` is upstream.
+pub type WeakMemo = rustc_hash::FxHashMap<u64, Arc<UOp>>;
+
+pub fn lower_weak_srcs(memo: &mut WeakMemo, u: &Arc<UOp>) -> Option<Arc<UOp>> {
+    fn lower(memo: &mut WeakMemo, s: &Arc<UOp>) -> Arc<UOp> {
+        if let Some(cached) = memo.get(&s.id) {
+            return cached.clone();
         }
-        _ => DType::Scalar(ScalarDType::Int32),
+        let r = crate::rewrite::graph_rewrite(pm_lower_weak(), s.clone(), &mut ());
+        // the consumer absorbs the cast on its own edge
+        let r = match r.op() {
+            Op::Cast { src, dtype } if dtype.is_weak() => src.clone(),
+            _ => r,
+        };
+        memo.insert(s.id, r.clone());
+        r
+    }
+
+    if matches!(u.op(), Op::Binary(op, ..) if op.is_comparison()) {
+        let ret = lower(memo, u);
+        return (!Arc::ptr_eq(&ret, u)).then_some(ret);
+    }
+    let old_src = u.op().sources();
+    let src: Vec<_> = old_src.iter().map(|s| if s.dtype().is_weak() { lower(memo, s) } else { s.clone() }).collect();
+    if src.iter().zip(&old_src).all(|(a, b)| Arc::ptr_eq(a, b)) {
+        return None;
+    }
+    let lowered = u.with_sources(src);
+    (!Arc::ptr_eq(&lowered, u)).then_some(lowered)
+}
+
+pub fn commit_weak(s: &Arc<UOp>, dt: DType) -> Arc<UOp> {
+    match s.op() {
+        Op::Const(value) => UOp::const_(dt, value.0),
+        _ => s.cast(dt),
     }
 }
 
-/// Pattern matcher for lowering Index dtype to concrete i32/i64.
-/// Based on Tinygrad's pm_lower_index_dtype.
-pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
+pub fn commit_weak_srcs(u: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let src = u.op().sources();
+    if !src.iter().any(|s| s.dtype().is_weak()) {
+        return None;
+    }
+    let dt = DType::least_upper_dtype(&src.iter().map(|s| s.dtype()).collect::<Vec<_>>())?;
+    if dt.is_weak() {
+        return None;
+    }
+    Some(u.with_sources(
+        src.iter().map(|s| if s.dtype().is_weak() { commit_weak(s, dt.clone()) } else { s.clone() }).collect(),
+    ))
+}
+
+pub fn pm_commit_weak() -> TypedPatternMatcher {
     crate::patterns! {
-        // ================================================================
-        // PHASE 1: Create wrappers (leaf nodes)
-        // ================================================================
-
-        // CONST(Index) → CONST(concrete).cast(Index)
-        // Tinygrad: u.replace(dtype=select_dtype(u)).cast(u.dtype)
-        c @const(cv) if c.dtype() == DType::Index => |c, cv| {
-            let dt = select_dtype(c);
-            Some(UOp::const_(dt, cv).cast(DType::Index))
-        },
-
-        // VCONST(Vector<Index, N>) → VCONST(Vector<concrete, N>).cast(Vector<Index, N>)
-        // Tinygrad: (CONST, VCONST) with dtype=index → u.replace(dtype=select_dtype(u)).cast(u.dtype)
-        vc @ VConst { values } if vc.dtype().base() == ScalarDType::Index => |vc, values| {
-            let dt = select_dtype(vc);
-            let vcount = vc.dtype().vcount();
-            let vec_dt = dt.vec(vcount).expect("select_dtype returns a scalar");
-            let vec_index_dt = DType::Vector { scalar: ScalarDType::Index, count: vcount };
-            let new_vc = UOp::new(Op::VConst { values: values.clone() }, vec_dt);
-            Some(new_vc.cast(vec_index_dt))
-        },
-
-        // DEFINE_VAR(Index) → DEFINE_VAR(concrete).cast(Index)
-        dv @ DefineVar { name, min_val, max_val } if dv.dtype() == DType::Index => |dv, name, min_val, max_val| {
-            let dt = select_dtype(dv);
-            let var = UOp::new(Op::DefineVar { name: name.clone(), min_val: *min_val, max_val: *max_val }, dt);
-            Some(var.cast(DType::Index))
-        },
-
-        // ================================================================
-        // PHASE 2: Process wrapped values
-        // ================================================================
-
-        // AFTER(x.cast(Index), deps) → AFTER(x, deps).cast(Index)
-        // Push the ordering wrapper inside the cast so the AFTER's result is a
-        // `cast(Index)` wrapper that the Binary/Where/etc. rules below can match
-        // and lower. AFTER is pure ordering metadata (dtype = passthrough dtype),
-        // so moving it onto the concrete-int passthrough preserves both the
-        // dependency and the lowering. Without this, a hand-built kernel that
-        // anchors an Index value to a loop scope (`x.after(scope)`) would leave an
-        // un-lowered `Op::Binary(Index)` for codegen.
-        node @ After { passthrough, deps } if node.dtype() == DType::Index => |node, passthrough, deps| {
-            let Op::Cast { src, dtype } = passthrough.op() else { return None };
-            if *dtype != DType::Index { return None; }
-            Some(src.after(deps.clone()).cast(DType::Index))
-        },
-
-        // Unary(x.cast(Index)) → Unary(x.cast(dt), dt).cast(Index)
-        // Handles Neg and other unary ops on Index-wrapped values.
-        node if matches!(node.op(), Op::Unary(_, _)) && node.dtype() == DType::Index => |node| {
-            let Op::Unary(op, x) = node.op() else { return None };
-            let Op::Cast { src, dtype } = x.op() else { return None };
-            if *dtype != DType::Index { return None; }
-
-            let dt = least_upper_dtype(&select_dtype(node), &src.dtype());
-            let result = UOp::new(Op::Unary(*op, src.cast(dt.clone())), dt);
-            Some(result.cast(DType::Index))
-        },
-
-        // Binary(x.cast(Index), y.cast(Index)) → alu(op, x.cast(dt), y.cast(dt)).cast(u.dtype)
-        // Tinygrad: x.cast(dt:=least_upper_dtype(select_dtype(u), x.dtype, y.dtype)).alu(u.op, y.cast(dt)).cast(u.dtype)
-        // No dtype guard on result — comparisons (Lt, Ge, etc.) produce Bool, not Index,
-        // but their operands still need unwrapping from .cast(Index).
-        node if matches!(node.op(), Op::Binary(_, _, _)) => |node| {
-            let Op::Binary(op, lhs, rhs) = node.op() else { return None };
-
-            // Both operands must be .cast(Index) wrappers
-            let (Op::Cast { src: x, dtype: lhs_dt }, Op::Cast { src: y, dtype: rhs_dt }) = (lhs.op(), rhs.op()) else {
-                return None;
-            };
-            if *lhs_dt != DType::Index || *rhs_dt != DType::Index {
-                return None;
-            }
-
-            // dt = least_upper_dtype(select_dtype(result), x.dtype, y.dtype)
-            let result_dt = select_dtype(node);
-            let dt = least_upper_dtype(&result_dt, &least_upper_dtype(&x.dtype(), &y.dtype()));
-
-            // alu() auto-selects Bool for comparisons, dt for arithmetic
-            let result = UOp::alu(*op, x.cast(dt.clone()), y.cast(dt));
-            Some(result.cast(node.dtype()))
-        },
-
-        // WHERE(cond, x.cast(Index), y.cast(Index)) → WHERE(cond, x.cast(dt), y.cast(dt)).cast(Index)
-        Where(cond, true_val, false_val)
-            if true_val.dtype() == DType::Index && false_val.dtype() == DType::Index => |cond, true_val, false_val| {
-            let (Op::Cast { src: x, dtype: t_dt }, Op::Cast { src: y, dtype: f_dt }) = (true_val.op(), false_val.op()) else {
-                return None;
-            };
-            if *t_dt != DType::Index || *f_dt != DType::Index {
-                return None;
-            }
-
-            let dt = least_upper_dtype(&x.dtype(), &y.dtype());
-            let result = UOp::try_where(cond.clone(), x.cast(dt.clone()), y.cast(dt)).ok()?;
-            Some(result.cast(DType::Index))
-        },
-
-        // RANGE(end.cast(Index)) → RANGE(end, end.dtype).cast(Index)
-        // Tinygrad: r.replace(dtype=end.dtype, src=(end,)).cast(dtypes.index)
-        range @ Range { end, axis_id, axis_type } if range.dtype() == DType::Index => |end, axis_id, axis_type| {
-            let Op::Cast { src: end_inner, dtype: end_dt } = end.op() else {
-                return None;
-            };
-            if *end_dt != DType::Index {
-                return None;
-            }
-
-            let dt = end_inner.dtype();
-            let result = UOp::new(Op::Range { end: end_inner.clone(), axis_id: *axis_id, axis_type: *axis_type, deps: smallvec::SmallVec::new() }, dt);
-            Some(result.cast(DType::Index))
-        },
-
-        // SPECIAL(end.cast(Index)) → SPECIAL(end, i32).cast(Index)
-        // Tinygrad: u.replace(dtype=dtypes.int, src=(var,)).cast(dtypes.index)
-        special @ Special { name, end } if special.dtype() == DType::Index => |name, end| {
-            let Op::Cast { src: end_inner, dtype: end_dt } = end.op() else {
-                return None;
-            };
-            if *end_dt != DType::Index {
-                return None;
-            }
-
-            let i32_dt = DType::Scalar(ScalarDType::Int32);
-            let result = UOp::new(Op::Special { end: end_inner.clone(), name: name.clone() }, i32_dt);
-            Some(result.cast(DType::Index))
-        },
-
-        // VECTORIZE(e0.cast(Index), ...) → VECTORIZE(e0.cast(dt), ...).cast(Vector<Index>)
-        vec @ Vectorize { elements } if vec.dtype().base() == ScalarDType::Index => |vec, elements| {
-            let inner: Option<Vec<_>> = elements.iter().map(|e| {
-                match e.op() {
-                    Op::Cast { src, dtype } if *dtype == DType::Index => Some(src.clone()),
-                    _ => None,
-                }
-            }).collect();
-            let inner = inner?;
-
-            let dt = select_dtype(vec);
-            let casted: Vec<_> = inner.iter().map(|e| e.cast(dt.clone())).collect();
-            let vec_index_dt = DType::Vector { scalar: ScalarDType::Index, count: elements.len() };
-            Some(UOp::vectorize(casted.into()).cast(vec_index_dt))
-        },
-
-        // BIND(var.cast(Index), val.cast(Index)) → var.bind(val).cast(Index)
-        // Tinygrad: (UPat(Ops.BIND, src=(var.cast(index), val.cast(index))), lambda var,val: var.bind(val).cast(index))
-        Bind { var, value } if var.dtype() == DType::Index => |var, value| {
-            let Op::Cast { src: var_inner, dtype: var_dt } = var.op() else { return None };
-            let Op::Cast { src: val_inner, dtype: val_dt } = value.op() else { return None };
-            if *var_dt != DType::Index || *val_dt != DType::Index { return None; }
-
-            // Compute common dtype for the binding
-            let dt = least_upper_dtype(&var_inner.dtype(), &val_inner.dtype());
-            let bound = var_inner.cast(dt.clone()).bind(val_inner.cast(dt));
-            Some(bound.cast(DType::Index))
-        },
-
-        // ================================================================
-        // PHASE 3: Cleanup - strip wrappers at terminal nodes
-        // ================================================================
-
-        // INDEX(buf, ...idx.cast(Index)...) → INDEX(buf, ...idx...) — strip Cast(Index) from all per-dim indices
-        // Tinygrad: ops.py:1308-1310 — buf.index(idx, ptr=True)
-        // Generalized for multi-index INDEX (Tinygrad keeps multi-index through the pipeline).
-        node @ Index { buffer, indices, gate } => |node, buffer, indices, gate| {
-            let mut changed = false;
-            let new_indices: smallvec::SmallVec<[std::sync::Arc<UOp>; 4]> = indices.iter().map(|idx| {
-                if let Op::Cast { src, dtype } = idx.op()
-                    && *dtype == DType::Index && src.dtype().is_int() {
-                        changed = true;
-                        return src.clone();
-                    }
-                idx.clone()
-            }).collect();
-            if !changed { return None; }
-            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: new_indices, gate: gate.clone() }, node.dtype()))
-        },
-
-        // INDEX(buf, ...WHERE(cond, idx, Invalid)...) → INDEX(buf, ...idx..., gate=AND(conds...))
-        // Tinygrad: ops.py:1306 — extract WHERE-Invalid from index, merge conds into gate
-        // Generalized for multi-index: extracts validity from ALL per-dimension indices.
-        node @ Index { buffer, indices, gate } => |node, buffer, indices, gate| {
-            let mut new_indices: smallvec::SmallVec<[std::sync::Arc<UOp>; 4]> = smallvec::SmallVec::new();
-            let mut conds: Vec<std::sync::Arc<UOp>> = Vec::new();
-            let mut changed = false;
-            for idx in indices.iter() {
-                if let Op::Ternary(svod_ir::TernaryOp::Where, cond, true_val, false_val) = idx.op()
-                    && UOp::is_invalid_marker(false_val) {
-                        new_indices.push(true_val.clone());
-                        conds.push(cond.clone());
-                        changed = true;
-                        continue;
-                    }
-                new_indices.push(idx.clone());
-            }
-            if !changed { return None; }
-            let extracted = conds.into_iter().reduce(|a, b| a.try_and_op(&b).expect("ICE: AND gate merge"));
-            let new_gate = match (gate, extracted) {
-                (Some(existing), Some(ext)) => Some(existing.try_and_op(&ext).expect("ICE: AND gate merge")),
-                (Some(existing), None) => Some(existing.clone()),
-                (None, ext) => ext,
-            };
-            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: new_indices, gate: new_gate }, node.dtype()))
-        },
-
-        // SINK/END - strip .cast(Index) from sources
-        // Tinygrad (ops.py:1311) also includes NOOP here, but Svod's Op::Noop has no sources,
-        // so stripping .cast(Index) from NOOP sources is a no-op.
-
-        // SINK - strip .cast(Index) from sources
-        Sink { sources } => |sources| {
-            let mut changed = false;
-            let new_sources: Vec<Arc<UOp>> = sources.iter().map(|s| {
-                if let Op::Cast { src, dtype } = s.op() && *dtype == DType::Index {
-                    changed = true;
-                    src.clone()
-                } else {
-                    s.clone()
-                }
-            }).collect();
-            if !changed { return None; }
-            Some(UOp::sink(new_sources))
-        },
-
-        // END - strip .cast(Index) from computation
-        End { computation, ranges } => |computation, ranges| {
-            let Op::Cast { src, dtype } = computation.op() else { return None };
-            if *dtype != DType::Index { return None; }
-            Some(UOp::new(Op::End { computation: src.clone(), ranges: ranges.clone() }, DType::Void))
+        u if matches!(u.op(), Op::Binary(..) | Op::Ternary(..)) => |u| commit_weak_srcs(u),
+        u @ Store { index, value, gate } if value.dtype().is_weak() => |u, index, value, gate| {
+            let mut src = vec![index.clone(), commit_weak(value, index.dtype())];
+            src.extend(gate.iter().cloned());
+            Some(u.with_sources(src))
         },
     }
+}
+
+pub fn cast_weak_srcs(c: &Arc<UOp>, u: &Arc<UOp>) -> Option<Arc<UOp>> {
+    if c.dtype().is_weak() || c.dtype().weak_dtype() != u.dtype() {
+        return None;
+    }
+    let dt = DType::least_upper_dtype(&[c.dtype(), select_dtype(u)])?;
+    let src = u.op().sources();
+    let lowered = u
+        .with_sources(
+            src.iter().map(|s| if s.dtype().is_weak() { commit_weak(s, dt.clone()) } else { s.clone() }).collect(),
+        )
+        .cast(c.dtype());
+    (!Arc::ptr_eq(&lowered, c)).then_some(lowered)
+}
+
+pub fn pm_cast_weak() -> TypedPatternMatcher {
+    crate::patterns! {
+        c @ Cast { src: u, dtype: _ } if matches!(u.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..)) && u.dtype().is_weak() => |c, u| {
+            cast_weak_srcs(c, u)
+        },
+    }
+}
+
+fn max_numel_fits_i32(buf: &Arc<UOp>) -> bool {
+    buf.shape()
+        .ok()
+        .flatten()
+        .and_then(|shape| shape.iter().try_fold(1usize, |n, dim| n.checked_mul(dim.vmax()?)))
+        .is_some_and(|n| n.saturating_sub(1) <= i32::MAX as usize)
+}
+
+pub fn pm_lower_index_dtype() -> TypedPatternMatcher<WeakMemo> {
+    pm_commit_weak().with_context::<WeakMemo>()
+        + pm_cast_weak().with_context()
+        + crate::patterns! {
+            @context WeakMemo;
+            u @ Shrink { src, offsets, sizes }
+                if offsets.dtype().is_weak() || sizes.dtype().is_weak() => |u, src, offsets, sizes| {
+                let offsets = if offsets.dtype().is_weak() {
+                    commit_weak(offsets, select_dtype(offsets))
+                } else {
+                    offsets.clone()
+                };
+                let sizes = if sizes.dtype().is_weak() {
+                    commit_weak(sizes, select_dtype(sizes))
+                } else {
+                    sizes.clone()
+                };
+                Some(u.with_sources(vec![src.clone(), offsets, sizes]))
+            },
+            u if !u.dtype().is_weak() && u.op().sources().iter().any(|s| s.dtype().is_weak()) => |u| lower_weak_srcs(ctx, u),
+            u @ Index { buffer, indices } => |u, buffer, indices| {
+                let first = indices.first()?;
+                let Op::Ternary(TernaryOp::Where, gate, idx, invalid) = first.op() else { return None };
+                if idx.dtype() != DType::Int64 || !UOp::is_invalid_marker(invalid) || !max_numel_fits_i32(buffer) { return None; }
+                let mut new_indices = indices.clone();
+                new_indices[0] = idx.cast(DType::Int32).valid(gate.clone());
+                Some(u.with_sources(std::iter::once(buffer.clone()).chain(new_indices).collect()))
+            },
+            u @ Shrink { src, offsets, sizes } => |u, src, offsets, sizes| {
+                let Op::Ternary(TernaryOp::Where, gate, idx, invalid) = offsets.op() else { return None };
+                if idx.dtype() != DType::Int64 || !UOp::is_invalid_marker(invalid) || !max_numel_fits_i32(src) { return None; }
+                Some(u.with_sources(vec![src.clone(), idx.cast(DType::Int32).valid(gate.clone()), sizes.clone()]))
+            },
+        }
 }

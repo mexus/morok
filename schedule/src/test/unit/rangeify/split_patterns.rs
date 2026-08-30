@@ -1,715 +1,194 @@
+//! `to_param_patterns`: the rewrite `split_store` runs over a kernel body to turn
+//! storage into codegen PARAMs, unbind scalars, canonicalise range ids, and peel
+//! AFTER ordering wrappers.
+
 use std::sync::Arc;
 
 use smallvec::smallvec;
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::{AxisId, AxisType, ConstValue, Op, UOp};
+use test_case::test_case;
 
 use crate::rangeify::{RangeifyBufferContext, patterns::to_param_patterns};
 
-/// Helper to apply to_param patterns and return result
-fn apply_patterns(uop: &Arc<UOp>, ctx: &mut RangeifyBufferContext) -> Option<Arc<UOp>> {
-    let matcher = to_param_patterns();
-    match matcher.rewrite(uop, ctx) {
+fn apply(uop: &Arc<UOp>, ctx: &mut RangeifyBufferContext) -> Option<Arc<UOp>> {
+    match to_param_patterns().rewrite(uop, ctx) {
         svod_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
         _ => None,
     }
 }
 
-#[test]
-fn test_debuf_global() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a BUFFER operation directly
-    let unique = UOp::buffer_id(Some(0));
-    let device = UOp::device(svod_device::DeviceSpec::Cpu);
-    let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
-
-    // Apply pattern via matcher
-    let result = apply_patterns(&buffer, &mut ctx);
-
-    // Should return a codegen PARAM
-    let op = result.expect("Expected Some result");
-    assert!(matches!(op.op(), Op::Param { device: None, .. }));
-    assert_eq!(ctx.global_counter, 1);
+fn range(end: i64, axis_id: AxisId, axis_type: AxisType) -> Arc<UOp> {
+    UOp::range_axis(UOp::index_const(end), axis_id, axis_type)
 }
 
+// ===== storage becomes a dense codegen PARAM =====
+
+/// Each BUFFER becomes the next PARAM slot and is mapped to it, so later reads of
+/// the same BUFFER reuse the slot.
 #[test]
-fn test_unbind_kernel() {
+fn buffers_are_numbered_into_dense_param_slots() {
     let mut ctx = RangeifyBufferContext::new();
 
-    // Create a BIND operation
-    let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
-    let value = UOp::index_const(5);
-    let bind = var.bind(value);
+    for slot in 0..2 {
+        let buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 100 * (slot + 1), DType::Float32);
+        let param = apply(&buffer, &mut ctx).expect("a BUFFER becomes a PARAM");
 
-    // Apply pattern via matcher
-    let result = apply_patterns(&bind, &mut ctx);
-
-    // Should return just the variable
-    let op = result.expect("Expected Some result");
-    assert!(matches!(op.op(), Op::DefineVar { .. }));
-    assert!(ctx.vars.contains_key("x"));
-    let (_, bound_val) = ctx.vars.get("x").unwrap();
-    assert_eq!(*bound_val, Some(5));
-}
-
-#[test]
-fn test_renumber_range() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a RANGE with unrenumbered axis_id (use Reduce since it returns plain Range)
-    let end = UOp::index_const(10);
-    let range = UOp::range_axis(end, AxisId::Unrenumbered(5), AxisType::Reduce);
-
-    // Apply pattern via matcher
-    let result = apply_patterns(&range, &mut ctx);
-
-    // Should return a RANGE with axis_id=Renumbered(0) (renumbered)
-    let op = result.expect("Expected Some result");
-    if let Op::Range { axis_id, .. } = op.op() {
-        assert_eq!(*axis_id, AxisId::Renumbered(0));
-    } else {
-        panic!("Expected RANGE operation");
+        assert!(matches!(param.op(), Op::Param { arg, .. }
+            if arg.slot == slot && arg.device == Some(svod_device::DeviceSpec::Cpu)));
+        assert_eq!(ctx.global_counter, slot + 1);
+        assert!(Arc::ptr_eq(ctx.get_buffer(&buffer).expect("mapped"), &param));
     }
 }
 
+/// A bound scalar becomes a scalar PARAM and its value moves into `ctx.vars`, to
+/// be passed at launch.
 #[test]
-fn test_renumber_range_loop_no_bind() {
+fn a_bound_variable_becomes_a_scalar_param_and_a_launch_value() {
     let mut ctx = RangeifyBufferContext::new();
+    let var = UOp::variable("x".to_string(), 0, 10, DType::WeakInt);
+    let bind = var.bind(UOp::const_(DType::WeakInt, ConstValue::Int(5)));
 
-    // Create a LOOP RANGE with unrenumbered axis_id
-    let end = UOp::index_const(10);
-    let range = UOp::range_axis(end, AxisId::Unrenumbered(5), AxisType::Loop);
+    let param = apply(&bind, &mut ctx).expect("a BIND unbinds");
 
-    // Apply pattern via matcher
-    let result = apply_patterns(&range, &mut ctx);
+    assert!(matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_none()));
+    let (_, bound) = ctx.vars.get("x").expect("the value is recorded for launch");
+    assert_eq!(*bound, Some(5));
+}
 
-    // LOOP ranges should be renumbered without BIND wrapper.
-    // Codegen creates loops directly from RANGE ops
-    let op = result.expect("Expected Some result");
-    if let Op::Range { axis_id, axis_type, .. } = op.op() {
-        assert_eq!(*axis_id, AxisId::Renumbered(0));
-        assert_eq!(*axis_type, AxisType::Loop);
-    } else {
-        panic!("Expected RANGE operation for LOOP axis, got {:?}", op.op());
+// ===== range canonicalisation =====
+
+/// Unrenumbered ranges get sequential canonical ids, keeping their axis type and
+/// extent node; an already-renumbered range is left alone.
+#[test]
+fn unrenumbered_ranges_are_numbered_sequentially() {
+    let mut ctx = RangeifyBufferContext::new();
+    let axis_types = [AxisType::Loop, AxisType::Loop, AxisType::Reduce];
+
+    for (i, axis_type) in axis_types.into_iter().enumerate() {
+        let original = range(10 * (i as i64 + 1), AxisId::Unrenumbered(i + 5), axis_type);
+        let renumbered = apply(&original, &mut ctx).expect("an unrenumbered range is renumbered");
+
+        let Op::Range { axis_id, axis_type: kept, end, .. } = renumbered.op() else {
+            panic!("expected RANGE, got {}", renumbered.tree())
+        };
+        assert_eq!(*axis_id, AxisId::Renumbered(i));
+        assert_eq!(*kept, axis_type, "renumbering must not change the axis type");
+        let Op::Range { end: original_end, .. } = original.op() else { unreachable!() };
+        assert!(Arc::ptr_eq(end, original_end), "the extent node is preserved");
+    }
+    assert_eq!(ctx.range_counter, axis_types.len());
+}
+
+/// Nothing to do: an already-canonical range with a non-zero extent, and a bare
+/// CONST, are both left as they are.
+#[test_case(range(10, AxisId::Renumbered(5), AxisType::Loop) ; "already renumbered")]
+#[test_case(range(10, AxisId::Renumbered(0), AxisType::Loop) ; "renumbered with a non-zero extent")]
+#[test_case(UOp::native_const(42i32) ; "a bare const")]
+fn canonical_nodes_are_left_alone(uop: Arc<UOp>) {
+    assert!(apply(&uop, &mut RangeifyBufferContext::new()).is_none());
+}
+
+/// An empty range materialises as index 0. It still consumes its canonical id,
+/// and the constant stays weak until target-width lowering.
+#[test]
+fn a_zero_extent_range_collapses_to_a_weak_zero() {
+    let mut ctx = RangeifyBufferContext::new();
+    let empty = range(0, AxisId::Renumbered(0), AxisType::Loop);
+
+    let collapsed = apply(&empty, &mut ctx).expect("an empty range collapses");
+
+    assert!(matches!(collapsed.op(), Op::Const(v) if v.0 == ConstValue::Int(0)));
+    assert_eq!(collapsed.dtype(), DType::WeakInt);
+    assert_eq!(ctx.range_counter, 1, "a materialized RANGE must still consume its canonical id");
+}
+
+// ===== AFTER peeling and buffer tracking =====
+
+fn global_param() -> Arc<UOp> {
+    let dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global).expect("global ptr");
+    UOp::param(11, 1024, DType::Scalar(dtype.base()), None)
+}
+
+fn local_buffer() -> Arc<UOp> {
+    UOp::buffer(1, 1024, DType::Float32, AddrSpace::Local, None)
+}
+
+fn unique_buffer() -> Arc<UOp> {
+    UOp::buffer_id(Some(0))
+}
+
+/// AFTER is an ordering wrapper: the pattern unwraps it to the storage it passes
+/// through. Global storage is recorded in the buffer map so later readers pick up
+/// the same ordering edge; local storage is kernel-scoped and synchronised by
+/// BARRIER instead, so it must not be tracked.
+#[test_case(super::global_param, true ; "global param is tracked")]
+#[test_case(super::unique_buffer, true ; "unique buffer is tracked")]
+#[test_case(super::local_buffer, false ; "local buffer is not tracked")]
+fn after_unwraps_to_its_storage_and_tracks_only_global(build: fn() -> Arc<UOp>, tracked: bool) {
+    let mut ctx = RangeifyBufferContext::new();
+    let storage = build();
+    let after = storage.clone().after(smallvec![UOp::noop()]);
+
+    let unwrapped = apply(&after, &mut ctx).expect("AFTER unwraps");
+
+    assert!(Arc::ptr_eq(&unwrapped, &storage));
+    assert_eq!(ctx.has_buffer(&storage), tracked);
+    if tracked {
+        assert!(Arc::ptr_eq(ctx.get_buffer(&storage).expect("tracked"), &after), "the map points at the AFTER");
     }
 }
 
-#[test]
-fn test_renumber_range_already_numbered() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a RANGE with already-renumbered axis_id
-    let end = UOp::index_const(10);
-    let range = UOp::range_axis(end, AxisId::Renumbered(5), AxisType::Loop);
-
-    // Apply pattern via matcher - should return None (already numbered)
-    let result = apply_patterns(&range, &mut ctx);
-    assert!(result.is_none(), "Already-numbered range should not be renumbered");
+fn mstack(first: Arc<UOp>, second: Arc<UOp>) -> Arc<UOp> {
+    let dtype = first.dtype();
+    UOp::new(Op::MStack { buffers: smallvec![first, second] }, dtype)
 }
 
-#[test]
-fn test_remove_zero_range() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a RANGE with end=0
-    let end = UOp::index_const(0);
-    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
-
-    // Apply pattern via matcher
-    let result = apply_patterns(&range, &mut ctx);
-
-    // Should return CONST(0)
-    let op = result.expect("Expected Some result");
-    assert!(matches!(op.op(), Op::Const(_)));
+fn mselect(buffer: Arc<UOp>) -> Arc<UOp> {
+    let dtype = buffer.dtype();
+    UOp::new(Op::MSelect { buffer, device_index: 0 }, dtype)
 }
 
+/// Multi-device wrappers resolve to a single representative buffer — the first of
+/// an MSTACK, the selected one of an MSELECT — and that buffer, not the wrapper,
+/// is what the AFTER is recorded against.
 #[test]
-fn test_cleanup_const_with_sources() {
-    let mut ctx = RangeifyBufferContext::new();
+fn after_sees_through_multi_device_wrappers() {
+    for wrap in [
+        mstack(UOp::buffer_id(Some(1)), UOp::buffer_id(Some(2))),
+        mselect(UOp::buffer_id(Some(1))),
+        mstack(local_buffer(), UOp::buffer(2, 1024, DType::Float32, AddrSpace::Local, None)),
+        mselect(local_buffer()),
+    ] {
+        let mut ctx = RangeifyBufferContext::new();
+        let representative = match wrap.op() {
+            Op::MStack { buffers } => buffers[0].clone(),
+            Op::MSelect { buffer, .. } => buffer.clone(),
+            _ => unreachable!(),
+        };
+        let is_local = matches!(representative.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(AddrSpace::Local));
+        let after = wrap.after(smallvec![UOp::noop()]);
 
-    // Create a CONST operation (normally has no sources)
-    let const_op = UOp::native_const(42i32);
+        let unwrapped = apply(&after, &mut ctx).expect("AFTER unwraps the wrapper");
 
-    // Apply pattern via matcher (should not match since const has no sources normally)
-    let result = apply_patterns(&const_op, &mut ctx);
-
-    // Should return None since the const has no sources
-    assert!(result.is_none());
-}
-
-#[test]
-fn test_handle_after() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create an AFTER operation
-    let buffer = UOp::buffer_id(Some(0));
-    let store = UOp::noop();
-    let after = buffer.after(smallvec::smallvec![store]);
-
-    // Apply pattern via matcher
-    let result = apply_patterns(&after, &mut ctx);
-
-    // Should return the buffer
-    let op = result.expect("Expected Some result");
-    assert!(matches!(op.op(), Op::Unique(_)));
-    // Check that the buffer was mapped to the after operation
-    assert!(ctx.has_buffer(&buffer));
-    // Use Arc::ptr_eq for comparison
-    assert!(Arc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
-}
-
-#[test]
-fn test_debuf_counter_increment() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create first buffer
-    let unique1 = UOp::buffer_id(Some(1));
-    let device1 = UOp::device(svod_device::DeviceSpec::Cpu);
-    let buffer1 = UOp::new(Op::Buffer { unique: unique1, device: device1, size: 100 }, DType::Float32);
-
-    // Create second buffer
-    let unique2 = UOp::buffer_id(Some(2));
-    let device2 = UOp::device(svod_device::DeviceSpec::Cpu);
-    let buffer2 = UOp::new(Op::Buffer { unique: unique2, device: device2, size: 200 }, DType::Float32);
-
-    // Apply patterns to first buffer
-    let result1 = apply_patterns(&buffer1, &mut ctx);
-
-    assert!(result1.is_some());
-    assert_eq!(ctx.global_counter, 1);
-
-    // Apply patterns to second buffer
-    let result2 = apply_patterns(&buffer2, &mut ctx);
-
-    assert!(result2.is_some());
-    assert_eq!(ctx.global_counter, 2);
-
-    // Verify both buffers are mapped
-    assert!(ctx.has_buffer(&buffer1));
-    assert!(ctx.has_buffer(&buffer2));
-}
-
-#[test]
-fn test_debuf_buffer_mapping() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    let unique = UOp::buffer_id(Some(0));
-    let device = UOp::device(svod_device::DeviceSpec::Cpu);
-    let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
-
-    let result = apply_patterns(&buffer, &mut ctx);
-
-    // Pattern returns codegen PARAM and maps BUFFER → PARAM
-    assert!(result.is_some());
-    let param = result.unwrap();
-    assert!(matches!(param.op(), Op::Param { slot: 0, device: None, .. }));
-
-    // Buffer should be tracked, mapping to PARAM (not itself)
-    assert!(ctx.has_buffer(&buffer));
-    let mapped = ctx.get_buffer(&buffer).unwrap();
-    assert!(Arc::ptr_eq(mapped, &param));
-}
-
-#[test]
-fn test_handle_after_mstack_unwrap() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create MSTACK with buffers
-    let buf1 = UOp::buffer_id(Some(1));
-    let buf2 = UOp::buffer_id(Some(2));
-    let mstack = UOp::new(Op::MStack { buffers: smallvec![buf1.clone(), buf2] }, buf1.dtype());
-
-    // Create AFTER wrapping MSTACK
-    let store = UOp::noop();
-    let after = mstack.after(smallvec::smallvec![store]);
-
-    let result = apply_patterns(&after, &mut ctx);
-
-    // Should unwrap to first buffer of MSTACK
-    let op = result.expect("Expected Some result");
-    assert!(matches!(op.op(), Op::Unique(_)));
-    assert!(Arc::ptr_eq(&op, &buf1));
-    // buf1 should be mapped to after
-    assert!(Arc::ptr_eq(ctx.get_buffer(&buf1).unwrap(), &after));
-}
-
-#[test]
-fn test_handle_after_mselect_unwrap() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create MSELECT
-    let buffer = UOp::buffer_id(Some(1));
-    let mselect = UOp::new(Op::MSelect { buffer: buffer.clone(), device_index: 0 }, buffer.dtype());
-
-    // Create AFTER wrapping MSELECT
-    let store = UOp::noop();
-    let after = mselect.after(smallvec::smallvec![store]);
-
-    let result = apply_patterns(&after, &mut ctx);
-
-    // Should unwrap to buffer
-    let op = result.expect("Expected Some result");
-    assert!(Arc::ptr_eq(&op, &buffer));
-    // buffer should be mapped to after
-    assert!(Arc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
-}
-
-#[test]
-fn test_renumber_range_different_axis_types() {
-    let mut ctx = RangeifyBufferContext::new();
-    let end = UOp::index_const(10);
-
-    // Test axis types with unrenumbered axis_ids
-    // All axis types now return plain Range without BIND wrapper.
-    // Codegen creates loops directly from RANGE ops
-    for (i, axis_type) in [AxisType::Loop, AxisType::Reduce].iter().enumerate() {
-        let range = UOp::range_axis(end.clone(), AxisId::Unrenumbered(i), *axis_type);
-
-        let result = apply_patterns(&range, &mut ctx);
-
-        if let Some(r) = result {
-            // All axis types return plain Range
-            if let Op::Range { axis_type: new_type, .. } = r.op() {
-                assert_eq!(*new_type, *axis_type);
-            } else {
-                panic!("Expected Range for {:?}, got {:?}", axis_type, r.op());
-            }
-        } else {
-            panic!("Expected Some result for {:?}", axis_type);
+        assert!(Arc::ptr_eq(&unwrapped, &representative));
+        assert_eq!(ctx.has_buffer(&representative), !is_local);
+        if !is_local {
+            assert!(Arc::ptr_eq(ctx.get_buffer(&representative).expect("tracked"), &after));
         }
     }
-}
-
-#[test]
-fn test_renumber_range_no_change_if_same() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // First range will get ID 0
-    let end = UOp::index_const(10);
-    let range1 = UOp::range_axis(end.clone(), AxisId::Renumbered(5), AxisType::Loop);
-
-    apply_patterns(&range1, &mut ctx);
-
-    // Now create a range that already has axis_id=Renumbered(1)
-    let range2 = UOp::range_axis(end.clone(), AxisId::Renumbered(1), AxisType::Loop);
-
-    let result = apply_patterns(&range2, &mut ctx);
-
-    // Should return None since it's already renumbered
-    assert!(result.is_none());
-}
-
-#[test]
-#[ignore = "Incomplete: only tests negative case, missing spurious sources test case"]
-fn test_cleanup_const_define_var() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a DEFINE_VAR
-    let define_var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
-
-    // Without sources, should not match
-    let result = apply_patterns(&define_var, &mut ctx);
-    assert!(result.is_none());
-
-    // TODO: Test with spurious sources once we have a way to create them
-}
-
-#[test]
-fn test_remove_zero_range_uint() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a RANGE with end=0 (UInt)
-    let end = UOp::index_const(0);
-    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
-
-    let result = apply_patterns(&range, &mut ctx);
-
-    // Should return CONST(0)
-    let op = result.expect("Expected Some result");
-    assert!(matches!(op.op(), Op::Const(_)));
-}
-
-#[test]
-fn test_remove_zero_range_non_zero() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a RANGE with non-zero end
-    let end = UOp::index_const(10);
-    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
-
-    let result = apply_patterns(&range, &mut ctx);
-
-    // Should renumber (since it's Renumbered already, no match for renumber; non-zero, no match for zero)
-    assert!(result.is_none());
 }
 
 #[test]
 #[ignore = "MSTACK/AFTER handling not fully implemented yet"]
-fn test_handle_after_mstack_advanced() {
+fn an_after_with_no_deps_still_tracks_its_mstack() {
     let mut ctx = RangeifyBufferContext::new();
-
-    // Create MSTACK operation
     let buf1 = UOp::buffer_id(Some(1));
-    let buf2 = UOp::buffer_id(Some(2));
-    let mstack = UOp::new(Op::MStack { buffers: smallvec::smallvec![buf1.clone(), buf2] }, DType::Float32);
+    let stack = UOp::new(Op::MStack { buffers: smallvec![buf1.clone(), UOp::buffer_id(Some(2))] }, DType::Float32);
+    let after = stack.clone().after(smallvec::SmallVec::new());
 
-    // Create AFTER wrapping MSTACK
-    // Note: AFTER has passthrough + deps, not src
-    let after = mstack.after(smallvec::SmallVec::new());
+    let unwrapped = apply(&after, &mut ctx).expect("AFTER unwraps");
 
-    let result = apply_patterns(&after, &mut ctx);
-
-    // Should unwrap MSTACK and return first buffer
-    match result {
-        Some(buf) => {
-            // Should return buf1 (first in MSTACK)
-            assert!(std::sync::Arc::ptr_eq(&buf, &buf1));
-
-            // MSTACK should be tracked in context
-            assert!(ctx.buffer_map.contains_key(&svod_ir::UOpKey(mstack)));
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
-}
-
-#[test]
-fn test_cleanup_const_with_spurious_sources() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a CONST that has sources (spurious - consts shouldn't have sources normally)
-    // This tests the cleanup pattern that removes unnecessary sources from CONST
-
-    // Create a CONST
-    let const_op = UOp::native_const(42i32);
-
-    let result = apply_patterns(&const_op, &mut ctx);
-
-    // DEFINE_VAR shouldn't be cleaned up (it's not a CONST)
-    assert!(result.is_none());
-}
-
-#[test]
-fn test_renumber_range_sequential() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create ranges with unrenumbered axis_ids
-    // All axis types now return plain Range without BIND wrapper.
-    let range0 = UOp::range_axis(UOp::index_const(10), AxisId::Unrenumbered(0), AxisType::Loop);
-    let range1 = UOp::range_axis(UOp::index_const(20), AxisId::Unrenumbered(1), AxisType::Loop);
-    let range2 = UOp::range_axis(UOp::index_const(30), AxisId::Unrenumbered(2), AxisType::Reduce);
-
-    // Process them in sequence - should get sequential IDs Renumbered(0), Renumbered(1), Renumbered(2)
-
-    let result0 = apply_patterns(&range0, &mut ctx);
-    match result0 {
-        Some(new_range) => {
-            // LOOP returns plain Range (no BIND)
-            if let Op::Range { axis_id, axis_type, .. } = new_range.op() {
-                assert_eq!(*axis_id, AxisId::Renumbered(0));
-                assert_eq!(*axis_type, AxisType::Loop);
-            } else {
-                panic!("Expected RANGE operation for LOOP");
-            }
-        }
-        None => panic!("Expected renumbered range"),
-    }
-
-    let result1 = apply_patterns(&range1, &mut ctx);
-    match result1 {
-        Some(new_range) => {
-            // LOOP returns plain Range (no BIND)
-            if let Op::Range { axis_id, axis_type, .. } = new_range.op() {
-                assert_eq!(*axis_id, AxisId::Renumbered(1));
-                assert_eq!(*axis_type, AxisType::Loop);
-            } else {
-                panic!("Expected RANGE operation for LOOP");
-            }
-        }
-        None => panic!("Expected renumbered range"),
-    }
-
-    let result2 = apply_patterns(&range2, &mut ctx);
-    match result2 {
-        Some(new_range) => {
-            // Reduce returns plain Range
-            if let Op::Range { axis_id, axis_type, .. } = new_range.op() {
-                assert_eq!(*axis_id, AxisId::Renumbered(2));
-                assert_eq!(*axis_type, AxisType::Reduce);
-            } else {
-                panic!("Expected RANGE operation");
-            }
-        }
-        None => panic!("Expected renumbered range"),
-    }
-
-    // Context should have assigned 3 sequential IDs
-    assert_eq!(ctx.range_counter, 3);
-}
-
-#[test]
-fn test_remove_zero_range_verification() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create RANGE with end=0
-    let end = UOp::index_const(0);
-    let range = UOp::range_axis(end.clone(), AxisId::Renumbered(0), AxisType::Loop);
-
-    let result = apply_patterns(&range, &mut ctx);
-
-    // Should rewrite to CONST(0)
-    match result {
-        Some(const_op) => {
-            // Should be a CONST
-            if let Op::Const(val) = const_op.op() {
-                // Should be Int(0)
-                assert_eq!(val.0, ConstValue::Int(0));
-
-                // Should NOT be the same as the original range
-                assert!(!std::sync::Arc::ptr_eq(&const_op, &range));
-
-                // Should have Index dtype (same as range)
-                assert_eq!(const_op.dtype(), DType::Index);
-            } else {
-                panic!("Expected CONST operation");
-            }
-        }
-        _ => panic!("Expected Rewritten result for zero range"),
-    }
-}
-
-#[test]
-fn test_pattern_composition_sequence() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Test that patterns can be applied in sequence
-    // 1. Create a RANGE with unrenumbered ID (use Reduce for plain Range output)
-    // 2. Apply renumber pattern
-    // 3. Verify the result
-
-    let range_unnum = UOp::range_axis(UOp::index_const(15), AxisId::Unrenumbered(7), AxisType::Reduce);
-
-    // Apply pattern
-    let result1 = apply_patterns(&range_unnum, &mut ctx);
-
-    match result1 {
-        Some(renumbered) => {
-            // Should be renumbered to ID 0 (first in sequence)
-            if let Op::Range { axis_id, end, axis_type, .. } = renumbered.op() {
-                assert_eq!(*axis_id, AxisId::Renumbered(0));
-                assert_eq!(*axis_type, AxisType::Reduce);
-
-                // End should be preserved
-                if let Op::Range { end: original_end, .. } = range_unnum.op() {
-                    assert!(std::sync::Arc::ptr_eq(end, original_end));
-                }
-
-                // Now apply another pattern to the result
-                // For example, if the renumbered range has zero end, remove it
-
-                let result2 = apply_patterns(&renumbered, &mut ctx);
-
-                // Should return NoMatch since end is 15, not 0
-                assert!(result2.is_none());
-            } else {
-                panic!("Expected RANGE operation");
-            }
-        }
-        None => panic!("Expected Rewritten result"),
-    }
-}
-
-#[test]
-fn test_pattern_composition_sequence_no_bind() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Test that LOOP ranges return plain Range (no BIND wrapper).
-    let range_unnum = UOp::range_axis(UOp::index_const(15), AxisId::Unrenumbered(7), AxisType::Loop);
-
-    // Apply pattern
-    let result1 = apply_patterns(&range_unnum, &mut ctx);
-
-    match result1 {
-        Some(new_range) => {
-            // LOOP should return plain Range (codegen creates loops from RANGE ops)
-            if let Op::Range { axis_id, axis_type, end, .. } = new_range.op() {
-                assert_eq!(*axis_id, AxisId::Renumbered(0));
-                assert_eq!(*axis_type, AxisType::Loop);
-
-                // End should be preserved
-                if let Op::Range { end: original_end, .. } = range_unnum.op() {
-                    assert!(std::sync::Arc::ptr_eq(end, original_end));
-                }
-            } else {
-                panic!("Expected RANGE operation for LOOP axis, got {:?}", new_range.op());
-            }
-        }
-        None => panic!("Expected Rewritten result"),
-    }
-}
-
-// ============================================================================
-// Local Buffer Address Space Tests
-// ============================================================================
-
-#[test]
-fn test_handle_after_local_buffer_not_tracked() {
-    // Local buffers should NOT be tracked in the buffer map
-    // They are kernel-scoped and synchronized via BARRIER, not AFTER
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a local buffer (DEFINE_LOCAL with Ptr{Local} dtype)
-    let local_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Local).unwrap();
-    let local_buf = UOp::define_local(1, local_dtype);
-
-    // Wrap in AFTER operation
-    let store = UOp::noop();
-    let after = local_buf.after(smallvec![store]);
-
-    // Apply pattern
-    let result = apply_patterns(&after, &mut ctx);
-
-    // Should return the buffer unwrapped
-    match result {
-        Some(op) => {
-            assert!(matches!(op.op(), Op::DefineLocal(_)));
-            // Local buffer should NOT be in buffer map
-            assert!(!ctx.has_buffer(&local_buf));
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
-}
-
-#[test]
-fn test_handle_after_global_buffer_tracked() {
-    // Global buffers SHOULD be tracked in the buffer map
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a global buffer (PARAM with Ptr{Global} dtype)
-    let global_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global).unwrap();
-    let global_buf = UOp::param(1, 1024, global_dtype, None);
-
-    // Wrap in AFTER operation
-    let store = UOp::noop();
-    let after = global_buf.after(smallvec![store]);
-
-    // Apply pattern
-    let result = apply_patterns(&after, &mut ctx);
-
-    // Should return the buffer unwrapped
-    match result {
-        Some(op) => {
-            assert!(matches!(op.op(), Op::Param { device: None, .. }));
-            // Global buffer SHOULD be in buffer map
-            assert!(ctx.has_buffer(&global_buf));
-            assert!(Arc::ptr_eq(ctx.get_buffer(&global_buf).unwrap(), &after));
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
-}
-
-#[test]
-fn test_handle_after_mstack_with_local_buffer() {
-    // AFTER wrapping MSTACK containing local buffer should not be tracked
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create local buffer
-    let local_dtype = DType::Float32.ptr(Some(512), AddrSpace::Local).unwrap();
-    let local_buf1 = UOp::define_local(1, local_dtype.clone());
-    let local_buf2 = UOp::define_local(2, local_dtype.clone());
-
-    // Create MSTACK
-    let mstack = UOp::new(Op::MStack { buffers: smallvec![local_buf1.clone(), local_buf2] }, local_dtype);
-
-    // Wrap in AFTER
-    let store = UOp::noop();
-    let after = mstack.after(smallvec![store]);
-
-    // Apply pattern
-    let result = apply_patterns(&after, &mut ctx);
-
-    // Should unwrap to first buffer in MSTACK
-    match result {
-        Some(op) => {
-            // Verify MSTACK was actually unwrapped to local_buf1 (not just any DEFINE_LOCAL)
-            assert!(Arc::ptr_eq(&op, &local_buf1), "Should unwrap to first buffer in MSTACK");
-            assert!(matches!(op.op(), Op::DefineLocal(1)));
-            // Local buffer should NOT be tracked
-            assert!(!ctx.has_buffer(&local_buf1));
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
-}
-
-#[test]
-fn test_handle_after_mselect_with_local_buffer() {
-    // AFTER wrapping MSELECT containing local buffer should not be tracked
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create local buffer
-    let local_dtype = DType::Int32.ptr(Some(256), AddrSpace::Local).unwrap();
-    let local_buf = UOp::define_local(3, local_dtype.clone());
-
-    // Create MSELECT
-    let mselect = UOp::new(Op::MSelect { buffer: local_buf.clone(), device_index: 0 }, local_dtype);
-
-    // Wrap in AFTER
-    let store = UOp::noop();
-    let after = mselect.after(smallvec![store]);
-
-    // Apply pattern
-    let result = apply_patterns(&after, &mut ctx);
-
-    // Should unwrap to the buffer in MSELECT
-    match result {
-        Some(op) => {
-            // Verify MSELECT was actually unwrapped to local_buf (not just any DEFINE_LOCAL)
-            assert!(Arc::ptr_eq(&op, &local_buf), "Should unwrap to buffer from MSELECT");
-            assert!(matches!(op.op(), Op::DefineLocal(3)));
-            // Local buffer should NOT be tracked
-            assert!(!ctx.has_buffer(&local_buf));
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
-}
-
-#[test]
-fn test_handle_after_mixed_address_spaces() {
-    // Verify local and global buffers are handled differently
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create both local and global buffers
-    let local_dtype = DType::Float32.ptr(Some(128), AddrSpace::Local).unwrap();
-    let global_dtype = DType::Float32.ptr(Some(128), AddrSpace::Global).unwrap();
-
-    let local_buf = UOp::define_local(10, local_dtype);
-    let global_buf = UOp::param(11, 128, global_dtype, None);
-
-    // Wrap both in AFTER
-    let store1 = UOp::noop();
-    let store2 = UOp::noop();
-    let after_local = local_buf.after(smallvec![store1]);
-    let after_global = global_buf.after(smallvec![store2]);
-
-    // Apply patterns to both and validate return values
-    let result_local = apply_patterns(&after_local, &mut ctx);
-    let result_global = apply_patterns(&after_global, &mut ctx);
-
-    // Verify both returned Rewritten with correct buffers
-    match result_local {
-        Some(op) => {
-            assert!(Arc::ptr_eq(&op, &local_buf), "Local AFTER should return local buffer");
-        }
-        _ => panic!("Expected Rewritten for local"),
-    }
-    match result_global {
-        Some(op) => {
-            assert!(Arc::ptr_eq(&op, &global_buf), "Global AFTER should return global buffer");
-        }
-        _ => panic!("Expected Rewritten for global"),
-    }
-
-    // Verify only global buffer is tracked (side effect validation)
-    assert!(!ctx.has_buffer(&local_buf), "Local buffer should NOT be tracked");
-    assert!(ctx.has_buffer(&global_buf), "Global buffer SHOULD be tracked");
+    assert!(Arc::ptr_eq(&unwrapped, &buf1));
+    assert!(ctx.buffer_map.contains_key(&svod_ir::UOpKey(stack)));
 }

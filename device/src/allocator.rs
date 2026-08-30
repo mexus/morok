@@ -135,7 +135,42 @@ impl RawBuffer {
     /// only owners that know their resource is AMD-device-backed call it.
     pub(crate) fn free_amd_device_in_place(&self) {
         if let RawBuffer::AmdDevice { gpu_addr, size, handle, device, .. } = self {
+            if std::thread::panicking() {
+                tracing::warn!(gpu_addr, size, "quarantining AMD allocation during panic unwind");
+                return;
+            }
+            if device.core().poison_error().is_some() {
+                tracing::warn!(gpu_addr, size, "quarantining AMD allocation referenced by a poisoned device");
+                return;
+            }
             device.core().iface().free_raw(*gpu_addr, *size, *handle);
+        }
+    }
+}
+
+/// Construction guard for an AMD allocation before ownership is transferred to
+/// a long-lived object. Ordinary failures reclaim it; poisoned devices retain
+/// the mapping through `free_amd_device_in_place`'s quarantine policy.
+pub(crate) struct AmdBufferGuard(Option<RawBuffer>);
+
+impl AmdBufferGuard {
+    pub(crate) fn new(buffer: RawBuffer) -> Self {
+        Self(Some(buffer))
+    }
+
+    pub(crate) fn buffer(&self) -> &RawBuffer {
+        self.0.as_ref().expect("AMD buffer guard already disarmed")
+    }
+
+    pub(crate) fn into_inner(mut self) -> RawBuffer {
+        self.0.take().expect("AMD buffer guard already disarmed")
+    }
+}
+
+impl Drop for AmdBufferGuard {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.0.as_ref() {
+            buffer.free_amd_device_in_place();
         }
     }
 }
@@ -348,7 +383,14 @@ impl Allocator for CpuAllocator {
     fn _transfer(&self, dest: &RawBuffer, dest_off: usize, src: &RawBuffer, src_off: usize, sz: usize) -> Result<()> {
         match (dest, src) {
             (RawBuffer::Cpu { data: dst, .. }, RawBuffer::Cpu { data: src, .. }) => {
-                // SAFETY: distinct allocations (no aliasing); scheduler exclusivity.
+                if std::ptr::eq(dst, src) {
+                    // Avoid creating aliased references when two buffer
+                    // handles share the same allocation.
+                    let buf = unsafe { &mut *dst.get() };
+                    buf.copy_within(src_off..src_off + sz, dest_off);
+                    return Ok(());
+                }
+                // SAFETY: distinct allocations; scheduler guarantees exclusivity.
                 let dst_buf = unsafe { &mut *dst.get() };
                 let src_buf = unsafe { &*src.get() };
                 dst_buf[dest_off..dest_off + sz].copy_from_slice(&src_buf[src_off..src_off + sz]);
@@ -657,6 +699,12 @@ impl LruAllocator {
     }
 }
 
+impl Drop for LruAllocator {
+    fn drop(&mut self) {
+        self.free_cache();
+    }
+}
+
 impl Allocator for LruAllocator {
     fn alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
         // nolru never pools: deterministic free.
@@ -681,12 +729,20 @@ impl Allocator for LruAllocator {
         }; // Drop lock before any (re)allocation.
 
         if let Some(buffer) = buffer {
-            if zero && !self.zero_cached(&buffer)? {
-                // Device-only buffer we can't memset on the host: free it (a
-                // bare `drop` leaks — RawBuffer has no Drop) and allocate fresh
-                // so we never hand back un-zeroed data.
-                self.inner.free(buffer, size, options);
-                return self.inner.alloc(size, options, zero);
+            if zero {
+                match self.zero_cached(&buffer) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // Device-only buffer we can't memset on the host: free
+                        // it and allocate fresh rather than returning stale data.
+                        self.inner.free(buffer, size, options);
+                        return self.inner.alloc(size, options, zero);
+                    }
+                    Err(error) => {
+                        self.inner.free(buffer, size, options);
+                        return Err(error);
+                    }
+                }
             }
             return Ok(buffer);
         }

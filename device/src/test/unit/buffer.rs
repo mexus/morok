@@ -16,7 +16,7 @@ fn test_lazy_allocation() {
 }
 
 #[test]
-fn test_buffer_view() {
+fn test_buffer_alias() {
     let allocator = Arc::new(CpuAllocator);
     let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], BufferSpec::default()).unwrap();
 
@@ -68,6 +68,57 @@ fn test_invalid_view() {
     // Try to create a view that exceeds buffer size
     let result = buffer.view(36, 16);
     assert!(result.is_err());
+}
+
+fn byte_buffer(allocator: Arc<CpuAllocator>, len: usize) -> Buffer {
+    Buffer::allocate(allocator, DType::UInt8, vec![len], BufferSpec::default()).unwrap()
+}
+
+#[test]
+fn test_copyin_at_writes_region_and_checks_bounds() {
+    let mut buffer = byte_buffer(Arc::new(CpuAllocator), 8);
+    buffer.copyin(&[0; 8]).unwrap();
+
+    buffer.copyin_at(3, &[1, 2, 3]).unwrap();
+    let mut actual = [0; 8];
+    buffer.copyout(&mut actual).unwrap();
+    assert_eq!(actual, [0, 0, 0, 1, 2, 3, 0, 0]);
+
+    assert!(buffer.copyin_at(7, &[1, 2]).is_err());
+    assert!(buffer.copyin_at(usize::MAX, &[1]).is_err());
+}
+
+#[test]
+fn test_copy_region_from_copies_partial_regions_and_checks_both_bounds() {
+    let allocator = Arc::new(CpuAllocator);
+    let mut src = byte_buffer(allocator.clone(), 8);
+    let mut dst = byte_buffer(allocator, 8);
+    src.copyin(&[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    dst.copyin(&[9; 8]).unwrap();
+
+    dst.copy_region_from(2, &src, 3, 3).unwrap();
+    let mut actual = [0; 8];
+    dst.copyout(&mut actual).unwrap();
+    assert_eq!(actual, [9, 9, 3, 4, 5, 9, 9, 9]);
+
+    assert!(dst.copy_region_from(6, &src, 0, 3).is_err());
+    assert!(dst.copy_region_from(0, &src, 7, 2).is_err());
+    assert!(dst.copy_region_from(usize::MAX, &src, 0, 1).is_err());
+}
+
+#[test]
+fn test_copy_within_allows_non_overlapping_regions_and_rejects_overlap() {
+    let mut buffer = byte_buffer(Arc::new(CpuAllocator), 8);
+    buffer.copyin(&[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+
+    buffer.copy_within(4, 0, 4).unwrap();
+    let mut actual = [0; 8];
+    buffer.copyout(&mut actual).unwrap();
+    assert_eq!(actual, [0, 1, 2, 3, 0, 1, 2, 3]);
+
+    assert!(buffer.copy_within(2, 0, 4).is_err());
+    assert!(buffer.copy_within(7, 0, 2).is_err());
+    assert!(buffer.copy_within(0, usize::MAX, 1).is_err());
 }
 
 #[cfg(feature = "cuda")]

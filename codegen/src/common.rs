@@ -1,10 +1,87 @@
 //! Common utilities shared between codegen backends.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use svod_ir::{Op, UOp};
+use svod_dtype::DType;
+use svod_ir::{ConstValue, Op, UOp};
 
 use crate::{Error, Result};
+
+/// FNUZ FP8 formats have different bias, zero, NaN, and saturation semantics
+/// from the OCP formats. No renderer currently implements those semantics.
+pub fn reject_unsupported_fnuz(nodes: &[Arc<UOp>], renderer: &str) -> Result<()> {
+    if let Some(dtype) = nodes.iter().map(|node| node.dtype().base()).find(|dtype| dtype.is_fp8_fnuz()) {
+        return Err(Error::TypeError {
+            reason: format!(
+                "{renderer} renderer does not support {dtype:?}; FNUZ cannot use OCP FP8 decomposition or raw-byte fallback"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Lane count of a memory access, taken from the address expression. Grouped
+/// accesses keep a scalar dtype and carry their width in the SHRINK size (or,
+/// pre-shape-migration, in a vector dtype).
+pub fn access_width(index: &Arc<UOp>) -> usize {
+    match index.op() {
+        Op::Shrink { sizes, .. } => match sizes.op() {
+            Op::Const(value) => match value.0 {
+                ConstValue::Int(value) if value > 0 => value as usize,
+                ConstValue::UInt(value) if value > 0 => value as usize,
+                _ => 1,
+            },
+            _ => 1,
+        },
+        Op::Cast { src, .. } => access_width(src),
+        _ => index.dtype().vcount(),
+    }
+}
+
+/// Lane count of a value. This branch carries the count in the UOp shape rather
+/// than the dtype, so a shape-`[N]` scalar-dtype value renders as an `N`-lane
+/// vector.
+pub fn value_width(value: &Arc<UOp>) -> usize {
+    if value.dtype().vcount() > 1 {
+        return value.dtype().vcount();
+    }
+    match value.op() {
+        Op::Stack { sources } => sources.len(),
+        Op::Load { index, .. } => access_width(index),
+        Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. } | Op::Wmma { .. } => {
+            value
+                .shape()
+                .ok()
+                .flatten()
+                .and_then(|shape| shape.iter().try_fold(1usize, |count, dim| count.checked_mul(dim.as_const()?)))
+                .unwrap_or(1)
+        }
+        _ => 1,
+    }
+}
+
+/// The dtype a memory access renders as. Its lane count is the wider of the
+/// stored value's and the address's, so a scalar-dtype address still renders a
+/// full vector access instead of truncating the value to one lane.
+pub fn access_dtype(index: &Arc<UOp>, value: &Arc<UOp>) -> DType {
+    let width = value_width(value).max(access_width(index));
+    if width > 1 {
+        value.dtype().scalar_dtype().vec(width).expect("grouped access dtype must be vectorizable")
+    } else {
+        value.dtype()
+    }
+}
+
+/// The dtype a value renders as: its scalar dtype widened to [`value_width`].
+pub fn shaped_dtype(value: &Arc<UOp>) -> DType {
+    let count = value_width(value);
+    if count > 1 {
+        value.dtype().scalar_dtype().vec(count).expect("grouped value dtype must be vectorizable")
+    } else {
+        value.dtype()
+    }
+}
 
 /// Check whether a buffer (PARAM/DefineGlobal) is used as a STORE target in the graph.
 pub fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
@@ -25,47 +102,48 @@ pub fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
     false
 }
 
+/// `(buffers, variables)` in canonical ABI order.
+pub type BuffersAndVars = (Vec<Arc<UOp>>, Vec<Arc<UOp>>);
+
 /// Collect buffer and variable parameters from a UOp graph.
 ///
 /// Collects:
-/// - Buffers: PARAM, DEFINE_LOCAL operations
-/// - Variables: DEFINE_VAR operations (passed as i64 kernel params)
+/// - Buffers: address-space PARAM operations
+/// - Variables: DEFINE_VAR and scalar PARAM operations
 ///
 /// Returns (buffers, variables) sorted for deterministic function signatures.
-pub fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
+pub fn collect_buffers_and_vars(root: &Arc<UOp>) -> Result<BuffersAndVars> {
     let nodes = root.toposort();
+    let params = collect_abi_params(&nodes)?;
+    Ok(params.into_iter().partition(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_some())))
+}
 
-    // Collect buffers
-    let mut buffers = Vec::new();
-    for node in &nodes {
-        match node.op() {
-            Op::Buffer { .. } | Op::Param { device: None, .. } | Op::DefineLocal(_) => {
-                buffers.push(node.clone());
-            }
-            _ => {}
+/// Collect PARAMs in the canonical external ABI order. All PARAM address
+/// spaces are arguments in the pinned renderer; local/register BUFFERs are
+/// internal scratch allocations and therefore deliberately excluded.
+pub(crate) fn collect_abi_params(nodes: &[Arc<UOp>]) -> Result<Vec<Arc<UOp>>> {
+    let mut params = Vec::new();
+    let mut occupied = HashMap::new();
+    for node in nodes {
+        let Op::Param { arg, .. } = node.op() else { continue };
+        if arg.slot == usize::MAX {
+            return Err(Error::InvalidGraph { reason: "unassigned PARAM reached renderer ABI collection".into() });
         }
+        if arg.addrspace.is_none() && arg.name.is_none() {
+            return Err(Error::InvalidGraph { reason: format!("scalar PARAM in slot {} has no name", arg.slot) });
+        }
+        if let Some(first) = occupied.insert(arg.slot, node.id) {
+            return Err(Error::InvalidGraph {
+                reason: format!("duplicate PARAM slot {} for UOps {first} and {}", arg.slot, node.id),
+            });
+        }
+        params.push(node.clone());
     }
-
-    // Sort buffers by internal ID (matches split_kernel.rs ordering)
-    buffers.sort_by_key(|b| match b.op() {
-        Op::Param { slot, device: None, .. } => *slot as u64,
-        Op::DefineLocal(id) => (*id as u64) + (1u64 << 32),
-        Op::Buffer { .. } => b.id + (1u64 << 48),
-        _ => b.id,
+    params.sort_by_key(|param| match param.op() {
+        Op::Param { arg, .. } => arg.slot,
+        _ => usize::MAX,
     });
-
-    // Collect DefineVar nodes - these become i64 kernel parameters
-    let mut variables = Vec::new();
-    for node in &nodes {
-        if matches!(node.op(), Op::DefineVar { .. }) {
-            variables.push(node.clone());
-        }
-    }
-
-    // Sort variables by name for deterministic function signatures
-    variables.sort_by_key(|v| if let Op::DefineVar { name, .. } = v.op() { name.clone() } else { String::new() });
-
-    (buffers, variables)
+    Ok(params)
 }
 
 pub fn validate_custom_template_strict(template: &str, arg_count: usize) -> Result<()> {

@@ -133,6 +133,7 @@ fn remap_encoder_layer(i: &str, rest: &[&str], config: &GigaAmConfig) -> Option<
         let suffix = match rest[2] {
             "weight" => "proj",
             "bias" => "bias",
+            "weight_scale" => "weight_scale",
             _ => return None,
         };
         return Some(format!("layers.{i}.mhsa.{base}_{suffix}"));

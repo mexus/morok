@@ -12,7 +12,7 @@ fn main() {
     generate_light_tests();
 }
 
-/// Generate a dual-backend (clang + llvm) test module for each test case.
+/// Generate a Clang, LLVM, and availability-gated AMD test module for each case.
 fn write_backend_test(code: &mut String, fn_name: &str, ignored: bool, helper_call: &str) {
     let attr = if ignored { "#[ignore]\n        " } else { "" };
     code.push_str(&format!(
@@ -31,6 +31,16 @@ mod {fn_name} {{
     {attr}fn llvm() {{
         ::svod_schedule::testing::setup_test_tracing();
         let config = svod_tensor::PrepareConfig::for_cpu_backend(svod_tensor::CpuBackend::Llvm);
+        {helper_call}
+    }}
+
+    #[test]
+    {attr}fn amd() {{
+        ::svod_schedule::testing::setup_test_tracing();
+        let Some(config) = svod_tensor::PrepareConfig::for_amd_if_available() else {{
+            eprintln!(\"AMD ONNX variant skipped: no active supported AMD device\");
+            return;
+        }};
         {helper_call}
     }}
 }}

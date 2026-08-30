@@ -66,10 +66,13 @@ pub const WARP_THREADS: usize = 64;
 const _: () = assert!(WARP_THREADS == svod_dtype::AmdArch::Gfx942.wave_size() as usize);
 
 // ── Use the built-in kernels (Tensor in → Tensor out) ───────────────────────
-pub use kernels::fa::{FaOpts, flash_attention, flash_attention_with};
+pub use kernels::fa::{
+    FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaOpts, flash_attention, flash_attention_supported, flash_attention_with,
+};
 pub use kernels::kmeans::{kmeans_assign, kmeans_update};
 pub use kernels::knn::knn;
 pub use kernels::matmul::matmul;
+pub use kernels::sq_attention::{SqAttentionOpts, single_query_attention, single_query_attention_packed};
 pub use launch::{Error as LaunchError, Result as LaunchResult};
 
 // ── Author your own kernel (the tile DSL) ───────────────────────────────────

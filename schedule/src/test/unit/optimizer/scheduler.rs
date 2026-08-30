@@ -205,7 +205,7 @@ fn test_scheduler_upcastable_dims() {
     let end_32 = UOp::index_const(32);
 
     let r_global = UOp::range_axis(end_16.clone(), AxisId::Renumbered(0), AxisType::Global);
-    let r_loop = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Loop);
+    let r_loop = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Weak);
     let r_reduce = UOp::range_axis(end_16.clone(), AxisId::Renumbered(2), AxisType::Reduce);
     let r_size1 = UOp::range_axis(end_1, AxisId::Renumbered(3), AxisType::Global); // Size 1, not upcastable
 
@@ -215,11 +215,11 @@ fn test_scheduler_upcastable_dims() {
     let ren = Renderer::cpu();
     let scheduler = Scheduler::new(sink, ren);
 
-    // upcastable_dims: GLOBAL(16), LOOP(32) - excludes REDUCE and size-1 GLOBAL
+    // upcastable_dims: GLOBAL(16), WEAK(32) - excludes REDUCE and size-1 GLOBAL
     let upcastable = scheduler.upcastable_dims();
     assert_eq!(upcastable.len(), 2);
     assert!(upcastable.contains(&0)); // Global(16)
-    assert!(upcastable.contains(&1)); // Loop(32)
+    assert!(upcastable.contains(&1)); // Weak(32)
 }
 
 #[test]
@@ -1180,7 +1180,7 @@ fn test_swap_square_axes() {
         .into_iter()
         .find_map(|n| match n.op() {
             Op::Binary(svod_ir::types::BinaryOp::Mul, a, b) => [a, b].into_iter().find_map(|s| match s.op() {
-                Op::Range { axis_id, .. } => Some(*axis_id),
+                Op::Range { axis_id, .. } => Some(axis_id.clone()),
                 _ => None,
             }),
             _ => None,
@@ -1243,8 +1243,8 @@ fn test_group_no_shared_memory() {
 #[test]
 fn test_convert_loop_to_global_gpu() {
     // Create a simple kernel with LOOP axes
-    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Loop);
-    let loop2 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Loop);
+    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Weak);
+    let loop2 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Weak);
 
     let val = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![val, loop1.clone(), loop2.clone()]);
@@ -1271,7 +1271,7 @@ fn test_convert_loop_to_global_gpu() {
 #[test]
 fn test_convert_loop_to_global_cpu() {
     // Create a simple kernel with LOOP axes
-    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Loop);
+    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Weak);
     let val = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![val, loop1.clone()]);
 
@@ -1286,7 +1286,7 @@ fn test_convert_loop_to_global_cpu() {
     assert_eq!(ranges.len(), 1);
 
     if let Op::Range { axis_type, .. } = ranges[0].op() {
-        assert_eq!(*axis_type, AxisType::Loop);
+        assert_eq!(*axis_type, AxisType::Weak);
     }
 }
 
@@ -1314,12 +1314,7 @@ fn test_get_optimized_ast_reduce_kernel() {
     assert!(info.is_some());
 
     let info = info.unwrap();
-    // Kernel name should be: r_g16l8R32u4
-    assert!(info.name.starts_with("r_"));
-    assert!(info.name.contains("g16"));
-    assert!(info.name.contains("l8"));
-    assert!(info.name.contains("R32"));
-    assert!(info.name.contains("u4"));
+    assert!(info.name.starts_with("r_16_8_4_32"), "{}", info.name);
 }
 
 #[test]
@@ -1342,9 +1337,19 @@ fn test_get_optimized_ast_elementwise_kernel() {
     assert!(info.is_some());
 
     let info = info.unwrap();
-    // Kernel name should be: E_g256
-    assert!(info.name.starts_with("E_"));
-    assert!(info.name.contains("g256"));
+    assert!(info.name.starts_with("E_256"));
+}
+
+#[test]
+fn test_kernel_name_places_special_extents_before_range_extents() {
+    let special =
+        UOp::new(Op::Special { end: UOp::index_const(8), name: "gidx1".to_string() }, svod_dtype::DType::Int32);
+    let range = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Local);
+    let scheduler = Scheduler::new(UOp::sink(vec![special, range]), Renderer::cuda());
+
+    let optimized = scheduler.get_optimized_ast(None);
+    let info = optimized.metadata::<crate::optimizer::KernelInfo>().unwrap();
+    assert!(info.name.starts_with("E_8_16"));
 }
 
 #[test]
@@ -1366,13 +1371,15 @@ fn test_get_optimized_ast_custom_name() {
 
     let info = info.unwrap();
     assert_eq!(info.name, "custom_kernel");
+    let repeated = scheduler.get_optimized_ast(Some("custom_kernel".to_string()));
+    assert_eq!(repeated.metadata::<KernelInfo>().unwrap().name, "custom_kernel");
 }
 
 #[test]
 fn test_phase7_integration() {
     // Full Phase 7 integration test: LOOP → GLOBAL → optimize → finalize
-    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Loop);
-    let loop2 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Loop);
+    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Weak);
+    let loop2 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Weak);
 
     let val = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![val, loop1, loop2]);
@@ -1433,9 +1440,9 @@ fn test_kernel_name_deduplication() {
     assert_ne!(info1.name, info3.name, "Third kernel should have different name than first");
 
     // They should all start with the same base name
-    assert!(info1.name.starts_with("E_g16"), "First kernel name should start with E_g16");
-    assert!(info2.name.starts_with("E_g16"), "Second kernel name should start with E_g16");
-    assert!(info3.name.starts_with("E_g16"), "Third kernel name should start with E_g16");
+    assert!(info1.name.starts_with("E_16"), "First kernel name should start with E_16");
+    assert!(info2.name.starts_with("E_16"), "Second kernel name should start with E_16");
+    assert!(info3.name.starts_with("E_16"), "Third kernel name should start with E_16");
 
     // The second and third should have the deduplication suffix 'n'
     assert!(info2.name.contains('n'), "Second kernel should have deduplication suffix");
@@ -1448,8 +1455,8 @@ fn test_kernel_name_deduplication() {
 #[test]
 fn test_globalizable_rngs_with_sink() {
     // Test that SINK operations are properly handled in globalizable_rngs
-    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Loop);
-    let loop2 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Loop);
+    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Weak);
+    let loop2 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Weak);
 
     let val = UOp::native_const(1.0f32);
     // Use SINK operation
@@ -1505,7 +1512,7 @@ fn test_flatten_ranges_store() {
 fn test_thread_basic() {
     // Create a kernel with Loop axis (what CPU uses after convert_outer_to_loop)
     let end_64 = UOp::index_const(64);
-    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Loop);
+    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Weak);
 
     let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_loop]);
@@ -1531,7 +1538,7 @@ fn test_thread_basic() {
     // After split: original axis becomes inner loop (Loop), new axis is outer Thread
     let types: Vec<AxisType> = rngs.iter().map(|r| get_axis_type(r)).collect();
     assert!(types.contains(&AxisType::Thread), "Should have Thread axis: {:?}", types);
-    assert!(types.contains(&AxisType::Loop), "Should have Loop axis: {:?}", types);
+    assert!(types.contains(&AxisType::Weak), "Should have Weak axis: {:?}", types);
 }
 
 #[test]
@@ -1540,7 +1547,7 @@ fn test_thread_rejects_second_application() {
     // beam expansion of an already-threaded scheduler doesn't generate
     // duplicate (parent == child) candidates that get silently dedup'd.
     let end_64 = UOp::index_const(64);
-    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Loop);
+    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Weak);
     let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_loop]);
 
@@ -1598,7 +1605,7 @@ fn test_apply_threading_heuristic_loop() {
     // For 2 threads: need at least 2 * 131072 = 262144 elements
     // Use 2 threads with 262144 elements (exactly the minimum)
     let end = UOp::index_const(262144);
-    let r_loop = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
+    let r_loop = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Weak);
 
     let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_loop]);
@@ -1627,10 +1634,18 @@ fn test_apply_threading_heuristic_symbolic_work_and_divisibility() {
 
     // Non-const loop extent with known vmax and const factor.
     // end = V * 4 where V in [1, 131072] => vmax=524288, divisible by 4.
-    let v = UOp::define_var("V".to_string(), 1, 131072);
+    let v = UOp::variable("V".into(), 1, 131072, DType::Int32);
     let four = UOp::index_const(4);
-    let end = UOp::new(Op::Binary(BinaryOp::Mul, v, four), DType::Index);
-    let r_loop = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
+    let end = UOp::new(Op::Binary(BinaryOp::Mul, v, four), DType::Int32);
+    let r_loop = UOp::new(
+        Op::Range {
+            end: end.clone(),
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Weak,
+            deps: smallvec::smallvec![],
+        },
+        end.dtype(),
+    );
 
     let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_loop]);

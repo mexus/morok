@@ -479,12 +479,10 @@ GEP pushing through ALU ops is restricted to `Index` dtype (Tinygrad: `symbolic.
 
 | Pattern | Result |
 |---------|--------|
-| `GEP(CAT([a<4>, b<4>]), [5])` | `GEP(b, [1])` |
-| `GEP(PTRCAT([a, b, c]), [1, 2])` | `PTRCAT([b, c])` |
+| `INDEX(STACK([a, b]), 1)` | `b` |
 | `GEP(CAST(x, dtype), idx)` | `CAST(GEP(x, idx), scalar_dtype)` |
 | `GEP(BITCAST(x, dtype), idx)` | `BITCAST(GEP(x, idx), scalar_dtype)` |
 | `GEP(WMMA(a, b, c), idx)` | `WMMA(GEP(a, ...), GEP(b, ...), GEP(c, ...))` |
-| `GEP(UNROLL(x, ...), idx)` | `GEP(x, idx)` |
 | `GEP(void_node, _)` | `void_node` |
 
 The WMMA pattern maps tile indices through upcast axes to extract corresponding input subgroups.

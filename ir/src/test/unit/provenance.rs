@@ -5,13 +5,34 @@ use crate::provenance::{
     get_relative_location,
 };
 use crate::uop::UOp;
+use crate::{DType, Op};
 use std::f32::consts::PI;
 use std::panic::Location;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Provenance capture is off by default because it sits on `UOp::new`'s hot
+/// path, so every test that exercises live capture has to opt its own thread in
+/// (the tracker and the switch are both thread-local).
+fn enable_tracking() {
+    crate::provenance::set_tracking(true);
+    PROVENANCE_TRACKER.with(|tracker| tracker.borrow_mut().clear());
+}
+
+/// Interning is global and permanent, and hash-cons hits deliberately capture
+/// nothing, so tests asserting on `Created` events need a node no other test has
+/// ever built.
+fn fresh_uop() -> Arc<UOp> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    UOp::new(Op::DefineVar { name: format!("prov_test_{n}"), min_val: 0, max_val: 100 }, DType::Int32)
+}
 
 #[test]
 fn test_basic_provenance_capture() {
+    enable_tracking();
     // Create a UOp - provenance should be captured automatically
-    let uop = UOp::native_const(42i32);
+    let uop = fresh_uop();
 
     PROVENANCE_TRACKER.with(|tracker| {
         let tracker = tracker.borrow();
@@ -32,9 +53,10 @@ fn test_basic_provenance_capture() {
 
 #[test]
 fn test_transformation_tracking() {
+    enable_tracking();
     // Create initial UOps
-    let a = UOp::native_const(1i32);
-    let b = UOp::native_const(2i32);
+    let a = fresh_uop();
+    let b = fresh_uop();
 
     // Perform operation (creates new UOp)
     let c = a.try_add(&b).unwrap();
@@ -57,6 +79,8 @@ fn test_substitute_transformation() {
     use crate::UOpKey;
     use std::collections::HashMap;
 
+    enable_tracking();
+
     // Create a simple UOp
     let original = UOp::native_const(10i32);
 
@@ -64,7 +88,6 @@ fn test_substitute_transformation() {
     let replacement = UOp::native_const(20i32);
 
     // Build substitution map
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(original.clone()), replacement.clone());
 
@@ -90,19 +113,19 @@ fn test_provenance_chain() {
     use crate::UOpKey;
     use std::collections::HashMap;
 
+    enable_tracking();
+
     // Create initial UOp
     let uop1 = UOp::native_const(1i32);
 
     // Transform it multiple times
     let uop2 = UOp::native_const(2i32);
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(uop1.clone()), uop2.clone());
     let result1 = uop1.substitute(&subst_map);
 
     // Another transformation
     let uop3 = UOp::native_const(3i32);
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map2 = HashMap::new();
     subst_map2.insert(UOpKey(result1.clone()), uop3.clone());
     let result2 = result1.substitute(&subst_map2);
@@ -243,6 +266,8 @@ fn test_multiple_parents() {
     use crate::UOpKey;
     use std::collections::HashMap;
 
+    enable_tracking();
+
     // Create two UOps
     let a = UOp::native_const(1i32);
     let b = UOp::native_const(2i32);
@@ -252,7 +277,6 @@ fn test_multiple_parents() {
 
     // Now substitute 'a' in 'c'
     let a_new = UOp::native_const(10i32);
-    #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(a.clone()), a_new.clone());
     let c_new = c.substitute(&subst_map);
@@ -369,4 +393,21 @@ fn test_get_relative_location() {
     // and start with the crate name
     assert!(relative.starts_with("ir/"), "Expected relative path starting with 'ir/', got: {}", relative);
     assert!(relative.contains("provenance.rs"), "Expected path to contain 'provenance.rs', got: {}", relative);
+}
+
+#[test]
+fn test_tracking_off_captures_nothing_on_the_hash_cons_hit_path() {
+    crate::provenance::set_tracking(false);
+    PROVENANCE_TRACKER.with(|tracker| tracker.borrow_mut().clear());
+
+    // Holding the Arc keeps the interning entry alive, so every `UOp::new`
+    // below is a genuine hash-cons hit.
+    let node = fresh_uop();
+    let op = node.op().clone();
+    for _ in 0..1_000 {
+        let hit = UOp::new(op.clone(), DType::Int32);
+        assert_eq!(hit.id, node.id, "expected an interning hit");
+    }
+
+    PROVENANCE_TRACKER.with(|tracker| assert!(tracker.borrow().is_empty(), "tracking is off; nothing may be recorded"));
 }

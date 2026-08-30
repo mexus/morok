@@ -1,4 +1,4 @@
-//! RANGEIFY transformation: convert movement ops to BUFFERIZE+INDEX, then split STORE/END boundaries into CALL wrappers.
+//! RANGEIFY transformation: convert movement ops to STAGE+INDEX, then split STORE/END boundaries into CALL wrappers.
 //!
 //! ## Module Structure (Consolidated from 19 → 5 files)
 //!
@@ -20,8 +20,8 @@ pub mod transforms;
 
 // Context types
 pub use context::RangeifyContext;
-pub use indexing::{IndexingContext, RangeifyStats, run_rangeify};
-pub use kernel::{LocalAddBufferContext, RangeifyBufferContext};
+pub use indexing::{IndexingContext, run_rangeify};
+pub use kernel::{KernelGraphError, LocalAddBufferContext, RangeifyBufferContext};
 
 // Entry points
 pub use kernel::try_get_kernel_graph;
@@ -35,19 +35,19 @@ pub use patterns::{
     apply_rangeify_patterns, buffer_folding, buffer_limit_patterns, dead_axis_removal, early_rewrites,
     movement_op_patterns, pm_comparison_negations, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul,
     pm_fma_decomposition, pm_load_collapse, pm_max_decomposition, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul,
-    pm_reduce_simplify, pm_remove_bufferize, pm_sqrt_decomposition, pm_syntactic_sugar, rangeify_codegen_patterns,
-    rangeify_codegen_simple, rangeify_codegen_with_kernel_ctx, split_reduceop_patterns, to_param_patterns,
+    pm_reduce_simplify, pm_remove_bufferize, pm_sqrt_decomposition, rangeify_codegen_patterns, rangeify_codegen_simple,
+    split_reduceop_patterns, to_param_patterns,
 };
 
 // Transforms
 pub use transforms::{
-    OpAccessType, SplitRangesContext, bufferize_to_store, find_bufs, flatten_range_impl, flatten_ranges,
-    pm_add_buffers_local_patterns, pm_add_buffers_patterns, pm_flatten_range, pm_simplify_ranges, pm_split_ranges,
-    reduce_collapse, reduce_load_collapse, simplify_merge_adjacent,
+    SimplifyRangesContext, SplitRangesContext, bufferize_to_store, find_bufs, flatten_range_impl, flatten_ranges,
+    pm_add_buffers_patterns, pm_flatten_range, pm_simplify_ranges, pm_split_ranges, reduce_collapse,
+    reduce_load_collapse, simplify_merge_adjacent,
 };
 
 // Utilities (re-exported from indexing)
-pub use indexing::{SimplifyCache, apply_movement_op, is_dead_axis, ranges_equal};
+pub use indexing::{apply_movement_op, is_dead_axis, ranges_equal};
 pub use patterns::{extract_device_from_graph, is_elementwise};
 
 // Testing exports

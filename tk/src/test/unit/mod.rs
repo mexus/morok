@@ -16,4 +16,5 @@ mod proptests;
 mod reductions;
 mod scaffold;
 mod shuffle;
+mod sq_attention;
 mod swizzle;

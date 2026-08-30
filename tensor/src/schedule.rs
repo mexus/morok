@@ -17,8 +17,7 @@ use std::sync::Arc;
 use svod_device::Buffer;
 use svod_device::device::Device;
 use svod_device::registry;
-use svod_dtype::DType;
-use svod_ir::{Op, UOp};
+use svod_ir::{CustomFunctionKind, Op, UOp};
 use tracing::{debug, trace};
 
 use crate::error::*;
@@ -56,14 +55,175 @@ fn source_primary_buffer_id(src: &Arc<UOp>) -> Option<u64> {
         Op::Bind { .. } => None,
         Op::MSelect { buffer, device_index } => {
             if let Op::MStack { buffers } = buffer.op() {
-                buffers.get(*device_index).map(|b| b.buf_uop().id).or_else(|| Some(src.buf_uop().id))
+                buffers.get(*device_index).map(|b| b.buf_uop().id)
             } else {
                 Some(src.buf_uop().id)
             }
         }
-        Op::MStack { buffers } => buffers.first().map(|b| b.buf_uop().id),
+        // A bare MSTACK owns multiple buffers. Until schedule items carry that
+        // ownership explicitly, resolving it to one shard would be incorrect.
+        Op::MStack { .. } => None,
         _ => None,
     }
+}
+
+fn validate_mselect_bounds(call_id: u64, root: &Arc<UOp>) -> Result<()> {
+    for node in root.toposort() {
+        let Op::MSelect { buffer, device_index } = node.op() else { continue };
+        let Op::MStack { buffers } = buffer.op() else {
+            return Err(Error::MultiUnsupportedForm {
+                call_id,
+                details: format!("MSELECT {} must select from an explicit MSTACK", node.id),
+            });
+        };
+        if *device_index >= buffers.len() {
+            return Err(Error::MultiSelectOutOfBounds {
+                source_id: node.id,
+                device_index: *device_index,
+                lane_count: buffers.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn device_lane_binding(call_id: u64, ast: &Arc<UOp>, lane_count: Option<usize>) -> Result<bool> {
+    let mut device_ranges = Vec::new();
+    let mut device_params = Vec::new();
+    for node in ast.toposort() {
+        match node.op() {
+            Op::Range { axis_type: svod_ir::AxisType::Device, .. } => device_ranges.push(node),
+            Op::Param { arg, .. } if arg.addrspace.is_none() && arg.name.as_deref() == Some("_device_num") => {
+                device_params.push(node)
+            }
+            _ => {}
+        }
+    }
+
+    let marker_count = device_ranges.len() + device_params.len();
+    if marker_count == 0 {
+        return Ok(false);
+    }
+    let Some(lane_count) = lane_count else {
+        return Err(Error::MultiUnsupportedForm {
+            call_id,
+            details: "DEVICE launch binding requires aligned MSTACK arguments".into(),
+        });
+    };
+    if marker_count != 1 {
+        return Err(Error::MultiUnsupportedForm {
+            call_id,
+            details: format!("expected exactly one DEVICE launch marker, found {marker_count}"),
+        });
+    }
+
+    let extent = if let Some(range) = device_ranges.first() {
+        let Op::Range { end, .. } = range.op() else { unreachable!() };
+        let (Some(vmin), Some(vmax)) = (end.vmin().try_int(), end.vmax().try_int()) else {
+            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+        };
+        if vmin != vmax {
+            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+        }
+        vmin
+    } else {
+        let Op::Param { arg, .. } = device_params[0].op() else { unreachable!() };
+        let Some((vmin, vmax)) = &arg.vmin_vmax else {
+            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+        };
+        let (Some(vmin), Some(vmax)) = (vmin.0.try_int(), vmax.0.try_int()) else {
+            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+        };
+        if vmin != 0 {
+            return Err(Error::MultiUnsupportedForm {
+                call_id,
+                details: format!("_device_num bounds must start at zero, got {vmin}..={vmax}"),
+            });
+        }
+        vmax.checked_add(1).ok_or(Error::MultiDeviceExtentNotStatic { call_id })?
+    };
+
+    if extent != lane_count as i64 {
+        return Err(Error::MultiDeviceExtentMismatch { call_id, expected: lane_count, actual: extent });
+    }
+    Ok(true)
+}
+
+struct MultiSourceExpansion {
+    lanes: Vec<Vec<Arc<UOp>>>,
+    bind_device_num: bool,
+    is_multi: bool,
+}
+
+fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> Result<MultiSourceExpansion> {
+    for source in sources {
+        validate_mselect_bounds(call_id, source)?;
+    }
+
+    let mut lane_count = None;
+    for (source_index, source) in sources.iter().enumerate() {
+        let Op::MStack { buffers } = source.op() else { continue };
+        if buffers.is_empty() {
+            return Err(Error::MultiEmptyLanes { call_id, source_index });
+        }
+        if let Some(expected) = lane_count {
+            if buffers.len() != expected {
+                return Err(Error::MultiLaneCountMismatch { call_id, source_index, expected, actual: buffers.len() });
+            }
+        } else {
+            lane_count = Some(buffers.len());
+        }
+    }
+
+    let bind_device_num = device_lane_binding(call_id, ast, lane_count)?;
+    let Some(lane_count) = lane_count else {
+        return Ok(MultiSourceExpansion { lanes: vec![sources.to_vec()], bind_device_num: false, is_multi: false });
+    };
+    let effect = match ast.op() {
+        Op::End { computation, .. } => computation,
+        _ => ast,
+    };
+    if matches!(effect.op(), Op::Slice { .. }) {
+        return Err(Error::MultiUnsupportedForm {
+            call_id,
+            details: "SLICE calls cannot be expanded across lanes".into(),
+        });
+    }
+
+    let mut lanes = vec![Vec::with_capacity(sources.len()); lane_count];
+    for (source_index, source) in sources.iter().enumerate() {
+        match source.op() {
+            Op::MStack { buffers } => {
+                for (lane, buffer) in buffers.iter().enumerate() {
+                    if buffer.toposort().iter().any(|node| matches!(node.op(), Op::Slice { .. })) {
+                        return Err(Error::MultiLaneSliceAlias { call_id, source_index, lane });
+                    }
+                    if matches!(buffer.op(), Op::MStack { .. }) {
+                        return Err(Error::MultiUnsupportedForm {
+                            call_id,
+                            details: format!("MSTACK source {source_index} lane {lane} is a nested MSTACK"),
+                        });
+                    }
+                    lanes[lane].push(buffer.clone());
+                }
+            }
+            Op::Bind { .. } => {
+                for lane_sources in &mut lanes {
+                    lane_sources.push(source.clone());
+                }
+            }
+            other => {
+                return Err(Error::MultiUnsupportedForm {
+                    call_id,
+                    details: format!(
+                        "source {source_index} is {other:?}; every non-scalar CALL argument must be an MSTACK when any argument is multi"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(MultiSourceExpansion { lanes, bind_device_num, is_multi: true })
 }
 
 fn collect_callable_dep_ids(dep: &Arc<UOp>, out: &mut HashSet<u64>) -> Result<()> {
@@ -164,7 +324,7 @@ fn callable_sources(callable: &Arc<UOp>) -> Option<Vec<Arc<UOp>>> {
 
 /// Schedule-level RANGEs are uniquely identified by being paired with an
 /// `END(Call)` in the transformed graph — the END structurally proves the
-/// Range wraps a kernel call. Standalone `Bind(DefineVar, Range)` arguments
+/// Range wraps a kernel call. Standalone `Bind(variable, Range)` arguments
 /// (user-supplied symbolic variable binds) reference Ranges with no END
 /// pairing and must be skipped to avoid being mistaken for loop wrappers.
 fn collect_scheduled_range_ids(root: &Arc<UOp>, callable_ids: &HashSet<u64>) -> HashSet<u64> {
@@ -193,15 +353,21 @@ fn collect_call_bound_ranges(callable: &Arc<UOp>, scheduled_range_ids: &HashSet<
         let Op::Bind { var, value } = arg.op() else {
             continue;
         };
-        let Op::DefineVar { name, .. } = var.op() else {
-            return IrConstructionSnafu {
-                details: format!("CALL BIND source must wrap DEFINE_VAR, got {:?}", var.op()),
-            }
-            .fail();
-        };
         let Op::Range { .. } = value.op() else {
-            // User variable binds (`BIND(DEFINE_VAR, CONST)`) are not schedule loops.
+            // User variable binds (`BIND(variable, CONST)`) are not schedule loops.
             continue;
+        };
+        let name = match var.op() {
+            Op::DefineVar { name, .. } => name,
+            Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.as_ref().ok_or_else(|| {
+                Error::IrConstruction { details: "CALL BIND scalar PARAM source must have a name".to_string() }
+            })?,
+            _ => {
+                return IrConstructionSnafu {
+                    details: format!("CALL BIND Range source must wrap a variable, got {:?}", var.op()),
+                }
+                .fail();
+            }
         };
         // Only Ranges paired with an `END(Call)` are schedule-level wrappers;
         // standalone Range-valued binds carry runtime values, not loop counters.
@@ -612,9 +778,12 @@ pub struct ScheduleResult {
     /// Extracted directly from the SINK's sources via `buf_uop()`.
     /// For single-tensor realize, contains one ID.
     pub output_uop_ids: Vec<u64>,
+    /// Concrete handles for alias-only outputs that have no executable item.
+    pub alias_output_buffers: HashMap<u64, Buffer>,
 }
 
 /// Buffers collected for a single callable.
+#[derive(Clone)]
 struct CallableBuffers {
     /// Device buffers in codegen order.
     buffers: Vec<Buffer>,
@@ -780,12 +949,66 @@ pub fn instantiate_schedule(
     };
 
     let mut templates: HashMap<u64, ScheduleItemTemplate> = HashMap::with_capacity(pre_schedule.items.len());
+    let mut alias_dependencies: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut alias_output_ids = HashSet::new();
     for item in &pre_schedule.items {
         let nodes = item.ast.toposort();
 
-        // Map sources to actual Buffers.
-        let kb =
-            collect_callable_buffers(&item.sources, &item.ast, input_buffers, &mut allocated_buffers, &output_ids)?;
+        let expansion = expand_multi_sources(item.kernel.id, &item.ast, &item.sources)?;
+        let mut lane_buffers = Vec::with_capacity(expansion.lanes.len());
+        for sources in &expansion.lanes {
+            lane_buffers.push(collect_callable_buffers(sources, input_buffers, &mut allocated_buffers, &output_ids)?);
+        }
+
+        let effect = match item.ast.op() {
+            Op::End { computation, .. } => computation,
+            _ => &item.ast,
+        };
+        let cross_device_effect = matches!(effect.op(), Op::Copy { .. })
+            || matches!(effect.op(), Op::CustomFunction { kind: CustomFunctionKind::AllReduce { .. }, .. });
+        if expansion.is_multi && !cross_device_effect {
+            for (lane, kb) in lane_buffers.iter().enumerate() {
+                let mut expected: Option<svod_dtype::DeviceSpec> = None;
+                for buffer in &kb.buffers {
+                    let actual = buffer.allocator().device_spec();
+                    if actual.is_disk() {
+                        continue;
+                    }
+                    if let Some(expected) = &expected
+                        && expected != &actual
+                    {
+                        return Err(Error::MultiLaneDeviceMismatch {
+                            call_id: item.kernel.id,
+                            lane,
+                            expected: format!("{expected:?}"),
+                            actual: format!("{actual:?}"),
+                        });
+                    }
+                    expected = Some(actual);
+                }
+            }
+        }
+        if let Op::Slice { offset, size, .. } = effect.op() {
+            let kb = lane_buffers.first_mut().expect("single-lane expansion always has one buffer set");
+            let offset = match offset.op() {
+                Op::Const(value) => value.0.try_int().and_then(|value| usize::try_from(value).ok()),
+                _ => None,
+            }
+            .ok_or_else(|| Error::IrConstruction { details: "SLICE offset must be a non-negative constant".into() })?;
+            if kb.buffers.len() < 2 || kb.uop_ids.len() < 2 {
+                return IrConstructionSnafu {
+                    details: format!("SLICE call {} requires output and base buffers", item.kernel.id),
+                }
+                .fail();
+            }
+            let base = &kb.buffers[1];
+            let view = base.view(offset * base.dtype().bytes(), size * effect.dtype().bytes()).context(DeviceSnafu)?;
+            allocated_buffers.insert(kb.uop_ids[0], view.clone());
+            alias_output_ids.insert(kb.uop_ids[0]);
+            kb.buffers[0] = view;
+            alias_dependencies.insert(item.kernel.id, item.dependencies.clone());
+            continue;
+        }
 
         debug!(callable.id = item.kernel.id, num_sources = item.sources.len(), "Schedule item created");
 
@@ -797,6 +1020,7 @@ pub fn instantiate_schedule(
                 .iter()
                 .filter_map(|n| match n.op() {
                     Op::DefineVar { name, .. } => Some(name.as_str()),
+                    Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.as_deref(),
                     _ => None,
                 })
                 .collect();
@@ -812,17 +1036,30 @@ pub fn instantiate_schedule(
             ScheduleItemTemplate {
                 kernel: item.kernel.clone(),
                 ast: item.ast.clone(),
-                buffers: kb.buffers,
-                buffer_uop_ids: kb.uop_ids,
+                lane_buffers,
                 dependencies: item.dependencies.clone(),
-                alias_registered_ids: kb.alias_ids,
                 base_fixedvars: fixedvars,
+                bind_device_num: expansion.bind_device_num,
             },
         );
     }
 
+    fn executable_dependencies(dependencies: &[u64], aliases: &HashMap<u64, Vec<u64>>, out: &mut HashSet<u64>) {
+        for dependency in dependencies {
+            if let Some(nested) = aliases.get(dependency) {
+                executable_dependencies(nested, aliases, out);
+            } else {
+                out.insert(*dependency);
+            }
+        }
+    }
+
     let mut schedule = Vec::with_capacity(pre_schedule.invocations.len());
+    let mut expanded_instances_by_kernel: HashMap<u64, Vec<usize>> = HashMap::new();
     for invocation in &pre_schedule.invocations {
+        if alias_dependencies.contains_key(&invocation.kernel_id) {
+            continue;
+        }
         let Some(template) = templates.get(&invocation.kernel_id) else {
             return IrConstructionSnafu {
                 details: format!("invocation references unknown kernel id {}", invocation.kernel_id),
@@ -830,31 +1067,61 @@ pub fn instantiate_schedule(
             .fail();
         };
 
-        // Merge the kernel's user-Variable bindings (`base_fixedvars`) with
-        // the loop-counter bindings produced at this iteration.
-        let mut fixedvars = template.base_fixedvars.clone();
-        fixedvars.extend(invocation.fixedvars.iter().map(|(k, v)| (k.clone(), *v)));
-        let loop_var_names: HashSet<String> = invocation.fixedvars.keys().cloned().collect();
+        let mut dependencies = HashSet::new();
+        executable_dependencies(&template.dependencies, &alias_dependencies, &mut dependencies);
+        let mut dependencies: Vec<u64> = dependencies.into_iter().collect();
+        dependencies.sort_unstable();
 
-        schedule.push(ScheduleItem {
-            kernel: template.kernel.clone(),
-            ast: template.ast.clone(),
-            buffers: template.buffers.clone(),
-            buffer_uop_ids: template.buffer_uop_ids.clone(),
-            fixedvars,
-            loop_var_names,
-            dependencies: template.dependencies.clone(),
-            instance_dependencies: Vec::new(),
-            alias_registered_ids: template.alias_registered_ids.clone(),
-        });
-    }
+        let mut instance_dependencies = HashSet::new();
+        for dependency in &dependencies {
+            if let Some(instances) = expanded_instances_by_kernel.get(dependency) {
+                instance_dependencies.extend(instances.iter().copied());
+            }
+        }
+        let mut instance_dependencies: Vec<usize> = instance_dependencies.into_iter().collect();
+        instance_dependencies.sort_unstable();
 
-    if schedule.is_empty() {
-        return EmptyScheduleSnafu.fail();
+        let expanded = template.lane_buffers.len() > 1;
+        let first_schedule_index = schedule.len();
+        for (lane, kb) in template.lane_buffers.iter().enumerate() {
+            let mut fixedvars = template.base_fixedvars.clone();
+            fixedvars.extend(invocation.fixedvars.iter().map(|(name, value)| (name.clone(), *value)));
+            if template.bind_device_num {
+                insert_fixedvar_checked(&mut fixedvars, template.kernel.id, "_device_num", lane as i64)?;
+            }
+            let loop_var_names: HashSet<String> = invocation.fixedvars.keys().cloned().collect();
+
+            schedule.push(ScheduleItem {
+                kernel: template.kernel.clone(),
+                ast: template.ast.clone(),
+                buffers: kb.buffers.clone(),
+                buffer_uop_ids: kb.uop_ids.clone(),
+                fixedvars,
+                loop_var_names,
+                dependencies: dependencies.clone(),
+                instance_dependencies: instance_dependencies.clone(),
+                alias_registered_ids: kb.alias_ids.clone(),
+            });
+        }
+        if expanded {
+            expanded_instances_by_kernel
+                .entry(invocation.kernel_id)
+                .or_default()
+                .extend(first_schedule_index..schedule.len());
+        }
     }
 
     let output_uop_ids: Vec<u64> = pre_schedule.output_buffer_uops.iter().map(|u| u.buf_uop().id).collect();
-    Ok(ScheduleResult { items: schedule, output_uop_ids })
+    let alias_output_buffers = output_uop_ids
+        .iter()
+        .filter_map(|id| {
+            if !alias_output_ids.contains(id) {
+                return None;
+            }
+            allocated_buffers.get(id).cloned().or_else(|| input_buffers.get(id).cloned()).map(|buffer| (*id, buffer))
+        })
+        .collect();
+    Ok(ScheduleResult { items: schedule, output_uop_ids, alias_output_buffers })
 }
 
 pub fn create_schedule(
@@ -925,7 +1192,6 @@ fn find_first_input_buffer_device(
 /// input buffer. Newly allocated buffers are tracked in `allocated_buffers`.
 fn collect_callable_buffers(
     sources: &[Arc<UOp>],
-    ast: &Arc<UOp>,
     input_buffers: &InputBuffers,
     allocated_buffers: &mut HashMap<u64, Buffer>,
     output_ids: &HashSet<u64>,
@@ -1006,30 +1272,24 @@ fn collect_callable_buffers(
                     return Err(Error::BufferNotFound { uop_id: canonical_id });
                 }
             }
-            // Callable args/sources are typically Buffer/Param/After/DefineLocal.
-            Op::DefineLocal(_id) => {
-                // Allocate local/shared memory buffer on same device as inputs
-                let ptr_dtype = canonical_src.dtype();
-                let size = compute_buffer_size(ast, &canonical_src)?;
-
-                // Extract the base scalar dtype from the Ptr type
-                let scalar_dtype = match ptr_dtype {
-                    svod_dtype::DType::Ptr { base, .. } => *base,
-                    other => {
-                        return ExpectedPtrDtypeSnafu { context: "DEFINE_LOCAL", actual: other.clone() }.fail();
-                    }
+            // LOCAL/REG BUFFERs are compiler-managed and never runtime arguments.
+            Op::Buffer { arg, .. } if arg.addrspace != Some(svod_ir::AddrSpace::Global) => {}
+            Op::Buffer { .. } | Op::Param { .. } => {
+                let size = match canonical_src.op() {
+                    Op::Buffer { .. } => canonical_src.buffer_size().ok_or_else(|| Error::IrConstruction {
+                        details: "BUFFER allocation requires a concrete shape".to_string(),
+                    })?,
+                    Op::Param { .. } => canonical_src
+                        .shape()
+                        .ok()
+                        .flatten()
+                        .and_then(svod_ir::shape::to_static)
+                        .and_then(|shape| shape.into_iter().try_fold(1usize, usize::checked_mul))
+                        .ok_or_else(|| Error::IrConstruction {
+                            details: "PARAM allocation requires a concrete shape".to_string(),
+                        })?,
+                    _ => unreachable!(),
                 };
-
-                let buffer =
-                    Buffer::new(target_device.allocator.clone(), scalar_dtype.clone(), vec![size], Default::default());
-
-                // Track in allocated_buffers (no registry needed)
-                allocated_buffers.insert(canonical_src.id, buffer.clone());
-
-                buffers.push(buffer);
-                uop_ids.push(canonical_src.id);
-            }
-            Op::Buffer { size, .. } | Op::Param { size, .. } => {
                 let canonical_id = canonical_src.buf_uop().id;
                 if canonical_id != canonical_src.id {
                     alias_ids.push(canonical_src.id);
@@ -1060,7 +1320,7 @@ fn collect_callable_buffers(
                     } else {
                         Default::default()
                     };
-                    let buffer = Buffer::new(target_device.allocator.clone(), scalar_dtype.clone(), vec![*size], spec);
+                    let buffer = Buffer::new(target_device.allocator.clone(), scalar_dtype.clone(), vec![size], spec);
 
                     // Track in allocated_buffers
                     allocated_buffers.insert(canonical_id, buffer.clone());
@@ -1090,11 +1350,23 @@ fn collect_callable_buffers(
 struct ScheduleItemTemplate {
     kernel: Arc<UOp>,
     ast: Arc<UOp>,
-    buffers: Vec<Buffer>,
-    buffer_uop_ids: Vec<u64>,
+    lane_buffers: Vec<CallableBuffers>,
     dependencies: Vec<u64>,
-    alias_registered_ids: Vec<u64>,
     base_fixedvars: HashMap<String, i64>,
+    bind_device_num: bool,
+}
+
+fn insert_fixedvar_checked(
+    fixedvars: &mut HashMap<String, i64>,
+    call_id: u64,
+    name: &str,
+    incoming: i64,
+) -> Result<()> {
+    if let Some(&existing) = fixedvars.get(name) {
+        return Err(Error::MultiBindingConflict { call_id, name: name.to_string(), existing, incoming });
+    }
+    fixedvars.insert(name.to_string(), incoming);
+    Ok(())
 }
 
 fn schedule_range_bounds(range: &Arc<UOp>) -> Result<(i64, i64)> {
@@ -1122,17 +1394,4 @@ fn schedule_range_bounds(range: &Arc<UOp>) -> Result<(i64, i64)> {
             .fail();
     }
     Ok((vmin, vmax))
-}
-
-/// Compute buffer size from the buffer definition's dtype.
-///
-/// Buffer size is embedded in the Ptr dtype by debuf() during rangeify
-/// (`dtype.ptr(size=...)`).
-fn compute_buffer_size(_ast: &Arc<UOp>, buffer_def: &Arc<UOp>) -> Result<usize> {
-    // Extract size from Ptr dtype (set by debuf() in split_patterns.rs)
-    match buffer_def.dtype() {
-        DType::Ptr { size: Some(s), .. } => Ok(s),
-        DType::Ptr { size: None, .. } => BufferPtrNoSizeSnafu.fail(),
-        other => ExpectedPtrDtypeSnafu { context: "buffer_size", actual: other.clone() }.fail(),
-    }
 }

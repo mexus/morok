@@ -52,8 +52,9 @@
 //! let result = graph_rewrite(&matcher, root, &mut ());
 //! ```
 
-use crate::{Op, UOp, UOpKey};
-use std::collections::{HashMap, HashSet};
+use crate::{Op, UOp};
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::{SmallVec, smallvec};
 use std::sync::Arc;
 
 use crate::pattern::{Matcher, RewriteResult};
@@ -64,35 +65,25 @@ enum TraversalMode {
     PreserveCallBodies,
 }
 
-fn traversal_children(node: &Arc<UOp>, mode: TraversalMode) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
+/// Borrowed children, split into traversed sources and skipped-but-preserved ones.
+/// Borrowing (rather than `Op::sources()`) keeps the per-visit cost at zero
+/// allocations and zero refcount traffic — tinygrad reads `n.src` directly.
+type Children<'a> = SmallVec<[&'a Arc<UOp>; 4]>;
+
+fn traversal_children<'a>(node: &'a Arc<UOp>, mode: TraversalMode) -> (Children<'a>, Children<'a>) {
     if mode == TraversalMode::Full {
-        return (node.op().sources().into_iter().collect(), Vec::new());
+        return (node.op().children(), SmallVec::new());
     }
 
     match node.op() {
-        Op::Call { body, args, .. } | Op::Function { body, args, .. } => {
-            (args.iter().cloned().collect(), vec![body.clone()])
+        Op::Call { body, args, .. } | Op::Function { body, args, .. } => (args.iter().collect(), smallvec![body]),
+        // PROGRAM is opaque when preserving call bodies.
+        Op::Program { sink, linear, source, binary, .. } => {
+            let mut skipped: Children<'a> = smallvec![sink];
+            skipped.extend(linear.iter().chain(source.iter()).chain(binary.iter()));
+            (SmallVec::new(), skipped)
         }
-        // Program holds compiled artifacts (linear/source/binary) wrapped as
-        // UOps; traversing through them during rewrite passes is expensive
-        // and unnecessary — only the device producer is traversed.
-        Op::Program { sink, device, linear, source, binary } => {
-            let mut skipped = Vec::with_capacity(
-                1 + usize::from(linear.is_some()) + usize::from(source.is_some()) + usize::from(binary.is_some()),
-            );
-            skipped.push(sink.clone());
-            if let Some(linear) = linear {
-                skipped.push(linear.clone());
-            }
-            if let Some(source) = source {
-                skipped.push(source.clone());
-            }
-            if let Some(binary) = binary {
-                skipped.push(binary.clone());
-            }
-            (vec![device.clone()], skipped)
-        }
-        _ => (node.op().sources().into_iter().collect(), Vec::new()),
+        _ => (node.op().children(), SmallVec::new()),
     }
 }
 
@@ -134,11 +125,19 @@ where
     /// Traversal mode controlling CALL/FUNCTION/PROGRAM boundary handling.
     traversal_mode: TraversalMode,
 
-    /// Results cache: maps original node → optimized result.
-    replace: HashMap<UOpKey, Arc<UOp>>,
+    /// Results cache: maps original node id → optimized result.
+    ///
+    /// Keyed on `UOp::id` with an Fx hasher. The key wrapper this replaced already
+    /// compared and hashed by id alone, so the `Arc` it carried only bought a
+    /// refcount pair per probe, and SipHash only bought cycles over an integer we
+    /// already had.
+    replace: FxHashMap<u64, Arc<UOp>>,
 
     /// BPM result cache: prevents re-running pattern matching on nodes already seen.
-    bpm_cache: HashMap<UOpKey, Option<Arc<UOp>>>,
+    bpm_cache: FxHashMap<u64, Option<Arc<UOp>>>,
+
+    /// Scratch set for the bpm fixed-point loop, reused across nodes.
+    bpm_seen: FxHashSet<u64>,
 }
 
 impl<'a, PM, BPM, C> RewriteEngine<'a, PM, BPM, C>
@@ -147,7 +146,15 @@ where
     BPM: Matcher<C>,
 {
     fn new(pm: Option<&'a PM>, bpm: Option<&'a BPM>, ctx: &'a mut C, traversal_mode: TraversalMode) -> Self {
-        Self { pm, bpm, ctx, traversal_mode, replace: HashMap::new(), bpm_cache: HashMap::new() }
+        Self {
+            pm,
+            bpm,
+            ctx,
+            traversal_mode,
+            replace: FxHashMap::default(),
+            bpm_cache: FxHashMap::default(),
+            bpm_seen: FxHashSet::default(),
+        }
     }
 
     /// Single-shot top-down pattern application.
@@ -176,7 +183,7 @@ where
     /// Gate results are NOT cached — Gate is an exception that bypasses the cache.
     #[inline]
     fn cached_bpm_rewrite(&mut self, x: &Arc<UOp>) -> Result<Option<Arc<UOp>>, Arc<UOp>> {
-        let key = UOpKey(x.clone());
+        let key = x.id;
         if let Some(cached) = self.bpm_cache.get(&key) {
             return match cached {
                 Some(node) => Ok(Some(node.clone())),
@@ -208,25 +215,21 @@ where
     #[inline]
     fn record_replace(&mut self, original: &Arc<UOp>, result: Arc<UOp>) {
         if !Arc::ptr_eq(original, &result) {
-            use crate::provenance::{PROVENANCE_TRACKER, PassName};
-            PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().record_transform(result.id, original.id, PassName::RewritePattern);
-            });
+            crate::provenance::record_transformed(result.id, original.id, crate::provenance::PassName::RewritePattern);
         }
-        self.replace.insert(UOpKey(original.clone()), result);
+        self.replace.insert(original.id, result);
     }
 
     /// Main rewrite method — stack-based 3-stage traversal.
-    #[allow(clippy::mutable_key_type)]
     fn rewrite(&mut self, root: Arc<UOp>) -> Arc<UOp> {
         let mut stack: Vec<Entry> = vec![Entry { n: root.clone(), stage: 0, new_n: root.clone() }];
 
         // All UOps either on the stack or in self.replace — don't have to be placed again.
-        let mut on_stack: HashSet<UOpKey> = HashSet::new();
-        on_stack.insert(UOpKey(root.clone()));
+        let mut on_stack: FxHashSet<u64> = FxHashSet::default();
+        on_stack.insert(root.id);
 
         // UOps waiting on a dependency to be in self.replace.
-        let mut waitlist: HashMap<UOpKey, Vec<Entry>> = HashMap::new();
+        let mut waitlist: FxHashMap<u64, Vec<Entry>> = FxHashMap::default();
 
         while let Some(Entry { n, stage, new_n }) = stack.pop() {
             if stack.len() > REWRITE_STACK_LIMIT {
@@ -237,7 +240,7 @@ where
                 );
             }
 
-            let n_key = UOpKey(n.clone());
+            let n_key = n.id;
 
             if self.replace.contains_key(&n_key) {
                 continue;
@@ -249,18 +252,21 @@ where
 
                 if self.bpm.is_some() {
                     // Apply bpm rewrite rules until a fixed point is reached.
-                    let mut seen: HashSet<UOpKey> = HashSet::new();
+                    // The scratch set is reused across nodes rather than freshly
+                    // allocated per node — a deliberate improvement over tinygrad's
+                    // per-node `seen = set()` (ops.py:1732), which costs ~280k
+                    // allocations on a resnet50 schedule for a set that almost
+                    // always holds a single element.
+                    self.bpm_seen.clear();
                     let mut gated = false;
                     loop {
-                        let working_key = UOpKey(working.clone());
-                        if seen.contains(&working_key) {
+                        if !self.bpm_seen.insert(working.id) {
                             panic!(
                                 "infinite loop in fixed_point_rewrite: node {:?} (id={}) seen twice",
                                 working.op().as_ref(),
                                 working.id
                             );
                         }
-                        seen.insert(working_key);
                         match self.cached_bpm_rewrite(&working) {
                             Ok(Some(rewritten)) => {
                                 working = rewritten;
@@ -286,46 +292,48 @@ where
 
                 let (sources, skipped) = traversal_children(&working, self.traversal_mode);
                 for skipped_child in skipped {
-                    self.replace.entry(UOpKey(skipped_child.clone())).or_insert(skipped_child);
+                    self.replace.entry(skipped_child.id).or_insert_with(|| skipped_child.clone());
                 }
 
                 for child in sources.into_iter().rev() {
-                    let child_key = UOpKey(child.clone());
+                    let child_key = child.id;
                     if on_stack.contains(&child_key) {
                         continue;
                     }
-                    stack.push(Entry { n: child.clone(), stage: 0, new_n: child });
+                    stack.push(Entry { n: child.clone(), stage: 0, new_n: child.clone() });
                     on_stack.insert(child_key);
                 }
             } else if stage == 1 {
                 // Stage 1: ApplyPatterns
-                let sources = new_n.op().sources();
+                // Scoped so the borrow of `new_n`'s children ends before `new_n` is consumed.
+                let (tmp, waiting, sources_changed) = {
+                    let sources = new_n.op().children();
+                    let mut tmp: Vec<Arc<UOp>> = Vec::with_capacity(sources.len());
+                    let mut waiting = false;
+                    let mut changed = false;
 
-                let mut tmp: Vec<Arc<UOp>> = Vec::with_capacity(sources.len());
-                let mut waiting = false;
-
-                for src in &sources {
-                    let src_key = UOpKey(src.clone());
-                    if let Some(rx) = self.replace.get(&src_key) {
-                        tmp.push(rx.clone());
-                    } else {
-                        // Source not ready: register in waitlist
-                        waitlist.entry(src_key).or_default().push(Entry {
-                            n: n.clone(),
-                            stage: 1,
-                            new_n: new_n.clone(),
-                        });
-                        waiting = true;
-                        break;
+                    for src in sources {
+                        let src_key = src.id;
+                        if let Some(rx) = self.replace.get(&src_key) {
+                            changed |= !Arc::ptr_eq(rx, src);
+                            tmp.push(rx.clone());
+                        } else {
+                            // Source not ready: register in waitlist
+                            waitlist.entry(src_key).or_default().push(Entry {
+                                n: n.clone(),
+                                stage: 1,
+                                new_n: new_n.clone(),
+                            });
+                            waiting = true;
+                            break;
+                        }
                     }
-                }
+                    (tmp, waiting, changed)
+                };
 
                 if waiting {
                     continue;
                 }
-
-                // All sources ready — reconstruct if any changed
-                let sources_changed = tmp.iter().zip(sources.iter()).any(|(a, b)| !Arc::ptr_eq(a, b));
 
                 // Hash consing may collapse reconstruction to same node even when
                 // sources logically changed. Detect this and treat as unchanged.
@@ -355,7 +363,7 @@ where
                 }
             } else {
                 // Stage 2: Link
-                let new_n_key = UOpKey(new_n.clone());
+                let new_n_key = new_n.id;
 
                 if let Some(replaced_new_n) = self.replace.get(&new_n_key).cloned() {
                     self.record_replace(&n, replaced_new_n);
@@ -369,7 +377,7 @@ where
             }
         }
 
-        self.replace.get(&UOpKey(root.clone())).cloned().unwrap_or(root)
+        self.replace.get(&root.id).cloned().unwrap_or(root)
     }
 
     /// MLIR-style walk pattern rewrite driver — single-pass, no re-traversal.
@@ -394,7 +402,7 @@ where
                 );
             }
 
-            let n_key = UOpKey(n.clone());
+            let n_key = n.id;
             if self.replace.contains_key(&n_key) {
                 continue;
             }
@@ -422,21 +430,18 @@ where
 
                 let (sources, skipped) = traversal_children(&n, self.traversal_mode);
                 for skipped_child in skipped {
-                    self.replace.entry(UOpKey(skipped_child.clone())).or_insert(skipped_child);
+                    self.replace.entry(skipped_child.id).or_insert_with(|| skipped_child.clone());
                 }
                 for child in sources.into_iter().rev() {
-                    let child_key = UOpKey(child.clone());
-                    if !self.replace.contains_key(&child_key) {
-                        stack.push((child, false));
+                    if !self.replace.contains_key(&child.id) {
+                        stack.push((child.clone(), false));
                     }
                 }
             } else {
                 // Rebuild with rewritten sources.
-                let sources = n.op().sources();
-                let new_src: Vec<Arc<UOp>> = sources
-                    .iter()
-                    .map(|s| self.replace.get(&UOpKey(s.clone())).cloned().unwrap_or_else(|| s.clone()))
-                    .collect();
+                let sources = n.op().children();
+                let new_src: Vec<Arc<UOp>> =
+                    sources.iter().map(|s| self.replace.get(&s.id).cloned().unwrap_or_else(|| (*s).clone())).collect();
                 let any_changed = new_src.iter().zip(sources.iter()).any(|(a, b)| !Arc::ptr_eq(a, b));
                 let rebuilt = if any_changed { n.with_sources(new_src) } else { n.clone() };
 
@@ -447,7 +452,7 @@ where
             }
         }
 
-        self.replace.get(&UOpKey(root.clone())).cloned().unwrap_or(root)
+        self.replace.get(&root.id).cloned().unwrap_or(root)
     }
 }
 
@@ -480,6 +485,11 @@ pub fn graph_rewrite_walk<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &m
     RewriteEngine::new(None::<&NoMatcher>, Some(matcher), ctx, TraversalMode::Full).walk_rewrite(root)
 }
 
+/// Single-pass walk rewrite that does not enter CALL/FUNCTION bodies or PROGRAM internals.
+pub fn graph_rewrite_walk_preserve_calls<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
+    RewriteEngine::new(None::<&NoMatcher>, Some(matcher), ctx, TraversalMode::PreserveCallBodies).walk_rewrite(root)
+}
+
 /// Apply graph rewriting with both top-down and bottom-up patterns.
 /// - `bpm` patterns see ORIGINAL children (Stage 0)
 /// - `pm` patterns see OPTIMIZED children (Stage 1)
@@ -496,7 +506,7 @@ where
 /// - `bpm` patterns see ORIGINAL children (Stage 0)
 /// - `pm` patterns see OPTIMIZED children (Stage 1)
 /// - Traversal skips CALL/FUNCTION bodies and PROGRAM internals
-/// - CALL/FUNCTION args and PROGRAM device are still traversed
+/// - CALL/FUNCTION args are still traversed; PROGRAM has no traversed internals
 pub fn graph_rewrite_with_bpm_preserve_calls<PM, BPM, C>(pm: &PM, bpm: &BPM, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
 where
     PM: Matcher<C>,
@@ -509,7 +519,7 @@ where
 ///
 /// CALL/FUNCTION/PROGRAM nodes are still matchable/rewriteable, but traversal
 /// does not descend into CALL/FUNCTION bodies or PROGRAM internals.
-/// CALL/FUNCTION arguments and PROGRAM device are still traversed.
+/// CALL/FUNCTION arguments are still traversed; PROGRAM has no traversed internals.
 pub fn graph_rewrite_preserve_calls<PM, C>(pm: &PM, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
 where
     PM: Matcher<C>,
@@ -521,7 +531,7 @@ where
 ///
 /// CALL/FUNCTION/PROGRAM nodes are still matchable/rewriteable, but traversal
 /// does not descend into CALL/FUNCTION bodies or PROGRAM internals.
-/// CALL/FUNCTION arguments and PROGRAM device are still traversed.
+/// CALL/FUNCTION arguments are still traversed; PROGRAM has no traversed internals.
 pub fn graph_rewrite_bottom_up_preserve_calls<BPM, C>(bpm: &BPM, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
 where
     BPM: Matcher<C>,

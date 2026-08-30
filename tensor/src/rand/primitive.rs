@@ -121,11 +121,11 @@ pub(crate) fn threefry_random_bits(key: &Tensor, counts0: &Tensor, counts1: &Ten
     let result = Tensor::from_lazy(result_uop);
 
     // Split each u64 result into two u32s, concat: `[low_0, …, low_{N-1}, high_0, …, high_{N-1}]`.
-    let mask_u64 = Tensor::full(&to_vec_usize(&counts_shape).context(UOpSnafu)?, 0xFFFF_FFFFu64, u64_dt)?;
-    let lo_u64 = result.try_bitand(&mask_u64)?;
-    let lo = lo_u64.cast(u32_dt.clone())?;
-    let hi_u64 = result.try_shr(&shift_32)?.try_bitand(&mask_u64)?;
-    let hi = hi_u64.cast(u32_dt)?;
+    // Narrowing casts truncate, so no mask is needed; this is the exact inverse
+    // of the pack above, which lets `symbolic_simple` cancel both against the
+    // THREEFRY decomposition instead of emitting 64-bit ALU.
+    let lo = result.cast(u32_dt.clone())?;
+    let hi = result.try_shr(&shift_32)?.cast(u32_dt)?;
 
     Tensor::cat(&[&lo, &hi], 0)
 }

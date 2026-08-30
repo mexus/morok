@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "matmul"
 harness = false
+
+[[bench]]
+name = "sq_attention"
+harness = false

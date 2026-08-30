@@ -27,18 +27,18 @@ object = { version = "0.38", default-features = false, features = [
   "elf",
   "read",
 ] }
+sha2 = "0.10"
 memmap2 = "0.9"
-melior = { version = "0.26.3", features = ["ods-dialects"], optional = true }
 libffi = "5.1.0"
 smallvec = { workspace = true }
 
 [dev-dependencies]
 test-case = "3.3.1"
+tempfile = "3"
 
 [features]
 default = []
 dlopen-fallback = ["dep:libloading", "dep:tempfile"]
 cuda = ["svod-device/cuda"]
-mlir = ["dep:melior", "svod-codegen/mlir"]
 # Enable trace-level spans in hot paths (compile-time control)
 tracing-verbose = []

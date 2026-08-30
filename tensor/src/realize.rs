@@ -1,7 +1,7 @@
 //! Tensor realization (execution) API.
 //!
 //! This module provides the execution pipeline for tensor operations:
-//! 1. **Rangeify** - Transform movement ops to BUFFERIZE + INDEX
+//! 1. **Rangeify** - Transform movement ops to STAGE + INDEX
 //! 2. **Kernel splitting** - Split at STORE boundaries into CALL wrappers
 //! 3. **Scheduling** - Extract callables and create execution schedule
 //! 4. **Execution** - Compile and run each kernel in dependency order
@@ -34,15 +34,16 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use svod_schedule::{Scheduler, apply_post_optimization_with_renderer, beam_search_cached, prepare_scheduler};
+use svod_schedule::optimizer::beam::{CompiledCandidate, beam_search_cached_remote};
+use svod_schedule::{apply_post_optimization_with_config, prepare_scheduler};
 use tracing::{debug, trace};
 
 use crate::{
     PrepareConfig, Result, Tensor,
     error::{
         BatchOutputMismatchSnafu, CompileKernelSnafu, CreateProgramSnafu, DeviceSnafu, EmptyScheduleSnafu,
-        ExecutionSnafu, IrConstructionSnafu, OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu,
-        UOpSnafu,
+        ExecutionSnafu, IrConstructionSnafu, KernelGraphSnafu, OptimizeSnafu, RangeifySnafu, RenderKernelSnafu,
+        ShapeUnknownSnafu, UOpSnafu,
     },
     schedule::ScheduleItem,
 };
@@ -53,8 +54,8 @@ use svod_device::{Buffer, device::Device};
 use svod_ir::pattern::is_any_const;
 use svod_ir::{DeviceSpec, Op, UOp, UOpKey};
 use svod_runtime::{
-    ExecutionPlan, ExecutionPlanBuilder, PreparedBufferView, PreparedCopy, PreparedCustomFunction, PreparedKernel,
-    PreparedOp, ProfileOptions, RunProfile,
+    ExecutionPlan, ExecutionPlanBuilder, PreparedCopy, PreparedCustomFunction, PreparedKernel, PreparedOp,
+    ProfileOptions, RunProfile,
 };
 
 fn collect_pending_indices(tensors: &[&mut Tensor]) -> Vec<usize> {
@@ -116,7 +117,7 @@ impl Tensor {
         let input_buffer_ids: HashSet<u64> = collect_input_buffers(&old_uop).keys().copied().collect();
 
         let t_prep = std::time::Instant::now();
-        let plan = self.prepare()?;
+        let plan = self.prepare_plan_with(&PrepareConfig::from_env())?;
         let prep_ms = t_prep.elapsed().as_millis();
         let t_exec = std::time::Instant::now();
         plan.execute().context(ExecutionSnafu)?;
@@ -127,7 +128,6 @@ impl Tensor {
 
         let realized_uop = self.uop();
         if !Arc::ptr_eq(&old_uop, &realized_uop) {
-            #[allow(clippy::mutable_key_type)]
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
             crate::tensor_registry::apply_map_to_tensors(&becomes_map);
         }
@@ -178,7 +178,7 @@ impl Tensor {
         let input_buffer_ids: HashSet<u64> = collect_input_buffers(&old_uop).keys().copied().collect();
 
         let t_prep = std::time::Instant::now();
-        let plan = self.prepare_with(config)?;
+        let plan = self.prepare_plan_with(config)?;
         let prep_ms = t_prep.elapsed().as_millis();
         let t_exec = std::time::Instant::now();
         plan.execute().context(ExecutionSnafu)?;
@@ -189,7 +189,6 @@ impl Tensor {
 
         let realized_uop = self.uop();
         if !Arc::ptr_eq(&old_uop, &realized_uop) {
-            #[allow(clippy::mutable_key_type)]
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
             crate::tensor_registry::apply_map_to_tensors(&becomes_map);
         }
@@ -227,13 +226,12 @@ impl Tensor {
         let old_uop = self.uop();
         let input_buffer_ids: HashSet<u64> = collect_input_buffers(&old_uop).keys().copied().collect();
 
-        let plan = self.prepare()?;
+        let plan = self.prepare_plan_with(&PrepareConfig::from_env())?;
         let report = plan.profile(opts).context(ExecutionSnafu)?;
 
         self.finalize_realize(&plan, &old_uop)?;
         let realized_uop = self.uop();
         if !Arc::ptr_eq(&old_uop, &realized_uop) {
-            #[allow(clippy::mutable_key_type)]
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
             crate::tensor_registry::apply_map_to_tensors(&becomes_map);
         }
@@ -351,6 +349,14 @@ impl Tensor {
     /// plan.execute()?;
     /// ```
     pub fn prepare_with(&mut self, config: &PrepareConfig) -> Result<ExecutionPlan> {
+        let uop = self.uop();
+        let plan = self.prepare_plan_with(config)?;
+
+        self.wire_output_tensor(&plan, &uop)?;
+        Ok(plan)
+    }
+
+    fn prepare_plan_with(&self, config: &PrepareConfig) -> Result<ExecutionPlan> {
         let t_total = std::time::Instant::now();
         let uop = self.uop();
 
@@ -361,7 +367,6 @@ impl Tensor {
         // (e.g., sort substages, repeated model inference) skip optimize+compile.
         let plan = prepare_execution_plan(&schedule_result, config)?;
 
-        self.wire_output_tensor(&plan, &uop)?;
         debug!(total_ms = t_total.elapsed().as_millis() as u64, "prepare: total");
         Ok(plan)
     }
@@ -448,18 +453,16 @@ impl Tensor {
         let t_prep = std::time::Instant::now();
         let plan = prepare_execution_plan(&schedule_result, config)?;
         let prep_ms = t_prep.elapsed().as_millis();
+        snafu::ensure!(
+            plan.num_outputs() == pending_indices.len(),
+            BatchOutputMismatchSnafu { expected: pending_indices.len(), actual: plan.num_outputs() }
+        );
         let t_exec = std::time::Instant::now();
         plan.execute().context(ExecutionSnafu)?;
         let exec_ms = t_exec.elapsed().as_millis();
         debug!(prep_ms, exec_ms, num_outputs = pending_indices.len(), "realize_batch complete");
 
-        snafu::ensure!(
-            plan.num_outputs() >= pending_indices.len(),
-            BatchOutputMismatchSnafu { expected: pending_indices.len(), actual: plan.num_outputs() }
-        );
-
         // Finalize each pending tensor in-place + build batched becomes_map
-        #[allow(clippy::mutable_key_type)]
         let mut becomes_map = HashMap::new();
         for (buf_idx, &orig_idx) in pending_indices.iter().enumerate() {
             let output_buf = plan.output_buffer_at(buf_idx).expect("buf_idx in range").clone();
@@ -513,30 +516,26 @@ impl Tensor {
             return EmptyScheduleSnafu.fail();
         }
 
-        // Handle already-realized tensors
-        for t in &mut tensors {
-            if t.uop().has_buffer_identity() {
-                t.ensure_buffer();
-            }
-        }
-
-        // Wrap pure constants in CONTIGUOUS to force materialization (matches realize())
-        for t in &mut tensors {
-            if !t.uop().has_buffer_identity() && is_any_const(&t.uop()) {
-                let contiguous_uop = t.uop().contiguous();
-                t.set_uop(contiguous_uop);
-            }
-        }
-
-        // Collect pending (unrealized) tensor indices
-        let pending_indices = collect_pending_indices(&tensors);
+        // Keep tensor state unchanged until the complete plan has been validated.
+        let pending_indices: Vec<usize> = tensors
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.uop().has_buffer_identity() && !t.has_zero_elements())
+            .map(|(i, _)| i)
+            .collect();
 
         if pending_indices.is_empty() {
             return EmptyScheduleSnafu.fail();
         }
 
         // Collect UOps from pending tensors only
-        let uops: Vec<Arc<UOp>> = pending_indices.iter().map(|&i| tensors[i].uop()).collect();
+        let uops: Vec<Arc<UOp>> = pending_indices
+            .iter()
+            .map(|&i| {
+                let uop = tensors[i].uop();
+                if is_any_const(&uop) { uop.contiguous() } else { uop }
+            })
+            .collect();
 
         let mut var_vals = HashMap::new();
         for uop in &uops {
@@ -552,12 +551,20 @@ impl Tensor {
 
         let plan = prepare_execution_plan(&schedule_result, config)?;
 
+        snafu::ensure!(
+            plan.num_outputs() == pending_indices.len(),
+            BatchOutputMismatchSnafu { expected: pending_indices.len(), actual: plan.num_outputs() }
+        );
+
+        for t in &mut tensors {
+            if t.uop().has_buffer_identity() {
+                t.ensure_buffer();
+            }
+        }
+
         // Wire each pending output tensor to its plan buffer.
         // After execute/execute_with_vars, tensor.array_view() reads the result directly.
         for (buf_idx, &orig_idx) in pending_indices.iter().enumerate() {
-            if buf_idx >= plan.num_outputs() {
-                break;
-            }
             let output_buf = plan.output_buffer_at(buf_idx).expect("buf_idx in range").clone();
             let buf_arc = Arc::new(output_buf);
             let old_uop = &uops[buf_idx];
@@ -618,11 +625,17 @@ fn extract_var_vals(root: &Arc<UOp>) -> Result<HashMap<String, i64>> {
     let mut var_vals = HashMap::new();
     for node in root.toposort() {
         if let Op::Bind { var, value } = node.op()
-            && let Op::DefineVar { name, .. } = var.op()
             && let Op::Const(cv) = value.op()
             && let Some(val) = cv.0.try_int()
         {
-            insert_var_val_checked(&mut var_vals, name, val, "bind extraction")?;
+            let name = match var.op() {
+                Op::DefineVar { name, .. } => Some(name.as_str()),
+                Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.as_deref(),
+                _ => None,
+            };
+            if let Some(name) = name {
+                insert_var_val_checked(&mut var_vals, name, val, "bind extraction")?;
+            }
         }
     }
     Ok(var_vals)
@@ -638,6 +651,7 @@ fn schedule_result_from_sink_with_cache(
     mut var_vals: HashMap<String, i64>,
     config: &PrepareConfig,
 ) -> Result<crate::schedule::ScheduleResult> {
+    svod_ir::dump_canonical_stage("tensor", &sink);
     if config.disable_schedule_cache || schedule_cache_disabled_by_env() {
         return schedule_result_from_sink_uncached(sink, var_vals, config);
     }
@@ -660,9 +674,10 @@ fn schedule_result_from_sink_with_cache(
             hit
         }
         None => {
-            let schedule_root = restore_bind_placeholders_for_schedule(&normalization.normalized, &normalization);
-            let rangeify_result = svod_schedule::rangeify_with_map(schedule_root).context(RangeifySnafu)?;
-            let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
+            let rangeify_result =
+                svod_schedule::rangeify_with_map(normalization.normalized.clone()).context(RangeifySnafu)?;
+            let (kernel_graph, _) =
+                svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(KernelGraphSnafu)?;
             let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
             let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { pre_schedule: Arc::new(pre_schedule) });
             let guard = cache.guard();
@@ -672,7 +687,7 @@ fn schedule_result_from_sink_with_cache(
     };
 
     let restored_pre_schedule = restore_post_schedule_pre_schedule(&entry.pre_schedule, &normalization);
-    let schedule_input_buffers = build_schedule_input_buffers(&restored_pre_schedule, &normalization);
+    let schedule_input_buffers = build_schedule_input_buffers(&restored_pre_schedule);
     let result = crate::schedule::instantiate_schedule(
         &restored_pre_schedule,
         &schedule_input_buffers,
@@ -684,22 +699,29 @@ fn schedule_result_from_sink_with_cache(
 
 fn schedule_result_from_sink_uncached(
     sink: Arc<UOp>,
-    var_vals: HashMap<String, i64>,
-    _config: &PrepareConfig,
+    mut var_vals: HashMap<String, i64>,
+    config: &PrepareConfig,
 ) -> Result<crate::schedule::ScheduleResult> {
-    let rangeify_result = svod_schedule::rangeify_with_map(sink).context(RangeifySnafu)?;
-    let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
-    let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph.clone())?;
-    let input_buffers = collect_input_buffers(&kernel_graph);
-    let result =
-        crate::schedule::instantiate_schedule(&pre_schedule, &input_buffers, &var_vals, _config.device_local_outputs)?;
+    let normalization = normalize_for_schedule_cache(&sink)?;
+    merge_var_vals_checked(&mut var_vals, &normalization.var_vals, "uncached schedule normalization")?;
+    let rangeify_result = svod_schedule::rangeify_with_map(normalization.normalized.clone()).context(RangeifySnafu)?;
+    let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(KernelGraphSnafu)?;
+    let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
+    let restored_pre_schedule = restore_post_schedule_pre_schedule(&pre_schedule, &normalization);
+    let input_buffers = build_schedule_input_buffers(&restored_pre_schedule);
+    let result = crate::schedule::instantiate_schedule(
+        &restored_pre_schedule,
+        &input_buffers,
+        &var_vals,
+        config.device_local_outputs,
+    )?;
     Ok(result)
 }
 
 /// Pre-schedule cache normalization result.
 ///
 /// - BUFFER -> PARAM
-/// - BUFFER_VIEW identities normalized via recursive BUFFER -> PARAM
+/// - buffer identities normalized recursively through view metadata
 /// - strip runtime value from BIND(DEFINE_VAR, CONST)
 /// - normalize standalone UNIQUE identity -> LUNIQUE
 pub(crate) struct ScheduleCacheNormalization {
@@ -731,44 +753,30 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
 
     use svod_ir::op::pattern_derived::OpKey;
     use svod_ir::pattern::{RewriteResult, SimplifiedPatternMatcher};
-    use svod_ir::rewrite::graph_rewrite;
+    use svod_ir::rewrite::graph_rewrite_preserve_calls;
 
     let mut matcher = SimplifiedPatternMatcher::<NormalizeScheduleCacheCtx>::new();
 
-    fn to_param(
-        node: &Arc<UOp>,
-        ctx: &mut NormalizeScheduleCacheCtx,
-        size: usize,
-        device: Option<Arc<UOp>>,
-    ) -> Arc<UOp> {
-        let slot = *ctx.param_map.entry(node.id).or_insert_with(|| {
-            let s = ctx.param_values.len();
-            ctx.param_values.push(node.clone());
-            s
-        });
-        UOp::param(slot, size, node.dtype(), device)
-    }
-
-    // BUFFER -> PARAM (erase runtime buffer identity in cache key).
+    // Global BUFFER -> PARAM (erase runtime buffer identity in cache key).
+    // REG/LOCAL allocations are kernel-internal storage, not CALL arguments.
     matcher.add(&[OpKey::Buffer], |node, ctx| {
-        let Op::Buffer { size, device, .. } = node.op() else {
+        let Op::Buffer { arg, .. } = node.op() else {
             return RewriteResult::NoMatch;
         };
+        if arg.addrspace != Some(svod_ir::AddrSpace::Global) {
+            return RewriteResult::NoMatch;
+        }
+        let Some(size) = node.buffer_size() else { return RewriteResult::NoMatch };
         let slot = *ctx.param_map.entry(node.id).or_insert_with(|| {
             let s = ctx.param_values.len();
             ctx.param_values.push(node.clone());
             s
         });
         ctx.param_buffers.push((node.id, node.clone()));
-        RewriteResult::Rewritten(UOp::param(slot, *size, node.dtype(), Some(device.clone())))
-    });
-
-    // BUFFER_VIEW -> PARAM.
-    matcher.add(&[OpKey::BufferView], |node, ctx| {
-        let Op::BufferView { size, .. } = node.op() else {
-            return RewriteResult::NoMatch;
-        };
-        RewriteResult::Rewritten(to_param(node, ctx, *size, Some(UOp::device(DeviceSpec::Cpu))))
+        RewriteResult::Rewritten(
+            UOp::param(slot, size, node.dtype(), arg.device.clone())
+                .with_tag(smallvec::smallvec![svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM]),
+        )
     });
 
     // Strip runtime value from BIND for cache-key stability and collect var_vals.
@@ -778,9 +786,12 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
         let Op::Bind { var, value } = node.op() else {
             return RewriteResult::NoMatch;
         };
-        let Op::DefineVar { name, .. } = var.op() else {
-            return RewriteResult::NoMatch;
+        let name = match var.op() {
+            Op::DefineVar { name, .. } => Some(name.as_str()),
+            Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.as_deref(),
+            _ => None,
         };
+        let Some(name) = name else { return RewriteResult::NoMatch };
         let Op::Const(cv) = value.op() else {
             return RewriteResult::NoMatch;
         };
@@ -794,21 +805,21 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
             }
             return RewriteResult::NoMatch;
         }
-        RewriteResult::Rewritten(to_param(node, ctx, 0, Some(UOp::device(DeviceSpec::Cpu))))
+        RewriteResult::Rewritten(var.clone())
     });
 
     // Pre-schedule cache normalization:
     // - BUFFER(UNIQUE, DEVICE) -> PARAM
-    // - BUFFER_VIEW base identity normalized through child BUFFER -> PARAM
+    // - view base identity normalized through child BUFFER -> PARAM
     // - BIND(DEFINE_VAR, CONST) -> PARAM + var_vals capture
-    let normalized = graph_rewrite(&matcher, sink.clone(), &mut ctx);
+    let normalized = graph_rewrite_preserve_calls(&matcher, sink.clone(), &mut ctx);
 
     if let Some(details) = ctx.bind_mismatch.take() {
         return IrConstructionSnafu { details }.fail();
     }
 
     // Normalize standalone UNIQUE identity to deterministic LUNIQUE slots.
-    // This runs after BUFFER/BUFFER_VIEW replacement to avoid capturing UNIQUE
+    // This runs after BUFFER replacement to avoid capturing UNIQUE
     // nodes that are no longer present in the normalized graph.
     struct UniqueNormalizationCtx {
         unique_map: HashMap<u64, usize>,
@@ -827,7 +838,7 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
         });
         RewriteResult::Rewritten(UOp::lunique(Some(slot)))
     });
-    let normalized = graph_rewrite(&unique_matcher, normalized, &mut unique_ctx);
+    let normalized = graph_rewrite_preserve_calls(&unique_matcher, normalized, &mut unique_ctx);
 
     ctx.param_buffers.sort_unstable_by_key(|(id, _)| *id);
     ctx.param_buffers.dedup_by_key(|(id, _)| *id);
@@ -850,32 +861,39 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
 ///
 /// BIND runtime values are carried separately through `var_vals` and applied
 /// at execution-time via fixedvars, preserving `execute_with_vars` behavior.
-#[allow(clippy::mutable_key_type)]
 pub(crate) fn restore_post_schedule_cache(root: &Arc<UOp>, normalization: &ScheduleCacheNormalization) -> Arc<UOp> {
     let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     let mut lunique_buffers: HashMap<usize, Arc<UOp>> = HashMap::new();
 
     for node in root.toposort() {
         match node.op() {
-            Op::Param { slot, device: Some(_), .. } => {
-                if let Some(original) = normalization.param_values.get(*slot) {
+            Op::Param { arg, .. }
+                if node
+                    .tag()
+                    .as_ref()
+                    .is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM)) =>
+            {
+                if let Some(original) = normalization.param_values.get(arg.slot) {
                     let restored_original = restore_post_schedule_cache(original, normalization);
                     subs.insert(UOpKey(node.clone()), restored_original);
                 }
             }
-            Op::Buffer { unique, device, size } => {
-                let Op::LUnique(slot) = unique.op() else {
+            Op::Buffer { arg, .. } => {
+                let schedule_local = node
+                    .tag()
+                    .as_ref()
+                    .is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER));
+                if arg.addrspace != Some(svod_ir::AddrSpace::Global) || !schedule_local {
                     continue;
-                };
-                let restored = if let Some(existing) = lunique_buffers.get(slot) {
+                }
+                let slot = arg.slot;
+                let restored = if let Some(existing) = lunique_buffers.get(&slot) {
                     existing.clone()
                 } else {
-                    let runtime_unique = UOp::buffer_id(None);
-                    let fresh = UOp::new(
-                        Op::Buffer { unique: runtime_unique, device: device.clone(), size: *size },
-                        node.dtype(),
-                    );
-                    lunique_buffers.insert(*slot, fresh.clone());
+                    let Some(device) = arg.device.clone() else { continue };
+                    let Some(size) = node.buffer_size() else { continue };
+                    let fresh = UOp::new_buffer(device, size, arg.dtype.clone());
+                    lunique_buffers.insert(slot, fresh.clone());
                     fresh
                 };
                 subs.insert(UOpKey(node.clone()), restored);
@@ -893,40 +911,12 @@ pub(crate) fn restore_post_schedule_cache(root: &Arc<UOp>, normalization: &Sched
     root.substitute(&subs)
 }
 
-/// Restore only normalized BIND placeholders back to BIND nodes.
-///
-/// Cache keying strips bind runtime values (`BIND -> PARAM`) for key stability,
-/// but rangeify needs BIND semantics to preserve variable tracking. This helper
-/// rewrites just those placeholders while keeping BUFFER/PARAM normalization —
-/// the kernel AST must stay parametric so the cached pre-schedule can be reused
-/// across runs with different runtime buffers (post-cache restoration only
-/// swaps the buffer-uop *lists*, not the deep kernel AST).
-#[allow(clippy::mutable_key_type)]
-fn restore_bind_placeholders_for_schedule(root: &Arc<UOp>, normalization: &ScheduleCacheNormalization) -> Arc<UOp> {
-    let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
-
-    for node in root.toposort() {
-        let Op::Param { slot, device: Some(_), .. } = node.op() else {
-            continue;
-        };
-
-        let Some(original) = normalization.param_values.get(*slot) else {
-            continue;
-        };
-        if matches!(original.op(), Op::Bind { .. }) {
-            subs.insert(UOpKey(node.clone()), original.clone());
-        }
-    }
-
-    if subs.is_empty() { root.clone() } else { root.substitute(&subs) }
-}
-
 /// Restore cached pre-schedule buffer UOps for the current invocation.
 ///
 /// `pre_schedule` is cached with normalized PARAM placeholders; this helper
 /// restores source/output buffer UOps to run-specific BUFFER identities while
 /// callable identities/ASTs stay cached.
-fn restore_post_schedule_pre_schedule(
+pub(crate) fn restore_post_schedule_pre_schedule(
     pre_schedule: &crate::schedule::PreSchedule,
     normalization: &ScheduleCacheNormalization,
 ) -> crate::schedule::PreSchedule {
@@ -955,10 +945,11 @@ fn restore_post_schedule_pre_schedule(
         let end = cursor + source_count;
         let sources = restored_flat[cursor..end].to_vec();
         cursor = end;
-        let ast = restore_post_schedule_cache(&item.ast, normalization);
         restored_items.push(crate::schedule::PreScheduleItem {
             kernel: item.kernel.clone(),
-            ast,
+            // Callable bodies contain codegen PARAM formals. Only CALL args
+            // and output identities are restored to concrete runtime buffers.
+            ast: item.ast.clone(),
             sources,
             dependencies: item.dependencies.clone(),
             bound_ranges: item.bound_ranges.clone(),
@@ -973,20 +964,12 @@ fn restore_post_schedule_pre_schedule(
     }
 }
 
-fn build_schedule_input_buffers(
-    pre_schedule: &crate::schedule::PreSchedule,
-    _normalization: &ScheduleCacheNormalization,
-) -> crate::schedule::InputBuffers {
+fn build_schedule_input_buffers(pre_schedule: &crate::schedule::PreSchedule) -> crate::schedule::InputBuffers {
     let mut inputs = crate::schedule::InputBuffers::new();
 
     for item in &pre_schedule.items {
         for src in &item.sources {
-            let buf = src.buf_uop();
-            if let Op::Buffer { .. } = buf.op()
-                && let Some(buffer) = crate::tensor_registry::get_buffer(buf.id)
-            {
-                inputs.insert(buf.id, buffer);
-            }
+            inputs.extend(collect_input_buffers(src));
         }
     }
 
@@ -1057,6 +1040,32 @@ fn output_indices_from_program_metadata(globals: &[usize], outs: &[usize], num_b
     Ok(output_indices)
 }
 
+fn input_indices_from_program_metadata(globals: &[usize], ins: &[usize], num_buffers: usize) -> Result<Vec<usize>> {
+    let slot_to_position: HashMap<usize, usize> =
+        globals.iter().copied().enumerate().map(|(position, slot)| (slot, position)).collect();
+    let mut input_indices = Vec::with_capacity(ins.len());
+    for &slot in ins {
+        let Some(position) = slot_to_position.get(&slot).copied() else {
+            return IrConstructionSnafu {
+                details: format!("ProgramSpec.ins slot {slot} not found in ProgramSpec.globals={globals:?}"),
+            }
+            .fail();
+        };
+        if position >= num_buffers {
+            return IrConstructionSnafu {
+                details: format!(
+                    "ProgramSpec input index {position} (slot {slot}) out of range for {num_buffers} buffers"
+                ),
+            }
+            .fail();
+        }
+        input_indices.push(position);
+    }
+    input_indices.sort_unstable();
+    input_indices.dedup();
+    Ok(input_indices)
+}
+
 fn resolve_item_buffer_indices(item: &ScheduleItem, uop_id_to_idx: &HashMap<u64, usize>) -> Result<Vec<usize>> {
     let mut indices = Vec::with_capacity(item.buffer_uop_ids.len());
     for &uop_id in &item.buffer_uop_ids {
@@ -1074,27 +1083,38 @@ fn resolve_compiled_kernel_buffer_indices(
     globals: &[usize],
 ) -> Result<Vec<usize>> {
     let buffer_indices = resolve_item_buffer_indices(item, uop_id_to_idx)?;
-
-    let mut ordered = Vec::with_capacity(globals.len());
-    for &position in globals {
-        let Some(idx) = buffer_indices.get(position).copied() else {
-            return IrConstructionSnafu {
-                details: format!(
-                    "ProgramSpec.globals position {position} out of range for CALL {} buffer list len {} (buffer_uop_ids={:?})",
-                    item.kernel.id,
-                    buffer_indices.len(),
-                    item.buffer_uop_ids
-                ),
-            }
-            .fail();
-        };
-        ordered.push(idx);
+    if buffer_indices.len() != globals.len() {
+        return IrConstructionSnafu {
+            details: format!(
+                "PROGRAM expected {} compact buffers for slots {globals:?}, CALL {} supplied {} (buffer_uop_ids={:?})",
+                globals.len(),
+                item.kernel.id,
+                buffer_indices.len(),
+                item.buffer_uop_ids
+            ),
+        }
+        .fail();
     }
-
-    Ok(ordered)
+    Ok(buffer_indices)
 }
 
-type OptKey = (u64, DeviceSpec, &'static str, u64);
+type OptKey = (u64, DeviceSpec, String, u64, u64);
+
+fn optimized_kernel_key(
+    ast: &Arc<UOp>,
+    device: &DeviceSpec,
+    compiler_identity: &str,
+    renderer_fingerprint: u64,
+    optimizer_fingerprint: u64,
+) -> OptKey {
+    (
+        crate::schedule_cache::content_hash(ast),
+        device.clone(),
+        compiler_identity.to_string(),
+        renderer_fingerprint,
+        optimizer_fingerprint,
+    )
+}
 
 /// Bounded global cache for optimized + compiled kernels keyed by AST hash.
 ///
@@ -1139,9 +1159,7 @@ impl OptCacheState {
 
 pub(crate) fn runtime_effect_ast(ast: &Arc<UOp>) -> &Arc<UOp> {
     match ast.op() {
-        Op::End { computation, .. }
-            if matches!(computation.op(), Op::Copy { .. } | Op::BufferView { .. } | Op::CustomFunction { .. }) =>
-        {
+        Op::End { computation, .. } if matches!(computation.op(), Op::Copy { .. } | Op::CustomFunction { .. }) => {
             computation
         }
         _ => ast,
@@ -1151,6 +1169,13 @@ pub(crate) fn runtime_effect_ast(ast: &Arc<UOp>) -> &Arc<UOp> {
 fn optimizer_config_fingerprint(config: &PrepareConfig) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     config.optimizer.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn post_optimizer_behavior_fingerprint(config: &svod_schedule::OptimizerConfig) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.transcendental.hash(&mut hasher);
+    config.disable_fast_idiv.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1182,9 +1207,14 @@ fn prepare_execution_plan(
     // Liveness-based memory planning. `PlannerMode::Arena` (default) packs
     // plannable buffers into one or two large allocations; `Remap` swaps
     // per-pool `Arc<Buffer>`s; `Disabled` short-circuits. Mode is selected
-    // by `SVOD_MEMORY_PLANNER` (`Arena` if unset).
-    let planner_mode = crate::memory_planner::mode_from_env();
-    let output_buffer_ids = collect_output_buffer_ids(&schedule_items, &schedule_result.output_uop_ids);
+    // explicitly by PrepareConfig (`from_env` is the environment-reading
+    // constructor).
+    let planner_mode = config.planner_mode;
+    let output_buffer_ids = collect_output_buffer_ids(
+        &schedule_items,
+        &schedule_result.output_uop_ids,
+        schedule_result.alias_output_buffers.values(),
+    );
     // Reuse is keyed by execution LEVEL (computed from callable deps, matching
     // the runtime's per-op leveling), so storage is only shared across the
     // per-level barrier — no ordering edges are injected. This is why the
@@ -1194,13 +1224,24 @@ fn prepare_execution_plan(
     let item_levels = crate::memory_planner::compute_item_levels(&schedule_items)?;
     let planner_result =
         crate::memory_planner::memory_planner(&schedule_items, &item_levels, &output_buffer_ids, planner_mode);
+    trace!(
+        mode = ?planner_result.metrics.mode,
+        replacements = planner_result.buffer_replace.len(),
+        buffers_reused = planner_result.buffers_reused,
+        memory_saved_bytes = planner_result.memory_saved,
+        logical_bytes = planner_result.metrics.logical_bytes,
+        rounded_bytes = planner_result.metrics.rounded_bytes,
+        logical_peak_bytes = planner_result.metrics.logical_peak_bytes,
+        arena_committed_bytes = planner_result.metrics.arena_committed_bytes,
+        physical_bytes = planner_result.metrics.physical_bytes,
+        fragmentation_bytes = planner_result.metrics.fragmentation_bytes,
+        padding_bytes = planner_result.metrics.padding_bytes,
+        reused_allocations = planner_result.metrics.reused_allocations,
+        reused_bytes = planner_result.metrics.reused_bytes,
+        exclusions = ?planner_result.metrics.exclusions,
+        "memory planner measurements"
+    );
     if !planner_result.buffer_replace.is_empty() {
-        trace!(
-            replacements = planner_result.buffer_replace.len(),
-            buffers_reused = planner_result.buffers_reused,
-            memory_saved_bytes = planner_result.memory_saved,
-            "applying memory planner buffer replacements"
-        );
         crate::memory_planner::apply_buffer_replacements(&mut schedule_items, &planner_result.buffer_replace);
     }
     // The planner injects zero ordering edges; the real safety invariant (op
@@ -1212,15 +1253,15 @@ fn prepare_execution_plan(
     // Resolve primary plan device from the first schedule item for plan metadata.
     // Individual compiled kernels may still resolve/compile on per-item devices.
     let alloc_registry = svod_device::registry::registry();
-    let plan_device = if !schedule_items.is_empty() {
+    let plan_device = {
         let device_spec = schedule_items
             .iter()
             .flat_map(|item| item.buffers.iter().map(|b| b.allocator().device_spec()))
+            .chain(schedule_result.alias_output_buffers.values().map(|b| b.allocator().device_spec()))
             .find(|spec| !spec.is_disk())
+            .or_else(|| schedule_result.alias_output_buffers.values().next().map(|b| b.allocator().device_spec()))
             .unwrap_or_else(svod_dtype::default_device::default_device);
         config.resolve_device(&device_spec, alloc_registry)?
-    } else {
-        return EmptyScheduleSnafu.fail();
     };
     let optimizer_fingerprint = optimizer_config_fingerprint(config);
 
@@ -1232,20 +1273,6 @@ fn prepare_execution_plan(
     // We track buffers by their UOp ID (what they were registered under in tensor_registry's buffer index).
     let mut uop_id_to_idx: HashMap<u64, usize> = HashMap::new();
     let mut storage_to_idx: HashMap<BufferStorageKey, usize> = HashMap::new();
-
-    // BUFFER_VIEW output slots are replaced later with base views. Keep them as
-    // distinct entries even if they currently share physical storage, so replace
-    // cannot accidentally mutate another logical buffer mapping.
-    let buffer_view_output_uop_ids: HashSet<u64> = schedule_items
-        .iter()
-        .filter_map(|item| {
-            if matches!(runtime_effect_ast(&item.ast).op(), Op::BufferView { .. }) {
-                item.buffer_uop_ids.first().copied()
-            } else {
-                None
-            }
-        })
-        .collect();
 
     for item in &schedule_items {
         // Ensure all buffers are allocated
@@ -1263,23 +1290,39 @@ fn prepare_execution_plan(
                 dtype: buffer.dtype(),
             };
 
-            let idx = if !buffer_view_output_uop_ids.contains(&uop_id) {
-                if let Some(&existing_idx) = storage_to_idx.get(&storage_key) {
-                    builder.map_buffer(uop_id, existing_idx);
-                    existing_idx
-                } else {
-                    let new_idx = builder.add_buffer(uop_id, buffer.clone());
-                    storage_to_idx.insert(storage_key, new_idx);
-                    new_idx
-                }
+            let idx = if let Some(&existing_idx) = storage_to_idx.get(&storage_key) {
+                builder.map_buffer(uop_id, existing_idx);
+                existing_idx
             } else {
-                builder.add_buffer(uop_id, buffer.clone())
+                let new_idx = builder.add_buffer(uop_id, buffer.clone());
+                storage_to_idx.insert(storage_key, new_idx);
+                new_idx
             };
             uop_id_to_idx.insert(uop_id, idx);
         }
 
         // Collect alias IDs for cleanup
         builder.add_alias_ids(item.alias_registered_ids.iter().copied());
+    }
+
+    // Alias-only outputs have no executable schedule item, but the plan still
+    // owns their concrete Buffer handles and maps their logical UOp identities.
+    for (&uop_id, buffer) in &schedule_result.alias_output_buffers {
+        if uop_id_to_idx.contains_key(&uop_id) {
+            continue;
+        }
+        buffer.ensure_allocated().context(DeviceSnafu)?;
+        let storage_key =
+            BufferStorageKey { id: buffer.id().0, offset: buffer.offset(), size: buffer.size(), dtype: buffer.dtype() };
+        let idx = if let Some(&existing_idx) = storage_to_idx.get(&storage_key) {
+            builder.map_buffer(uop_id, existing_idx);
+            existing_idx
+        } else {
+            let idx = builder.add_buffer(uop_id, buffer.clone());
+            storage_to_idx.insert(storage_key, idx);
+            idx
+        };
+        uop_id_to_idx.insert(uop_id, idx);
     }
 
     // Step 2: Compile callable kernels and create prepared runtime ops
@@ -1311,61 +1354,10 @@ fn prepare_execution_plan(
             continue;
         }
 
-        // BUFFER_VIEW: zero-copy sub-buffer view (DISK weight views).
-        // Creates a view into the base buffer at the specified byte offset.
-        // BUFFER_VIEW lowers to a base.view(size, dtype, offset) on the source buffer.
-        if let Op::BufferView { size, offset, .. } = runtime_ast.op() {
-            let buffer_indices = resolve_item_buffer_indices(item, &uop_id_to_idx)?;
-
-            // A BUFFER_VIEW must carry [output, base]. Anything less is malformed
-            // IR — fail loud rather than silently emit no op, which would break
-            // the 1:1 op↔item emission the memory planner's leveling relies on.
-            if item.buffers.len() < 2 || item.buffer_uop_ids.len() < 2 || buffer_indices.len() < 2 {
-                return IrConstructionSnafu {
-                    details: format!(
-                        "BUFFER_VIEW kernel {} must have >=2 buffers (output, base) for 1:1 op emission; \
-                         got buffers={}, buffer_uop_ids={}, buffer_indices={}",
-                        item.kernel.id,
-                        item.buffers.len(),
-                        item.buffer_uop_ids.len(),
-                        buffer_indices.len(),
-                    ),
-                }
-                .fail();
-            }
-
-            let base = &item.buffers[1];
-            let byte_offset = offset * base.dtype().bytes();
-            let byte_size = size * runtime_ast.dtype().bytes();
-            let view = base.view(byte_offset, byte_size).context(crate::error::BufferViewSnafu {
-                kernel_id: item.kernel.id,
-                offset: byte_offset,
-                size: byte_size,
-            })?;
-            // Register the view under the output buffer's UOp ID so downstream
-            // COPY/kernel items find it as their source buffer.
-            let output_uop_id = item.buffer_uop_ids[0];
-            if let Some(&idx) = uop_id_to_idx.get(&output_uop_id) {
-                builder.replace_buffer(idx, view);
-            }
-
-            builder.add_op_with_instance_dependencies(
-                PreparedOp::BufferView(PreparedBufferView {
-                    id: item.kernel.id,
-                    buffer_indices,
-                    byte_offset,
-                    byte_size,
-                    dependencies: item.dependencies.clone(),
-                }),
-                item.instance_dependencies.clone(),
-            );
-            continue;
-        }
-
         // CALL bodies rooted at CUSTOM_FUNCTION are lowered directly to runtime
         // PreparedOp::CustomFunction with typed dispatch. Match against the
         // unwrapped runtime AST so END(CustomFunction) reaches this branch
-        // consistently with Copy/BufferView above.
+        // consistently with Copy above.
         if let Op::CustomFunction { kind, attrs } = runtime_ast.op() {
             let buffer_indices = resolve_item_buffer_indices(item, &uop_id_to_idx)?;
             let runtime_vars = attrs.iter().flat_map(svod_runtime::execution_plan::collect_runtime_vars).collect();
@@ -1391,19 +1383,19 @@ fn prepare_execution_plan(
             .find(|spec| !spec.is_disk())
             .unwrap_or_else(svod_dtype::default_device::default_device);
         let item_device = config.resolve_device(&item_device_spec, alloc_registry)?;
-        let item_codegen: &'static str = item_device.compiler.cache_key();
-
-        let opt_key = (
-            crate::schedule_cache::content_hash(&item.ast),
-            item_device.device.clone(),
+        let item_codegen = item_device.compiler.cache_key();
+        let optimizer_renderer = get_optimizer_renderer(&item_device);
+        let opt_key = optimized_kernel_key(
+            &item.ast,
+            &item_device.device,
             item_codegen,
+            optimizer_renderer.cache_fingerprint(),
             optimizer_fingerprint,
         );
 
         let cached = if let Some(cached) = opt_cache.get(&opt_key, &opt_guard) {
             Arc::clone(cached)
         } else {
-            let optimizer_renderer = get_optimizer_renderer(&item_device);
             // Author-supplied `opts_to_apply` short-circuits before beam: such
             // kernels must go through the heuristic entry so `apply_explicit_opts`
             // honors the exact opt list (empty = none).
@@ -1423,23 +1415,11 @@ fn prepare_execution_plan(
                         .context(OptimizeSnafu)?
                 };
 
-            // Optimizer-scheduled kernels carry their name in the schedule metadata;
-            // hand-lowered custom kernels (tk graph_launch) carry it on the SINK's
-            // KernelInfo instead, so fall back to that — otherwise they render as the
-            // generic "kernel" default and collapse together in the profile.
-            let kernel_name = optimized_ast
-                .metadata::<svod_schedule::optimizer::KernelInfo>()
-                .map(|info| info.function_name())
-                .or_else(|| match optimized_ast.op() {
-                    svod_ir::Op::Sink { info: Some(ki), .. } => ki.name.clone(),
-                    _ => None,
-                });
-
-            let ast_decomposed = match item_device.renderer.decompositor() {
-                Some(matcher) => svod_ir::decompositions::decompose_with(&optimized_ast, &matcher),
-                None => optimized_ast,
-            };
-            let program = svod_codegen::program_pipeline::program_from_sink(ast_decomposed, item_device.device.clone());
+            let program = svod_codegen::program_pipeline::program_from_sink_with_renderer(
+                optimized_ast,
+                item_device.renderer.as_ref(),
+            )
+            .context(RenderKernelSnafu)?;
 
             let result = svod_runtime::kernel_cache::get_or_compile_kernel(
                 crate::schedule_cache::content_hash(&program),
@@ -1449,7 +1429,6 @@ fn prepare_execution_plan(
                         program.clone(),
                         item_device.renderer.as_ref(),
                         item_device.compiler.as_ref(),
-                        kernel_name.as_deref(),
                     )?;
                     let program = (item_device.runtime)(&compiled).context(CreateProgramSnafu)?;
                     Ok(svod_runtime::kernel_cache::CachedKernel {
@@ -1473,16 +1452,25 @@ fn prepare_execution_plan(
         // Build buffer indices in compiled ABI order (`ProgramSpec.globals`), not necessarily CALL arg order.
         let buffer_indices = resolve_compiled_kernel_buffer_indices(item, &uop_id_to_idx, &cached.globals)?;
 
-        trace!(kernel.ast_id = item.ast.id, num_buffers = item.buffers.len(), "kernel buffer mapping");
+        trace!(
+            kernel.ast_id = item.ast.id,
+            num_buffers = item.buffers.len(),
+            buffer_uop_ids = ?item.buffer_uop_ids,
+            buffer_ids = ?item.buffers.iter().map(|buffer| buffer.id()).collect::<Vec<_>>(),
+            buffer_indices = ?buffer_indices,
+            globals = ?cached.globals,
+            fixedvars = ?item.fixedvars,
+            var_names = ?cached.var_names,
+            "kernel buffer mapping"
+        );
 
         // Create PreparedKernel
         // Note: buffer_ptrs and buffer_ids will be computed in ExecutionPlanBuilder::build()
-        // Convert fixedvars HashMap to vals Vec using var_names order from CachedKernel
-        let vals: Vec<i64> =
-            cached.var_names.iter().map(|name| item.fixedvars.get(name).copied().unwrap_or(0)).collect();
+        let vals = initial_kernel_var_values(item, &cached.var_names)?;
         let non_overridable_fixedvars = collect_non_overridable_fixedvars(item);
 
         let output_indices = output_indices_from_program_metadata(&cached.globals, &cached.outs, buffer_indices.len())?;
+        let input_indices = input_indices_from_program_metadata(&cached.globals, &cached.ins, buffer_indices.len())?;
 
         let runtime_vars = svod_runtime::execution_plan::collect_runtime_vars(&item.ast);
         let prepared = PreparedKernel {
@@ -1492,6 +1480,7 @@ fn prepare_execution_plan(
             device: item_device.device.clone(),
             buffer_indices,
             output_indices,
+            input_indices,
             vals,
             fixedvars: non_overridable_fixedvars,
             dependencies: item.dependencies.clone(),
@@ -1508,8 +1497,7 @@ fn prepare_execution_plan(
 
     // 1:1 op↔item emission is the invariant that makes the planner's
     // (schedule-item) levels equal the runtime's (per-op) levels. Every branch
-    // above emits exactly one op per item (the BufferView `<2` case is now a
-    // hard error), so this must hold.
+    // above emits exactly one op per item, so this must hold.
     debug_assert_eq!(
         builder.op_count(),
         schedule_items.len(),
@@ -1533,7 +1521,11 @@ fn prepare_execution_plan(
     builder.build().context(ExecutionSnafu)
 }
 
-fn collect_output_buffer_ids(schedule: &crate::schedule::Schedule, output_uop_ids: &[u64]) -> HashSet<u64> {
+fn collect_output_buffer_ids<'a>(
+    schedule: &crate::schedule::Schedule,
+    output_uop_ids: &[u64],
+    alias_outputs: impl Iterator<Item = &'a Buffer>,
+) -> HashSet<u64> {
     let output_uop_set: HashSet<u64> = output_uop_ids.iter().copied().collect();
     let mut output_buffer_ids = HashSet::new();
     for item in schedule {
@@ -1543,6 +1535,13 @@ fn collect_output_buffer_ids(schedule: &crate::schedule::Schedule, output_uop_id
             }
         }
     }
+    let alias_output_storage: HashSet<_> = alias_outputs.map(Buffer::storage_id).collect();
+    output_buffer_ids.extend(
+        schedule
+            .iter()
+            .flat_map(|item| &item.buffers)
+            .filter_map(|buffer| alias_output_storage.contains(&buffer.storage_id()).then_some(buffer.id().0)),
+    );
     output_buffer_ids
 }
 
@@ -1551,14 +1550,55 @@ fn collect_non_overridable_fixedvars(item: &ScheduleItem) -> HashMap<String, i64
     // overridden by user `var_vals` — they're loop counters, not symbolic
     // input variables. `loop_var_names` is populated at instantiation time
     // from the keys of `KernelInvocation.fixedvars`, structurally separating
-    // loop counters from runtime variable binds.
-    let mut locked = HashMap::with_capacity(item.loop_var_names.len());
+    // loop counters from runtime variable binds. `_device_num` is similarly
+    // selected by host-side MSTACK lane expansion and is never user-overridable.
+    let mut locked = HashMap::with_capacity(item.loop_var_names.len() + 1);
     for name in &item.loop_var_names {
         if let Some(v) = item.fixedvars.get(name) {
             locked.insert(name.clone(), *v);
         }
     }
+    if let Some(v) = item.fixedvars.get("_device_num") {
+        locked.insert("_device_num".to_string(), *v);
+    }
     locked
+}
+
+fn initial_kernel_var_values(item: &ScheduleItem, var_names: &[String]) -> Result<Vec<i64>> {
+    let mut bounds = HashMap::new();
+    for node in item.ast.toposort() {
+        match node.op() {
+            Op::DefineVar { name, min_val, max_val } => {
+                bounds.insert(name.clone(), (*min_val, *max_val));
+            }
+            Op::Param { arg, .. }
+                if arg.addrspace.is_none()
+                    && let Some(name) = arg.name.as_deref()
+                    && let Some((min, max)) = &arg.vmin_vmax
+                    && let (Some(min), Some(max)) = (min.0.try_int(), max.0.try_int()) =>
+            {
+                bounds.insert(name.to_string(), (min, max));
+            }
+            _ => {}
+        }
+    }
+
+    var_names
+        .iter()
+        .map(|name| {
+            if let Some(value) = item.fixedvars.get(name) {
+                return Ok(*value);
+            }
+            if name == "core_id" {
+                return Ok(0);
+            }
+            // Unbound at prepare time: this is the documented prepare-once flow
+            // (`variable.rs`), so seed an in-bounds placeholder and let
+            // `ExecutionPlan::execute_with_vars` reject a value that never
+            // arrives or arrives out of bounds.
+            Ok(bounds.get(name.as_str()).map_or(0, |&(min, _)| min.max(0)))
+        })
+        .collect()
 }
 
 /// Render/compile entrypoint backed by PROGRAM pipeline stages.
@@ -1566,7 +1606,6 @@ fn compile_with_program_pipeline_components(
     kernel_ast: Arc<UOp>,
     renderer: &dyn svod_device::device::Renderer,
     compiler: &dyn svod_device::device::Compiler,
-    kernel_name: Option<&str>,
 ) -> Result<(svod_device::device::ProgramSpec, svod_device::device::CompiledSpec)> {
     let mut program = match kernel_ast.op() {
         Op::Program { .. } => kernel_ast,
@@ -1582,7 +1621,6 @@ fn compile_with_program_pipeline_components(
         &program,
         renderer,
         compiler,
-        kernel_name,
         svod_codegen::program_pipeline::ProgramTarget::Source,
     )
     .context(RenderKernelSnafu)?;
@@ -1600,7 +1638,7 @@ fn compile_with_program_pipeline_components(
 }
 
 /// Resolve the device string for cache keying (includes compiler cache key).
-pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &PrepareConfig) -> Result<&'static str> {
+pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &PrepareConfig) -> Result<String> {
     let alloc_registry = svod_device::registry::registry();
     let spec = param_buffers
         .iter()
@@ -1610,23 +1648,20 @@ pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &Prepar
         })
         .or_else(|| {
             param_buffers.iter().find_map(|(_, u)| {
-                let Op::Buffer { device, .. } = u.op() else {
+                let Op::Buffer { arg, .. } = u.op() else {
                     return None;
                 };
-                let Op::Device(spec) = device.op() else {
-                    return None;
-                };
-                (!spec.is_disk()).then_some(spec.clone())
+                arg.device.as_ref().filter(|spec| !spec.is_disk()).cloned()
             })
         })
         .unwrap_or_else(svod_dtype::default_device::default_device);
     let device = config.resolve_device(&spec, alloc_registry)?;
-    Ok(device.compiler.cache_key())
+    Ok(device.compiler.cache_key().to_string())
 }
 
 /// Get the optimizer renderer for a device.
-fn get_optimizer_renderer(device: &Device) -> svod_schedule::OptimizerRenderer {
-    match device.device {
+pub(crate) fn get_optimizer_renderer(device: &Device) -> svod_schedule::OptimizerRenderer {
+    let renderer = match device.device {
         DeviceSpec::Cpu => {
             if std::env::var("SVOD_AMX").as_deref() == Ok("1") {
                 svod_schedule::OptimizerRenderer::apple_amx()
@@ -1646,7 +1681,8 @@ fn get_optimizer_renderer(device: &Device) -> svod_schedule::OptimizerRenderer {
             .map(svod_schedule::OptimizerRenderer::for_amd_arch)
             .unwrap_or_else(svod_schedule::OptimizerRenderer::amd_rdna3),
         _ => svod_schedule::OptimizerRenderer::cpu(),
-    }
+    };
+    renderer.with_codegen_renderer(device.renderer.as_ref())
 }
 
 /// Optimize a kernel AST using beam search auto-tuning.
@@ -1654,24 +1690,6 @@ fn get_optimizer_renderer(device: &Device) -> svod_schedule::OptimizerRenderer {
 /// Beam search explores multiple optimization paths and selects the fastest
 /// by compiling and timing each candidate. Slower than heuristics but can
 /// find better optimizations. Beam and heuristic are mutually exclusive.
-/// Count the top-K most frequent Op variants in a flat uop list. Used by the
-/// `BEAM_LOG_SURPASS_MAX` diagnostic to identify which Op type is
-/// bloating the linearized count for a dropped BEAM candidate.
-pub(crate) fn count_top_ops(ops: &[Arc<UOp>], top_k: usize) -> Vec<(String, usize)> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for u in ops {
-        *counts.entry(u.op().as_ref().to_string()).or_insert(0) += 1;
-    }
-    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
-    v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-    v.truncate(top_k);
-    v
-}
-
-pub(crate) fn fmt_op_counts(counts: &[(String, usize)]) -> String {
-    counts.iter().map(|(o, n)| format!("{o}={n}")).collect::<Vec<_>>().join(", ")
-}
-
 fn beam_search_optimize(
     ast: Arc<UOp>,
     renderer: &svod_schedule::OptimizerRenderer,
@@ -1679,10 +1697,38 @@ fn beam_search_optimize(
     buffers: &[Buffer],
     optimizer_config: &svod_schedule::OptimizerConfig,
 ) -> Result<Arc<UOp>> {
-    let beam_config = &optimizer_config.beam;
+    let mut resolved_beam_config = optimizer_config.beam.clone();
+    resolved_beam_config.compile_workers =
+        std::env::var("PARALLEL").ok().and_then(|value| value.parse().ok()).unwrap_or_else(|| {
+            if resolved_beam_config.compile_workers > 0 {
+                resolved_beam_config.compile_workers
+            } else if matches!(
+                device.device,
+                DeviceSpec::Cuda { .. } | DeviceSpec::Amd { .. } | DeviceSpec::Metal { .. }
+            ) {
+                std::thread::available_parallelism().map(|count| count.get()).unwrap_or(1)
+            } else {
+                0
+            }
+        });
+    let beam_config = &resolved_beam_config;
+    let beam_debug = std::env::var("BEAM_DEBUG").ok().and_then(|value| value.parse::<u8>().ok()).unwrap_or(0);
+    if beam_debug > 0 {
+        eprintln!(
+            "[beam] start device={} width={} parallel={} spawn_workers={} max_tasks_per_child={} timeout={}s",
+            device.device.canonicalize(),
+            beam_config.beam_width,
+            beam_config.compile_workers,
+            beam_config.compile_workers.max(1),
+            beam_config.max_tasks_per_child,
+            beam_config.compile_timeout_secs
+        );
+    }
+    let post_optimizer_config = optimizer_config.clone();
+    let wire_graph = svod_ir::OptimizerWireGraph::from_root(&ast).context(UOpSnafu)?;
     // Prepare scheduler (applies symbolic simplification and loop→global).
     // BEAM and heuristic are mutually exclusive.
-    let scheduler = prepare_scheduler(ast, renderer);
+    let scheduler = prepare_scheduler(ast, renderer).context(OptimizeSnafu)?;
 
     // Ensure all buffers are allocated for timing
     for buf in buffers {
@@ -1691,325 +1737,212 @@ fn beam_search_optimize(
 
     // Clone buffers for the closure (Buffer is Clone + Send + Sync)
     let buffers: Vec<Buffer> = buffers.to_vec();
-    let bench_config = svod_runtime::BenchmarkConfig::default();
+    let bench_config = svod_runtime::BenchmarkConfig { timing_runs: beam_config.num_runs, ..Default::default() };
 
     // Clone device components for the closure
-    let dev_renderer = device.renderer.clone();
     let dev_compiler = device.compiler.clone();
-    let dev_runtime = device.runtime.clone();
-    let dev_device = device.device.clone();
-    let max_uops = beam_config.max_uops;
-
-    // Force rayon's global thread pool to materialise before the BEAM loop so
-    // the first candidate's bench doesn't pay pool-init cost. Subsequent calls
-    // are O(1) thread-pool dispatch — but the lazy init can dominate the first
-    // 1-2 measurements at the small kernel sizes BEAM-time uses, biasing
-    // ranking against fast candidates that happen to run first.
-    svod_runtime::warmup_thread_pool();
-
-    // Per-candidate **compile-only** timeout (default 10s). Rust can't
-    // safely deliver SIGALRM to a worker, so we use a two-stage detached
-    // worker thread: the worker signals `CompileDone` once
-    // codegen/compile/runtime-link finish, after which execution runs
-    // unbounded (only `early_stop` aborts a slow run). Side effect: a hung
-    // clang invocation orphans one OS thread per timeout, reaped at
-    // process exit.
-    let compile_timeout =
-        Duration::from_secs(std::env::var("BEAM_TIMEOUT_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(10));
 
     // When `BEAM_LOG_SURPASS_MAX` is set, every dropped candidate prints
     // one line with the failure reason, applied-opt chain, and (for "too
     // many uops") the top Op-variant counts in the linearized program.
     let log_surpass = std::env::var("BEAM_LOG_SURPASS_MAX").is_ok();
 
-    // Per-BEAM-call cache for `apply_post_optimization_with_renderer`. Many
-    // candidates expand from the same parent state and share the underlying
-    // raw AST; without this cache the rewrite engine re-runs the full
-    // post-optimisation graph rewrite for each, costing ~13 ms × N candidates.
-    // Scoped to one `beam_search_optimize` invocation so stale entries cannot
-    // leak between calls. Read-mostly access pattern fits papaya's lock-free
-    // reads + bounded-lock writes.
-    let post_opt_cache: Arc<papaya::HashMap<u64, Arc<UOp>>> = Arc::new(papaya::HashMap::new());
-
-    // Compile-and-time closure: compilation is NOT timed, only execution. Wrapped
-    // in catch_unwind because beam search explores speculative candidates that
-    // may trigger rewrite engine limits or other panics. Wrapped in a worker
-    // thread + recv_timeout so a hung clang invocation cannot block BEAM.
-    //
-    // Returns `CandidateMetrics` (timing + structural IR hash + compute-op count)
-    // so the beam loop can apply `seen_libs` dedup and the
-    // `least_compute_ops*1000` compute-bloat filter. The optional `early_stop`
-    // argument is propagated into `BenchmarkConfig` so `benchmark_kernel` can
-    // abort the run loop the moment any single run exceeds the threshold.
-    let compile_and_time = |s: &Scheduler, early_stop: Option<Duration>| -> Option<svod_schedule::CandidateMetrics> {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-        use std::sync::mpsc;
-
-        // Per-call clones move into the worker. All Arc/Clone — no deep copy.
-        let s_owned = s.clone();
-        let renderer_c = renderer.clone();
-        let dev_renderer_c = dev_renderer.clone();
-        let dev_compiler_c = dev_compiler.clone();
-        let dev_runtime_c = dev_runtime.clone();
-        let dev_device_c = dev_device.clone();
-        let buffers_c = buffers.clone();
-        let bench_config_c = bench_config.clone();
-        let max_uops_c = max_uops;
-        let post_opt_cache_c = Arc::clone(&post_opt_cache);
-        let log_surpass_c = log_surpass;
-        // Snapshot the applied-opts chain so the diagnostic line in the worker
-        // thread can identify which BEAM branch triggered the drop without
-        // having to send the full Scheduler back across the channel.
-        let opts_snapshot: Vec<svod_schedule::optimizer::Opt> = s_owned.applied_opts.clone();
-
-        // Two-stage signal: CompileDone fires when codegen/compile/runtime-link
-        // finish; Final carries the benchmark result (or None on failure/panic).
-        // Capacity 2 so the worker never blocks on send. Detached: drop the
-        // JoinHandle so the parent can abandon the worker on compile timeout.
-        enum WorkerMsg {
-            CompileDone,
-            Final(Option<svod_schedule::CandidateMetrics>),
+    struct CompiledBeamProgram {
+        compiled: svod_device::device::CompiledSpec,
+        opts: Vec<svod_schedule::optimizer::Opt>,
+        vals: Vec<i64>,
+        global_size: [usize; 3],
+        local_size: Option<[usize; 3]>,
+    }
+    let worker_init = crate::beam_worker::WorkerInit {
+        protocol_version: crate::beam_worker::BEAM_WORKER_PROTOCOL_VERSION,
+        graph: wire_graph,
+        device: device.device.clone(),
+        gpu_arch: device.renderer.gpu_arch(),
+        compiler_key: dev_compiler.cache_key().to_string(),
+        renderer_fingerprint: renderer.cache_fingerprint(),
+        base_opt_count: scheduler.applied_opts.len(),
+        beam: beam_config.clone(),
+        transcendental: post_optimizer_config.transcendental,
+        disable_fast_idiv: post_optimizer_config.disable_fast_idiv,
+        log_surpass,
+    };
+    let mut worker_pool = crate::beam_worker::WorkerPool::new(beam_config.compile_workers.max(1), worker_init)
+        .map_err(|error| svod_device::Error::Runtime { message: error.to_string() })
+        .context(DeviceSnafu)?;
+    let benchmark_ast = scheduler.ast().clone();
+    let launch_placeholder = [UOp::index_const(1), UOp::index_const(1), UOp::index_const(1)];
+    let compile_wave = |candidates: &[Vec<svod_schedule::optimizer::Opt>],
+                        emit: &mut dyn FnMut(usize, CompiledCandidate<CompiledBeamProgram>)|
+     -> std::result::Result<(), svod_schedule::optimizer::OptError> {
+        if beam_debug > 0 {
+            eprintln!("[beam] compile wave: {} candidates", candidates.len());
         }
-        let (tx, rx) = mpsc::sync_channel::<WorkerMsg>(2);
-        let tx_compile = tx.clone();
-        let _ = std::thread::spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                let raw_ast = s_owned.get_optimized_ast(None);
-
-                // Apply post-optimization passes for accurate timing.
-                // Pass the renderer so pm_add_gpudims fires for has_threads/has_local backends —
-                // otherwise the Thread axis stays as a plain RANGE and gets rendered as a
-                // sequential `for` loop instead of a parallel core_id dispatch, making BEAM
-                // candidates time as single-threaded and converge to wrong tile shapes.
-                //
-                // Cache by `raw_ast.content_hash`: BEAM expands children of the same
-                // parent in lockstep, so siblings share `raw_ast` and would otherwise
-                // re-run the full graph rewrite (~13 ms each).
-                let cache_key = raw_ast.content_hash;
-                let cache_pin = post_opt_cache_c.pin();
-                let optimized = if let Some(cached) = cache_pin.get(&cache_key) {
-                    cached.clone()
-                } else {
-                    let opt = apply_post_optimization_with_renderer(raw_ast, Some(&renderer_c));
-                    cache_pin.insert(cache_key, opt.clone());
-                    opt
-                };
-
-                // Extract kernel name before decomposition (which loses metadata).
-                // Hand-lowered custom kernels carry it on the SINK instead (see the
-                // non-BEAM path above), so fall back to that.
-                let kernel_name = optimized
-                    .metadata::<svod_schedule::optimizer::KernelInfo>()
-                    .map(|info| info.function_name())
-                    .or_else(|| match optimized.op() {
-                        svod_ir::Op::Sink { info: Some(ki), .. } => ki.name.clone(),
-                        _ => None,
-                    });
-
-                // Pre-codegen metrics: structural hash for `seen_libs`, ALU node
-                // count for `least_compute_ops`. Computed before compile so even
-                // failed compiles still consume a slot fairly.
-                let ir_hash = svod_schedule::hash_post_codegen_ir(&optimized);
-                let compute_ops = svod_schedule::compute_ops_estimate(&optimized);
-
-                // Apply decomposition
-                let decomposed = match dev_renderer_c.decompositor() {
-                    Some(m) => svod_ir::decompositions::decompose_with(&optimized, &m),
-                    None => optimized,
-                };
-                let mut program = svod_codegen::program_pipeline::program_from_sink(decomposed, dev_device_c.clone());
-
-                // Linearize *now* so we can count flat uops. Counting the
-                // post-optimization AST `toposort()` (the earlier behavior)
-                // under-counts because svod's high-level Reduce/Index/Cast
-                // nodes get fanned out into many flat uops by the codegen
-                // pipeline. Counting post-linearize gives the number to
-                // compare against `BEAM_UOPS_MAX`.
-                program = match svod_codegen::program_pipeline::do_linearize(&program) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        if log_surpass_c {
-                            eprintln!("[BEAM drop] linearize_err: {e:?} opts={opts_snapshot:?}");
-                        }
-                        return None;
+        let mut completed_count = 0usize;
+        worker_pool.run(candidates, |response| {
+            let index = response.index;
+            let Some(artifact) = response.result else {
+                if let Some(error) = response.error.filter(|_| log_surpass || beam_debug > 1) {
+                    eprintln!("[BEAM drop] worker candidate={index}: {error}");
+                }
+                return;
+            };
+            let compiled = match svod_device::device::CompiledSpec::from_beam_worker(
+                artifact.name,
+                artifact.source.clone(),
+                artifact.bytes,
+                benchmark_ast.clone(),
+                artifact.abi,
+                launch_placeholder.clone(),
+                artifact.identity,
+                &device.device,
+                dev_compiler.cache_key(),
+            ) {
+                Ok(compiled) => compiled,
+                Err(error) => {
+                    if log_surpass || beam_debug > 0 {
+                        eprintln!("[BEAM drop] validate_worker_artifact candidate={index}: {error}");
                     }
-                };
-                let (linear_uops_count, top_op_counts) = if let svod_ir::Op::Program { linear: Some(linear), .. } =
-                    program.op()
-                    && let svod_ir::Op::Linear { ops } = linear.op()
-                {
-                    (ops.len(), if log_surpass_c { count_top_ops(ops, 8) } else { Vec::new() })
-                } else {
-                    (0, Vec::new())
-                };
-                if linear_uops_count > max_uops_c {
-                    if log_surpass_c {
-                        eprintln!(
-                            "[BEAM drop] too_many_uops: linear={linear_uops_count} max={max_uops_c} opts={opts_snapshot:?} top_ops=[{}]",
-                            fmt_op_counts(&top_op_counts)
-                        );
+                    return;
+                }
+            };
+            completed_count += 1;
+            let mut binary_key = Vec::with_capacity(compiled.bytes.len() + 1);
+            if compiled.bytes.is_empty() {
+                binary_key.push(b'S');
+                binary_key.extend_from_slice(artifact.source.as_bytes());
+            } else {
+                binary_key.push(b'B');
+                binary_key.extend_from_slice(&compiled.bytes);
+            }
+            let preparation = Duration::from_nanos(artifact.preparation_ns);
+            let compilation = Duration::from_nanos(artifact.compilation_ns);
+            if beam_debug > 1 {
+                eprintln!(
+                    "[beam] candidate={index:5} completed={completed_count:4}/{:4} compile={compilation:?} opts={:?}",
+                    candidates.len(), candidates[index]
+                );
+            }
+            emit(index, CompiledCandidate {
+                artifact: CompiledBeamProgram {
+                    compiled, opts: candidates[index].clone(), vals: artifact.vals,
+                    global_size: artifact.global_size, local_size: artifact.local_size,
+                },
+                binary_key, compute_ops: artifact.compute_ops, preparation, compilation,
+            });
+        })
+            .map_err(|error| svod_schedule::optimizer::OptError::BeamWorker { message: error.to_string() })
+    };
+
+    let dev_runtime = device.runtime.clone();
+    let benchmark = |candidate: &CompiledBeamProgram, early_stop: Option<Duration>| -> Option<Duration> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        match catch_unwind(AssertUnwindSafe(|| {
+            let program = match (dev_runtime)(&candidate.compiled) {
+                Ok(program) => program,
+                Err(e) => {
+                    if log_surpass {
+                        eprintln!("[BEAM drop] runtime_err: {e:?} opts={:?}", candidate.opts);
                     }
                     return None;
                 }
+            };
 
-                // Render and compile through PROGRAM stages (NOT timed).
-                let (spec, compiled) = match compile_with_program_pipeline_components(
-                    program,
-                    dev_renderer_c.as_ref(),
-                    dev_compiler_c.as_ref(),
-                    kernel_name.as_deref(),
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if log_surpass_c {
-                            eprintln!("[BEAM drop] compile_err: {e:?} opts={opts_snapshot:?}");
-                        }
-                        return None;
-                    }
-                };
-                let program = match (dev_runtime_c)(&compiled) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        if log_surpass_c {
-                            eprintln!("[BEAM drop] runtime_err: {e:?} opts={opts_snapshot:?}");
-                        }
-                        return None;
-                    }
-                };
+            let buffer_ptrs: Vec<*mut u8> = buffers.iter().map(|buffer| unsafe { buffer.as_raw_ptr() }).collect();
 
-                // Compile phase done — release parent from the `BEAM_TIMEOUT_SEC`
-                // bound. Anything below is execution-only (bounded by `early_stop`).
-                let _ = tx_compile.send(WorkerMsg::CompileDone);
+            let vals = &candidate.vals;
 
-                // Extract buffer pointers inside the worker (avoids Sync issue
-                // and keeps raw pointers thread-local).
-                let buffer_ptrs: Vec<*mut u8> = buffers_c.iter().map(|b| unsafe { b.as_raw_ptr() }).collect();
-
-                // Time ONLY execution. Each non-runtime variable gets the midpoint
-                // of its declared range (`(vmin+vmax)/2`) so symbolic-bound kernels
-                // do representative work. `core_id` stays unbound (patched per-thread
-                // by `execute_parallel`).
-                let mut user_var_vals: HashMap<&str, i64> = HashMap::new();
-                for v in &spec.vars {
-                    if v.name != "core_id" {
-                        user_var_vals.insert(v.name.as_str(), (v.min + v.max) / 2);
-                    }
-                }
-                let launch_dims = spec.launch_dims(&user_var_vals).ok()?;
-                let vals: Vec<i64> =
-                    spec.var_names.iter().map(|n| user_var_vals.get(n.as_str()).copied().unwrap_or(0)).collect();
-
-                // Bound BEAM dispatch grid: if `prod(global_size) > MAX_TEST_GLOBAL_SIZE`,
-                // halve the largest dim (>16) until it fits, then scale the measured
-                // time by `factor = original_size / shrunk_size` to recover the
-                // full-grid estimate. Svod's CPU dispatch has `global_size[0]` = thread
-                // count, typically ≤ 16, so this is a no-op for CPU and only engages
-                // for GPU-style large grids.
-                const MAX_TEST_GLOBAL_SIZE: usize = 65536;
-                let mut test_global_size = launch_dims.global_size;
-                let original_size: usize = test_global_size.iter().product();
-                while test_global_size.iter().product::<usize>() > MAX_TEST_GLOBAL_SIZE {
-                    let mut halved = false;
-                    for j in (0..test_global_size.len()).rev() {
-                        if test_global_size[j] > 16 {
-                            test_global_size[j] /= 2;
-                            halved = true;
-                            break;
-                        }
-                    }
-                    if !halved {
+            const MAX_TEST_GLOBAL_SIZE: usize = 65536;
+            let mut test_global_size = candidate.global_size;
+            let original_size: usize = test_global_size.iter().product();
+            while test_global_size.iter().product::<usize>() > MAX_TEST_GLOBAL_SIZE {
+                let mut halved = false;
+                for axis in (0..test_global_size.len()).rev() {
+                    if test_global_size[axis] > 16 {
+                        test_global_size[axis] /= 2;
+                        halved = true;
                         break;
                     }
                 }
-                let shrunk_size: usize = test_global_size.iter().product();
-                let factor: f64 = if shrunk_size > 0 { original_size as f64 / shrunk_size as f64 } else { 1.0 };
-
-                let mut bench_config = bench_config_c.clone();
-                // Translate the unshrunk early-stop threshold into the shrunk
-                // timing domain so per-run abort fires at the same effective point.
-                bench_config.early_stop = early_stop.map(|t| {
-                    let nanos = t.as_nanos() as f64 / factor;
-                    Duration::from_nanos(nanos.min(u64::MAX as f64) as u64)
-                });
-                // CPU/AMX have no hardware cache-invalidate primitive — run warm-cache.
-                // GPU backends keep the invalidate.
-                bench_config.clear_l2 = renderer_c.device.has_hardware_cache_invalidate();
-                let result = unsafe {
-                    svod_runtime::benchmark_kernel(
-                        program.as_ref(),
-                        &buffer_ptrs,
-                        &vals,
-                        Some(test_global_size),
-                        launch_dims.local_size,
-                        &bench_config,
-                    )
-                    .ok()?
-                };
-
-                // Scale measured time back to the full-grid estimate.
-                let scaled_nanos = (result.min.as_nanos() as f64 * factor).min(u64::MAX as f64);
-                let timing = Duration::from_nanos(scaled_nanos as u64);
-                Some(svod_schedule::CandidateMetrics { timing, ir_hash, compute_ops })
-            }));
-            let final_result = match result {
-                Ok(opt) => opt,
-                Err(_) => {
-                    if log_surpass_c {
-                        eprintln!("[BEAM drop] panic_in_worker opts={opts_snapshot:?}");
-                    }
-                    None
-                }
-            };
-            // Receiver may have already given up on compile timeout — ignore send errors.
-            let _ = tx.send(WorkerMsg::Final(final_result));
-        });
-
-        // Stage 1: wait for compile to finish, bounded by `BEAM_TIMEOUT_SEC`.
-        // Three outcomes:
-        // - `CompileDone`: compile succeeded, fall through to unbounded execution wait.
-        // - `Final(_)`: compile failed/aborted before reaching the signal (early return
-        //   on linearize_err / too_many_uops / compile_err / runtime_err, or panic).
-        // - timeout: clang hung past the budget; abandon the worker (orphaned thread).
-        match rx.recv_timeout(compile_timeout) {
-            Ok(WorkerMsg::CompileDone) => {
-                // Stage 2: execution. Unbounded — `bench_config.early_stop`
-                // aborts a slow run from inside `benchmark_kernel`.
-                match rx.recv() {
-                    Ok(WorkerMsg::Final(metrics)) => metrics,
-                    _ => None,
+                if !halved {
+                    break;
                 }
             }
-            Ok(WorkerMsg::Final(metrics)) => metrics,
+            let shrunk_size: usize = test_global_size.iter().product();
+            let factor = if shrunk_size > 0 { original_size as f64 / shrunk_size as f64 } else { 1.0 };
+
+            let mut config = bench_config.clone();
+            config.early_stop = early_stop
+                .map(|timing| Duration::from_nanos((timing.as_nanos() as f64 / factor).min(u64::MAX as f64) as u64));
+            config.clear_l2 = renderer.device.has_hardware_cache_invalidate();
+            let result = unsafe {
+                svod_runtime::benchmark_kernel(
+                    program.as_ref(),
+                    &buffer_ptrs,
+                    vals,
+                    Some(test_global_size),
+                    candidate.local_size,
+                    &config,
+                )
+                .ok()?
+            };
+            Some(Duration::from_nanos((result.min.as_nanos() as f64 * factor).min(u64::MAX as f64) as u64))
+        })) {
+            Ok(timing) => timing,
             Err(_) => {
                 if log_surpass {
-                    eprintln!("[BEAM drop] compile_timeout opts={:?}", s.applied_opts);
+                    eprintln!("[BEAM drop] panic_in_benchmark opts={:?}", candidate.opts);
                 }
                 None
             }
         }
     };
 
-    // Suppress panic output during beam search. Speculative candidates may panic
-    // at compile or runtime — this is expected. catch_unwind catches panics
-    // but the default hook prints them first.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = beam_search_cached(scheduler, beam_config, compile_and_time);
-    std::panic::set_hook(prev_hook);
+    let behavior_fingerprint = post_optimizer_behavior_fingerprint(&post_optimizer_config);
+    let result = beam_search_cached_remote(
+        scheduler,
+        beam_config,
+        device.compiler.cache_key(),
+        behavior_fingerprint,
+        compile_wave,
+        benchmark,
+    );
     let result = result.context(OptimizeSnafu)?;
+    if beam_debug > 0 {
+        eprintln!(
+            "[beam] final timing={:?} iterations={} generated={} compiled={} unique_binary={} benchmarked={} opts={:?}",
+            result.timing,
+            result.iterations,
+            result.generated,
+            result.compiled,
+            result.unique_binary,
+            result.benchmarked,
+            result.scheduler.applied_opts
+        );
+    }
 
     // Debug: log beam search results
     tracing::debug!(
         opts = ?result.scheduler.applied_opts,
         timing = ?result.timing,
         iterations = result.iterations,
+        generated = result.generated,
+        unique_ir = result.unique_ir,
+        compiled = result.compiled,
+        unique_binary = result.unique_binary,
+        benchmarked = result.benchmarked,
+        generation_time = ?result.stage_timings.generation,
+        filtering_time = ?result.stage_timings.filtering,
+        compilation_time = ?result.stage_timings.compilation,
+        binary_dedup_time = ?result.stage_timings.binary_dedup,
+        benchmarking_time = ?result.stage_timings.benchmarking,
         "beam_search_optimize: completed"
     );
 
     // Apply post-optimization to final result with renderer so pm_add_gpudims runs
     // (Thread → core_id, Global → SPECIAL).
     let raw_ast = result.scheduler.get_optimized_ast(None);
-    Ok(apply_post_optimization_with_renderer(raw_ast, Some(renderer)))
+    apply_post_optimization_with_config(raw_ast, renderer, &post_optimizer_config).context(OptimizeSnafu)
 }
 
 #[cfg(test)]

@@ -1,5 +1,52 @@
 use super::*;
 use smallvec::SmallVec;
+use svod_dtype::DType;
+use test_case::test_case;
+
+#[test]
+fn beam_behavior_fingerprint_ignores_parallelism() {
+    let base = svod_schedule::OptimizerConfig::default();
+    let mut parallel = base.clone();
+    parallel.beam.compile_workers += 7;
+    parallel.beam.max_tasks_per_child += 9;
+    assert_eq!(post_optimizer_behavior_fingerprint(&base), post_optimizer_behavior_fingerprint(&parallel));
+
+    let mut semantic_change = base.clone();
+    semantic_change.transcendental += 1;
+    assert_ne!(post_optimizer_behavior_fingerprint(&base), post_optimizer_behavior_fingerprint(&semantic_change));
+}
+
+fn cpu_buffer(numel: usize) -> Arc<svod_device::Buffer> {
+    let allocator = svod_device::registry::cpu().expect("cpu allocator");
+    Arc::new(svod_device::Buffer::new(allocator, DType::Float32, vec![numel], Default::default()))
+}
+
+#[test]
+fn test_build_schedule_input_buffers_collects_nonzero_mselect_shard() {
+    let shard0 = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    let shard1 = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    let buffer0 = cpu_buffer(4);
+    let buffer1 = cpu_buffer(4);
+    crate::tensor_registry::register_buffer_by_uop_id(shard0.id, buffer0.clone());
+    crate::tensor_registry::register_buffer_by_uop_id(shard1.id, buffer1.clone());
+
+    let selected = UOp::mstack(SmallVec::from_vec(vec![shard0, shard1.clone()])).mselect(1);
+    let body = UOp::sink(vec![UOp::native_const(0.0f32)]);
+    let call = body.call(SmallVec::from_vec(vec![selected.clone()]), svod_ir::CallInfo::default());
+    let pre_schedule = crate::schedule::PreSchedule {
+        items: vec![crate::schedule::PreScheduleItem {
+            kernel: call,
+            ast: body,
+            sources: vec![selected],
+            dependencies: vec![],
+            bound_ranges: vec![],
+        }],
+        invocations: vec![],
+        output_buffer_uops: vec![],
+    };
+    let inputs = build_schedule_input_buffers(&pre_schedule);
+    assert_eq!(inputs.get(&shard1.id).expect("selected shard").id(), buffer1.id());
+}
 
 #[test]
 fn test_profile_populates_static_info_and_realizes() {
@@ -53,78 +100,54 @@ fn test_output_indices_from_program_metadata_rejects_out_of_range_position() {
     assert!(format!("{err}").contains("out of range"));
 }
 
-#[test]
-fn test_resolve_compiled_kernel_buffer_indices_reorders_by_program_globals() {
-    let p0 = UOp::param(0, 4, svod_dtype::DType::Float32, None);
-    let p1 = UOp::param(1, 4, svod_dtype::DType::Float32, None);
-    let body = UOp::sink(vec![p0.clone(), p1.clone()]);
-    let call = body.call(SmallVec::from_vec(vec![p1.clone(), p0.clone()]), svod_ir::CallInfo::default());
-    let item = crate::schedule::ScheduleItem {
-        kernel: call,
-        ast: body,
-        buffers: vec![],
-        buffer_uop_ids: vec![p1.id, p0.id],
-        fixedvars: std::collections::HashMap::new(),
-        dependencies: vec![],
-        instance_dependencies: vec![],
-        alias_registered_ids: vec![],
-        loop_var_names: std::collections::HashSet::new(),
-    };
-    let uop_id_to_idx = std::collections::HashMap::from([(p1.id, 11), (p0.id, 10)]);
-
-    let ordered =
-        resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, &[0, 1]).expect("compiled buffer ABI ordering");
-
-    assert_eq!(ordered, vec![11, 10]);
+/// `ins` names the readable globals by slot; a write-only global (absent from
+/// `ins`) and an in-place one (present in both roles) are equally legal.
+#[test_case(&[2, 4, 7], &[4], &[1]; "only program ins")]
+#[test_case(&[0, 1], &[], &[]; "write-only globals")]
+#[test_case(&[0, 1], &[0], &[0]; "in-place global")]
+fn test_input_indices_from_program_metadata(globals: &[usize], ins: &[usize], expected: &[usize]) {
+    let inputs = input_indices_from_program_metadata(globals, ins, globals.len()).expect("metadata mapping");
+    assert_eq!(inputs, expected);
 }
 
-#[test]
-fn test_resolve_compiled_kernel_buffer_indices_treats_globals_as_buffer_positions() {
-    let p0 = UOp::param(0, 4, svod_dtype::DType::Float32, None);
-    let p1 = UOp::param(1, 4, svod_dtype::DType::Float32, None);
-    let body = UOp::sink(vec![p0.clone(), p1.clone()]);
-    let call = body.call(SmallVec::from_vec(vec![p1.clone(), p0.clone()]), svod_ir::CallInfo::default());
+/// A CALL passing `count` PARAMs, with the runtime buffer index each argument
+/// resolves to (10, 11, ...) in CALL argument order.
+fn param_call_item(count: usize) -> (crate::schedule::ScheduleItem, std::collections::HashMap<u64, usize>) {
+    let params = (0..count).map(|slot| UOp::param(slot, 4, DType::Float32, None)).collect::<Vec<_>>();
+    let body = UOp::sink(params.clone());
     let item = crate::schedule::ScheduleItem {
-        kernel: call,
+        kernel: body.call(SmallVec::from_vec(params.clone()), svod_ir::CallInfo::default()),
         ast: body,
         buffers: vec![],
-        buffer_uop_ids: vec![p1.id, p0.id],
+        buffer_uop_ids: params.iter().map(|param| param.id).collect(),
         fixedvars: std::collections::HashMap::new(),
         dependencies: vec![],
         instance_dependencies: vec![],
         alias_registered_ids: vec![],
         loop_var_names: std::collections::HashSet::new(),
     };
-    let uop_id_to_idx = std::collections::HashMap::from([(p1.id, 11), (p0.id, 10)]);
+    (item, params.iter().enumerate().map(|(position, param)| (param.id, 10 + position)).collect())
+}
 
+/// `globals` only tells the caller how many compact buffers the compiled
+/// PROGRAM expects — the slots are neither positions nor an ordering, so the
+/// buffer order always comes from the CALL's argument order.
+#[test_case(&[0, 1]; "dense slots")]
+#[test_case(&[1, 0]; "descending slots")]
+#[test_case(&[0, 5]; "sparse slots")]
+fn test_resolve_compiled_kernel_buffer_indices_follows_call_argument_order(globals: &[usize]) {
+    let (item, uop_id_to_idx) = param_call_item(2);
     let ordered =
-        resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, &[1, 0]).expect("compiled buffer ABI ordering");
-
+        resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, globals).expect("compiled buffer ABI ordering");
     assert_eq!(ordered, vec![10, 11]);
 }
 
 #[test]
-fn test_resolve_compiled_kernel_buffer_indices_rejects_out_of_range_global_position() {
-    let p0 = UOp::param(0, 4, svod_dtype::DType::Float32, None);
-    let body = UOp::sink(vec![p0.clone()]);
-    let call = body.call(SmallVec::from_vec(vec![p0.clone()]), svod_ir::CallInfo::default());
-    let item = crate::schedule::ScheduleItem {
-        kernel: call,
-        ast: body,
-        buffers: vec![],
-        buffer_uop_ids: vec![p0.id],
-        fixedvars: std::collections::HashMap::new(),
-        dependencies: vec![],
-        instance_dependencies: vec![],
-        alias_registered_ids: vec![],
-        loop_var_names: std::collections::HashSet::new(),
-    };
-    let uop_id_to_idx = std::collections::HashMap::from([(p0.id, 10)]);
-
-    let err = resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, &[1])
-        .expect_err("out-of-range global position should fail");
-
-    assert!(format!("{err}").contains("out of range"), "unexpected error: {err}");
+fn test_resolve_compiled_kernel_buffer_indices_rejects_wrong_compact_count() {
+    let (item, uop_id_to_idx) = param_call_item(1);
+    let err = resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, &[0, 5])
+        .expect_err("wrong compact count should fail");
+    assert!(format!("{err}").contains("expected 2 compact buffers"), "unexpected error: {err}");
 }
 
 #[test]
@@ -140,26 +163,24 @@ fn test_restore_post_schedule_pre_schedule_rewrites_runtime_buf_uops() {
     let pre_schedule_cached = crate::schedule::create_pre_schedule(kernel_graph_cached).expect("pre schedule");
 
     assert!(
-        pre_schedule_cached
-            .items
-            .iter()
-            .flat_map(|item| item.sources.iter())
-            .any(|src| matches!(src.op(), Op::Param { device: Some(_), .. })),
+        pre_schedule_cached.items.iter().flat_map(|item| item.sources.iter()).any(|src| {
+            src.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM))
+        }),
         "cached pre-schedule should keep normalized PARAM placeholders"
     );
 
     let restored = restore_post_schedule_pre_schedule(&pre_schedule_cached, &normalization);
 
     assert!(
-        restored
-            .items
-            .iter()
-            .flat_map(|item| item.sources.iter())
-            .all(|src| !matches!(src.op(), Op::Param { device: Some(_), .. })),
+        restored.items.iter().flat_map(|item| item.sources.iter()).all(|src| {
+            !src.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM))
+        }),
         "restored pre-schedule should rewrite callable source PARAM placeholders"
     );
     assert!(
-        restored.output_buffer_uops.iter().all(|u| !matches!(u.op(), Op::Param { device: Some(_), .. })),
+        restored.output_buffer_uops.iter().all(|u| {
+            !u.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM))
+        }),
         "restored pre-schedule should rewrite output buffer PARAM placeholders"
     );
     assert!(
@@ -168,11 +189,9 @@ fn test_restore_post_schedule_pre_schedule_rewrites_runtime_buf_uops() {
     );
 
     assert!(
-        pre_schedule_cached
-            .items
-            .iter()
-            .flat_map(|item| item.sources.iter())
-            .any(|src| matches!(src.op(), Op::Param { device: Some(_), .. })),
+        pre_schedule_cached.items.iter().flat_map(|item| item.sources.iter()).any(|src| {
+            src.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM))
+        }),
         "restoring should not mutate cached pre-schedule"
     );
 }
@@ -185,20 +204,24 @@ impl svod_device::device::Renderer for TestRenderer {
         ast: &std::sync::Arc<UOp>,
         name: Option<&str>,
     ) -> svod_device::Result<svod_device::device::ProgramSpec> {
-        let mut spec = svod_device::device::ProgramSpec::new(
+        let spec = svod_device::device::ProgramSpec::new(
             name.unwrap_or("kernel").to_string(),
             "// test source".to_string(),
             svod_dtype::DeviceSpec::Cpu,
             ast.clone(),
         );
-        spec.set_buffer_metadata(vec![0], vec![0], vec![]);
-        spec.buf_count = 1;
         Ok(spec)
     }
 
     fn device(&self) -> &svod_dtype::DeviceSpec {
         static DEVICE: svod_dtype::DeviceSpec = svod_dtype::DeviceSpec::Cpu;
         &DEVICE
+    }
+
+    fn supported_ops(&self) -> svod_ir::RendererOps {
+        let mut ops = svod_ir::RendererOps::all();
+        ops.binary.remove(&svod_ir::BinaryOp::Threefry);
+        ops
     }
 }
 
@@ -209,7 +232,12 @@ impl svod_device::device::Compiler for TestCompiler {
         &self,
         spec: &svod_device::device::ProgramSpec,
     ) -> svod_device::Result<svod_device::device::CompiledSpec> {
-        Ok(svod_device::device::CompiledSpec::from_bytes(spec.name.clone(), vec![1, 2, 3], spec.ast.clone()))
+        svod_device::device::CompiledSpec::from_bytes(
+            spec.name.clone(),
+            vec![1, 2, 3],
+            spec.ast.clone(),
+            spec.abi.clone(),
+        )
     }
 
     fn cache_key(&self) -> &'static str {
@@ -220,22 +248,41 @@ impl svod_device::device::Compiler for TestCompiler {
 #[test]
 fn test_compile_with_program_pipeline_components_accepts_program_input() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let program = svod_codegen::program_pipeline::program_from_sink(sink, svod_dtype::DeviceSpec::Cpu);
+    let program = svod_codegen::program_pipeline::program_from_sink(sink, svod_dtype::DeviceSpec::Cpu)
+        .expect("final target graph");
 
-    let (spec, compiled) =
-        compile_with_program_pipeline_components(program, &TestRenderer, &TestCompiler, Some("p_test"))
-            .expect("PROGRAM input should compile through staged pipeline");
+    let (spec, compiled) = compile_with_program_pipeline_components(program, &TestRenderer, &TestCompiler)
+        .expect("PROGRAM input should compile through staged pipeline");
 
-    assert_eq!(spec.name, "p_test");
-    assert_eq!(compiled.name, "p_test");
+    assert_eq!(spec.name, "test");
+    assert_eq!(compiled.name, "test");
     assert_eq!(compiled.bytes, vec![1, 2, 3]);
+}
+
+#[test]
+fn test_optimized_kernel_key_includes_exact_compiler_and_renderer_identity() {
+    let ast = UOp::sink(vec![UOp::native_const(1.0f32)]);
+    let renderer = svod_schedule::OptimizerRenderer::cpu();
+    let mut changed_renderer = renderer.clone();
+    changed_renderer.supports_float4 = false;
+    let key = |compiler: &str, renderer: &svod_schedule::OptimizerRenderer| {
+        optimized_kernel_key(&ast, &svod_dtype::DeviceSpec::Cpu, compiler, renderer.cache_fingerprint(), 7)
+    };
+
+    let base = key("cpu-clang:17:flags-a", &renderer);
+    assert_ne!(base, key("cpu-clang:18:flags-a", &renderer), "exact compiler identity must key optimized kernels");
+    assert_ne!(
+        base,
+        key("cpu-clang:17:flags-a", &changed_renderer),
+        "renderer capabilities must key optimized kernels"
+    );
 }
 
 #[test]
 fn test_compile_with_program_pipeline_components_rejects_non_program_input() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
 
-    let err = compile_with_program_pipeline_components(sink, &TestRenderer, &TestCompiler, Some("p_test"))
+    let err = compile_with_program_pipeline_components(sink, &TestRenderer, &TestCompiler)
         .expect_err("non-PROGRAM input must fail");
     assert!(format!("{err}").contains("expects PROGRAM input"), "unexpected error: {err:?}");
 }
@@ -244,52 +291,40 @@ fn test_compile_with_program_pipeline_components_rejects_non_program_input() {
 fn test_compile_with_program_pipeline_components_accepts_stage1_program_input() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
     let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
-    let program = UOp::program(sink, UOp::device(svod_dtype::DeviceSpec::Cpu), Some(linear), None, None);
+    let info = svod_ir::ProgramInfo::from_sink(&sink, svod_dtype::DeviceSpec::Cpu);
+    let program = UOp::program(sink, info, Some(linear), None, None);
 
-    let (spec, compiled) =
-        compile_with_program_pipeline_components(program, &TestRenderer, &TestCompiler, Some("p_test"))
-            .expect("stage-1 PROGRAM input should compile");
-    assert_eq!(spec.name, "p_test");
+    let (spec, compiled) = compile_with_program_pipeline_components(program, &TestRenderer, &TestCompiler)
+        .expect("stage-1 PROGRAM input should compile");
+    assert_eq!(spec.name, "test");
     assert_eq!(compiled.bytes, vec![1, 2, 3]);
 }
 
 #[test]
 fn test_compile_with_program_pipeline_components_accepts_stage2_program_input() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
-    let program = UOp::program(
-        sink,
-        UOp::device(svod_dtype::DeviceSpec::Cpu),
-        Some(linear),
-        Some(UOp::source("// pre-rendered source".to_string())),
-        None,
-    );
+    let program = svod_codegen::program_pipeline::program_from_sink(sink, svod_dtype::DeviceSpec::Cpu).unwrap();
+    let (program, _) = svod_codegen::program_pipeline::do_render(&program, &TestRenderer).unwrap();
 
-    let (spec, compiled) =
-        compile_with_program_pipeline_components(program, &TestRenderer, &TestCompiler, Some("p_test"))
-            .expect("stage-2 PROGRAM input should compile");
-    assert_eq!(spec.name, "kernel");
+    let (spec, compiled) = compile_with_program_pipeline_components(program, &TestRenderer, &TestCompiler)
+        .expect("stage-2 PROGRAM input should compile");
+    assert_eq!(spec.name, "test");
     assert_eq!(compiled.bytes, vec![1, 2, 3]);
 }
 
 #[test]
 fn test_compile_with_program_pipeline_components_rejects_malformed_program_state() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let program = UOp::program(
-        sink,
-        UOp::device(svod_dtype::DeviceSpec::Cpu),
-        None,
-        Some(UOp::source("// malformed source".to_string())),
-        None,
-    );
+    let info = svod_ir::ProgramInfo::from_sink(&sink, svod_dtype::DeviceSpec::Cpu);
+    let program = UOp::program(sink, info, None, Some(UOp::source("// malformed source".to_string())), None);
 
-    let err = compile_with_program_pipeline_components(program, &TestRenderer, &TestCompiler, Some("p_test"))
+    let err = compile_with_program_pipeline_components(program, &TestRenderer, &TestCompiler)
         .expect_err("malformed PROGRAM input must fail");
     assert!(format!("{err}").contains("malformed PROGRAM state"), "unexpected error: {err:?}");
 }
 
 #[test]
-fn test_collect_non_overridable_fixedvars_locks_only_loop_var_names() {
+fn test_collect_non_overridable_fixedvars_locks_loop_and_device_bindings() {
     // After the schedule-level Range/End refactor, schedule-loop bindings are
     // tracked structurally via `ScheduleItem.loop_var_names` (populated from
     // `KernelInvocation.fixedvars` at instantiation time). User-supplied
@@ -308,6 +343,7 @@ fn test_collect_non_overridable_fixedvars_locks_only_loop_var_names() {
             ("outer_i".to_string(), 2_i64),
             ("loop_j".to_string(), 1_i64),
             ("user_n".to_string(), 7_i64),
+            ("_device_num".to_string(), 3_i64),
         ]),
         dependencies: vec![],
         instance_dependencies: vec![],
@@ -317,8 +353,71 @@ fn test_collect_non_overridable_fixedvars_locks_only_loop_var_names() {
 
     let locked = collect_non_overridable_fixedvars(&item);
     assert_eq!(locked.get("outer_i"), Some(&2));
+    assert_eq!(locked.get("_device_num"), Some(&3));
     assert!(!locked.contains_key("loop_j"));
     assert!(!locked.contains_key("user_n"));
+}
+
+#[test]
+fn test_cpu_plan_executes_device_bound_mstack_lanes() {
+    crate::test::helpers::test_setup();
+
+    let output0 = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 1, DType::Float32);
+    let output1 = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 1, DType::Float32);
+    let output_param = UOp::param(0, 1, DType::Float32, None);
+    let output_index =
+        UOp::index().buffer(output_param).indices(vec![UOp::index_const(0)]).call().expect("output index");
+    let device_num = UOp::range_axis(UOp::index_const(2), svod_ir::AxisId::Renumbered(0), svod_ir::AxisType::Device);
+    let value = device_num
+        .cast(DType::Float32)
+        .try_mul(&UOp::native_const(11.0f32))
+        .and_then(|value| value.try_add(&UOp::native_const(10.0f32)))
+        .expect("lane value expression");
+    let body = UOp::sink_with_info(
+        vec![output_index.store(value)],
+        svod_ir::KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() },
+    );
+    let stack = UOp::mstack(SmallVec::from_vec(vec![output0.clone(), output1.clone()]));
+    let call = body.call(SmallVec::from_vec(vec![stack.clone()]), svod_ir::CallInfo::default());
+    let pre_schedule = crate::schedule::PreSchedule {
+        items: vec![crate::schedule::PreScheduleItem {
+            kernel: call.clone(),
+            ast: body,
+            sources: vec![stack],
+            dependencies: vec![],
+            bound_ranges: vec![],
+        }],
+        invocations: vec![crate::schedule::KernelInvocation { kernel_id: call.id, fixedvars: HashMap::new() }],
+        output_buffer_uops: vec![output0.clone(), output1.clone()],
+    };
+    let inputs = HashMap::from([(output0.id, (*cpu_buffer(1)).clone()), (output1.id, (*cpu_buffer(1)).clone())]);
+    let schedule = crate::schedule::instantiate_schedule(&pre_schedule, &inputs, &HashMap::new(), false)
+        .expect("expand MSTACK lanes");
+    assert_eq!(schedule.items.len(), 2);
+
+    let mut plan = prepare_execution_plan(&schedule, &PrepareConfig::for_cpu_backend(crate::CpuBackend::Clang))
+        .expect("prepare CPU lane plan");
+    let fixed_device_nums: Vec<i64> = plan
+        .prepared_ops()
+        .iter()
+        .filter_map(|op| match op {
+            PreparedOp::CompiledProgram(kernel) => kernel.fixedvars.get("_device_num").copied(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fixed_device_nums, vec![0, 1]);
+
+    plan.execute_with_vars(&[("_device_num", 99)]).expect("fixed lane binding must ignore runtime override");
+    let mut values = Vec::new();
+    for lane in 0..2 {
+        let output = plan.output_buffer_at(lane).expect("lane output");
+        let mut value = [0.0f32];
+        output
+            .copyout(unsafe { std::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<f32>()) })
+            .expect("copy lane output");
+        values.push(value[0]);
+    }
+    assert_eq!(values, vec![10.0, 21.0]);
 }
 
 #[test]
@@ -347,7 +446,7 @@ fn test_realize_simple_add() {
 ///
 /// This verifies the complete reduction pipeline:
 /// - Early-return pattern prevents unnecessary ReduceAxis for size-1 dimensions
-/// - Vectorize consistency prevents VConst panics in shape extraction
+/// - Stack consistency prevents VConst panics in shape extraction
 /// - ReduceAxis → REDUCE transformation
 /// - REDUCE codegen generates correct LLVM IR
 #[test]
@@ -506,6 +605,7 @@ fn test_prepare_execution_plan_lowers_explicit_custom_function_op() {
             loop_var_names: std::collections::HashSet::new(),
         }],
         output_uop_ids: vec![1001],
+        alias_output_buffers: std::collections::HashMap::new(),
     };
 
     let plan = prepare_execution_plan(&schedule_result, &PrepareConfig::from_env()).expect("prepare should succeed");
@@ -523,6 +623,50 @@ fn test_prepare_execution_plan_lowers_explicit_custom_function_op() {
     let err = plan.execute().expect_err("EncDec runtime should be explicit unsupported");
     let msg = format!("{err}");
     assert!(msg.contains("Unsupported runtime feature EncDec"), "unexpected error: {msg}");
+}
+
+#[test]
+fn test_prepare_execution_plan_owns_alias_only_output_without_runtime_op() {
+    crate::test::helpers::test_setup();
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let base = Buffer::new(alloc, svod_dtype::DType::Float32, vec![8], Default::default());
+    let storage = base.storage_id();
+    let view = base.view(8, 16).unwrap();
+    let schedule_result = crate::schedule::ScheduleResult {
+        items: vec![],
+        output_uop_ids: vec![2001],
+        alias_output_buffers: std::collections::HashMap::from([(2001, view)]),
+    };
+
+    let plan = prepare_execution_plan(&schedule_result, &PrepareConfig::from_env()).unwrap();
+    assert!(plan.prepared_ops().is_empty());
+    let output = plan.output_buffer().unwrap();
+    assert_eq!(output.storage_id(), storage);
+    assert_eq!(output.offset(), 8);
+    assert_eq!(output.size(), 16);
+}
+
+#[test]
+fn alias_output_storage_is_protected_from_memory_planning() {
+    crate::test::helpers::test_setup();
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let producer = Buffer::new(alloc, svod_dtype::DType::Float32, vec![8], Default::default());
+    let alias = producer.view(8, 16).unwrap();
+    let sink = UOp::sink(vec![]);
+    let item = crate::schedule::ScheduleItem {
+        kernel: sink.clone(),
+        ast: sink,
+        buffers: vec![producer.clone()],
+        buffer_uop_ids: vec![1001],
+        fixedvars: std::collections::HashMap::new(),
+        dependencies: vec![],
+        instance_dependencies: vec![],
+        alias_registered_ids: vec![],
+        loop_var_names: std::collections::HashSet::new(),
+    };
+    let protected = collect_output_buffer_ids(&vec![item], &[2001], std::iter::once(&alias));
+
+    assert!(protected.contains(&producer.id().0));
 }
 
 /// Test that realize() produces correct results.

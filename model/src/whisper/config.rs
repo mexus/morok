@@ -16,6 +16,8 @@ pub const N_TEXT_CTX: usize = 448;
 
 // ─── ModelDimensions (matching whisper/model.py) ─────────────────────────────
 
+use svod_dtype::DType;
+
 #[derive(Clone, Debug)]
 pub struct ModelDimensions {
     pub n_mels: usize,
@@ -28,6 +30,10 @@ pub struct ModelDimensions {
     pub n_text_state: usize,
     pub n_text_head: usize,
     pub n_text_layer: usize,
+    /// Compute dtype for projected weights and activations. Defaults to
+    /// Float16; set to Float32 for CPU parity tests or hardware without fp16
+    /// support. fp8 is viable on AMD-GPU paths only (CPU treats it as raw i8).
+    pub dtype: DType,
 }
 
 impl ModelDimensions {
@@ -53,6 +59,7 @@ impl ModelDimensions {
                 n_text_state: 384,
                 n_text_head: 6,
                 n_text_layer: 4,
+                dtype: DType::Float16,
             },
             WhisperSize::Tiny => Self {
                 n_mels: 80,
@@ -65,6 +72,7 @@ impl ModelDimensions {
                 n_text_state: 384,
                 n_text_head: 6,
                 n_text_layer: 4,
+                dtype: DType::Float16,
             },
             WhisperSize::BaseEn => Self {
                 n_mels: 80,
@@ -77,6 +85,7 @@ impl ModelDimensions {
                 n_text_state: 512,
                 n_text_head: 8,
                 n_text_layer: 6,
+                dtype: DType::Float16,
             },
             WhisperSize::Base => Self {
                 n_mels: 80,
@@ -89,6 +98,7 @@ impl ModelDimensions {
                 n_text_state: 512,
                 n_text_head: 8,
                 n_text_layer: 6,
+                dtype: DType::Float16,
             },
             WhisperSize::SmallEn => Self {
                 n_mels: 80,
@@ -101,6 +111,7 @@ impl ModelDimensions {
                 n_text_state: 768,
                 n_text_head: 12,
                 n_text_layer: 12,
+                dtype: DType::Float16,
             },
             WhisperSize::Small => Self {
                 n_mels: 80,
@@ -113,6 +124,7 @@ impl ModelDimensions {
                 n_text_state: 768,
                 n_text_head: 12,
                 n_text_layer: 12,
+                dtype: DType::Float16,
             },
             WhisperSize::MediumEn => Self {
                 n_mels: 80,
@@ -125,6 +137,7 @@ impl ModelDimensions {
                 n_text_state: 1024,
                 n_text_head: 16,
                 n_text_layer: 24,
+                dtype: DType::Float16,
             },
             WhisperSize::Medium => Self {
                 n_mels: 80,
@@ -137,6 +150,7 @@ impl ModelDimensions {
                 n_text_state: 1024,
                 n_text_head: 16,
                 n_text_layer: 24,
+                dtype: DType::Float16,
             },
             WhisperSize::LargeV1 | WhisperSize::LargeV2 => Self {
                 n_mels: 80,
@@ -149,6 +163,7 @@ impl ModelDimensions {
                 n_text_state: 1280,
                 n_text_head: 20,
                 n_text_layer: 32,
+                dtype: DType::Float16,
             },
             WhisperSize::LargeV3 => Self {
                 n_mels: 128,
@@ -161,6 +176,7 @@ impl ModelDimensions {
                 n_text_state: 1280,
                 n_text_head: 20,
                 n_text_layer: 32,
+                dtype: DType::Float16,
             },
             WhisperSize::Turbo => Self {
                 n_mels: 128,
@@ -173,6 +189,7 @@ impl ModelDimensions {
                 n_text_state: 1280,
                 n_text_head: 20,
                 n_text_layer: 8,
+                dtype: DType::Float16,
             },
         }
     }

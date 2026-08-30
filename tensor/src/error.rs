@@ -107,6 +107,12 @@ pub enum Error {
     #[snafu(display("Rangeify failed: {source}"))]
     Rangeify { source: svod_ir::Error },
 
+    #[snafu(display("Kernel graph failed: {source}"))]
+    KernelGraph {
+        #[snafu(source(from(svod_schedule::KernelGraphError, Box::new)))]
+        source: Box<svod_schedule::KernelGraphError>,
+    },
+
     #[snafu(display("Optimization error: {source}"))]
     Optimize { source: svod_schedule::OptError },
 
@@ -124,6 +130,35 @@ pub enum Error {
 
     #[snafu(display("Expected CALL operation"))]
     ExpectedCallableOp,
+
+    #[snafu(display("CALL {call_id} MSTACK source {source_index} has no lanes"))]
+    MultiEmptyLanes { call_id: u64, source_index: usize },
+
+    #[snafu(display("CALL {call_id} MSTACK source {source_index} has {actual} lanes, expected {expected}"))]
+    MultiLaneCountMismatch { call_id: u64, source_index: usize, expected: usize, actual: usize },
+
+    #[snafu(display("MSELECT {source_id} lane {device_index} is out of bounds for {lane_count} lanes"))]
+    MultiSelectOutOfBounds { source_id: u64, device_index: usize, lane_count: usize },
+
+    #[snafu(display("CALL {call_id} has unsupported MULTI form: {details}"))]
+    MultiUnsupportedForm { call_id: u64, details: String },
+
+    #[snafu(display("CALL {call_id} MSTACK source {source_index} lane {lane} cannot contain a SLICE alias"))]
+    MultiLaneSliceAlias { call_id: u64, source_index: usize, lane: usize },
+
+    #[snafu(display("CALL {call_id} lane {lane} mixes device endpoints {expected} and {actual}"))]
+    MultiLaneDeviceMismatch { call_id: u64, lane: usize, expected: String, actual: String },
+
+    #[snafu(display("CALL {call_id} DEVICE extent must be a static integer"))]
+    MultiDeviceExtentNotStatic { call_id: u64 },
+
+    #[snafu(display("CALL {call_id} DEVICE extent {actual} does not match MSTACK lane count {expected}"))]
+    MultiDeviceExtentMismatch { call_id: u64, expected: usize, actual: i64 },
+
+    #[snafu(display(
+        "CALL {call_id} fixed binding conflict for '{name}': existing value {existing}, incoming value {incoming}"
+    ))]
+    MultiBindingConflict { call_id: u64, name: String, existing: i64, incoming: i64 },
 
     // =========================================================================
     // Runtime Errors
@@ -167,9 +202,6 @@ pub enum Error {
     #[snafu(display("Disk access failed for '{path}': {source}"))]
     Disk { source: std::io::Error, path: String },
 
-    #[snafu(display("Buffer view failed for kernel {kernel_id} (offset={offset}, size={size}): {source}"))]
-    BufferView { source: svod_device::Error, kernel_id: u64, offset: usize, size: usize },
-
     #[snafu(display("Invalid ProgramSpec at {stage}: {source}"))]
     ProgramSpec { source: svod_device::Error, stage: String },
 
@@ -178,6 +210,9 @@ pub enum Error {
 
     #[snafu(display("{op} requires floating-point dtype for {arg}, got {dtype:?}"))]
     FloatDTypeRequired { op: &'static str, arg: &'static str, dtype: svod_dtype::DType },
+
+    #[snafu(display("{op} requires signed integer dtype for {arg}, got {dtype:?}"))]
+    SignedIntegerDTypeRequired { op: &'static str, arg: &'static str, dtype: svod_dtype::DType },
 
     #[snafu(display("Failed to create ndarray: {source}"))]
     NdarrayShape { source: ndarray::ShapeError },
@@ -190,6 +225,44 @@ pub enum Error {
 
     #[snafu(display("Cannot read data from tensor with symbolic shape — reduce or slice to concrete shape first"))]
     SymbolicShape,
+
+    #[snafu(display("BEAM compile helper: {source}"))]
+    BeamWorker { source: BeamWorker },
+}
+
+/// Failures of the out-of-process BEAM candidate compiler.
+///
+/// The pool treats most of these as a dropped candidate rather than a fatal
+/// error, so they carry the structure the caller acts on instead of a rendered
+/// message.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum BeamWorker {
+    #[snafu(display("spawn BEAM helper {path}: {source}"))]
+    SpawnHelper { source: std::io::Error, path: String },
+
+    #[snafu(display("BEAM helper is unavailable: {reason}"))]
+    HelperUnavailable { reason: String },
+
+    #[snafu(display("BEAM helper frame ({what}): {source}"))]
+    Frame { source: std::io::Error, what: &'static str },
+
+    #[snafu(display("BEAM helper protocol version {actual}, expected {expected}"))]
+    ProtocolMismatch { expected: u32, actual: u32 },
+
+    #[snafu(display("BEAM helper returned candidate {got}, expected {expected:?}"))]
+    WorkerMisorder { got: usize, expected: Option<usize> },
+
+    #[snafu(display("BEAM candidate {stage}: {reason}"))]
+    CompileStage { stage: &'static str, reason: String },
+}
+
+impl BeamWorker {
+    /// `map_err` adapter for a pipeline stage whose upstream error is only ever
+    /// reported, never matched on.
+    pub(crate) fn at<E: std::fmt::Display>(stage: &'static str) -> impl Fn(E) -> Self {
+        move |error| Self::CompileStage { stage, reason: error.to_string() }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

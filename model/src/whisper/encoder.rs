@@ -7,8 +7,8 @@ use svod_tensor::Tensor;
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::attention::MultiHeadAttention;
-use super::blocks::{Conv1dWeights, LayerNormWeights, sinusoids};
+use super::attention::{MultiHeadAttention, padded_fa_sequence_len};
+use super::blocks::{Conv1dWeights, LayerNormWeights, linear_with_bias, sinusoids};
 use super::config::ModelDimensions;
 use super::error::{Result, TensorSnafu};
 
@@ -27,30 +27,38 @@ pub struct EncoderBlock {
 
 impl EncoderBlock {
     pub fn empty(n_state: usize, n_head: usize) -> Self {
+        Self::empty_dtype(n_state, n_head, DType::Float32)
+    }
+
+    pub fn empty_dtype(n_state: usize, n_head: usize, dtype: DType) -> Self {
         let mlp = n_state * 4;
         Self {
-            attn: MultiHeadAttention::empty(n_state, n_head),
-            attn_ln: LayerNormWeights::empty(n_state),
-            mlp0_w: fan_in_uniform(&[mlp, n_state], n_state, DType::Float32),
-            mlp0_b: fan_in_uniform(&[mlp], n_state, DType::Float32),
-            mlp1_w: fan_in_uniform(&[n_state, mlp], mlp, DType::Float32),
-            mlp1_b: fan_in_uniform(&[n_state], mlp, DType::Float32),
-            mlp_ln: LayerNormWeights::empty(n_state),
+            attn: MultiHeadAttention::empty_dtype(n_state, n_head, dtype.clone()),
+            attn_ln: LayerNormWeights::empty_dtype(n_state, dtype.clone()),
+            mlp0_w: fan_in_uniform(&[mlp, n_state], n_state, dtype.clone()),
+            mlp0_b: fan_in_uniform(&[mlp], n_state, dtype.clone()),
+            mlp1_w: fan_in_uniform(&[n_state, mlp], mlp, dtype.clone()),
+            mlp1_b: fan_in_uniform(&[n_state], mlp, dtype.clone()),
+            mlp_ln: LayerNormWeights::empty_dtype(n_state, dtype),
             n_state,
         }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with_key_lens(x, None)
+    }
+
+    fn forward_with_key_lens(&self, x: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
         // Self-attention (pre-norm)
         let h = self.attn_ln.apply(x)?;
-        let attn_out = self.attn.forward(&h, None, None)?;
+        let attn_out = self.attn.forward_with_key_lens(&h, None, None, key_lens)?;
         let x = x.try_add(&attn_out).context(TensorSnafu)?;
 
         // MLP (pre-norm)
         let h = self.mlp_ln.apply(&x)?;
-        let h = h.linear().weight(&self.mlp0_w).bias(&self.mlp0_b).call().context(TensorSnafu)?;
+        let h = linear_with_bias(&h, &self.mlp0_w, &self.mlp0_b)?;
         let h = h.gelu_exact().context(TensorSnafu)?;
-        let h = h.linear().weight(&self.mlp1_w).bias(&self.mlp1_b).call().context(TensorSnafu)?;
+        let h = linear_with_bias(&h, &self.mlp1_w, &self.mlp1_b)?;
         let x = x.try_add(&h).context(TensorSnafu)?;
         Ok(x)
     }
@@ -96,12 +104,15 @@ pub struct AudioEncoder {
 impl AudioEncoder {
     pub fn empty(dims: &ModelDimensions) -> Self {
         let n_state = dims.n_audio_state;
+        let dtype = dims.dtype.clone();
         Self {
-            conv1: Conv1dWeights::empty(dims.n_mels, n_state, 3, 1, 1, true),
-            conv2: Conv1dWeights::empty(n_state, n_state, 3, 2, 1, true),
+            conv1: Conv1dWeights::empty_dtype(dims.n_mels, n_state, 3, 1, 1, true, dtype.clone()),
+            conv2: Conv1dWeights::empty_dtype(n_state, n_state, 3, 2, 1, true, dtype.clone()),
             positional_embedding: sinusoids(dims.n_audio_ctx, n_state, 10_000.0).expect("sinusoidal embedding"),
-            blocks: (0..dims.n_audio_layer).map(|_| EncoderBlock::empty(n_state, dims.n_audio_head)).collect(),
-            ln_post: LayerNormWeights::empty(n_state),
+            blocks: (0..dims.n_audio_layer)
+                .map(|_| EncoderBlock::empty_dtype(n_state, dims.n_audio_head, dtype.clone()))
+                .collect(),
+            ln_post: LayerNormWeights::empty_dtype(n_state, dtype),
             n_state,
             n_head: dims.n_audio_head,
         }
@@ -109,7 +120,12 @@ impl AudioEncoder {
 
     /// Forward: mel `[B, n_mels, T]` → encoder features `[B, T/2, D]`.
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
-        let x = self.conv1.forward(mel)?;
+        // Cast input to the compute dtype (weights are dims.dtype; the host
+        // feeds fp32 mel). Matches `model.py:48` weight.to(x.dtype) from the
+        // other direction — we cast x to the weight dtype so the graph is uniform.
+        let dtype = self.conv1.weight.uop().dtype().clone();
+        let mel = mel.cast(dtype.clone()).context(TensorSnafu)?;
+        let x = self.conv1.forward(&mel)?;
         let x = x.gelu_exact().context(TensorSnafu)?;
         let x = self.conv2.forward(&x)?;
         let x = x.gelu_exact().context(TensorSnafu)?;
@@ -118,17 +134,51 @@ impl AudioEncoder {
         let x = x.try_permute(&[0, 2, 1]).context(TensorSnafu)?;
 
         // Add positional embedding [n_audio_ctx, D]
-        let x = x.try_add(&self.positional_embedding).context(TensorSnafu)?;
+        let x = x.try_add(&self.positional_embedding).context(TensorSnafu)?.cast(dtype).context(TensorSnafu)?;
+
+        let shape = x.shape().context(TensorSnafu)?;
+        let concrete = |axis: usize, operation: &str| {
+            shape[axis].as_const().ok_or_else(|| super::error::Error::Tensor {
+                source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported { operation: operation.into() }),
+            })
+        };
+        let (batch, sequence, state) = (
+            concrete(0, "Whisper encoder batch")?,
+            concrete(1, "Whisper encoder sequence")?,
+            concrete(2, "Whisper encoder state")?,
+        );
+        let padded_sequence = encoder_padded_sequence_len(&x.device(), sequence);
+        let (mut x, key_lens) = match padded_sequence {
+            Some(padded) => {
+                let x = x.try_pad(&[(0, 0), (0, (padded - sequence) as isize), (0, 0)]).context(TensorSnafu)?;
+                let lens = Tensor::full(&[batch], svod_ir::ConstValue::Int(sequence as i64), DType::Int32)
+                    .context(TensorSnafu)?
+                    .to(x.device());
+                (x, Some(lens))
+            }
+            None => (x, None),
+        };
 
         // Transformer blocks
-        let mut x = x;
         for block in &self.blocks {
-            x = block.forward(&x)?;
+            x = block.forward_with_key_lens(&x, key_lens.as_ref())?;
+        }
+        if padded_sequence.is_some() {
+            x = x.try_shrink([(0, batch), (0, sequence), (0, state)]).context(TensorSnafu)?;
         }
 
-        // Final LayerNorm
-        self.ln_post.apply(&x)
+        // Final LayerNorm + cast to fp32. The encoder output is consumed by the
+        // host (copyout_prefix into Vec<f32>) and fed to the prefill/step JITs
+        // which cast it back to the compute dtype. Keeping the output fp32 means
+        // the host read path works regardless of compute dtype.
+        self.ln_post.apply(&x)?.cast(DType::Float32).context(TensorSnafu)
     }
+}
+
+pub(crate) fn encoder_padded_sequence_len(device: &svod_dtype::DeviceSpec, sequence: usize) -> Option<usize> {
+    svod_tk::flash_attention_supported(device)
+        .then(|| padded_fa_sequence_len(false, sequence, sequence, sequence))
+        .flatten()
 }
 
 impl HasStateDict for AudioEncoder {

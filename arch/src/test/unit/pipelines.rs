@@ -81,10 +81,18 @@ fn crop_keeps_midpoints_inside_core_and_rebases() {
 }
 
 #[test]
-fn words_to_text_joins_and_drops_empties() {
-    let words = vec![word("hello", 0.0, 0.1), word("", 0.1, 0.1), word("world", 0.2, 0.3)];
-    assert_eq!(words_to_text(&words), "hello world");
+fn words_to_text_concatenates_fragments_and_drops_blanks() {
+    let words =
+        vec![word("  hello", 0.0, 0.1), word("", 0.1, 0.1), word(" \t", 0.1, 0.1), word("  world!  ", 0.2, 0.3)];
+    assert_eq!(words_to_text(&words), "hello  world!");
     assert_eq!(words_to_text(&[]), "");
+}
+
+#[test]
+fn cropped_fragments_reconstruct_without_spacing_heuristics() {
+    let words = vec![word(" prefix", 0.0, 1.0), word(" 23", 2.0, 3.0), word("-м", 3.0, 4.0), word(" доме", 4.0, 5.0)];
+    let cropped = crop_words_to_core(words, 1.5, 4.0);
+    assert_eq!(words_to_text(&cropped), "23-м доме");
 }
 
 // ─── Transcriber::transcribe_chunks default (geometry + crop + stitch) ─────────
@@ -100,11 +108,12 @@ fn transcribe_chunks_slices_decode_windows_crops_and_stitches() {
             Transcript {
                 text: String::new(),
                 words: vec![word("pre", 1.0, 3.0), word("a1", 6.0, 8.0), word("post", 16.0, 18.0)],
+                ..Default::default()
             },
-            Transcript { text: String::new(), words: vec![word("b1", 3.0, 5.0)] },
+            Transcript { text: String::new(), words: vec![word("b1", 3.0, 5.0)], ..Default::default() },
         ],
     };
-    let out = asr.transcribe_chunks(&waveform, &chunks, RunOptions { words: true, profile: false }).unwrap();
+    let out = asr.transcribe_chunks(&waveform, &chunks, RunOptions { words: true, ..Default::default() }).unwrap();
     assert_eq!(out.text, "a1 b1");
     assert_eq!(
         out.chunks,
@@ -113,13 +122,15 @@ fn transcribe_chunks_slices_decode_windows_crops_and_stitches() {
                 start_sec: 10.0,
                 end_sec: 20.0,
                 text: "a1".to_string(),
-                words: Some(vec![word("a1", 1.0, 3.0)])
+                words: Some(vec![word("a1", 1.0, 3.0)]),
+                ..Default::default()
             },
             ChunkResult {
                 start_sec: 30.0,
                 end_sec: 40.0,
                 text: "b1".to_string(),
-                words: Some(vec![word("b1", 1.0, 3.0)])
+                words: Some(vec![word("b1", 1.0, 3.0)]),
+                ..Default::default()
             },
         ]
     );
@@ -131,7 +142,7 @@ fn transcribe_chunks_empty_returns_default() {
     // Silence-only audio yields no chunks → empty Transcription, and
     // transcribe_windows is never called (no zero-window batch-math underflow).
     let mut t = PresetTranscriber { out: Vec::new() };
-    let out = t.transcribe_chunks(&[0.0_f32; 10], &[], RunOptions { words: true, profile: false }).unwrap();
+    let out = t.transcribe_chunks(&[0.0_f32; 10], &[], RunOptions { words: true, ..Default::default() }).unwrap();
     assert_eq!(out.text, "");
     assert!(out.chunks.is_empty());
     assert!(out.profile.is_none());
@@ -141,8 +152,9 @@ fn transcribe_chunks_empty_returns_default() {
 fn transcribe_chunks_omits_words_when_not_wanted() {
     let waveform = vec![0.0_f32; 20];
     let chunks = vec![AudioChunk::new(0, 10)];
-    let mut asr =
-        PresetTranscriber { out: vec![Transcript { text: String::new(), words: vec![word("hi", 1.0, 2.0)] }] };
+    let mut asr = PresetTranscriber {
+        out: vec![Transcript { text: String::new(), words: vec![word("hi", 1.0, 2.0)], ..Default::default() }],
+    };
     // default options → words: false, so cropped words are not surfaced.
     let out = asr.transcribe_chunks_default(&waveform, &chunks).unwrap();
     assert_eq!(out.text, "hi");
@@ -200,9 +212,9 @@ fn asr_composes_split_and_transcribe() {
     let splitter = FixedLengthSplitter::new(10, 1);
     let transcriber = PresetTranscriber {
         out: vec![
-            Transcript { text: String::new(), words: vec![word("one", 1.0, 2.0)] },
-            Transcript { text: String::new(), words: vec![word("two", 1.0, 2.0)] },
-            Transcript { text: String::new(), words: vec![word("three", 1.0, 2.0)] },
+            Transcript { text: String::new(), words: vec![word("one", 1.0, 2.0)], ..Default::default() },
+            Transcript { text: String::new(), words: vec![word("two", 1.0, 2.0)], ..Default::default() },
+            Transcript { text: String::new(), words: vec![word("three", 1.0, 2.0)], ..Default::default() },
         ],
     };
     let mut asr = Asr::new(splitter, transcriber);
@@ -232,7 +244,7 @@ impl Transcriber for ProfilingTranscriber {
             p.push(svod_runtime::StageProfile::host("decode", std::time::Duration::from_millis(1)));
             p
         });
-        Ok((Transcript { text: "x".to_string(), words: Vec::new() }, prof))
+        Ok((Transcript { text: "x".to_string(), words: Vec::new(), ..Default::default() }, prof))
     }
 }
 
@@ -242,8 +254,9 @@ fn transcribe_windows_default_merges_per_window_profiles() {
     // merges both `decode` stages into one with summed wall (1 ms × 2).
     let waveform = vec![0.0_f32; 20];
     let chunks = vec![AudioChunk::new(0, 10), AudioChunk::new(10, 20)];
-    let out =
-        ProfilingTranscriber.transcribe_chunks(&waveform, &chunks, RunOptions { words: false, profile: true }).unwrap();
+    let out = ProfilingTranscriber
+        .transcribe_chunks(&waveform, &chunks, RunOptions { profile: true, ..Default::default() })
+        .unwrap();
     let profile = out.profile.expect("profile collected");
     assert_eq!(profile.stages.len(), 1, "stages merged by name");
     assert_eq!(profile.stage("decode").unwrap().wall, std::time::Duration::from_millis(2));
@@ -257,7 +270,7 @@ fn asr_profiles_per_call_without_rebuild() {
     let splitter = VadSplitter::new(MockVad { probs: vec![1.0; 4], samples_per_prob: 1 }, fast_chunker_opts());
     let mut asr = Asr::new(splitter, ProfilingTranscriber);
 
-    let profiled = asr.transcribe(&[0.0_f32; 4], RunOptions { words: false, profile: true }).unwrap();
+    let profiled = asr.transcribe(&[0.0_f32; 4], RunOptions { profile: true, ..Default::default() }).unwrap();
     let profile = profiled.profile.expect("profile");
     let stages: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(stages, vec!["vad", "decode"], "VAD stage leads the merged profile");
@@ -270,10 +283,11 @@ fn asr_surfaces_split_stage_even_when_transcriber_does_not() {
     // Profiled run, but the transcriber emits no profile: the `vad` stage still
     // surfaces on its own.
     let splitter = VadSplitter::new(MockVad { probs: vec![1.0; 4], samples_per_prob: 1 }, fast_chunker_opts());
-    let transcriber =
-        PresetTranscriber { out: vec![Transcript { text: String::new(), words: vec![word("a", 1.0, 2.0)] }] };
+    let transcriber = PresetTranscriber {
+        out: vec![Transcript { text: String::new(), words: vec![word("a", 1.0, 2.0)], ..Default::default() }],
+    };
     let mut asr = Asr::new(splitter, transcriber);
-    let out = asr.transcribe(&[0.0_f32; 4], RunOptions { words: false, profile: true }).unwrap();
+    let out = asr.transcribe(&[0.0_f32; 4], RunOptions { profile: true, ..Default::default() }).unwrap();
     let profile = out.profile.expect("vad-only profile surfaces");
     let stages: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(stages, vec!["vad"]);

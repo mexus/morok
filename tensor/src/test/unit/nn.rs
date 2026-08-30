@@ -1,6 +1,7 @@
 //! Tests for neural network operations: pool, conv, normalization, resize.
 
 use ndarray::{Array4, array};
+use svod_dtype::DType;
 
 use crate::Tensor;
 use crate::nn::{Conv1d, LSTMCell, Layer, Reduction, ResizeMode};
@@ -8,6 +9,24 @@ use crate::test::helpers::RealizeTestExt;
 
 fn get_shape(tensor: &Tensor) -> Vec<usize> {
     tensor.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()
+}
+
+#[test]
+fn dynamic_quantized_linear_matches_integer_reference() {
+    let x = Tensor::from_slice([127.0f32, -64.0, 32.0, 0.0, 63.5, -32.0, 16.0, 0.0]).try_reshape([2, 4]).unwrap();
+    let weight = Tensor::from_slice([1i8, 1, 1, 1, 2, -1, 0, 1, -1, 0, 2, -2]).try_reshape([3, 4]).unwrap();
+    let weight_scale = Tensor::from_slice([0.5f32, 1.0, 2.0]);
+    let bias = Tensor::from_slice([1.0f32, -2.0, 0.5]);
+
+    let mut output =
+        x.dynamic_quantized_linear().weight(&weight).weight_scale(&weight_scale).bias(&bias).call().unwrap();
+    output.realize().unwrap();
+
+    assert_eq!(output.uop().dtype(), DType::Float32);
+    let expected = [48.5f32, 316.0, -125.5, 24.75, 157.0, -62.5];
+    for (actual, expected) in output.as_vec::<f32>().unwrap().iter().zip(expected) {
+        assert!((actual - expected).abs() < 1e-4, "actual={actual}, expected={expected}");
+    }
 }
 
 // =========================================================================
@@ -236,7 +255,7 @@ crate::codegen_tests! {
     // The failure is NOT specific to conv2d groups. It's a fundamental bug in the
     // CONTIGUOUS realization path: assign_ranges() creates separate RANGE nodes for
     // CONTIGUOUS realization that leak into the outer STORE scope when the inner
-    // BUFFERIZE is removed. split_store() then rejects the END because it sees
+    // STAGE is removed. split_store() then rejects the END because it sees
     // non-OUTER ranges in scope. This affects ANY tensor with multiple non-trivial
     // dims that goes through CONTIGUOUS realization.
     // Minimal repro: Tensor::from_slice(&[1.0f32, 2.0]).contiguous().realize()
@@ -336,6 +355,21 @@ crate::codegen_tests! {
         for val in result.iter() {
             assert!((*val - (-5.0)).abs() < 1e-4, "max_pool2d with padding should use -inf fill, got {val}");
         }
+    }
+
+    fn test_max_pool2d_large_symmetric_pad(config) {
+        // Padding as wide as the kernel's reach: every window is clamped to the
+        // input, so out[i][j] is the element at (min(i, 2) + 2, min(j, 2) + 2).
+        let x_data: Vec<f32> = (1..=25).map(|v| v as f32).collect();
+        let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 5, 5), x_data).unwrap());
+        let mut result =
+            x.max_pool2d().kernel_size(&[5, 5]).stride(&[1, 1]).padding(&[(2, 2), (2, 2)]).call().unwrap();
+        result.realize_with(&config).unwrap();
+        assert_eq!(get_shape(&result), vec![1, 1, 5, 5]);
+        let expected: Vec<f32> = (0..5)
+            .flat_map(|i: usize| (0..5).map(move |j: usize| ((i.min(2) + 2) * 5 + j.min(2) + 3) as f32))
+            .collect();
+        assert_eq!(result.as_vec::<f32>().unwrap(), expected);
     }
 
     fn test_max_pool2d_with_indices_basic(config) {
@@ -631,7 +665,7 @@ fn test_densenet_two_layer_kernel_count() {
     let result = Tensor::cat(&[&cat1, &conv3x3_2], 1).unwrap();
 
     let uop = result.uop();
-    let sink = svod_ir::UOp::sink(vec![uop.clone()]);
+    let sink = svod_ir::UOp::sink(vec![uop.contiguous()]);
     // Normalize Buffer→Param before rangeify (matches real pipeline)
     let normalization = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize schedule cache");
     let (rangeified, _ctx) = svod_schedule::rangeify::rangeify(normalization.normalized).unwrap();

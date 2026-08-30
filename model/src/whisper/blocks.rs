@@ -22,14 +22,40 @@ pub struct LinearWeights {
 
 impl LinearWeights {
     pub fn empty(in_features: usize, out_features: usize, has_bias: bool) -> Self {
-        let weight = fan_in_uniform(&[out_features, in_features], in_features, DType::Float32);
-        let bias = has_bias.then(|| fan_in_uniform(&[out_features], in_features, DType::Float32));
+        Self::empty_dtype(in_features, out_features, has_bias, DType::Float32)
+    }
+
+    pub fn empty_dtype(in_features: usize, out_features: usize, has_bias: bool, dtype: DType) -> Self {
+        let weight = fan_in_uniform(&[out_features, in_features], in_features, dtype.clone());
+        let bias = has_bias.then(|| fan_in_uniform(&[out_features], in_features, dtype));
         Self { weight, bias }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.linear().weight(&self.weight).maybe_bias(self.bias.as_ref()).call().context(TensorSnafu)
+        match &self.bias {
+            Some(bias) => linear_with_bias(x, &self.weight, bias),
+            None => x.linear().weight(&self.weight).call().context(TensorSnafu),
+        }
     }
+}
+
+pub(crate) fn linear_with_bias(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    let output_dtype = x.uop().dtype();
+    let is_low_precision = |dtype: &DType| dtype == &DType::Float16 || dtype == &DType::BFloat16;
+    let low_precision = is_low_precision(&output_dtype) && is_low_precision(&weight.uop().dtype());
+    if !low_precision {
+        return x.linear().weight(weight).bias(bias).call().context(TensorSnafu);
+    }
+
+    x.linear()
+        .weight(weight)
+        .dtype(DType::Float32)
+        .call()
+        .context(TensorSnafu)?
+        .try_add(&bias.cast(DType::Float32).context(TensorSnafu)?)
+        .context(TensorSnafu)?
+        .cast(output_dtype)
+        .context(TensorSnafu)
 }
 
 impl HasStateDict for LinearWeights {
@@ -62,10 +88,30 @@ pub struct LayerNormWeights {
 
 impl LayerNormWeights {
     pub fn empty(size: usize) -> Self {
-        Self { weight: ones(&[size], DType::Float32), bias: zeros(&[size], DType::Float32), eps: 1e-5 }
+        Self::empty_dtype(size, DType::Float32)
+    }
+
+    pub fn empty_dtype(size: usize, dtype: DType) -> Self {
+        Self { weight: ones(&[size], dtype.clone()), bias: zeros(&[size], dtype), eps: 1e-5 }
     }
 
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
+        let output_dtype = x.uop().dtype();
+        if output_dtype == DType::Float16 || output_dtype == DType::BFloat16 {
+            let x = x.cast(DType::Float32).context(TensorSnafu)?;
+            let weight = self.weight.cast(DType::Float32).context(TensorSnafu)?;
+            let bias = self.bias.cast(DType::Float32).context(TensorSnafu)?;
+            return x
+                .layernorm(-1, self.eps)
+                .context(TensorSnafu)?
+                .try_mul(&weight)
+                .context(TensorSnafu)?
+                .try_add(&bias)
+                .context(TensorSnafu)?
+                .cast(output_dtype)
+                .context(TensorSnafu);
+        }
+
         let normed = x.layernorm(-1, self.eps).context(TensorSnafu)?;
         normed.try_mul(&self.weight).context(TensorSnafu)?.try_add(&self.bias).context(TensorSnafu)
     }
@@ -97,10 +143,22 @@ pub struct Conv1dWeights {
 
 impl Conv1dWeights {
     pub fn empty(in_ch: usize, out_ch: usize, kernel: usize, stride: usize, padding: usize, has_bias: bool) -> Self {
+        Self::empty_dtype(in_ch, out_ch, kernel, stride, padding, has_bias, DType::Float32)
+    }
+
+    pub fn empty_dtype(
+        in_ch: usize,
+        out_ch: usize,
+        kernel: usize,
+        stride: usize,
+        padding: usize,
+        has_bias: bool,
+        dtype: DType,
+    ) -> Self {
         let fan_in = in_ch * kernel;
         Self {
-            weight: fan_in_uniform(&[out_ch, in_ch, kernel], fan_in, DType::Float32),
-            bias: has_bias.then(|| fan_in_uniform(&[out_ch], fan_in, DType::Float32)),
+            weight: fan_in_uniform(&[out_ch, in_ch, kernel], fan_in, dtype.clone()),
+            bias: has_bias.then(|| fan_in_uniform(&[out_ch], fan_in, dtype)),
             stride,
             padding,
         }

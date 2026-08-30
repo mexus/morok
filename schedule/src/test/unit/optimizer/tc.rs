@@ -373,7 +373,7 @@ fn create_matmul_pattern_symbolic_m(m_end: Arc<svod_ir::UOp>, n: i64, k: i64) ->
 }
 
 fn sym_var(name: &str) -> Arc<svod_ir::UOp> {
-    UOp::var(name, svod_dtype::DType::Index, 1, 1 << 16)
+    UOp::variable(name.into(), 1, 1 << 16, svod_dtype::DType::Int32)
 }
 
 #[test_case::test_case(1; "no padding")]

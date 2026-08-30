@@ -29,7 +29,6 @@ fn test_apply_map_updates_tensors() {
     // Create a replacement for the shared const
     let replacement = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
-    #[allow(clippy::mutable_key_type)]
     let mut becomes_map = HashMap::new();
     becomes_map.insert(UOpKey(shared.clone()), replacement.clone());
 

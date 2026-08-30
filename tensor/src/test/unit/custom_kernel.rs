@@ -110,10 +110,10 @@ crate::codegen_tests! {
                 let in_buf = placeholders[1].clone();
 
                 let idx = UOp::index_const(0);
-                let load_idx = UOp::index().buffer(in_buf.clone()).indices(vec![idx.clone()]).ptr(true).call().unwrap();
-                let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![idx]).ptr(true).call().unwrap();
+                let load_idx = UOp::index().buffer(in_buf.clone()).indices(vec![idx.clone()]).call().unwrap();
+                let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![idx]).call().unwrap();
 
-                let loaded = UOp::load().buffer(in_buf).index(load_idx).call();
+                let loaded = UOp::load().index(load_idx).call();
                 let two = UOp::const_(DType::Float32, ConstValue::Float(2.0));
                 let doubled = loaded.try_mul(&two).unwrap();
                 let store = store_idx.store(doubled);
@@ -146,10 +146,10 @@ fn run_custom_op_numerical_test(backend: CpuBackend, mul_tpl: &str, add_tpl: &st
                 let in_buf = placeholders[1].clone();
 
                 let idx = UOp::index_const(0);
-                let load_idx = UOp::index().buffer(in_buf.clone()).indices(vec![idx.clone()]).ptr(true).call().unwrap();
-                let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![idx]).ptr(true).call().unwrap();
+                let load_idx = UOp::index().buffer(in_buf.clone()).indices(vec![idx.clone()]).call().unwrap();
+                let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![idx]).call().unwrap();
 
-                let loaded = UOp::load().buffer(in_buf).index(load_idx).call();
+                let loaded = UOp::load().index(load_idx).call();
                 let scaled = UOp::custom(smallvec![loaded], mul_tpl.to_string(), DType::Float32);
                 let shifted = UOp::custom(smallvec![scaled], add_tpl.to_string(), DType::Float32);
                 let store = store_idx.store(shifted);
@@ -188,11 +188,11 @@ fn hand_ranged_add1_body(n: usize) -> impl FnOnce(Vec<Arc<UOp>>) -> Arc<UOp> {
         let out_buf = ph[0].clone();
         let in_buf = ph[1].clone();
         let i = UOp::range_const(n as i64, 0);
-        let in_idx = UOp::index().buffer(in_buf.clone()).indices(vec![i.clone()]).ptr(true).call().unwrap();
-        let loaded = UOp::load().buffer(in_buf).index(in_idx).call();
+        let in_idx = UOp::index().buffer(in_buf.clone()).indices(vec![i.clone()]).call().unwrap();
+        let loaded = UOp::load().index(in_idx).call();
         let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
         let val = loaded.try_add(&one).unwrap();
-        let out_idx = UOp::index().buffer(out_buf).indices(vec![i.clone()]).ptr(true).call().unwrap();
+        let out_idx = UOp::index().buffer(out_buf).indices(vec![i.clone()]).call().unwrap();
         // Plain STORE, with the manual loop closed by an explicit END(range) —
         // the tinykittens `store(..).end(i)` pattern. (`store_with_ranges` is for
         // output-upcast UNROLL, not loop closing.)
@@ -200,7 +200,7 @@ fn hand_ranged_add1_body(n: usize) -> impl FnOnce(Vec<Arc<UOp>>) -> Arc<UOp> {
         // opts_to_apply = Some(vec![]) — the tinygrad `()` analog: this SINK is
         // already in finished, hand-lowered form; the optimizer must apply zero
         // opts (no heuristic upcast/vectorize of the manual loop).
-        UOp::sink_with_info(vec![store], KernelInfo { opts_to_apply: Some(vec![]), name: None })
+        UOp::sink_with_info(vec![store], KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() })
     }
 }
 
@@ -261,10 +261,10 @@ fn test_tensor_custom_op_amd_end_to_end() {
             let in_buf = placeholders[1].clone();
 
             let idx = UOp::index_const(0);
-            let load_idx = UOp::index().buffer(in_buf.clone()).indices(vec![idx.clone()]).ptr(true).call().unwrap();
-            let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![idx]).ptr(true).call().unwrap();
+            let load_idx = UOp::index().buffer(in_buf.clone()).indices(vec![idx.clone()]).call().unwrap();
+            let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![idx]).call().unwrap();
 
-            let loaded = UOp::load().buffer(in_buf).index(load_idx).call();
+            let loaded = UOp::load().index(load_idx).call();
             let custom = UOp::custom(smallvec![loaded], "fmul float {0}, 2.0".to_string(), DType::Float32);
             let store = store_idx.store(custom);
             UOp::sink(vec![store])

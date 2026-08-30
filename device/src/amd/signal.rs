@@ -14,7 +14,7 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 
-use crate::allocator::RawBuffer;
+use crate::allocator::{AmdBufferGuard, RawBuffer};
 use crate::amd::AmdAllocator;
 use crate::amd::device::AmdDeviceCore;
 use crate::error::{Error, Result};
@@ -23,7 +23,10 @@ use crate::sync::TimelineSignal;
 /// Spin / yield budget before escalating to a KFD WAIT_EVENTS sleep: cheap
 /// polling for short waits, kernel blocking for long ones so a stalled wait
 /// doesn't pin a CPU.
+#[cfg(not(test))]
 const WAIT_EVENTS_ESCALATE_MS: u64 = 200;
+#[cfg(test)]
+const WAIT_EVENTS_ESCALATE_MS: u64 = 1;
 
 /// 64-byte slot laid out as an `amd_signal_t` (kind@0, value@8). The AQL packet
 /// processor reads a dispatch packet's `completion_signal.handle` as the struct
@@ -36,9 +39,9 @@ const SLOT_BYTES: usize = 64;
 const SLOTS_PER_PAGE: usize = 64;
 /// Byte offset of the `value` counter inside an `amd_signal_t` slot.
 const SIGNAL_VALUE_OFFSET: usize = 8;
-/// Byte offsets of the CP-written dispatch timestamps (`amd_signal_t.start_ts`
-/// / `.end_ts`). Stamped on every dispatch because our queues run with
-/// `AMD_QUEUE_PROPERTIES_ENABLE_PROFILING` set.
+/// Byte offsets of dispatch timestamps (`amd_signal_t.start_ts` / `.end_ts`).
+/// AMD HCQ submission finalizers write these fields with explicit PM4 timestamp
+/// commands on both PM4 and AQL queues.
 const SIGNAL_START_TS_OFFSET: usize = 32;
 const SIGNAL_END_TS_OFFSET: usize = 40;
 /// The GPU clock counter feeding the timestamps ticks at the architected
@@ -52,7 +55,7 @@ const NS_PER_TICK: u64 = 10;
 /// slot to its pool. The pool keeps the underlying VRAM allocation alive.
 pub struct AmdSignal {
     slot: u32,
-    /// `amd_signal_t` struct base (GPU VA) — the AQL `completion_signal.handle`.
+    /// `amd_signal_t` struct base (GPU VA), used to derive timestamp fields.
     base_gpu: u64,
     /// GPU VA of the `value` counter (`base_gpu + SIGNAL_VALUE_OFFSET`) — what
     /// PM4/SDMA packets write and what the host polls.
@@ -77,15 +80,6 @@ impl AmdSignal {
         self.value_addr
     }
 
-    /// GPU VA of the `amd_signal_t` struct base — the value to place in an AQL
-    /// kernel-dispatch packet's `completion_signal.handle`. The packet processor
-    /// decrements the `value` field (at [`value_addr`](Self::value_addr)) when
-    /// the dispatch completes.
-    #[inline]
-    pub fn signal_handle(&self) -> u64 {
-        self.base_gpu
-    }
-
     /// GPU VA of the dispatch `start_ts` field (`base_gpu + 32`). On the
     /// single-XCC PM4 path the CP does not auto-stamp dispatches (the AQL path's
     /// `ENABLE_PROFILING` does), so a profiling dispatch targets this address
@@ -102,6 +96,13 @@ impl AmdSignal {
         self.base_gpu + SIGNAL_END_TS_OFFSET as u64
     }
 
+    /// The owning device's latched fault, if any. Lets waiters that are not
+    /// polling this slot (a submission still awaiting publication) bail on a
+    /// dead device instead of burning their whole deadline.
+    pub(crate) fn device_poison(&self) -> Option<Error> {
+        self.device.upgrade().and_then(|device| device.poison_error())
+    }
+
     /// Slot index inside the pool. Useful for debugging.
     pub fn slot(&self) -> u32 {
         self.slot
@@ -114,56 +115,61 @@ impl AmdSignal {
         unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) }
     }
 
-    /// Arm a native countdown completion signal to `count` (1 for one dispatch).
-    /// The AQL packet processor decrements it to 0 on completion; the host then
-    /// observes done via [`wait_done`](Self::wait_done). Clears any stale
-    /// dispatch timestamps so [`timestamps_ns`](Self::timestamps_ns) never
-    /// reports a previous tenant's stamps after slot reuse.
+    /// Reset a slot before assigning it to a timeline or timestamp probe.
+    /// Monotonic PM4/SDMA timelines start at zero and receive literal stores;
+    /// stale profiling stamps are always cleared on reuse.
     #[inline]
-    pub fn arm(&self, count: i64) {
+    pub(crate) fn reset(&self, value: u64) {
         // SAFETY: the full 64-byte slot is mapped; ts fields at +32/+40.
         unsafe {
             let base = (self.host_ptr.as_ptr() as *mut u8).sub(SIGNAL_VALUE_OFFSET);
             std::ptr::write_volatile(base.add(SIGNAL_START_TS_OFFSET) as *mut u64, 0);
             std::ptr::write_volatile(base.add(SIGNAL_END_TS_OFFSET) as *mut u64, 0);
-            self.host_ptr.as_ref().store(count as u64, Ordering::Release);
+            self.host_ptr.as_ref().store(value, Ordering::Release);
         }
     }
 
     /// Tiered busy-wait until `ready(value)` holds, or `timeout_ms` of *no
     /// progress* elapses, or KFD reports a GPU fault. Shared by the
-    /// increment-convention ([`wait_signal_value`](Self::wait_signal_value)) and
-    /// countdown-convention ([`wait_done`](Self::wait_done)) waits.
+    /// monotonic timeline waits.
     ///
     /// Early-exit on fault is load-bearing for BEAM search: a bad kernel config
     /// may fault the GPU, and paying the full timeout per rejected candidate is
     /// unaffordable.
-    fn poll_until(&self, ready: impl Fn(u64) -> bool, timeout_ms: u64, what: &'static str) -> Result<()> {
+    fn poll_until(&self, target: u64, timeout_ms: u64, what: &'static str, progress: &[Arc<AmdSignal>]) -> Result<()> {
         let mut start = std::time::Instant::now();
         let mut prev = u64::MAX;
+        let mut progress_values = vec![u64::MAX; progress.len()];
         loop {
+            if let Some(error) = self.device.upgrade().and_then(|device| device.poison_error()) {
+                return Err(error);
+            }
             let v = self.load();
-            if ready(v) {
+            if v >= target {
                 return Ok(());
             }
-            if v != prev {
-                prev = v; // progress: timeout is for *no* progress, so reset.
+            let mut advanced = v != prev;
+            prev = v;
+            for (signal, previous) in progress.iter().zip(&mut progress_values) {
+                let value = signal.load();
+                advanced |= value != *previous;
+                *previous = value;
+            }
+            if advanced {
                 start = std::time::Instant::now();
             }
             if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
                 // A hung kernel almost always raised a fault; surface it
                 // alongside the deadline.
                 let fault = self.device.upgrade().and_then(|d| d.poll_faults_nonblocking());
-                // The wait predicate is opaque here (increment vs. countdown
-                // convention), so `target` is reported as 0; `what` names the op.
                 return Err(fault.unwrap_or(Error::TimelineTimeout {
                     what,
-                    target: 0,
+                    target,
                     current: v,
                     waited_ms: timeout_ms,
                 }));
             }
-            if let Some(fault) = self.spin_or_escalate(start) {
+            if let Some(fault) = self.spin_or_escalate(start)? {
                 return Err(fault);
             }
         }
@@ -171,31 +177,24 @@ impl AmdSignal {
 
     /// Spin-wait until the value is ≥ `target` (increment convention — SDMA
     /// fence / monotonic timeline writes a literal increasing value).
-    pub fn wait_signal_value(&self, target: u64, timeout_ms: u64) -> Result<()> {
-        self.poll_until(|v| v >= target, timeout_ms, "wait_signal_value")
+    pub(crate) fn wait_signal_value(&self, target: u64, timeout_ms: u64) -> Result<()> {
+        self.poll_until(target, timeout_ms, "wait_signal_value", &[])
     }
 
-    /// Spin-wait until a native countdown completion signal reaches 0 (any
-    /// `value as i64 <= 0`). Pairs with [`arm`](Self::arm).
-    pub fn wait_done(&self, timeout_ms: u64) -> Result<()> {
-        self.poll_until(|v| (v as i64) <= 0, timeout_ms, "wait_done")
-    }
-
-    /// Non-blocking check that a native countdown signal has retired (value
-    /// decremented to 0). Used to reclaim pool slots without waiting.
-    #[inline]
-    pub fn is_done(&self) -> bool {
-        (self.load() as i64) <= 0
+    pub(crate) fn wait_signal_value_with_progress(
+        &self,
+        target: u64,
+        timeout_ms: u64,
+        progress: &[Arc<AmdSignal>],
+    ) -> Result<()> {
+        self.poll_until(target, timeout_ms, "wait_signal_value", progress)
     }
 
     /// CP-written dispatch timestamps in nanoseconds, valid only after the
-    /// signal retired ([`is_done`](Self::is_done)). `None` until then, or when
-    /// the slot was never the completion signal of a dispatch (both stamps
-    /// zeroed by [`arm`](Self::arm)).
+    /// signal retired. `None` until then, or when
+    /// the slot was never targeted by timestamp commands (both stamps
+    /// zeroed by [`reset`](Self::reset)).
     pub fn timestamps_ns(&self) -> Option<(u64, u64)> {
-        if !self.is_done() {
-            return None;
-        }
         // SAFETY: the full 64-byte slot is mapped; value lives at +8, so the
         // slot base is host_ptr − SIGNAL_VALUE_OFFSET.
         let (start, end) = unsafe {
@@ -213,12 +212,11 @@ impl AmdSignal {
     /// wakes us when the device's `queue_event` fires, eliminating CPU burn
     /// for stalled or long-running dispatches.
     ///
-    /// Returns `Some(Error)` when KFD reports a GPU fault during the kernel
-    /// wait so callers can break out of the spin immediately. `None` for
-    /// normal wake-ups (queue_event fired, WAIT_EVENTS timed out internally,
-    /// device dropped, or the pure spin/yield path).
+    /// Returns the typed `WAIT_EVENTS` failure directly. Otherwise, `Some`
+    /// carries a reported GPU fault and `None` means a normal wake-up, timeout,
+    /// dropped device, or the pure spin/yield path.
     #[inline]
-    fn spin_or_escalate(&self, start: std::time::Instant) -> Option<Error> {
+    fn spin_or_escalate(&self, start: std::time::Instant) -> Result<Option<Error>> {
         let elapsed_ms = start.elapsed().as_millis() as u64;
         if elapsed_ms >= WAIT_EVENTS_ESCALATE_MS
             && let Some(dev) = self.device.upgrade()
@@ -230,15 +228,16 @@ impl AmdSignal {
             // here so we bail with the actual error instead of grinding
             // through the rest of the timeout.
             match dev.wait_events(WAIT_EVENTS_ESCALATE_MS as u32) {
-                Ok(Some(fault)) => return Some(fault),
-                Ok(None) | Err(_) => return None,
+                Ok(Some(fault)) => return Ok(Some(fault)),
+                Ok(None) => return Ok(None),
+                Err(error) => return Err(error),
             }
         }
         std::hint::spin_loop();
         if start.elapsed().as_micros() >= 100 {
             std::thread::yield_now();
         }
-        None
+        Ok(None)
     }
 }
 
@@ -253,7 +252,16 @@ impl std::fmt::Debug for AmdSignal {
 }
 
 impl Drop for AmdSignal {
+    /// Tinygrad's `HCQSignal.__del__` (`support/hcq.py:250-251`) returns the
+    /// slot unconditionally, and so does this — leaking a slot on every caught
+    /// panic drains the pool for no benefit, and the slot is host memory.
+    ///
+    /// Documented divergence: a poisoned device may still have a wedged command
+    /// processor writing this slot, so a poisoned device never recycles slots.
     fn drop(&mut self) {
+        if self.device.upgrade().is_some_and(|device| device.is_poisoned()) {
+            return;
+        }
         if let Some(pool) = self.pool.upgrade() {
             pool.release_slot(self.slot);
         }
@@ -268,10 +276,10 @@ pub const TIMELINE_WRAP_WATERMARK: u64 = 1 << 31;
 /// A connector's timeline: an owned monotonic counter plus the shared signal
 /// the GPU writes on dispatch completion. This is the ONE primitive that
 /// crosses owners — a `PoolQueue` dispatches against it (advancing `value`), and
-/// any thread can *drain* it (read `value`, poll the signal slot) without ever
-/// taking the queue's dispatch lock. The registry on `AmdDeviceCore` holds
+/// any thread can *drain* it (read `value`, poll the signal slot) without taking
+/// lane publication authority. The registry on `AmdDeviceCore` holds
 /// `Weak<PoolQueue>`, and `drain_all` fences in-flight work purely through these
-/// atomics + the per-op signals — keeping concurrent dispatch unblocked.
+/// atomics plus retained linked-plan timelines, keeping concurrent dispatch unblocked.
 #[derive(Debug)]
 pub struct Timeline {
     signal: Arc<AmdSignal>,
@@ -282,10 +290,11 @@ pub struct Timeline {
 
 impl Timeline {
     pub fn new(signal: Arc<AmdSignal>) -> Arc<Self> {
+        signal.reset(0);
         Arc::new(Self { signal, value: AtomicU64::new(1) })
     }
 
-    /// The shared completion signal (for emitting wait/signal packets).
+    /// The shared completion timeline (for emitting wait/signal packets).
     #[inline]
     pub fn signal(&self) -> &Arc<AmdSignal> {
         &self.signal
@@ -304,6 +313,12 @@ impl Timeline {
         self.value.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Undo the most recent reservation before its doorbell was rung. Queue
+    /// publication authority guarantees there can be no later reservation.
+    pub(crate) fn rollback(&self, reserved: u64) -> bool {
+        self.value.compare_exchange(reserved + 1, reserved, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
     /// Highest value reserved so far (the value the next `signal` packet writes
     /// is `current()`; the last reserved is `current() - 1`).
     #[inline]
@@ -311,23 +326,26 @@ impl Timeline {
         self.value.load(Ordering::Acquire)
     }
 
-    /// Block until the GPU has written `current() - 1` (all submitted work
-    /// drained), then wrap-reset if past the watermark. Touches only the
-    /// atomic + the signal's host slot — never a queue. The owner is the sole
-    /// writer of `value`, so a concurrent drainer reading it is race-free.
+    /// Block until the GPU has written the current `value - 1` snapshot. This
+    /// never resets the generation because callers that do not hold the queue's
+    /// publication lock can race a later reservation.
     pub fn drain(&self, timeout_ms: u64) -> Result<()> {
         let target = self.value.load(Ordering::Acquire).saturating_sub(1);
         if target == 0 {
             return Ok(());
         }
         self.signal.wait_signal_value(target, timeout_ms)?;
-        // Wraparound: we've drained to `target` (GPU idle), so it's safe to
-        // reset the slot to 0 and restart the counter at 1.
+        Ok(())
+    }
+
+    /// Reset a drained generation. The caller must hold the same lock that
+    /// serializes `next()` with queue publication and must have just drained.
+    pub fn reset_after_drain(&self) {
         if self.value.load(Ordering::Acquire) > TIMELINE_WRAP_WATERMARK {
-            self.signal.set(0);
+            debug_assert!(self.signal.value() >= self.value.load(Ordering::Acquire).saturating_sub(1));
+            self.signal.reset(0);
             self.value.store(1, Ordering::Release);
         }
-        Ok(())
     }
 }
 
@@ -356,67 +374,114 @@ impl TimelineSignal for AmdSignal {
     fn wait(&self, target: u64, timeout_ms: u64) -> Result<()> {
         // Tiered strategy (spin → yield → KFD WAIT_EVENTS sleep) + fault
         // surfacing live in the shared `poll_until` helper.
-        self.poll_until(|v| v >= target, timeout_ms, "wait")
+        self.poll_until(target, timeout_ms, "wait", &[])
     }
 }
 
-/// Pool over a shared host-visible GTT region (one or more pages); hands out
-/// [`AmdSignal`]s. Sized at construction: a flat per-owner model needs only a
-/// handful, but DAG dispatch reserves one slot per kernel of the largest
-/// captured graph (low hundreds for GigaAM), so the pool spans several pages.
-pub struct SignalPool {
-    /// Owning buffer — held to keep the GTT mapping alive while signals exist.
-    _buffer: RawBuffer,
+/// One GTT-backed run of `chunk_slots` consecutive signal slots.
+struct SignalChunk {
+    buffer: RawBuffer,
     base_gpu: u64,
     base_host: NonNull<u8>,
-    /// Total slots carved from the region (rounded up to whole pages).
-    slots: usize,
-    free_slots: Mutex<Vec<u32>>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    chunks: Vec<SignalChunk>,
+    free_slots: Vec<u32>,
+}
+
+/// Pool over host-visible GTT chunks; hands out [`AmdSignal`]s. A flat
+/// per-owner model needs only a handful of slots, but DAG dispatch reserves one
+/// per kernel of the largest captured graph (low hundreds for GigaAM), so the
+/// initial chunk spans several pages and exhaustion grows another chunk rather
+/// than failing (tinygrad `HCQCompiled.new_signal`, `support/hcq.py:452-458`).
+///
+/// Slot ids are a flat numbering across chunks: chunk `i` owns
+/// `i * chunk_slots .. (i + 1) * chunk_slots`, so a released slot needs no
+/// chunk bookkeeping.
+pub struct SignalPool {
+    /// Used to carve additional chunks on exhaustion. Its `Arc<AmdDevice>` is
+    /// the same one every chunk's `RawBuffer` already holds.
+    allocator: AmdAllocator,
+    chunk_slots: usize,
+    state: Mutex<PoolState>,
     /// Captured at pool creation; signals downgrade-clone this into a `Weak`
     /// so `wait` can call `AmdDeviceCore::wait_events` for KFD escalation.
     device: Arc<AmdDeviceCore>,
 }
 
-// SAFETY: AtomicU64 covers concurrent reads/writes through `base_host`;
-// `free_slots` is mutex-protected; `_buffer` is owned and not aliased.
+// SAFETY: AtomicU64 covers concurrent reads/writes through a chunk's
+// `base_host`; chunks and free slots are mutex-protected and not aliased.
 unsafe impl Send for SignalPool {}
 unsafe impl Sync for SignalPool {}
 
+impl Drop for SignalPool {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        if let Err(error) = self.device.synchronize_all() {
+            tracing::warn!(?error, "SignalPool drop: backing allocations quarantined");
+            return;
+        }
+        for chunk in &self.state.get_mut().chunks {
+            chunk.buffer.free_amd_device_in_place();
+        }
+    }
+}
+
 impl SignalPool {
-    /// Allocate the backing GTT page from `allocator` and partition it.
+    /// Allocate the first GTT chunk from `allocator` and partition it.
     ///
     /// Critical: the signal page must be **GTT-coherent + uncached** so that
     /// the GPU's decrement of the completion_signal field is immediately
     /// visible to the host (otherwise it sits in GPU L2 and we spin
     /// forever).
     pub fn new(allocator: &AmdAllocator, slots: usize) -> Result<Arc<Self>> {
-        // Round up to a whole page so the GTT allocation is page-aligned and
+        // Round up to a whole page so every GTT allocation is page-aligned and
         // every byte is usable as a slot.
-        let slots = slots.max(1).next_multiple_of(SLOTS_PER_PAGE);
-        let buffer = allocator.alloc_uncached(SLOT_BYTES * slots)?;
-        let (base_gpu, base_host) = match &buffer {
-            RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-            _ => {
-                return Err(Error::NotHostVisible { what: "SignalPool" });
-            }
-        };
-        let free_slots = Mutex::new((0..slots as u32).rev().collect()); // pop low slots first
-        let device = Arc::clone(allocator.dev.core());
-        Ok(Arc::new(Self { _buffer: buffer, base_gpu, base_host, slots, free_slots, device }))
+        let pool = Arc::new(Self {
+            allocator: AmdAllocator { dev: Arc::clone(&allocator.dev), device_id: allocator.device_id },
+            chunk_slots: slots.max(1).next_multiple_of(SLOTS_PER_PAGE),
+            state: Mutex::new(PoolState::default()),
+            device: Arc::clone(allocator.dev.core()),
+        });
+        pool.grow(&mut pool.state.lock())?;
+        Ok(pool)
     }
 
-    /// Carve off a new signal from the pool. Returns `Err` when exhausted.
+    /// Append one more chunk's worth of slots. The caller holds `state`.
+    fn grow(&self, state: &mut PoolState) -> Result<()> {
+        let buffer = AmdBufferGuard::new(
+            self.allocator
+                .alloc_uncached_tagged(SLOT_BYTES * self.chunk_slots, crate::amd::va_registry::AllocTag::SignalPool)?,
+        );
+        let (base_gpu, base_host) = match buffer.buffer() {
+            RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
+            _ => return Err(Error::NotHostVisible { what: "SignalPool" }),
+        };
+        let first = (state.chunks.len() * self.chunk_slots) as u32;
+        state.chunks.push(SignalChunk { buffer: buffer.into_inner(), base_gpu, base_host });
+        // Pop low slots first.
+        state.free_slots.extend((first..first + self.chunk_slots as u32).rev());
+        Ok(())
+    }
+
+    /// Carve off a new signal, growing the pool when every slot is in use.
     pub fn acquire(self: &Arc<Self>) -> Result<AmdSignal> {
-        let slot = self.free_slots.lock().pop().ok_or_else(|| Error::AmdAllocFailed {
-            reason: format!("SignalPool exhausted ({} slots in use)", self.slots),
-        })?;
-        let offset = slot as usize * SLOT_BYTES;
-        let base_gpu = self.base_gpu + offset as u64;
-        let base_host = self.base_host.as_ptr();
+        let mut state = self.state.lock();
+        if state.free_slots.is_empty() {
+            self.grow(&mut state)?;
+        }
+        let slot = state.free_slots.pop().expect("a grown pool has free slots");
+        let chunk = &state.chunks[slot as usize / self.chunk_slots];
+        let offset = (slot as usize % self.chunk_slots) * SLOT_BYTES;
+        let base_gpu = chunk.base_gpu + offset as u64;
         // Lay out the amd_signal_t: zero the 64-byte slot, then set kind=USER so
         // the AQL packet processor treats it as a value signal, value stays 0.
-        // SAFETY: offset + SLOT_BYTES <= page size by construction.
-        let slot_host = unsafe { base_host.add(offset) };
+        // SAFETY: offset + SLOT_BYTES <= the chunk size by construction.
+        let slot_host = unsafe { chunk.base_host.as_ptr().add(offset) };
         unsafe {
             std::ptr::write_bytes(slot_host, 0, SLOT_BYTES);
             std::ptr::write_volatile(
@@ -439,7 +504,7 @@ impl SignalPool {
     }
 
     fn release_slot(&self, slot: u32) {
-        self.free_slots.lock().push(slot);
+        self.state.lock().free_slots.push(slot);
     }
 
     /// Currently-free slot count. Used by graph capture to decide whether a DAG
@@ -447,17 +512,22 @@ impl SignalPool {
     /// enough headroom for per-op AQL back-pressure + PM4 counters; if not,
     /// capture falls back to blanket-BARRIER instead of starving dispatch.
     pub fn free(&self) -> usize {
-        self.free_slots.lock().len()
+        self.state.lock().free_slots.len()
+    }
+
+    /// Slots carved so far, across every chunk.
+    pub fn capacity(&self) -> usize {
+        self.state.lock().chunks.len() * self.chunk_slots
     }
 }
 
 impl std::fmt::Debug for SignalPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let free = self.free_slots.lock().len();
+        let state = self.state.lock();
         f.debug_struct("SignalPool")
-            .field("base_gpu", &format_args!("{:#x}", self.base_gpu))
-            .field("slots_total", &self.slots)
-            .field("slots_free", &free)
+            .field("chunks", &state.chunks.len())
+            .field("slots_total", &(state.chunks.len() * self.chunk_slots))
+            .field("slots_free", &state.free_slots.len())
             .finish()
     }
 }
