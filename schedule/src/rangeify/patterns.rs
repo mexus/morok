@@ -1731,28 +1731,43 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
         (lhs.as_ref(), rhs.clone())
     };
 
-    // Pattern: (x + y) < c → x < (c - y)
-    if let Op::Binary(BinaryOp::Add, x, y) = inner_lhs.op()
-        && no_range(y)
-    {
-        let new_rhs = effective_rhs.try_sub(y).ok()?;
-        return x.try_cmplt(&new_rhs).ok();
+    // Pattern: (x + y) < c → x < (c - y). ADD is commutative, so try both
+    // operand orders: tinygrad's UPat matches commutative sources in either
+    // position (`(UPat.var("x")+UPat.var("y")) < UPat.var("c")`,
+    // `codegen/simplify.py:101`), and morok's canonical ordering puts the
+    // range-free operand first whenever it sorts below the RANGE.
+    if let Op::Binary(BinaryOp::Add, x, y) = inner_lhs.op() {
+        if no_range(y) {
+            let new_rhs = effective_rhs.try_sub(y).ok()?;
+            return x.try_cmplt(&new_rhs).ok();
+        }
+        if no_range(x) {
+            let new_rhs = effective_rhs.try_sub(x).ok()?;
+            return y.try_cmplt(&new_rhs).ok();
+        }
     }
 
-    // Pattern: (x * y) < c → x < ceil(c/y) when y > 0
-    if let Op::Binary(BinaryOp::Mul, x, y) = inner_lhs.op()
-        && no_range(y)
-    {
-        // Check y > 0 via vmin
-        if let ConstValue::Int(ymin) = y.vmin()
-            && *ymin > 0
-        {
-            // ceil(c/y) = (c + y - 1) / y
+    // Pattern: (x * y) < c → x < ceil(c/y) when y > 0, either operand order.
+    if let Op::Binary(BinaryOp::Mul, x, y) = inner_lhs.op() {
+        let ceil_div = |num: &Arc<UOp>, den: &Arc<UOp>| -> Option<Arc<UOp>> {
+            // Check den > 0 via vmin.
+            let ConstValue::Int(den_min) = den.vmin() else { return None };
+            if *den_min <= 0 {
+                return None;
+            }
+            // ceil(c/den) = (c + den - 1) / den
             let one = UOp::index_const(1);
-            let c_plus_y = effective_rhs.try_add(y).ok()?;
-            let c_plus_y_minus_1 = c_plus_y.try_sub(&one).ok()?;
-            let new_rhs = c_plus_y_minus_1.try_div(y).ok()?;
+            num.try_add(den).ok()?.try_sub(&one).ok()?.try_div(den).ok()
+        };
+        if no_range(y)
+            && let Some(new_rhs) = ceil_div(&effective_rhs, y)
+        {
             return x.try_cmplt(&new_rhs).ok();
+        }
+        if no_range(x)
+            && let Some(new_rhs) = ceil_div(&effective_rhs, x)
+        {
+            return y.try_cmplt(&new_rhs).ok();
         }
     }
 
