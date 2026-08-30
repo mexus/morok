@@ -150,8 +150,8 @@ enum OpClass {
 /// The generated metadata at svod_ir::op::pattern_derived::pattern_metadata::BINARY_OPS
 /// can be used for runtime validation.
 const BINARY_OPS: &[&str] = &[
-    "Add", "Mul", "Sub", "Mod", "Max", "Pow", "Idiv", "Fdiv", "Lt", "Le", "Eq", "Ne", "Gt", "Ge", "And", "Or", "Xor",
-    "Shl", "Shr", "Threefry",
+    "Add", "Mul", "Sub", "FloorMod", "CMod", "Max", "Pow", "FloorDiv", "CDiv", "Fdiv", "Lt", "Le", "Eq", "Ne", "Gt",
+    "Ge", "And", "Or", "Xor", "Shl", "Shr", "Threefry",
 ];
 
 /// Unary IR operations.
@@ -186,6 +186,7 @@ const TERNARY_OPS: &[&str] = &["Where", "MulAcc"];
 /// Single-source operations mapped to their pattern helper method names.
 /// NOTE: These ops must have `src` as their first child field.
 const SINGLE_SOURCE_OPS: &[(&str, &str)] = &[
+    ("GetAddr", "get_addr"),
     ("Detach", "detach"),
     ("ContiguousBackward", "contiguous_backward"),
     ("Cast", "cast"),
@@ -195,8 +196,6 @@ const SINGLE_SOURCE_OPS: &[(&str, &str)] = &[
     ("Pad", "pad"),
     ("Shrink", "shrink"),
     ("Flip", "flip"),
-    ("Contract", "contract"),
-    ("Unroll", "unroll"),
     ("Contiguous", "contiguous"),
     ("Precast", "precast"),
     ("BitCast", "bitcast"),
@@ -207,7 +206,7 @@ const SINGLE_SOURCE_OPS: &[(&str, &str)] = &[
 /// Map of operation names to their child field names (in positional order).
 ///
 /// This is used for tuple-style pattern matching: `Op(x, y)` where we need
-/// to know that `x` maps to `buffer` and `y` maps to `index` for Load.
+/// to know that positional memory patterns map to their required operands.
 ///
 /// Ops not in this list default to single `src` field handling via SINGLE_SOURCE_OPS.
 const OP_CHILD_FIELDS: &[(&str, &[&str])] = &[
@@ -221,17 +220,14 @@ const OP_CHILD_FIELDS: &[(&str, &[&str])] = &[
     ("Barrier", &["src"]),
     // Buffer ops
     ("Buffer", &["unique", "device"]),
-    ("BufferView", &["buffer"]),
+    ("Slice", &["buffer", "offset"]),
     ("MSelect", &["buffer"]),
     ("Index", &["buffer"]),
-    ("PointerIndex", &["ptr", "offset"]),
-    ("Copy", &["src", "device"]),
-    ("Bufferize", &["compute"]),
+    ("Copy", &["src"]),
+    ("Stage", &["compute"]),
     // Memory ops
-    ("Load", &["buffer", "index"]),
-    ("LoadGated", &["buffer", "index", "gate"]),
-    ("Store", &["buffer", "index", "value"]),
-    ("StoreGated", &["buffer", "index", "value", "gate"]),
+    ("Load", &["index"]),
+    ("Store", &["index", "value"]),
     // Symbolic
     ("Bind", &["var", "value"]),
     // Callable
@@ -241,7 +237,7 @@ const OP_CHILD_FIELDS: &[(&str, &[&str])] = &[
     ("GetTuple", &["src"]),
     // Reduction
     ("Reduce", &["src"]),
-    ("AllReduce", &["src", "device"]),
+    ("AllReduce", &["src"]),
     // WMMA
     ("Wmma", &["a", "b", "c"]),
 ];
@@ -469,6 +465,49 @@ fn compute_op_keys(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Vec<Tok
         // They act like wildcards at the top level (shouldn't be used as top-level patterns)
         Pattern::OptionSome(inner) => compute_op_keys(inner, iter_ctx),
         Pattern::OptionNone => vec![],
+    }
+}
+
+/// Op kinds the root pattern demands of its direct children.
+///
+/// Tinygrad's `UPat.early_reject` (uop/ops.py:1349-1352): the union of the `op` sets of the
+/// fixed-position source patterns, taking only those constrained to exactly one op kind.
+/// Sources that are wildcards, bindings to wildcards, or alternatives over several kinds
+/// constrain nothing and contribute nothing.
+fn compute_early_reject_keys(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Vec<TokenStream2> {
+    match pattern {
+        Pattern::Binding { pattern, .. } => compute_early_reject_keys(pattern, iter_ctx),
+        // A top-level alternative matches if *any* branch does, so only kinds demanded by
+        // every branch are guaranteed present.
+        Pattern::Any(alternatives) => {
+            let mut branches = alternatives.iter().map(|alt| compute_early_reject_keys(alt, iter_ctx));
+            let first = branches.next().unwrap_or_default();
+            branches.fold(first, |acc, branch| {
+                let keep: std::collections::HashSet<String> = branch.iter().map(TokenStream2::to_string).collect();
+                acc.into_iter().filter(|key| keep.contains(&key.to_string())).collect()
+            })
+        }
+        _ => {
+            // Every source position below binds one of the root's direct children: tuple and
+            // op-variable args map onto child fields, struct fields that carry an op-shaped
+            // sub-pattern are child fields by construction.
+            let sources: Vec<&Pattern> = match pattern {
+                Pattern::OpTuple { args, .. } | Pattern::OpVar { args, .. } | Pattern::OpPermute { args, .. } => {
+                    args.iter().collect()
+                }
+                Pattern::OpStruct { fields, .. } => fields.iter().map(|field| &field.pattern).collect(),
+                _ => Vec::new(),
+            };
+            let mut seen = std::collections::HashSet::new();
+            sources
+                .into_iter()
+                .filter_map(|source| {
+                    let keys = compute_op_keys(source, iter_ctx);
+                    (keys.len() == 1).then(|| keys.into_iter().next().expect("one key"))
+                })
+                .filter(|key| seen.insert(key.to_string()))
+                .collect()
+        }
     }
 }
 
@@ -1008,7 +1047,7 @@ fn compute_ordering_cross_product(children: &[(TokenStream2, InlineMatchOutput)]
     result
 }
 
-/// Generate inline match for struct-style ops like Bufferize { compute: x, .. }
+/// Generate inline match for struct-style ops like Stage { compute: x, .. }
 fn generate_inline_op_struct_match(
     op: &Ident,
     fields: &[FieldPattern],
@@ -1452,6 +1491,7 @@ fn generate_simplified_alternatives_rule(
 
     // Collect OpKeys from all alternatives
     let op_keys = compute_op_keys(&rule.lhs, iter_ctx);
+    let early_reject = compute_early_reject_keys(&rule.lhs, iter_ctx);
 
     // Generate attempt blocks for each alternative
     // Each alternative is wrapped in an inner closure so that `return NoMatch`
@@ -1524,8 +1564,9 @@ fn generate_simplified_alternatives_rule(
         })
     } else {
         Ok(quote! {
-            __matcher.add(
+            __matcher.add_rejecting(
                 &[#(#op_keys),*],
+                &[#(#early_reject),*],
                 |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
                     #(#alt_blocks)*
                     svod_ir::pattern::RewriteResult::NoMatch
@@ -1546,8 +1587,9 @@ fn generate_simplified_rule(
         return generate_simplified_alternatives_rule(alternatives, rule, iter_ctx, has_context);
     }
 
-    // Compute OpKeys for dispatch
+    // Compute OpKeys for dispatch and the child op kinds that gate the closure.
     let op_keys = compute_op_keys(&rule.lhs, iter_ctx);
+    let early_reject = compute_early_reject_keys(&rule.lhs, iter_ctx);
     let tree_var = format_ident!("__tree");
 
     // Generate inline match
@@ -1674,8 +1716,9 @@ fn generate_simplified_rule(
         })
     } else {
         Ok(quote! {
-            __matcher.add(
+            __matcher.add_rejecting(
                 &[#(#op_keys),*],
+                &[#(#early_reject),*],
                 move |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
                     #body
                 }

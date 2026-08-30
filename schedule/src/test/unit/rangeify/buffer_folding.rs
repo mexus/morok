@@ -1,219 +1,113 @@
-use std::{f32::consts::PI, sync::Arc};
+//! `buffer_folding`: noop STAGE removal and constant propagation through
+//! STAGE / INDEX / COPY.
 
+use std::sync::Arc;
+
+use svod_dtype::{DType, DeviceSpec};
+use svod_ir::{ConstValue, Op, UOp};
+use test_case::test_case;
+
+use crate::pattern::RewriteResult;
 use crate::rangeify::patterns::buffer_folding;
 use crate::rewrite::graph_rewrite;
-use svod_dtype::DType;
-use svod_ir::{ConstValue, UOp};
 
-// Helper functions for creating test UOps
-fn create_const(val: i64) -> Arc<UOp> {
-    UOp::native_const(val as i32)
+fn fold(root: Arc<UOp>) -> Arc<UOp> {
+    graph_rewrite(&buffer_folding(), root, &mut ())
 }
 
-fn create_range(end: i64, axis_id: usize) -> Arc<UOp> {
+fn range(end: i64, axis_id: usize) -> Arc<UOp> {
     UOp::range_const(end, axis_id)
 }
 
-fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
-    UOp::bufferize_global(compute, ranges)
-}
-
-// Pattern 1: Noop Buffer Removal Tests
-
+/// `INDEX(STAGE(x, R), R) → x` — the buffer would be read back at exactly the
+/// coordinates it was written at, so it is a noop.
 #[test]
-fn test_noop_bufferize_same_ranges() {
-    // INDEX(BUFFERIZE(x, R), R) → x
+fn a_stage_read_at_its_own_ranges_folds_away() {
     let x = UOp::param(1, 10, DType::Float32, None);
-    let range = create_range(10, 0);
-    let ranges = vec![range.clone()];
+    let r = range(10, 0);
 
-    let bufferized = create_bufferize(x.clone(), ranges.clone());
-    let indexed = UOp::index().buffer(bufferized).indices(ranges).call().unwrap();
+    let staged = UOp::stage_global(Arc::clone(&x), vec![r.clone()]);
+    let result = fold(UOp::index().buffer(staged).indices(vec![r]).call().expect("index"));
 
-    let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed, &mut ());
-
-    // Should fold to just x
-    assert!(Arc::ptr_eq(&result, &x), "Noop BUFFERIZE should be removed");
+    assert!(Arc::ptr_eq(&result, &x));
 }
 
+/// With several ranges the fold still removes the STAGE, but the index has to be
+/// relinearised, so the result is a view of `x` rather than `x` itself.
 #[test]
-fn test_noop_bufferize_different_ranges() {
-    // INDEX(BUFFERIZE(x, R1), R2) where R1 != R2 should NOT fold
-    let x = UOp::param(1, 1024, DType::Float32, None);
-    let range1 = create_range(10, 0);
-    let range2 = create_range(10, 1); // Different axis_id
-
-    let bufferized = create_bufferize(x.clone(), vec![range1]);
-    let indexed = UOp::index().buffer(bufferized.clone()).indices(vec![range2]).call().unwrap();
-
-    let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed.clone(), &mut ());
-
-    // Should NOT fold - ranges are different
-    assert!(Arc::ptr_eq(&result, &indexed), "Should not fold with different ranges");
-}
-
-#[test]
-fn test_noop_bufferize_multiple_ranges() {
-    // INDEX(BUFFERIZE(x, [R1, R2]), [R1, R2]) → x
+fn a_multi_range_noop_stage_is_removed_but_reindexed() {
     let x = UOp::param(1, 200, DType::Float32, None);
-    let range1 = create_range(10, 0);
-    let range2 = create_range(20, 1);
-    let ranges = vec![range1.clone(), range2.clone()];
+    let ranges = vec![range(10, 0), range(20, 1)];
 
-    let bufferized = create_bufferize(x.clone(), ranges.clone());
-    let indexed = UOp::index().buffer(bufferized).indices(ranges).call().unwrap();
+    let staged = UOp::stage_global(Arc::clone(&x), ranges.clone());
+    let result = fold(UOp::index().buffer(staged).indices(ranges).call().expect("index"));
 
-    let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed, &mut ());
-
-    // Should fold to just x (after possible noop shrink)
-    assert!(
-        !matches!(result.op(), svod_ir::Op::Bufferize { .. }),
-        "Noop BUFFERIZE with multiple ranges should be removed"
-    );
-}
-
-// Pattern 2: BUFFERIZE(CONST) → CONST Tests
-
-#[test]
-fn test_bufferize_const_folding() {
-    // BUFFERIZE(CONST, ranges) → CONST
-    let const_val = create_const(42);
-    let range = create_range(10, 0);
-
-    let bufferized = create_bufferize(const_val.clone(), vec![range]);
-
-    let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, bufferized, &mut ());
-
-    // Should fold to just the constant
-    assert!(Arc::ptr_eq(&result, &const_val), "BUFFERIZE(CONST) should fold to CONST");
+    assert!(!result.toposort().iter().any(|n| matches!(n.op(), Op::Stage { .. })), "{}", result.tree());
+    assert!(result.toposort().iter().any(|n| Arc::ptr_eq(n, &x)), "{}", result.tree());
 }
 
 #[test]
-fn test_bufferize_different_const_types() {
-    // Test with different constant types
-    let test_cases = vec![
-        (DType::Int32, ConstValue::Int(100)),
-        (DType::Float32, ConstValue::Float(PI.into())),
-        (DType::Bool, ConstValue::Bool(true)),
-    ];
+fn a_stage_read_at_other_ranges_is_kept() {
+    let x = UOp::param(1, 1024, DType::Float32, None);
+    let staged = UOp::stage_global(x, vec![range(10, 0)]);
+    let indexed = UOp::index().buffer(staged).indices(vec![range(10, 1)]).call().expect("index");
 
-    for (dtype, val) in test_cases {
-        let const_val = UOp::const_(dtype.clone(), val);
-        let range = create_range(5, 0);
+    assert!(Arc::ptr_eq(&fold(indexed.clone()), &indexed));
+}
 
-        let bufferized = create_bufferize(const_val.clone(), vec![range]);
+/// The noop fold is structural — it does not care what the staged compute is.
+#[test]
+fn the_noop_fold_applies_to_arbitrary_compute() {
+    let compute = UOp::var("x", DType::Float32, 0, 100).try_add(&UOp::var("y", DType::Float32, 0, 100)).expect("add");
+    let r = range(10, 0);
 
-        let matcher = buffer_folding();
-        let result = graph_rewrite(&matcher, bufferized, &mut ());
+    let staged = UOp::stage_global(Arc::clone(&compute), vec![r.clone()]);
+    let result = fold(UOp::index().buffer(staged).indices(vec![r]).call().expect("index"));
 
-        assert!(Arc::ptr_eq(&result, &const_val), "BUFFERIZE(CONST) should fold for {:?}", dtype);
+    assert!(Arc::ptr_eq(&result, &compute));
+}
+
+fn staged(c: Arc<UOp>) -> Arc<UOp> {
+    UOp::stage_global(c, vec![range(10, 0)])
+}
+
+fn indexed(c: Arc<UOp>) -> Arc<UOp> {
+    UOp::index().buffer(c).indices(vec![range(10, 0), range(20, 1)]).call().expect("index")
+}
+
+fn copied(c: Arc<UOp>) -> Arc<UOp> {
+    c.copy(DeviceSpec::Cuda { device_id: 0 })
+}
+
+fn staged_then_indexed(c: Arc<UOp>) -> Arc<UOp> {
+    let r = range(15, 0);
+    UOp::index().buffer(UOp::stage_global(c, vec![r.clone()])).indices(vec![r]).call().expect("index")
+}
+
+/// A constant has no storage to allocate, index into, or transfer: every wrapper
+/// folds straight back to it.
+#[test_case(super::staged, DType::Int32, ConstValue::Int(42) ; "stage of int")]
+#[test_case(super::staged, DType::Bool, ConstValue::Bool(true) ; "stage of bool")]
+#[test_case(super::staged, DType::Float32, ConstValue::Float(std::f64::consts::PI) ; "stage of float")]
+#[test_case(super::indexed, DType::Float32, ConstValue::Float(2.5) ; "index of const")]
+#[test_case(super::copied, DType::Int32, ConstValue::Int(99) ; "copy of const")]
+#[test_case(super::staged_then_indexed, DType::Int32, ConstValue::Int(123) ; "index of stage of const")]
+fn constants_fold_out_of_every_wrapper(wrap: fn(Arc<UOp>) -> Arc<UOp>, dtype: DType, value: ConstValue) {
+    let c = UOp::const_(dtype, value);
+    assert!(Arc::ptr_eq(&fold(wrap(Arc::clone(&c))), &c));
+}
+
+#[test]
+fn a_copy_of_a_const_is_dropped_whatever_the_target_device() {
+    let c = UOp::native_const(1.5f32);
+    for device in [DeviceSpec::Cpu, DeviceSpec::Cuda { device_id: 0 }] {
+        assert!(Arc::ptr_eq(&fold(c.copy(device)), &c));
     }
 }
 
-// Pattern 3: INDEX(CONST) → CONST Tests
-
 #[test]
-fn test_index_const_folding() {
-    // INDEX(CONST, ranges) → CONST
-    let const_val = create_const(7);
-    let range = create_range(10, 0);
-
-    let indexed = UOp::index().buffer(const_val.clone()).indices(vec![range]).call().unwrap();
-
-    let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed, &mut ());
-
-    // Should fold to just the constant
-    assert!(Arc::ptr_eq(&result, &const_val), "INDEX(CONST) should fold to CONST");
-}
-
-#[test]
-fn test_index_const_multiple_indices() {
-    // INDEX(CONST, [R1, R2, R3]) → CONST
-    let const_val = UOp::native_const(2.5f32);
-    let ranges = vec![create_range(10, 0), create_range(20, 1), create_range(30, 2)];
-
-    let indexed = UOp::index().buffer(const_val.clone()).indices(ranges).call().unwrap();
-
-    let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed, &mut ());
-
-    assert!(Arc::ptr_eq(&result, &const_val), "INDEX(CONST) with multiple indices should fold");
-}
-
-// Pattern 4: COPY(CONST) → CONST Tests
-
-#[test]
-fn test_copy_const_folding() {
-    // COPY(CONST, device) → CONST
-    let const_val = create_const(99);
-    let device = UOp::device(svod_device::DeviceSpec::Cpu);
-
-    let copy = const_val.copy(device);
-
-    let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, copy, &mut ());
-
-    // Should fold to just the constant (device doesn't matter for constants)
-    assert!(Arc::ptr_eq(&result, &const_val), "COPY(CONST) should fold to CONST");
-}
-
-#[test]
-fn test_copy_const_different_devices() {
-    // Test copying constants to different devices - all should fold
-    let const_val = UOp::native_const(1.5f32);
-
-    let devices = vec![svod_device::DeviceSpec::Cpu, svod_device::DeviceSpec::Cuda { device_id: 0 }];
-
-    for device_spec in devices {
-        let device = UOp::device(device_spec);
-        let copy = const_val.copy(device);
-
-        let matcher = buffer_folding();
-        let result = graph_rewrite(&matcher, copy, &mut ());
-
-        assert!(Arc::ptr_eq(&result, &const_val), "COPY(CONST) should fold regardless of device");
-    }
-}
-
-// Combined/Integration Tests
-
-#[test]
-fn test_nested_constant_folding() {
-    // INDEX(BUFFERIZE(CONST, R1), R1) should fold through both patterns
-    let const_val = create_const(123);
-    let range = create_range(15, 0);
-
-    let bufferized = create_bufferize(const_val.clone(), vec![range.clone()]);
-    let indexed = UOp::index().buffer(bufferized).indices(vec![range]).call().unwrap();
-
-    let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed, &mut ());
-
-    // Should fold all the way to the constant
-    assert!(Arc::ptr_eq(&result, &const_val), "Nested constant operations should fold completely");
-}
-
-#[test]
-fn test_noop_fold_non_const_operations() {
-    // INDEX(BUFFERIZE(x, R), R) should fold to x even for non-constant operations
-    // Use symbolic variables instead of param (which requires pointer dtype)
-    let x = UOp::var("x", DType::Float32, 0, 100);
-    let y = UOp::var("y", DType::Float32, 0, 100);
-
-    let add = x.try_add(&y).unwrap();
-
-    let range = create_range(10, 0);
-    let bufferized = create_bufferize(add.clone(), vec![range.clone()]);
-    let indexed = UOp::index().buffer(bufferized.clone()).indices(vec![range]).call().unwrap();
-
-    let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed.clone(), &mut ());
-
-    // Should fold - noop buffer removal works for all operations
-    assert!(Arc::ptr_eq(&result, &add), "Noop BUFFERIZE+INDEX should fold regardless of operation type");
+fn buffer_folding_leaves_unrelated_nodes_alone() {
+    let c = UOp::native_const(1.0f32);
+    assert!(matches!(buffer_folding().rewrite(&c, &mut ()), RewriteResult::NoMatch));
+    assert!(matches!(fold(c).op(), Op::Const(_)));
 }

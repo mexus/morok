@@ -6,7 +6,7 @@
 use bon::bon;
 use snafu::ResultExt;
 use svod_dtype::{DType, ScalarDType};
-use svod_ir::{ConstValue, ReduceOp, SInt, UOp};
+use svod_ir::{ReduceOp, SInt, UOp};
 
 use crate::{
     Error, Result, Tensor,
@@ -106,11 +106,11 @@ impl Tensor {
 
         match scalar {
             Bool => DType::Int32,
-            Int8 | Int16 => DType::Int32,
+            WeakInt | Int8 | Int16 => DType::Int32,
             Int32 | Int64 => dtype.clone(),
             UInt8 | UInt16 => DType::UInt32,
             UInt32 | UInt64 => dtype.clone(),
-            Float16 | BFloat16 | FP8E4M3 | FP8E5M2 => DType::Float32,
+            WeakFloat | Float16 | BFloat16 | FP8E4M3 | FP8E4M3FNUZ | FP8E5M2 | FP8E5M2FNUZ => DType::Float32,
             Float32 | Float64 => dtype.clone(),
             Void | Index => dtype.clone(),
         }
@@ -125,45 +125,20 @@ impl Tensor {
     fn should_cast_back_after_sum(dtype: &DType) -> bool {
         matches!(
             dtype.scalar(),
-            Some(ScalarDType::Float16 | ScalarDType::BFloat16 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2)
+            Some(
+                ScalarDType::Float16
+                    | ScalarDType::BFloat16
+                    | ScalarDType::FP8E4M3
+                    | ScalarDType::FP8E4M3FNUZ
+                    | ScalarDType::FP8E5M2
+                    | ScalarDType::FP8E5M2FNUZ
+            )
         )
     }
 
     /// Check if dtype is an integer or bool type.
     fn is_integer_dtype(dtype: &DType) -> bool {
         dtype.is_int() || matches!(dtype.scalar(), Some(ScalarDType::Bool))
-    }
-
-    /// Remove singleton dimensions from reduced axes when keepdim=false.
-    ///
-    /// Example:
-    /// - shape [2, 3, 4], reduced axes [0, 2] → shape [2, 1, 4]
-    /// - keepdim=false → reshape to [3]
-    fn remove_singleton_dims(self, reduced_axes: &[usize]) -> Result<Self> {
-        let shape = self.shape()?;
-
-        // Build new shape by filtering out size-1 dimensions that were reduced
-        let new_shape: Vec<SInt> = shape
-            .iter()
-            .enumerate()
-            .filter_map(|(i, dim)| {
-                // Only keep non-reduced axes, or reduced axes that aren't size 1
-                if reduced_axes.contains(&i) {
-                    None // Remove this dimension
-                } else {
-                    Some(dim.clone())
-                }
-            })
-            .collect();
-
-        // If all dimensions were reduced, result is scalar (shape [])
-        if new_shape.is_empty() {
-            // For scalar result, reshape to shape [] (0-d tensor)
-            // IR reshape expects same product, so [] → [] is valid
-            self.try_reshape(std::iter::empty::<SInt>())
-        } else {
-            self.try_reshape(&new_shape)
-        }
     }
 }
 
@@ -627,17 +602,6 @@ fn all_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<Tensor> {
     any_negated.logical_not()
 }
 
-/// Identity element for a reduction over an empty set (matching Tinygrad's `identity_element`).
-fn reduction_identity(op: ReduceOp, dtype: &DType) -> ConstValue {
-    let s = dtype.scalar().expect("scalar dtype");
-    match op {
-        ReduceOp::Add => ConstValue::zero(s),
-        ReduceOp::Mul => ConstValue::one(s),
-        ReduceOp::Max => ConstValue::min(s),
-        ReduceOp::Min => ConstValue::max(s),
-    }
-}
-
 /// Internal reduction implementation.
 #[track_caller]
 fn reduce_internal(
@@ -674,30 +638,6 @@ fn reduce_internal(
         original_dtype.clone()
     };
 
-    // Handle zero-sized dimensions: short-circuit to identity element to avoid
-    // DivisionByZero in indexing (matching Tinygrad rangeify.py:115-120).
-    let reducing_empty_axis = resolved_axes.iter().any(|&ax| shape[ax].as_const() == Some(0));
-    if reducing_empty_axis {
-        // Compute output shape: reduced axes become 1
-        let out_shape: Vec<usize> = shape
-            .iter()
-            .enumerate()
-            .map(|(i, d)| if resolved_axes.contains(&i) { 1 } else { d.as_const().unwrap_or(1) })
-            .collect();
-
-        let identity = reduction_identity(op, &acc_dtype);
-        let result = Tensor::full(&out_shape, identity, acc_dtype.clone())?;
-
-        let result = if !keepdim { result.remove_singleton_dims(&resolved_axes)? } else { result };
-
-        return if dtype.is_none() && acc_dtype != original_dtype && Tensor::should_cast_back_after_sum(&original_dtype)
-        {
-            result.cast(original_dtype)
-        } else {
-            Ok(result)
-        };
-    }
-
     // Cast to accumulation dtype if needed
     let working_tensor = if acc_dtype != original_dtype { tensor.cast(acc_dtype.clone())? } else { tensor.clone() };
 
@@ -706,10 +646,14 @@ fn reduce_internal(
 
     // Handle keepdim
     let result = if keepdim {
-        Tensor::new(reduced)
+        let keepdim_shape: Vec<SInt> = shape
+            .iter()
+            .enumerate()
+            .map(|(axis, dim)| if resolved_axes.contains(&axis) { SInt::Const(1) } else { dim.clone() })
+            .collect();
+        Tensor::new(reduced).try_reshape(&keepdim_shape)?
     } else {
-        let temp = Tensor::new(reduced);
-        temp.remove_singleton_dims(&resolved_axes)?
+        Tensor::new(reduced)
     };
 
     // Cast back to the input dtype whenever we accumulated in a wider type

@@ -73,7 +73,7 @@ fn main() {
     dev.vram_write(done_pa, &0u32.to_le_bytes());
     let mut cmds: Vec<u32> = Vec::new();
     cmds.extend_from_slice(&sdma::copy_linear(src.va_addr, dst.va_addr, BUF as usize));
-    cmds.extend_from_slice(&sdma::fence(done_va, 0xc0ffee));
+    cmds.extend_from_slice(&sdma::fence(done_va, 0xc0ffee, 11));
     let mut ring_bytes = Vec::with_capacity(cmds.len() * 4);
     for c in &cmds {
         ring_bytes.extend_from_slice(&c.to_le_bytes());

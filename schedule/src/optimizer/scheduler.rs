@@ -61,7 +61,7 @@ pub fn clear_kernel_name_counts() {
 /// scheduler.convert_loop_to_global()?;
 ///
 /// // Apply optimizations
-/// scheduler.apply_opt(Opt::upcast(0, 4))?;  // Vectorize by 4
+/// scheduler.apply_opt(Opt::upcast(0, 4))?;  // Stack by 4
 /// scheduler.apply_opt(Opt::local(1, 16))?;  // 16 threads per workgroup
 ///
 /// // Get result
@@ -213,7 +213,7 @@ impl Scheduler {
         // Sort by (axis_type.priority(), axis_id)
         ranges.sort_by_key(|rng| {
             if let Op::Range { axis_id, axis_type, .. } = rng.op() {
-                (axis_type.priority(), *axis_id)
+                (axis_type.priority(), axis_id.clone())
             } else {
                 unreachable!("Filtered to only Range ops")
             }
@@ -447,7 +447,7 @@ impl Scheduler {
             .enumerate()
             .filter_map(|(i, rng)| {
                 if let Op::Range { axis_type, end, .. } = rng.op() {
-                    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
+                    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Weak) {
                         return None;
                     }
 
@@ -730,13 +730,13 @@ impl Scheduler {
 
         // 2. Create new range
         let new_rng = input_new_rng.unwrap_or_else(|| {
-            let end = UOp::const_(svod_dtype::DType::Index, ConstValue::Int(amount as i64));
+            let end = rng.const_like(amount as i64);
             UOp::range_axis(end, AxisId::Renumbered(self.maxarg() + 1), new_type)
         });
 
         // 3. Create reduced old range (same axis_id and type, symbolic end allowed)
         let replaced_rng = if let Op::Range { axis_id, axis_type, .. } = rng.op() {
-            UOp::range_axis(old_end.clone(), *axis_id, *axis_type)
+            UOp::range_axis(old_end.clone(), axis_id.clone(), *axis_type)
         } else {
             return ExpectedRangeOperationSnafu.fail();
         };
@@ -753,7 +753,7 @@ impl Scheduler {
         } else {
             // Bottom order: old varies faster
             // Example: [0,1,2,3, 4,5,6,7, 8,9,10,11, ...]
-            let amount_uop = UOp::const_(svod_dtype::DType::Index, ConstValue::Int(amount as i64));
+            let amount_uop = replaced_rng.const_like(amount as i64);
             replaced_rng
                 .try_mul(&amount_uop)
                 .expect("Multiplication should not fail for index types")
@@ -771,10 +771,7 @@ impl Scheduler {
 
         // Record high-level transformation
         if old_ast_id != self.ast.id {
-            use svod_ir::provenance::{PROVENANCE_TRACKER, PassName};
-            PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ShiftTo);
-            });
+            svod_ir::provenance::record_transformed(self.ast.id, old_ast_id, svod_ir::provenance::PassName::ShiftTo);
         }
 
         // Clear caches (maxarg will be recomputed on next access)
@@ -803,20 +800,15 @@ impl Scheduler {
             return vec![];
         }
 
-        // Get ranges from all stores, excluding REDUCE axes
-        let mut output_ranges = Vec::new();
+        // `ranges()` is the cached RangesProperty: every RANGE in the backward
+        // slice, already deduplicated. Avoids a fresh DFS per store.
+        let mut output_ranges: Vec<Arc<UOp>> = Vec::new();
         for store in stores {
-            // Use backward_slice to get all dependencies
-            let deps = store.backward_slice();
-            for dep in deps {
-                if let Op::Range { axis_type, .. } = dep.op() {
-                    // Include all non-REDUCE ranges
-                    if *axis_type != AxisType::Reduce {
-                        // Only add if not already in list (use pointer equality)
-                        if !output_ranges.iter().any(|r: &Arc<UOp>| Arc::ptr_eq(r, &dep)) {
-                            output_ranges.push(dep);
-                        }
-                    }
+            for range in store.ranges() {
+                if matches!(range.op(), Op::Range { axis_type, .. } if *axis_type != AxisType::Reduce)
+                    && !output_ranges.iter().any(|r| Arc::ptr_eq(r, range))
+                {
+                    output_ranges.push(range.clone());
                 }
             }
         }
@@ -824,19 +816,19 @@ impl Scheduler {
         output_ranges
     }
 
-    /// Get LOOP ranges that can be safely parallelized to GLOBAL.
+    /// Get WEAK ranges that can be safely parallelized to GLOBAL.
     ///
     /// A range is globalizable if:
-    /// 1. It's currently a LOOP axis
+    /// 1. It's currently a WEAK axis
     /// 2. It appears in all output operations (STORE nodes)
     ///
     /// This ensures parallelizing the range won't cause race conditions.
     pub(crate) fn globalizable_rngs(&self) -> Vec<Arc<UOp>> {
-        // Start with LOOP axes from outputs
+        // Start with WEAK axes from outputs
         let mut candidates: Vec<_> = self
             .output_rngs()
             .into_iter()
-            .filter(|r| if let Op::Range { axis_type, .. } = r.op() { *axis_type == AxisType::Loop } else { false })
+            .filter(|r| if let Op::Range { axis_type, .. } = r.op() { *axis_type == AxisType::Weak } else { false })
             .collect();
 
         // Find all STORE and SINK operations
@@ -853,18 +845,14 @@ impl Scheduler {
 
         // Keep only ranges that appear in ALL stores
         for store in &stores {
-            let store_deps = store.backward_slice();
-            let store_ranges: Vec<_> =
-                store_deps.into_iter().filter(|dep| matches!(dep.op(), Op::Range { .. })).collect();
-
-            // Filter candidates to keep only those in this store's ranges
+            let store_ranges = store.ranges();
             candidates.retain(|candidate| store_ranges.iter().any(|r| Arc::ptr_eq(r, candidate)));
         }
 
         candidates
     }
 
-    /// Convert eligible LOOP axes to GLOBAL for parallelization.
+    /// Convert eligible WEAK axes to GLOBAL for parallelization.
     ///
     /// Identifies which loops can be safely parallelized and converts them to
     /// GLOBAL (GPU thread) axes. Only applicable for GPU backends (has_local=true).
@@ -888,7 +876,7 @@ impl Scheduler {
             return Ok(());
         }
 
-        // Build substitution map: LOOP → GLOBAL
+        // Build substitution map: WEAK -> GLOBAL
         #[allow(clippy::mutable_key_type)]
         let mut subst_map = std::collections::HashMap::new();
         for rng in globalizable {
@@ -902,10 +890,11 @@ impl Scheduler {
 
         // Record high-level transformation
         if old_ast_id != self.ast.id {
-            use svod_ir::provenance::{PROVENANCE_TRACKER, PassName};
-            PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ConvertLoopToGlobal);
-            });
+            svod_ir::provenance::record_transformed(
+                self.ast.id,
+                old_ast_id,
+                svod_ir::provenance::PassName::ConvertLoopToGlobal,
+            );
         }
 
         self.clear_caches();
@@ -916,7 +905,7 @@ impl Scheduler {
     /// Get the optimized AST with kernel metadata attached.
     ///
     /// This is the final step of optimization, which:
-    /// 1. Generates a kernel name from the shape (e.g., "r_g16l16R32u4")
+    /// 1. Generates a kernel name from the shape (e.g., "r_16_16_32_4")
     /// 2. Flattens nested ranges
     /// 3. Attaches KernelInfo metadata
     ///
@@ -933,59 +922,54 @@ impl Scheduler {
     /// ```ignore
     /// let optimized = scheduler.get_optimized_ast(None);
     /// let info = optimized.metadata::<KernelInfo>().unwrap();
-    /// println!("Kernel: {}", info.name); // "r_g16l16R32u4"
+    /// println!("Kernel: {}", info.name); // "r_16_16_32_4"
     /// ```
     pub fn get_optimized_ast(&self, name_override: Option<String>) -> Arc<UOp> {
         use crate::optimizer::KernelInfo;
 
         // 1. Generate kernel name
+        let custom_name = name_override.is_some();
         let name = name_override.unwrap_or_else(|| {
             // Prefix: "r" for reduce, "E" for elementwise
             let prefix = if self.reduceop().is_some() { "r" } else { "E" };
 
-            // Encode each range: {letter}{size}.
-            let shape_parts: Vec<String> = self
-                .rngs()
-                .iter()
-                .filter_map(|rng| {
-                    if let Op::Range { end, axis_type, .. } = rng.op() {
-                        // Get size if constant
-                        let size = if let Op::Const(cv) = end.op()
-                            && let svod_ir::ConstValue::Int(sz) = cv.0
-                        {
-                            sz.to_string()
-                        } else {
-                            "?".to_string()
-                        };
+            let extent_name = |end: &Arc<UOp>| match end.op() {
+                Op::Const(cv) => cv.0.try_int().map_or_else(|| "?".to_string(), |size| size.to_string()),
+                _ => "?".to_string(),
+            };
 
-                        // Get letter for axis type
-                        let letter = match axis_type {
-                            AxisType::Global => "g",
-                            AxisType::Local => "l",
-                            AxisType::Loop => "L",
-                            AxisType::Upcast => "u",
-                            AxisType::Reduce => "R",
-                            AxisType::GroupReduce => "G",
-                            AxisType::Unroll => "r",
-                            AxisType::Warp => "w",
-                            AxisType::Thread => "t",
-                            AxisType::Placeholder => "P",
-                        };
-
-                        Some(format!("{}{}", letter, size))
-                    } else {
-                        None
-                    }
+            // Tinygrad uses color only to distinguish axis classes in
+            // diagnostics. Function names retain only ordered extents.
+            let mut specials: Vec<_> = self
+                .ast
+                .toposort()
+                .into_iter()
+                .filter_map(|node| match node.op() {
+                    Op::Special { end, name } => Some((name.clone(), extent_name(end))),
+                    _ => None,
                 })
                 .collect();
+            specials.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut shape_parts: Vec<String> = specials.into_iter().map(|(_, extent)| extent).collect();
+            shape_parts.extend(
+                self.rngs()
+                    .iter()
+                    .filter_map(|rng| {
+                        let Op::Range { end, .. } = rng.op() else { return None };
+                        Some(extent_name(end))
+                    })
+                    .collect::<Vec<_>>(),
+            );
 
-            format!("{}_{}", prefix, shape_parts.join(""))
+            if shape_parts.is_empty() { prefix.to_string() } else { format!("{}_{}", prefix, shape_parts.join("_")) }
         });
 
         // Deduplicate kernel names
-        let name = {
+        let name = if custom_name {
+            name
+        } else {
             let mut counts = kernel_name_counts().lock().unwrap();
-            let count = counts.entry(name.clone()).or_insert(0);
+            let count = counts.entry(svod_ir::to_function_name(&name)).or_insert(0);
             *count += 1;
 
             if *count > 1 { format!("{}n{}", name, *count - 1) } else { name }
@@ -994,6 +978,17 @@ impl Scheduler {
         // 2. Flatten ranges (top-down graph_rewrite default).
         let flattened_ast =
             crate::rewrite::graph_rewrite(crate::rangeify::pm_flatten_range(), self.ast.clone(), &mut ());
+
+        let flattened_ast = match flattened_ast.op() {
+            Op::Sink { sources, info } => {
+                let mut structural = info.clone().unwrap_or_default();
+                structural.name = Some(name.clone());
+                structural.applied_opts = self.applied_opts.clone();
+                structural.dont_use_locals = self.dont_use_locals;
+                UOp::sink_with_info(sources.iter().cloned().collect(), structural)
+            }
+            _ => flattened_ast,
+        };
 
         // 3. Attach metadata
         let info = KernelInfo { name, applied_opts: self.applied_opts.clone(), dont_use_locals: self.dont_use_locals };

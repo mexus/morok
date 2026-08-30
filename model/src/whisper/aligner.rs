@@ -173,7 +173,7 @@ impl WhisperAligner {
         let profiling = copies.is_some();
         let (graph_wall, kernels) = if profiling {
             let graph_started = Instant::now();
-            let kernels = self.jit.execute_profiled().context(JitSnafu)?;
+            let kernels = self.jit.execute_profiled_static().context(JitSnafu)?;
             self.jit.output().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
             (graph_started.elapsed(), kernels)
         } else {

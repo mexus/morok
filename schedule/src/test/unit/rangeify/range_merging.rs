@@ -1,372 +1,143 @@
-//! Tests for range merging in multi-consumer scenarios.
-//!
-//! Validates that merge_consumer_ranges correctly handles:
-//! - Identical ranges (merge validity, no realization)
-//! - Different ranges (create new range, partial realization)
-//! - Validity mask merging (OR operation)
+//! `merge_consumer_ranges`: one range per dimension across every consumer, and
+//! the realize decision that falls out of it.
 
 use std::sync::Arc;
 
 use svod_dtype::DType;
-use svod_ir::{AxisType, ConstValue, Op, SInt, TernaryOp, UOp};
+use svod_ir::{AxisType, BinaryOp, Op, SInt, TernaryOp, UOp, UOpKey};
 
-use crate::rangeify::indexing::IndexingContext;
+use crate::rangeify::indexing::{IndexingContext, all_ranges_same};
+use crate::rangeify::merge_consumer_ranges;
 
-#[test]
-fn test_identical_ranges_no_realization() {
-    // Two consumers with identical ranges should merge without realization
-    let mut ctx = IndexingContext::new();
-
-    // Create ranges
-    let r0 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let r1 = ctx.new_range(&SInt::Const(20), AxisType::Loop);
-
-    // Both consumers use the same ranges
-    let consumer_rngs = [vec![r0.clone(), r1.clone()], vec![r0.clone(), r1.clone()]];
-
-    // This would be called by merge_consumer_ranges
-    // For now, verify that identical ranges would not cause realization
-    // by checking all_ranges_same helper
-    use crate::rangeify::indexing::all_ranges_same;
-
-    let indices0: Vec<_> = consumer_rngs[0].iter().map(|r| r.get_idx()).collect();
-    let indices1: Vec<_> = consumer_rngs[1].iter().map(|r| r.get_idx()).collect();
-
-    // Verify indices are same for each dimension
-    assert!(all_ranges_same(&[indices0[0].clone(), indices1[0].clone()]));
-    assert!(all_ranges_same(&[indices0[1].clone(), indices1[1].clone()]));
-}
-
-#[test]
-fn test_get_idx_plain_range() {
-    // Plain ranges should return themselves
-    let mut ctx = IndexingContext::new();
-    let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-
-    let idx = range.get_idx();
-    assert!(Arc::ptr_eq(&idx, &range));
-}
-
-#[test]
-fn test_get_valid_plain_range() {
-    // Plain ranges should return constant true for validity
-    let mut ctx = IndexingContext::new();
-    let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-
-    let valid = range.get_valid();
-    if let Op::Const(cv) = valid.op() {
-        assert_eq!(cv.0, ConstValue::Bool(true));
-    } else {
-        panic!("Expected constant true for plain range validity");
-    }
-}
-
-#[test]
-fn test_get_idx_with_validity() {
-    // Ranges with WHERE wrapper should extract the index
-    let mut ctx = IndexingContext::new();
-    let idx = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let valid = UOp::native_const(true);
-    let invalid = UOp::invalid_marker();
-
-    let wrapped = UOp::try_where(valid, idx.clone(), invalid).unwrap();
-
-    let extracted_idx = wrapped.get_idx();
-    assert!(Arc::ptr_eq(&extracted_idx, &idx));
-}
-
-#[test]
-fn test_get_valid_with_validity() {
-    // Ranges with WHERE wrapper should extract the validity condition
-    let mut ctx = IndexingContext::new();
-    let idx = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-
-    // Create validity condition: i < 5
-    let five = UOp::index_const(5);
-    let valid = idx.try_cmplt(&five).unwrap();
-    let invalid = UOp::invalid_marker();
-
-    let wrapped = UOp::try_where(valid.clone(), idx.clone(), invalid).unwrap();
-
-    let extracted_valid = wrapped.get_valid();
-    assert!(Arc::ptr_eq(&extracted_valid, &valid));
-}
-
-#[test]
-fn test_all_ranges_same_identical() {
-    // Identical ranges (same pointer)
-    let mut ctx = IndexingContext::new();
-    let r1 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let r2 = r1.clone();
-
-    use crate::rangeify::indexing::all_ranges_same;
-    assert!(all_ranges_same(&[r1, r2]));
-}
-
-#[test]
-fn test_all_ranges_same_different() {
-    // Different ranges
-    let mut ctx = IndexingContext::new();
-    let r1 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let r2 = ctx.new_range(&SInt::Const(20), AxisType::Loop);
-
-    // Extract indices (as merge_consumer_ranges does)
-    let idx1 = r1.get_idx();
-    let idx2 = r2.get_idx();
-
-    use crate::rangeify::indexing::all_ranges_same;
-    assert!(!all_ranges_same(&[idx1, idx2]));
-}
-
-#[test]
-fn test_invalid_marker_detection() {
-    // Test that invalid marker is correctly detected
-    let invalid = UOp::invalid_marker();
-
-    // Should be Op::Invalid, not a constant
-    assert!(matches!(invalid.op(), Op::Invalid));
-    assert_eq!(invalid.dtype(), DType::Index);
-}
-
-#[test]
-fn test_padding_uses_invalid_marker() {
-    // Test that padding logic creates WHERE with Invalid marker
-    let idx = UOp::index_const(0);
-    let valid = UOp::native_const(true);
-    let invalid = UOp::invalid_marker();
-
-    let padded = UOp::try_where(valid, idx, invalid).unwrap();
-
-    // Verify structure: WHERE(valid, idx, Invalid)
-    if let Op::Ternary(TernaryOp::Where, _cond, _true_val, false_val) = padded.op() {
-        assert!(matches!(false_val.op(), Op::Invalid));
-    } else {
-        panic!("Expected WHERE operation");
-    }
-}
-
-#[test]
-fn test_or_merging_of_validity_masks() {
-    // Test that validity masks can be OR'd together
-    let mut ctx = IndexingContext::new();
-    let idx = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-
-    // Create two different validity conditions
-    let five = UOp::index_const(5);
-    let eight = UOp::index_const(8);
-
-    let valid1 = idx.try_cmplt(&five).unwrap(); // i < 5
-    let valid2 = idx.try_cmplt(&eight).unwrap(); // i < 8
-
-    // Merge with OR
-    let merged = valid1.try_or_op(&valid2).unwrap();
-
-    // Verify it's a binary OR operation
-    if let Op::Binary(op, _, _) = merged.op() {
-        assert!(matches!(op, svod_ir::BinaryOp::Or));
-    } else {
-        panic!("Expected OR operation");
-    }
-}
-
-#[test]
-fn test_empty_ranges_list() {
-    // Empty ranges list should return true
-    use crate::rangeify::indexing::all_ranges_same;
-    assert!(all_ranges_same(&[]));
-}
-
-#[test]
-fn test_single_range() {
-    // Single range should return true
-    let mut ctx = IndexingContext::new();
-    let r1 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-
-    use crate::rangeify::indexing::all_ranges_same;
-    assert!(all_ranges_same(&[r1]));
-}
-
-// ===== Direct merge_consumer_ranges Tests =====
-
-/// Helper to create a BUFFER with shape (size,)
-fn create_buffer_with_size(size: usize) -> Arc<UOp> {
-    // Op::Buffer has shape (size,) - see shape.rs line 591
+fn buffer(size: usize) -> Arc<UOp> {
     UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, DType::Float32)
 }
 
-/// Helper to create a 2D shaped UOp via RESHAPE
-fn create_reshaped_2d(sizes: &[usize]) -> Arc<UOp> {
-    let src = create_buffer_with_size(sizes.iter().product());
-    let new_shape = UOp::vectorize(sizes.iter().map(|&s| UOp::index_const(s as i64)).collect());
+fn reshaped_2d(dims: &[usize]) -> Arc<UOp> {
+    let src = buffer(dims.iter().product());
+    let new_shape = UOp::stack(dims.iter().map(|&d| UOp::index_const(d as i64)).collect());
     UOp::new(Op::Reshape { src, new_shape }, DType::Float32)
 }
 
-#[test]
-fn test_merge_consumer_ranges_identical_1d() {
-    // Two consumers with identical ranges should merge without realization
-    use crate::rangeify::merge_consumer_ranges;
-
-    let mut ctx = IndexingContext::new();
-
-    // Create a BUFFER with shape (100,)
-    let buffer = create_buffer_with_size(100);
-
-    // Create identical ranges for both consumers
-    let r0 = ctx.new_range(&SInt::Const(100), AxisType::Loop);
-
-    let consumer_rngs = vec![vec![r0.clone()], vec![r0.clone()]];
-
-    // Merge ranges
-    let merged = merge_consumer_ranges(&buffer, &consumer_rngs, &mut ctx).unwrap();
-
-    // Should return 1 range (one per dimension)
-    assert_eq!(merged.len(), 1, "Should have 1 merged range");
-
-    // Merged range should be identical to input (no realization needed)
-    assert!(Arc::ptr_eq(&merged[0], &r0), "Range should be unchanged");
-
-    // Should NOT mark for realization
-    assert!(
-        !ctx.realize_map.contains_key(&svod_ir::UOpKey(buffer.clone())),
-        "Identical ranges should NOT require realization"
-    );
+/// A range gated by `i < bound`, as a consumer with padding produces.
+fn gated(idx: &Arc<UOp>, bound: i64) -> (Arc<UOp>, Arc<UOp>) {
+    let valid = idx.try_cmplt(&UOp::index_const(bound)).expect("cmplt");
+    let wrapped = UOp::try_where(valid.clone(), idx.clone(), UOp::invalid_marker()).expect("where");
+    (wrapped, valid)
 }
 
-#[test]
-fn test_merge_consumer_ranges_different_1d() {
-    // Consumers with different ranges should trigger realization
-    use crate::rangeify::merge_consumer_ranges;
-
-    let mut ctx = IndexingContext::new();
-
-    // Create a BUFFER with shape (100,)
-    let buffer = create_buffer_with_size(100);
-
-    // Create different ranges for consumers (same size, different IDs)
-    let r0_a = ctx.new_range(&SInt::Const(100), AxisType::Loop);
-    let r0_b = ctx.new_range(&SInt::Const(100), AxisType::Loop);
-
-    let consumer_rngs = vec![vec![r0_a.clone()], vec![r0_b.clone()]];
-
-    // Merge ranges
-    let merged = merge_consumer_ranges(&buffer, &consumer_rngs, &mut ctx).unwrap();
-
-    // Should return 1 range
-    assert_eq!(merged.len(), 1, "Should have 1 merged range");
-
-    // Merged range should be NEW (not the original ones)
-    assert!(!Arc::ptr_eq(&merged[0], &r0_a), "Different ranges should create new range");
-    assert!(!Arc::ptr_eq(&merged[0], &r0_b), "Different ranges should create new range");
-
-    // Should mark for realization (because ranges differ)
-    let realize_info = ctx.realize_map.get(&svod_ir::UOpKey(buffer.clone()));
-    assert!(realize_info.is_some(), "Different ranges should require realization");
+#[allow(clippy::mutable_key_type)]
+fn realize_axes(ctx: &IndexingContext, uop: &Arc<UOp>) -> Option<Option<Vec<usize>>> {
+    ctx.realize_map.get(&UOpKey(uop.clone())).cloned()
 }
 
+/// `all_ranges_same` is the merge's decision procedure. Vacuously true for zero
+/// or one entry (tinygrad `helpers.py:31`), and pointer-based beyond that.
 #[test]
-fn test_merge_consumer_ranges_2d_partial_overlap() {
-    // One dimension same, one different
-    use crate::rangeify::merge_consumer_ranges;
-
+fn ranges_are_the_same_only_when_they_are_the_same_node() {
     let mut ctx = IndexingContext::new();
-
-    // Create a 2D shaped UOp (10, 20)
-    let reshaped = create_reshaped_2d(&[10, 20]);
-
-    // First dimension: same range, second dimension: different ranges
     let r0 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let r1_a = ctx.new_range(&SInt::Const(20), AxisType::Loop);
-    let r1_b = ctx.new_range(&SInt::Const(20), AxisType::Loop);
+    let r1 = ctx.new_range(&SInt::Const(20), AxisType::Loop);
 
-    let consumer_rngs = vec![vec![r0.clone(), r1_a.clone()], vec![r0.clone(), r1_b.clone()]];
-
-    // Merge ranges
-    let merged = merge_consumer_ranges(&reshaped, &consumer_rngs, &mut ctx).unwrap();
-
-    // With PCONTIG=0 (Tinygrad-aligned): when ANY dimension has different ranges
-    // across consumers, ALL dimensions get realized — even dim 0 which is identical.
-    // Tinygrad indexing.py:217: only `all_all_same` matters when PCONTIG=0.
-    assert_eq!(merged.len(), 2, "Should have 2 merged ranges");
-
-    // Both dimensions should get new ranges (not pointer-equal to originals)
-    assert!(!Arc::ptr_eq(&merged[0], &r0), "All dims realized when all_all_same=false");
-    assert!(!Arc::ptr_eq(&merged[1], &r1_a), "Different second dimension should create new range");
-
-    // Should mark BOTH dimensions for realization
-    let realize_info = ctx.realize_map.get(&svod_ir::UOpKey(reshaped.clone()));
-    assert!(realize_info.is_some(), "Should mark for realization");
-    if let Some(Some(axes)) = realize_info {
-        assert_eq!(axes, &[0, 1], "Both dimensions should need realization");
-    }
+    assert!(all_ranges_same(&[]));
+    assert!(all_ranges_same(std::slice::from_ref(&r0)));
+    assert!(all_ranges_same(&[r0.clone(), r0.clone()]));
+    assert!(!all_ranges_same(&[r0.get_idx(), r1.get_idx()]));
 }
 
+/// A plain range is its own index and is unconditionally valid; a gated one
+/// splits back into the two.
 #[test]
-fn test_merge_consumer_ranges_with_validity() {
-    // Ranges with validity masks should OR the masks
-    use crate::rangeify::merge_consumer_ranges;
-
+fn a_gated_range_decomposes_into_its_index_and_its_condition() {
     let mut ctx = IndexingContext::new();
-
-    // Create a BUFFER with shape (10,)
-    let buffer = create_buffer_with_size(10);
-
-    // Create same index but different validity masks
     let idx = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
-    // Consumer 1: valid when i < 5
-    let five = UOp::index_const(5);
-    let valid1 = idx.try_cmplt(&five).unwrap();
-    let invalid = UOp::invalid_marker();
-    let r0_a = UOp::try_where(valid1.clone(), idx.clone(), invalid.clone()).unwrap();
+    assert!(Arc::ptr_eq(&idx.get_idx(), &idx));
+    assert!(matches!(idx.get_valid().op(), Op::Const(c) if c.0 == svod_ir::ConstValue::Bool(true)));
 
-    // Consumer 2: valid when i < 8
-    let eight = UOp::index_const(8);
-    let valid2 = idx.try_cmplt(&eight).unwrap();
-    let r0_b = UOp::try_where(valid2.clone(), idx.clone(), invalid).unwrap();
-
-    let consumer_rngs = vec![vec![r0_a.clone()], vec![r0_b.clone()]];
-
-    // Merge ranges
-    let merged = merge_consumer_ranges(&buffer, &consumer_rngs, &mut ctx).unwrap();
-
-    // Should return 1 range
-    assert_eq!(merged.len(), 1, "Should have 1 merged range");
-
-    // Merged range should have WHERE structure with OR'd validity
-    if let Op::Ternary(TernaryOp::Where, merged_valid, merged_idx, _) = merged[0].op() {
-        // Merged index should be the original idx
-        assert!(Arc::ptr_eq(merged_idx, &idx), "Merged index should be unchanged");
-
-        // Merged validity should be OR of both conditions
-        if let Op::Binary(op, _, _) = merged_valid.op() {
-            assert!(matches!(op, svod_ir::BinaryOp::Or), "Validity should be OR'd");
-        } else {
-            panic!("Expected OR operation in merged validity, got {:?}", merged_valid.op());
-        }
-    } else {
-        panic!("Expected WHERE operation in merged range, got {:?}", merged[0].op());
-    }
+    let (wrapped, valid) = gated(&idx, 5);
+    assert!(Arc::ptr_eq(&wrapped.get_idx(), &idx));
+    assert!(Arc::ptr_eq(&wrapped.get_valid(), &valid));
+    let Op::Ternary(TernaryOp::Where, _, _, otherwise) = wrapped.op() else { panic!("expected WHERE") };
+    assert!(UOp::is_invalid_marker(otherwise));
 }
 
 #[test]
-fn test_merge_consumer_ranges_empty() {
-    // No consumers - should handle gracefully
-    use crate::rangeify::merge_consumer_ranges;
-
+fn identical_consumer_ranges_merge_without_realizing() {
     let mut ctx = IndexingContext::new();
+    let buffer = buffer(100);
+    let r0 = ctx.new_range(&SInt::Const(100), AxisType::Loop);
 
-    // Create a BUFFER with shape (10,)
-    let buffer = create_buffer_with_size(10);
+    let merged = merge_consumer_ranges(&buffer, &[vec![r0.clone()], vec![r0.clone()]], &mut ctx).expect("merge");
 
-    let consumer_rngs: Vec<Vec<Arc<UOp>>> = vec![];
+    assert_eq!(merged.len(), 1);
+    assert!(Arc::ptr_eq(&merged[0], &r0), "nothing to reconcile, so the range is passed through");
+    assert!(realize_axes(&ctx, &buffer).is_none());
+}
 
-    // Merge ranges
-    let merged = merge_consumer_ranges(&buffer, &consumer_rngs, &mut ctx).unwrap();
+#[test]
+fn differing_consumer_ranges_force_a_fresh_range_and_a_realize() {
+    let mut ctx = IndexingContext::new();
+    let buffer = buffer(100);
+    let a = ctx.new_range(&SInt::Const(100), AxisType::Loop);
+    let b = ctx.new_range(&SInt::Const(100), AxisType::Loop);
 
-    // Should create new ranges for all dimensions
-    assert_eq!(merged.len(), 1, "Should create 1 range for 1-dim buffer");
+    let merged = merge_consumer_ranges(&buffer, &[vec![a.clone()], vec![b.clone()]], &mut ctx).expect("merge");
 
-    // Should mark for realization (no consumer ranges means new ranges needed)
-    let realize_info = ctx.realize_map.get(&svod_ir::UOpKey(buffer.clone()));
-    assert!(realize_info.is_some(), "Should mark for realization");
+    assert_eq!(merged.len(), 1);
+    assert!(!Arc::ptr_eq(&merged[0], &a) && !Arc::ptr_eq(&merged[0], &b));
+    assert_eq!(realize_axes(&ctx, &buffer), Some(Some(vec![0])));
+}
+
+/// With PCONTIG=0 a single disagreeing dim realizes them all — tinygrad
+/// `indexing.py:217` only consults `all_all_same`.
+#[test]
+fn one_disagreeing_dimension_realizes_every_dimension() {
+    let mut ctx = IndexingContext::new();
+    let reshaped = reshaped_2d(&[10, 20]);
+    let shared = ctx.new_range(&SInt::Const(10), AxisType::Loop);
+    let a = ctx.new_range(&SInt::Const(20), AxisType::Loop);
+    let b = ctx.new_range(&SInt::Const(20), AxisType::Loop);
+
+    let consumers = [vec![shared.clone(), a.clone()], vec![shared.clone(), b]];
+    let merged = merge_consumer_ranges(&reshaped, &consumers, &mut ctx).expect("merge");
+
+    assert_eq!(merged.len(), 2);
+    assert!(!Arc::ptr_eq(&merged[0], &shared), "the agreeing dim is realized too");
+    assert!(!Arc::ptr_eq(&merged[1], &a));
+    assert_eq!(realize_axes(&ctx, &reshaped), Some(Some(vec![0, 1])));
+}
+
+/// Consumers reading the same index under different guards merge to that index
+/// under the disjunction of the guards.
+#[test]
+fn differing_validity_masks_are_merged_with_or() {
+    let mut ctx = IndexingContext::new();
+    let buffer = buffer(10);
+    let idx = ctx.new_range(&SInt::Const(10), AxisType::Loop);
+    let (narrow, _) = gated(&idx, 5);
+    let (wide, _) = gated(&idx, 8);
+
+    let merged = merge_consumer_ranges(&buffer, &[vec![narrow], vec![wide]], &mut ctx).expect("merge");
+
+    assert_eq!(merged.len(), 1);
+    let Op::Ternary(TernaryOp::Where, valid, merged_idx, _) = merged[0].op() else {
+        panic!("expected a gated range, got {}", merged[0].tree())
+    };
+    assert!(Arc::ptr_eq(merged_idx, &idx));
+    assert!(matches!(valid.op(), Op::Binary(BinaryOp::Or, _, _)), "got {}", valid.tree());
+}
+
+/// `all_same([])` is true upstream, so a dim with no consumer ranges does not
+/// drag the other dims into a realize — but it has nothing to inherit either, so
+/// it gets a fresh range and is realized on its own.
+#[test]
+fn a_dimension_with_no_consumers_is_realized_on_its_own() {
+    let mut ctx = IndexingContext::new();
+    let buffer = buffer(10);
+
+    let merged = merge_consumer_ranges(&buffer, &[], &mut ctx).expect("merge");
+
+    assert_eq!(merged.len(), 1);
+    assert_eq!(realize_axes(&ctx, &buffer), Some(Some(vec![0])));
 }

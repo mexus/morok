@@ -19,10 +19,10 @@ fn has_mul_by_const(topo: &[Arc<UOp>], val: i64) -> bool {
     })
 }
 
-/// Whether the toposort contains a `BinaryOp::Mod` whose rhs is `Const(Int(val))`.
+/// Whether the toposort contains a `BinaryOp::FloorMod` whose rhs is `Const(Int(val))`.
 fn has_mod_by_const(topo: &[Arc<UOp>], val: i64) -> bool {
     topo.iter().any(|u| {
-        let Op::Binary(svod_ir::BinaryOp::Mod, _, rhs) = u.op() else { return false };
+        let Op::Binary(svod_ir::BinaryOp::FloorMod, _, rhs) = u.op() else { return false };
         matches!(rhs.op(), Op::Const(c) if matches!(c.0, ConstValue::Int(v) if v == val))
     })
 }
@@ -43,7 +43,7 @@ fn map_position_topo(caps: ArchCaps, row_blk: Idx) -> Vec<Arc<UOp>> {
 
 /// gfx942 (CDNA, wave64): `map_position` emits the contiguous-stride
 /// `lane_rc` pattern — `row = (lane/16)*stride + inner` — so the graph carries
-/// a `Mul` by the stride (4) and a `Mod` by 16 (the column), and NOT the
+/// a `Mul` by the stride (4) and a `FloorMod` by 16 (the column), and NOT the
 /// even/odd interleave `Mul` by 2.
 #[test]
 fn test_map_position_emits_gfx942_stride() {
@@ -101,4 +101,22 @@ fn test_map_position_block_offset() {
         "non-zero row_blk: block_idx[0] present"
     );
     assert!(has_mul_by_const(&topo, 16), "row_blk * total_rows (=16) product present");
+}
+
+/// Tinygrad TK anchors tile reads to every tracked enclosing range. Helper
+/// ranges alone are insufficient: without this dependency a carried REG load
+/// can be hoisted before the outer loop and observe only its initial value.
+#[test]
+fn tracked_loop_anchors_tile_reads_in_rolled_kernels() {
+    let ker = Kernel::new("tracked_anchor", [1, 1, 1], 64, vec![], ArchCaps::GFX942);
+    let warp = ker.warp();
+    let tile = ker.acc((16, 16), TileLayout::Col);
+    let lp = ker.loop_static(4);
+
+    let anchored = warp.anchor(tile.uop());
+    let Op::After { passthrough, deps } = anchored.op() else {
+        panic!("tracked tile read must be wrapped in AFTER");
+    };
+    assert!(Arc::ptr_eq(passthrough, tile.uop()));
+    assert!(deps.iter().any(|dep| Arc::ptr_eq(dep, lp.index())), "AFTER must depend on the enclosing tracked RANGE");
 }

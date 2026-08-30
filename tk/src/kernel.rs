@@ -179,10 +179,7 @@ impl Kernel {
     pub fn alloc_local(&self, flat_size: usize, elem: DType) -> Arc<UOp> {
         let slot = self.shared_slot.get();
         self.shared_slot.set(slot + 1);
-        UOp::define_local(
-            slot,
-            elem.ptr(Some(flat_size), AddrSpace::Local).expect("alloc_local element must not be a pointer"),
-        )
+        UOp::buffer(slot, flat_size, elem, AddrSpace::Local, None)
     }
 
     /// Allocate register (per-lane) memory. The id is a per-kernel monotonic slot
@@ -194,7 +191,7 @@ impl Kernel {
     pub fn alloc_reg(&self, flat_size: usize, elem: DType) -> Arc<UOp> {
         let id = self.reg_slot.get();
         self.reg_slot.set(id + 1);
-        UOp::define_reg_typed_with_id(flat_size, elem, id)
+        UOp::buffer(id, flat_size, elem, AddrSpace::Reg, None)
     }
 
     /// Hand out the next global buffer placeholder (a flat 1-D `Param`) as a GL
@@ -217,8 +214,9 @@ impl Kernel {
     }
 
     /// Close every tracked range and group the last `stores` terminal stores
-    /// into the final kernel SINK (carrying `opts_to_apply = Some(vec![])` so
-    /// the optimizer leaves this hand-lowered body untouched).
+    /// into the final kernel SINK (carrying `opts_to_apply = Some(vec![])`, the
+    /// tinygrad `()` analog, so the optimizer applies zero schedule opts to this
+    /// hand-lowered body; it still runs the shared pre/post-optimization pipeline).
     ///
     /// # Panics
     /// Panics on store-stack underflow — fewer terminal stores were recorded
@@ -252,7 +250,10 @@ impl Kernel {
         // (the matmul, whose tile loop `endrange` already consumed) — and SINK
         // them directly (the native `SINK(END(STORE, ..))` kernel shape).
         let sources: Vec<Arc<UOp>> = store_uops.into_iter().map(|s| s.end(rngs.clone())).collect();
-        UOp::sink_with_info(sources, KernelInfo { opts_to_apply: Some(vec![]), name: Some(self.name.clone()) })
+        UOp::sink_with_info(
+            sources,
+            KernelInfo { opts_to_apply: Some(vec![]), name: Some(self.name.clone()), ..Default::default() },
+        )
     }
 
     /// Close `ranges` inner (accumulation) loops around the last store and
@@ -332,14 +333,10 @@ impl Kernel {
 fn flat_param(slot: usize, src: &Arc<UOp>) -> Arc<UOp> {
     let base = src.base();
     match base.op() {
-        Op::Buffer { size, .. } => {
+        Op::Buffer { .. } => {
+            let size = base.buffer_size().expect("flat_param requires a concrete BUFFER shape");
             let elem = base.dtype();
-            UOp::param(
-                slot,
-                *size,
-                elem.ptr(Some(*size), AddrSpace::Global).expect("flat_param buffer element must not be a pointer"),
-                None,
-            )
+            UOp::param(slot, size, elem, None)
         }
         // Already a buffer-like pointer (e.g. a pre-built Param): reuse as-is.
         _ => base,

@@ -14,11 +14,20 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use smallvec::SmallVec;
-use svod_dtype::DeviceSpec;
+use snafu::{ResultExt, Snafu};
 use svod_ir::{CallInfo, Op, SInt, UOp, UOpKey};
 use tracing::{debug, trace};
 
 pub use svod_ir::KernelInfo;
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum KernelGraphError {
+    #[snafu(display("kernel graph construction failed: {source}"))]
+    Ir { source: svod_ir::Error },
+    #[snafu(display("kernel graph specification failed: {source}"))]
+    Spec { source: crate::spec::SpecError },
+}
 
 // ============================================================================
 // CONFIGURATION
@@ -66,8 +75,8 @@ pub struct RangeifyBufferContext {
     pub local_counter: usize,
     pub lunique_counter: usize,
     pub buffer_map: HashMap<UOpKey, Arc<UOp>>,
-    /// Bound variables: maps variable name → (DEFINE_VAR UOp, optional bound value).
-    /// Populated when BIND(DEFINE_VAR, CONST) is stripped during kernel splitting.
+    /// Bound variables: maps variable name → (variable UOp, optional bound value).
+    /// Populated when BIND(variable, CONST) is stripped during kernel splitting.
     /// The UOp is kept for kernel sources; the i64 is the concrete bound value
     /// (None for schedule-loop wrappers — Range-bound variables).
     pub vars: HashMap<String, (Arc<UOp>, Option<i64>)>,
@@ -126,10 +135,14 @@ impl RangeifyBufferContext {
         self.buffer_map.insert(UOpKey(original), replacement);
     }
 
-    /// Track a bound variable with its DEFINE_VAR UOp and concrete value.
+    /// Track a bound variable UOp and its concrete value.
     pub fn add_var(&mut self, var: Arc<UOp>, value: Option<i64>) {
-        if let Op::DefineVar { name, .. } = var.op() {
-            self.vars.insert(name.clone(), (var, value));
+        let name = match var.op() {
+            Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.clone(),
+            _ => None,
+        };
+        if let Some(name) = name {
+            self.vars.insert(name, (var, value));
         }
     }
 }
@@ -159,7 +172,7 @@ pub struct LocalAddBufferContext {
     pub param_slot: usize,
     /// Buffer → AFTER mapping (IndexMap maintains insertion order)
     pub map: IndexMap<UOpKey, Arc<UOp>>,
-    /// Bound variables: binding UOp (typically BIND) -> (DEFINE_VAR UOp, optional bound value).
+    /// Bound variables: binding UOp (typically BIND) -> (variable UOp, optional bound value).
     ///
     /// Uses IndexMap to preserve insertion order for CALL source argument parity.
     pub vars: IndexMap<UOpKey, (Arc<UOp>, Option<i64>)>,
@@ -190,14 +203,14 @@ impl LocalAddBufferContext {
 
     /// Track a bound variable and its binding source.
     pub fn add_var(&mut self, binding: Arc<UOp>, var: Arc<UOp>, value: Option<i64>) {
-        if let Op::DefineVar { name, .. } = var.op() {
+        let var_name = |uop: &Arc<UOp>| match uop.op() {
+            Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.clone(),
+            _ => None,
+        };
+        if let Some(name) = var_name(&var) {
             // Keep latest binding for a variable name while preserving insertion order.
             if let Some(existing_key) = self.vars.iter().find_map(|(k, (existing_var, _))| {
-                if matches!(existing_var.op(), Op::DefineVar { name: existing_name, .. } if existing_name == name) {
-                    Some(k.clone())
-                } else {
-                    None
-                }
+                if var_name(existing_var).as_deref() == Some(name.as_str()) { Some(k.clone()) } else { None }
             }) {
                 self.vars.swap_remove(&existing_key);
             }
@@ -222,7 +235,7 @@ impl LocalAddBufferContext {
 
 /// Extract the stored value from a STORE/END(STORE) structure.
 ///
-/// Used to check if the stored value is COPY/BUFFER_VIEW without traversing
+/// Used to check if the stored value is COPY/SLICE without traversing
 /// the entire subgraph.
 fn extract_stored_value(ret: &Arc<UOp>) -> &Arc<UOp> {
     match ret.op() {
@@ -253,16 +266,11 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     trace!(uop_id = x.id, op = ?std::mem::discriminant(x.op()), "split_store: entering");
 
-    // If any ranges are still open here, this is not a kernel boundary.
-    // END(STORE) nodes that close their full output range have empty in-scope
-    // ranges after ended_ranges() is applied.
-    if !x.in_scope_ranges().is_empty() {
-        return None;
-    }
-
-    // Guard 1: index-shape stores should be handled by their END wrapper, not here.
-    if let Op::Store { index, .. } = x.op()
-        && index.shape().ok().flatten().is_some()
+    // DEVICE ranges are launch lanes and remain open across a callable boundary.
+    // Any computational range still makes this an interior STORE.
+    if x.in_scope_ranges()
+        .iter()
+        .any(|range| !matches!(range.0.op(), Op::Range { axis_type: svod_ir::AxisType::Device, .. }))
     {
         return None;
     }
@@ -282,7 +290,7 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Context-dependent rewrite per kernel.
     //
-    // Context-free patterns (movement_op, syntactic_sugar, flatten_range) were already
+    // Context-free movement and flatten-range patterns were already
     // applied in try_get_kernel_graph's pre-pass. Here we only run patterns that
     // need LocalAddBufferContext (Buffer/Param→codegen PARAM, Bind, After, Range renumber,
     // NOOP→zero, Contiguous→extract opts).
@@ -297,12 +305,11 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
         _ => None,
     };
 
-    // Check for COPY/BUFFER_VIEW directly on the stored value.
+    // Check for COPY/SLICE directly on the stored value.
     // No graph traversal needed — just walk the STORE/END structure.
     let stored = extract_stored_value(&ret);
-    let ast = if matches!(stored.op(), Op::Copy { .. } | Op::BufferView { .. }) {
-        // Keep COPY/BUFFER_VIEW call bodies as direct ops so runtime lowering
-        // can classify them into PreparedOp::BufferCopy/BufferView.
+    let ast = if matches!(stored.op(), Op::Copy { .. } | Op::Slice { .. }) {
+        // Keep host-side effects as direct call bodies.
         if let Some(ranges) = &closed_ranges { stored.end(ranges.clone()) } else { stored.clone() }
     } else {
         // Mark AST SINK structurally so it hash-cons-distinguishes from
@@ -327,23 +334,25 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(call)
 }
 
+/// A non-copy kernel reads and writes one device.
+///
+/// Tinygrad enforces this in `assert_all_same_devices` (`schedule/__init__.py:141`),
+/// after the copy-kernel rewrites in `pm_copy_from_store` have had their chance to
+/// turn a genuine cross-device store into a COPY. Without it a mixed-device CALL
+/// compiles for one device and is handed the other device's pointer.
 fn validate_normal_kernel_devices(root: &Arc<UOp>) -> svod_ir::Result<()> {
     for node in root.toposort() {
-        let Op::Call { body, args, .. } = node.op() else {
-            continue;
-        };
+        let Op::Call { body, args, .. } = node.op() else { continue };
         if !matches!(body.op(), Op::Sink { .. }) {
             continue;
         }
 
-        let mut devices: Vec<DeviceSpec> = Vec::new();
+        let mut devices: Vec<svod_dtype::DeviceSpec> = Vec::new();
         for arg in args {
             if matches!(arg.op(), Op::Bind { .. }) {
                 continue;
             }
-            let Some(device) = arg.device_spec() else {
-                continue;
-            };
+            let Some(device) = arg.device_spec() else { continue };
             if !devices.contains(&device) {
                 devices.push(device);
             }
@@ -449,7 +458,7 @@ fn fix_assign(root: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
 ///
 /// # Returns
 /// Returns `(result, RangeifyBufferContext)`.
-pub fn try_get_kernel_graph(root: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, RangeifyBufferContext)> {
+pub fn try_get_kernel_graph(root: Arc<UOp>) -> Result<(Arc<UOp>, RangeifyBufferContext), KernelGraphError> {
     use super::transforms::pm_add_buffers_patterns;
     use crate::rewrite::graph_rewrite_bottom_up;
 
@@ -464,29 +473,31 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, Rangei
         .unwrap_or(0);
     let mut ctx = RangeifyBufferContext::with_lunique_start(lunique_start);
 
-    // PASS 1: bufferize → store (pm_gate_kernel_sink + pm_add_buffers + pm_add_range_tags, bottom_up=True)
+    // PASS 1: stage → store (pm_gate_kernel_sink + pm_add_buffers + pm_add_range_tags, bottom_up=True)
     let t_stage = std::time::Instant::now();
-    let after_buffers = {
-        use svod_ir::op::pattern_derived::OpKey;
-        use svod_ir::pattern::RewriteResult;
-        let mut matcher = pm_add_buffers_patterns();
-        // Skip the SINK subtree of an already-formed kernel AST.
-        matcher.add(&[OpKey::Sink], |node, _ctx| {
-            if matches!(node.op(), Op::Sink { info: Some(_), .. }) {
-                RewriteResult::Gate(node.clone())
-            } else {
-                RewriteResult::NoMatch
-            }
+    static PM: std::sync::LazyLock<crate::TypedPatternMatcher<RangeifyBufferContext>> =
+        std::sync::LazyLock::new(|| {
+            use svod_ir::op::pattern_derived::OpKey;
+            use svod_ir::pattern::RewriteResult;
+            let mut matcher = pm_add_buffers_patterns().clone();
+            // Skip the SINK subtree of an already-formed kernel AST.
+            matcher.add(&[OpKey::Sink], |node, _ctx| {
+                if matches!(node.op(), Op::Sink { info: Some(_), .. }) {
+                    RewriteResult::Gate(node.clone())
+                } else {
+                    RewriteResult::NoMatch
+                }
+            });
+            matcher
         });
-        graph_rewrite_bottom_up(&matcher, root, &mut ctx)
-    };
+    let after_buffers = graph_rewrite_bottom_up(&*PM, root, &mut ctx);
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: pm_add_buffers complete");
 
     trace!(tree = %after_buffers.tree_full(), "after pm_add_buffers");
 
     // Pre-run pm_flatten_range on the FULL graph ONCE before kernel splitting.
     //
-    // split_store includes pm_flatten_range but NOT pm_mops/pm_syntactic_sugar
+    // split_store includes pm_flatten_range but NOT pm_mops
     // (those were already applied in earlier pipeline stages). Running flatten_range once
     // on the full graph avoids redundant per-kernel traversals on overlapping subgraphs.
     let t_stage = std::time::Instant::now();
@@ -500,12 +511,17 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, Rangei
     let after_split = split_all_stores(&after_ctx_free);
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: split_all_stores complete");
 
-    validate_normal_kernel_devices(&after_split)?;
+    validate_normal_kernel_devices(&after_split).context(IrSnafu)?;
 
     let t_stage = std::time::Instant::now();
-    let result = fix_assign(&after_split)?;
+    let result = fix_assign(&after_split).context(IrSnafu)?;
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: fix_assign complete");
 
+    if crate::spec::spec_enabled() {
+        crate::spec::verify_kernel_graph(&result).context(SpecSnafu)?;
+    }
+
+    svod_ir::dump_canonical_stage("kernel_ast", &result);
     Ok((result, ctx))
 }
 
@@ -575,7 +591,7 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
         .map(|(axis_id, dim)| match dim {
             SInt::Const(n) if *n > 1 => {
                 let end = UOp::index_const(*n as i64);
-                UOp::range_axis(end, svod_ir::AxisId::Unrenumbered(axis_id), svod_ir::AxisType::Loop)
+                UOp::range_axis(end, svod_ir::AxisId::Unrenumbered(axis_id), svod_ir::AxisType::Weak)
             }
             _ => UOp::index_const(0),
         })
@@ -594,13 +610,12 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
 
     let substituted = indexed.substitute(&substitutions);
 
-    use super::patterns::{movement_op_patterns, pm_syntactic_sugar};
+    use super::patterns::movement_op_patterns;
     use crate::rewrite::graph_rewrite_bottom_up;
 
-    // pm_mops + pm_syntactic_sugar (early movement ops, bottom_up=True)
+    // pm_mops (movement ops, bottom_up=True)
     use std::sync::LazyLock;
-    static PM_MOPS: LazyLock<crate::TypedPatternMatcher> =
-        LazyLock::new(|| movement_op_patterns() + pm_syntactic_sugar());
+    static PM_MOPS: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(movement_op_patterns);
     let transformed = graph_rewrite_bottom_up(&*PM_MOPS, substituted, &mut ());
 
     let surviving_range_ids = collect_range_ids(&transformed);
@@ -615,7 +630,7 @@ fn find_split_candidates(
     is_expanded: &[bool],
     config: &SplitReduceOpConfig,
 ) -> Vec<SplitCandidate> {
-    let Op::ReduceAxis { axes: reduce_axes, .. } = reduce.op() else {
+    let Op::Reduce { num_axes, .. } = reduce.op() else {
         return vec![];
     };
 
@@ -628,7 +643,7 @@ fn find_split_candidates(
 
     let mut candidates = Vec::new();
 
-    for &axis in reduce_axes {
+    for axis in 0..*num_axes {
         if axis >= is_expanded.len() || is_expanded[axis] {
             continue;
         }
@@ -662,7 +677,7 @@ fn apply_split_transformation(
     candidate: &SplitCandidate,
     input_shape: &[SInt],
 ) -> Option<Arc<UOp>> {
-    let Op::ReduceAxis { reduce_op, axes: reduce_axes, .. } = reduce.op() else {
+    let Op::Reduce { reduce_op, num_axes, .. } = reduce.op() else {
         return None;
     };
 
@@ -688,23 +703,7 @@ fn apply_split_transformation(
 
     let permuted = reshaped.try_permute(permutation.clone()).ok()?;
 
-    let adjusted_axes: Vec<usize> = reduce_axes
-        .iter()
-        .map(|&axis| {
-            if axis < dim_to_split {
-                axis
-            } else if axis == dim_to_split {
-                dim_to_split + 1
-            } else {
-                axis + 1
-            }
-        })
-        .collect();
-
-    let permuted_axes: Vec<usize> =
-        adjusted_axes.iter().map(|&old_axis| permutation.iter().position(|&p| p == old_axis).unwrap()).collect();
-
-    let first_reduce = permuted.try_reduce_axis(*reduce_op, permuted_axes).ok()?;
+    let first_reduce = permuted.try_reduce_axis(*reduce_op, (0..*num_axes).collect()).ok()?;
 
     let contiguous = first_reduce.contiguous();
 
@@ -718,15 +717,18 @@ fn apply_split_transformation(
     second_reduce.try_reshape(final_shape).ok()
 }
 
-/// Split large REDUCE_AXIS into two stages.
+/// Split a large tensor-form REDUCE into two stages.
 pub fn split_reduceop(reduce: &Arc<UOp>, config: &SplitReduceOpConfig) -> Option<Arc<UOp>> {
     if !config.enabled {
         return None;
     }
 
-    let Op::ReduceAxis { src: source, .. } = reduce.op() else {
+    let Op::Reduce { src: source, ranges, num_axes, .. } = reduce.op() else {
         return None;
     };
+    if *num_axes == 0 || !ranges.is_empty() {
+        return None;
+    }
 
     let input_shape = source.shape().ok()??;
     let output_shape = reduce.shape().ok()??;

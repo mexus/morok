@@ -12,7 +12,7 @@ const KEY: &str = "TREE";
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ndarray::{Array, Dim};
 use std::env;
-use svod_schedule::{HeuristicsConfig, OptStrategy, OptimizerConfig};
+use svod_schedule::{HeuristicsConfig, OptStrategy, OptimizerConfig, TcOptLevel};
 use svod_tensor::{PrepareConfig, Tensor};
 
 /// Create a test matrix of given size with sequential values.
@@ -56,7 +56,9 @@ fn bench_matmul(c: &mut Criterion) {
     // matching the `renderer.global_max[0]` behavior on CPU.
     let heuristic_config: PrepareConfig = OptimizerConfig::builder()
         .strategy(OptStrategy::Heuristic)
-        .heuristics(HeuristicsConfig::builder().build())
+        // TC_OPT is pinned: the heuristic default (Strict, tinygrad `helpers.py:238`)
+        // is what these numbers measure, not the BEAM action space's TC_OPT=2.
+        .heuristics(HeuristicsConfig::builder().tc_opt(TcOptLevel::Strict).build())
         .build()
         .into();
 

@@ -36,10 +36,200 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use svod_device::hcq::{CopyLeg, DeviceQueue, SemanticLinkedPlan};
 use svod_device::{CounterSet, KernelResources, PmcCounter};
 use svod_dtype::DeviceSpec;
 
 use crate::kernel_cache::CachedKernel;
+
+/// Measured duration for one command in a semantic linked plan. `copy_leg`
+/// distinguishes the two commands emitted for a host-staged copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationTiming {
+    pub operation: usize,
+    pub copy_leg: Option<CopyLeg>,
+    pub duration: Duration,
+}
+
+/// Critical-path measurements for one concrete device/queue lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneExecutionMetrics {
+    pub lane: DeviceQueue,
+    /// Completion time relative to the start of the linked plan.
+    pub makespan: Duration,
+    /// Time spent executing commands on this lane.
+    pub busy: Duration,
+    /// Lane-idle time forced by published cross-lane waits.
+    pub wait: Duration,
+    /// Busy time on this lane concurrent with at least one other lane.
+    pub overlap: Duration,
+}
+
+/// Deterministic execution-lane simulation using the authoritative semantic
+/// submissions and measured command durations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionLaneMetrics {
+    pub makespan: Duration,
+    pub busy: Duration,
+    pub wait: Duration,
+    /// Wall-clock time during which at least two lanes are busy.
+    pub overlap: Duration,
+    pub lanes: Vec<LaneExecutionMetrics>,
+}
+
+fn duration_from_nanos(nanos: u128) -> Duration {
+    Duration::new((nanos / 1_000_000_000).min(u64::MAX as u128) as u64, (nanos % 1_000_000_000) as u32)
+}
+
+/// Compute makespan, busy, wait, and overlap from a semantic plan. Missing
+/// command timings are treated as zero; this lets callers profile only the
+/// command classes for which their backend exposes timestamps.
+pub fn analyze_execution_lanes(plan: &SemanticLinkedPlan, timings: &[OperationTiming]) -> ExecutionLaneMetrics {
+    #[derive(Default)]
+    struct LaneState {
+        end: u128,
+        busy: u128,
+        wait: u128,
+        spans: Vec<(u128, u128)>,
+    }
+
+    let command_nanos = |operation: usize, copy_leg: Option<CopyLeg>| {
+        timings
+            .iter()
+            .find(|timing| timing.operation == operation && timing.copy_leg == copy_leg)
+            .map_or(0, |timing| timing.duration.as_nanos())
+    };
+    let mut states: std::collections::HashMap<DeviceQueue, LaneState> = std::collections::HashMap::new();
+    let mut completions: std::collections::HashMap<(DeviceQueue, u64), u128> = std::collections::HashMap::new();
+
+    for submission in plan.lanes() {
+        let previous_end = states.get(&submission.lane).map_or(0, |state| state.end);
+        let wait_until = submission
+            .waits
+            .iter()
+            .filter_map(|wait| completions.get(&(wait.lane.clone(), wait.value)).copied())
+            .max()
+            .unwrap_or(0);
+        let start = previous_end.max(wait_until);
+        let busy =
+            submission.commands.iter().map(|command| command_nanos(command.operation, command.copy_leg)).sum::<u128>();
+        let end = start.saturating_add(busy);
+        let state = states.entry(submission.lane.clone()).or_default();
+        state.wait = state.wait.saturating_add(start.saturating_sub(previous_end));
+        state.busy = state.busy.saturating_add(busy);
+        state.end = end;
+        if busy != 0 {
+            state.spans.push((start, end));
+        }
+        completions.insert((submission.lane.clone(), submission.signal_value), end);
+    }
+
+    let mut all_spans = Vec::new();
+    for (lane, state) in &states {
+        all_spans.extend(state.spans.iter().map(|&span| (lane, span)));
+    }
+    let mut events = all_spans.iter().flat_map(|(_, span)| [(span.0, 1i32), (span.1, -1i32)]).collect::<Vec<_>>();
+    events.sort_by_key(|&(time, delta)| (time, delta));
+    let mut active = 0i32;
+    let mut previous = 0u128;
+    let mut overlap = 0u128;
+    for (time, delta) in events {
+        if active >= 2 {
+            overlap = overlap.saturating_add(time.saturating_sub(previous));
+        }
+        active += delta;
+        previous = time;
+    }
+
+    let mut lanes = states
+        .iter()
+        .map(|(lane, state)| {
+            let mut intersections = Vec::new();
+            for &own in &state.spans {
+                for (other_lane, other) in &all_spans {
+                    if *other_lane == lane {
+                        continue;
+                    }
+                    let start = own.0.max(other.0);
+                    let end = own.1.min(other.1);
+                    if start < end {
+                        intersections.push((start, end));
+                    }
+                }
+            }
+            intersections.sort_unstable();
+            let mut merged: Vec<(u128, u128)> = Vec::new();
+            for span in intersections {
+                if let Some(last) = merged.last_mut()
+                    && span.0 <= last.1
+                {
+                    last.1 = last.1.max(span.1);
+                } else {
+                    merged.push(span);
+                }
+            }
+            LaneExecutionMetrics {
+                lane: lane.clone(),
+                makespan: duration_from_nanos(state.end),
+                busy: duration_from_nanos(state.busy),
+                wait: duration_from_nanos(state.wait),
+                overlap: duration_from_nanos(merged.iter().map(|(start, end)| end - start).sum()),
+            }
+        })
+        .collect::<Vec<_>>();
+    lanes.sort_by_key(|metrics| {
+        let queue = match metrics.lane.queue {
+            svod_device::hcq::QueueKind::Compute(number) => (0, number),
+            svod_device::hcq::QueueKind::Copy(number) => (1, number),
+        };
+        (metrics.lane.device.canonicalize(), queue)
+    });
+
+    ExecutionLaneMetrics {
+        makespan: duration_from_nanos(states.values().map(|state| state.end).max().unwrap_or(0)),
+        busy: duration_from_nanos(states.values().map(|state| state.busy).sum()),
+        wait: duration_from_nanos(states.values().map(|state| state.wait).sum()),
+        overlap: duration_from_nanos(overlap),
+        lanes,
+    }
+}
+
+/// Timestamp resources attached to one HCQ batch finalizer. Dispatch paths add
+/// records in queue order; the terminal submission waits that same queue
+/// timeline once, after which collection converts clocks and releases every
+/// backend-owned handle together.
+pub(crate) struct SubmissionProfileFinalizer {
+    profiles: Vec<KernelProfile>,
+    handles: Vec<Option<Arc<dyn svod_device::DispatchTimestamps>>>,
+}
+
+impl SubmissionProfileFinalizer {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self { profiles: Vec::with_capacity(capacity), handles: Vec::with_capacity(capacity) }
+    }
+
+    pub(crate) fn push(&mut self, profile: KernelProfile, handle: Option<Arc<dyn svod_device::DispatchTimestamps>>) {
+        self.profiles.push(profile);
+        self.handles.push(handle);
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        synchronize: impl FnOnce() -> crate::error::Result<()>,
+    ) -> crate::error::Result<Vec<KernelProfile>> {
+        if self.handles.iter().any(Option::is_some) {
+            synchronize()?;
+        }
+        for (profile, handle) in self.profiles.iter_mut().zip(&self.handles) {
+            if let Some((start, end)) = handle.as_ref().and_then(|handle| handle.timestamps_ns()) {
+                profile.gpu_start_ns = Some(start);
+                profile.gpu_end_ns = Some(end);
+            }
+            profile.counters = handle.as_ref().and_then(|handle| handle.counters());
+        }
+        Ok(self.profiles)
+    }
+}
 
 /// Per-kernel timing from a profiled execution.
 ///
@@ -150,7 +340,8 @@ impl PmcSelection {
 /// Options for [`ExecutionPlan::profile`](crate::ExecutionPlan::profile).
 #[derive(Debug, Clone)]
 pub struct ProfileOptions {
-    /// Replays to run; the per-kernel minimum device time is kept (robust to outliers).
+    /// Replays to run (clamped to at least one by `profile`); the per-kernel
+    /// minimum device time is kept (robust to outliers).
     pub iters: u32,
     /// Collect Tier-2/3 static analysis (flops/bytes/resources). Cheap; on by default.
     pub static_analysis: bool,
@@ -448,7 +639,7 @@ fn render_stage_table(s: &StageProfile) -> String {
         header.push("GB/s".into());
     }
     if any_res {
-        header.extend(["VGPR".into(), "SGPR".into(), "LDS".into(), "occ%".into()]);
+        header.extend(["VGPR".into(), "SGPR".into(), "LDS".into(), "scratch".into(), "occ%".into()]);
     }
     for c in &counter_cols {
         header.push(c.token().into());
@@ -474,9 +665,15 @@ fn render_stage_table(s: &StageProfile) -> String {
             match r.resources {
                 Some(res) => {
                     let occ = res.occupancy.map(|o| format!("{:.0}", o * 100.0)).unwrap_or_else(|| "-".into());
-                    cells.extend([res.vgprs.to_string(), res.sgprs.to_string(), res.lds_bytes.to_string(), occ]);
+                    cells.extend([
+                        res.vgprs.to_string(),
+                        res.sgprs.to_string(),
+                        res.lds_bytes.to_string(),
+                        res.scratch_bytes.to_string(),
+                        occ,
+                    ]);
                 }
-                None => cells.extend(["-".into(), "-".into(), "-".into(), "-".into()]),
+                None => cells.extend(["-".into(), "-".into(), "-".into(), "-".into(), "-".into()]),
             }
         }
         for c in &counter_cols {

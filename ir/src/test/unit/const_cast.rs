@@ -109,7 +109,7 @@ fn test_float_to_int_allowed() {
 fn test_float_to_float_allowed() {
     // Float -> Float is allowed (including narrowing)
     let value = ConstValue::Float(PI);
-    assert_eq!(value.cast(&DType::Float32), Some(ConstValue::Float(PI)));
+    assert_eq!(value.cast(&DType::Float32), Some(ConstValue::Float((PI as f32) as f64)));
     assert_eq!(value.cast(&DType::Float64), Some(ConstValue::Float(PI)));
 }
 
@@ -121,7 +121,7 @@ fn test_float_to_float_allowed() {
 fn test_unsupported_void_cast() {
     let value = ConstValue::Int(42);
     let void_dtype = DType::Scalar(ScalarDType::Void);
-    assert_eq!(value.cast(&void_dtype), None);
+    assert_eq!(value.cast(&void_dtype), Some(ConstValue::Int(42)));
 }
 
 #[test]
@@ -141,11 +141,10 @@ fn test_vector_dtype_returns_none() {
 }
 
 #[test]
-fn test_unsupported_fp8_cast() {
+fn test_fp8_cast_commits_to_grid() {
     let value = ConstValue::Bool(true);
-    // FP8 types should return None (not in our cast functions)
-    assert_eq!(value.cast(&DType::Scalar(ScalarDType::FP8E4M3)), None);
-    assert_eq!(value.cast(&DType::Scalar(ScalarDType::FP8E5M2)), None);
+    assert_eq!(value.cast(&DType::Scalar(ScalarDType::FP8E4M3)), Some(ConstValue::Float(1.0)));
+    assert_eq!(value.cast(&DType::Scalar(ScalarDType::FP8E5M2)), Some(ConstValue::Float(1.0)));
 }
 
 // =============================================================================

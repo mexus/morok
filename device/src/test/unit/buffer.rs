@@ -16,7 +16,7 @@ fn test_lazy_allocation() {
 }
 
 #[test]
-fn test_buffer_view() {
+fn test_buffer_alias() {
     let allocator = Arc::new(CpuAllocator);
     let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], BufferSpec::default()).unwrap();
 

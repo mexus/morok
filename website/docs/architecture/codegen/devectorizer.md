@@ -152,18 +152,8 @@ Note: Not all INDEX operations get wrapped in LOAD. Pointer types (already addre
 
 **What This Does**: Handles the transition from abstract vectors to hardware operations.
 
-**Why This Matters**: Devectorize runs 4 conceptual phases across 3 `graph_rewrite` calls (phases 3 and 4 share one call) — building PTRCAT groups, moving GEPs through LOAD/STORE, distributing into CAT(LOADs), and splitting to hardware width. The phase-by-phase contract lives in the `schedule/src/lib.rs` module docstring.
-
-**PTRCAT Construction**:
-
-PTRCAT groups consecutive pointer accesses:
-1. Generate individual indexes for each vector element
-2. Extract (valid, root_src) → [offsets] mapping
-3. Group consecutive offsets by validity and source
-4. Create PTRCAT from grouped pointers
-5. Return with GEP permutation for correct element order
-
-This reduces memory bus transactions.
+**Why This Matters**: Devectorize lowers `STACK` and `INDEX` lane structure to
+the widths supported by the target, while preserving contiguous memory accesses.
 
 **Device-Specific Fold Lengths**:
 

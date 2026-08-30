@@ -25,48 +25,55 @@ unsafe impl Send for LlvmKernel {}
 unsafe impl Sync for LlvmKernel {}
 
 impl LlvmKernel {
-    /// Compile LLVM IR text to executable code via external clang.
-    pub fn compile_ir(
+    pub fn compile_ir_with_abi(
         ir: &str,
         entry_point: impl Into<String>,
         name: impl Into<String>,
         var_names: Vec<String>,
-        buf_count: usize,
+        abi: &[svod_device::device::AbiParamDescriptor],
     ) -> Result<Self> {
         let entry_point = entry_point.into();
         let name = name.into();
-
+        let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
+        svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
         debug!(kernel.name = %name, ir.length = ir.len(), "Compiling LLVM IR via external clang");
-
         if let Ok(dir) = std::env::var("SVOD_DUMP_LLVM_IR") {
             let path = std::path::Path::new(&dir).join(format!("{name}.ll"));
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(&path, ir);
         }
-
         if let Ok(dir) = std::env::var("SVOD_DUMP_POST_O2_IR") {
-            // Run the same `-O2 -funroll-loops -fvectorize -fslp-vectorize`
-            // pipeline as the JIT compile but emit textual LLVM IR instead
-            // of an object file. Writes `<dir>/<name>.post.ll`.
             let _ = std::fs::create_dir_all(&dir);
             if let Some(post_ir) = compile_ir_to_post_o2_text(ir) {
                 let path = std::path::Path::new(&dir).join(format!("{name}.post.ll"));
                 let _ = std::fs::write(&path, post_ir);
             }
         }
-
         let obj = compile_ir_to_object(ir)?;
-        let (fn_ptr, mmap) = crate::jit_loader::jit_load(&obj, &entry_point)?;
-        let cif = KernelCif::new(buf_count + var_names.len());
+        Self::load_object_with_abi(&obj, entry_point, name, var_names, abi)
+    }
 
-        debug!(kernel.name = %name, "LLVM kernel compiled and loaded");
-
+    pub fn load_object_with_abi(
+        object: &[u8],
+        entry_point: impl Into<String>,
+        name: impl Into<String>,
+        var_names: Vec<String>,
+        abi: &[svod_device::device::AbiParamDescriptor],
+    ) -> Result<Self> {
+        let entry_point = entry_point.into();
+        let name = name.into();
+        let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
+        svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
+        crate::clang::validate_relocatable_object(object, &entry_point)?;
+        let (fn_ptr, mmap) = crate::jit_loader::jit_load(object, &entry_point)?;
+        let cif = KernelCif::from_abi(abi);
+        debug!(kernel.name = %name, "LLVM kernel object loaded");
         Ok(Self { _mmap: mmap, fn_ptr, entry_point, name, var_names, cif })
     }
 
     /// Compile a RenderedKernel from the codegen crate.
     pub fn compile(kernel: &svod_codegen::RenderedKernel) -> Result<Self> {
-        Self::compile_ir(&kernel.code, &kernel.name, &kernel.name, kernel.var_names.clone(), kernel.buffer_args.len())
+        Self::compile_ir_with_abi(&kernel.code, &kernel.name, &kernel.name, kernel.var_names.clone(), &kernel.abi)
     }
 
     pub fn var_names(&self) -> &[String] {
@@ -95,7 +102,7 @@ impl LlvmKernel {
             "Executing LLVM kernel"
         );
 
-        unsafe { self.cif.dispatch(self.fn_ptr, buffers, vals, None) };
+        unsafe { self.cif.dispatch(self.fn_ptr, buffers, vals, None)? };
 
         Ok(())
     }
@@ -111,11 +118,11 @@ impl LlvmKernel {
 /// (same as the C path in jit_loader), so the JIT ELF loader can handle
 /// relocations consistently.
 fn compile_ir_to_object(ir: &str) -> Result<Vec<u8>> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    let toolchain = crate::clang::ClangToolchain::discover(None)?;
+    compile_ir_to_object_with(&toolchain, ir, &llvm_object_flags())
+}
 
-    let target = crate::jit_loader::elf_target_triple();
-
+pub(crate) fn llvm_object_flags() -> Vec<String> {
     let mut args = vec![
         "-x",
         "ir",
@@ -128,13 +135,27 @@ fn compile_ir_to_object(ir: &str) -> Result<Vec<u8>> {
         "-funroll-loops",
         "-fvectorize",
         "-fslp-vectorize",
-    ];
-    args.push(&target);
-    args.extend_from_slice(crate::jit_loader::platform_clang_flags());
-    args.extend_from_slice(&["-", "-o", "-"]);
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    args.push(crate::jit_loader::elf_target_triple());
+    args.extend(crate::jit_loader::platform_clang_flags().iter().map(|flag| (*flag).to_string()));
+    args.extend(["-", "-o", "-"].map(str::to_string));
+    args
+}
 
-    let mut child = Command::new("clang")
-        .args(&args)
+pub(crate) fn compile_ir_to_object_with(
+    toolchain: &crate::clang::ClangToolchain,
+    ir: &str,
+    args: &[String],
+) -> Result<Vec<u8>> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = toolchain
+        .command()
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -219,7 +219,7 @@ pub fn patterns(input: TokenStream) -> TokenStream {
 /// # Example
 ///
 /// ```ignore
-/// pub fn pm_render() -> &'static TypedPatternMatcher {
+/// pub fn example_patterns() -> &'static TypedPatternMatcher {
 ///     cached_patterns! { ... }
 /// }
 /// ```

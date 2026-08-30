@@ -260,7 +260,7 @@ pub enum Pattern {
     Binding { name: Ident, pattern: Box<Pattern> },
     /// Operation pattern with positional args: `Add(x, y)` or `End(comp, ..)`
     OpTuple { op: Ident, args: Vec<Pattern>, rest: bool },
-    /// Operation pattern with named fields: `Bufferize { compute: x, .. }`
+    /// Operation pattern with named fields: `Stage { compute: x, .. }`
     OpStruct { op: Ident, fields: Vec<FieldPattern>, rest: bool },
     /// Constant pattern: `Const(value)` or `Const(_)`
     Const(ConstPattern),

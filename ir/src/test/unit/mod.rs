@@ -1,8 +1,11 @@
 pub mod arithmetic;
 pub mod bitwise;
+pub mod call_shape;
+pub mod canonical;
 pub mod comparison;
 pub mod const_cast;
 pub mod control;
+pub mod dtype_rule;
 pub mod memory;
 pub mod movement;
 pub mod pattern;
@@ -16,5 +19,6 @@ pub mod uop;
 pub mod validation;
 pub mod vector;
 pub mod vmin_vmax;
+pub mod wire;
 
 pub mod provenance;

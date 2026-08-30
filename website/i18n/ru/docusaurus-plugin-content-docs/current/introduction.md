@@ -29,7 +29,7 @@ ML-компилятор на Rust, вдохновлённый [Tinygrad](https:/
 | [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp-граф IR: 80+ операций, символьные целые, трассировка происхождения |
 | [device](https://github.com/npatsakula/svod/tree/main/device/) | Управление буферами: ленивое выделение, zero-copy view, LRU-кэширование |
 | [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | Движок оптимизаций: 20+ проходов, RANGEIFY, Z3-верификация |
-| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | Кодогенерация: Clang (по умолчанию), LLVM JIT, MLIR |
+| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | Кодогенерация: Clang (по умолчанию), LLVM JIT |
 | [runtime](https://github.com/npatsakula/svod/tree/main/runtime/) | JIT-компиляция и выполнение ядер |
 | [tensor](https://github.com/npatsakula/svod/tree/main/tensor/) | Высокоуровневый API ленивых тензоров |
 | [onnx](https://github.com/npatsakula/svod/tree/main/onnx/) | Импортер ONNX-моделей |

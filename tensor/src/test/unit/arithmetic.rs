@@ -263,7 +263,8 @@ fn test_provenance_tracking() {
     use svod_dtype::DType;
     use svod_ir::{ConstValue, UOp, provenance::PROVENANCE_TRACKER};
 
-    // Clear any existing provenance
+    // Capture is off by default (SVOD_TRACK_PROVENANCE); enable it for this thread.
+    let was_tracking = svod_ir::provenance::set_tracking(true);
     PROVENANCE_TRACKER.with(|t| t.borrow_mut().clear());
 
     // Test at UOp level first to verify #[track_caller] works
@@ -304,6 +305,7 @@ fn test_provenance_tracking() {
         // Just verify provenance exists - the exact location may vary due to inlining
         assert!(!events.unwrap().is_empty(), "Expected at least one provenance event");
     });
+    svod_ir::provenance::set_tracking(was_tracking);
 }
 
 #[test]

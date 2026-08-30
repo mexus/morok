@@ -1,487 +1,178 @@
-//! Tests for device-specific buffer limit enforcement.
+//! Device buffer-limit enforcement: when a kernel would bind more buffers than
+//! the device allows, elementwise sub-expressions are materialised.
 //!
-//! These tests validate that buffer limit enforcement correctly:
-//! - Detects when buffer count exceeds device limits
-//! - Forces bufferization of elementwise operations when needed
-//! - Accounts for output buffer in the count (-1)
-//! - Works with different device types (Metal, WebGPU, CPU, CUDA)
-//! - Integrates correctly with the rangeify pipeline
+//! The limit is passed to `buffer_limit_patterns` explicitly, so every row runs
+//! on CPU without a device feature gate.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use svod_device::DeviceSpec;
 use svod_dtype::DType;
-use svod_ir::{AddrSpace, AxisType, BufferizeOpts, Op, SInt, UOp, UOpKey};
+use svod_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, SInt, UOp, UOpKey};
 use test_case::test_case;
 
 use crate::rangeify::indexing::IndexingContext;
 use crate::rangeify::patterns::{buffer_limit_patterns, extract_device_from_graph, is_elementwise};
 use crate::rewrite::graph_rewrite;
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Create a test BUFFER with given size and dtype.
-fn create_test_buffer(size: usize, dtype: DType, id: usize, device: DeviceSpec) -> Arc<UOp> {
-    let unique = UOp::buffer_id(Some(id));
-    let device_op = UOp::device(device);
-    UOp::new(Op::Buffer { unique, device: device_op, size }, dtype)
+fn test_buffer(size: usize, slot: usize) -> Arc<UOp> {
+    let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![SInt::Const(size)]);
+    let arg = svod_ir::ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu));
+    UOp::new(Op::Buffer { shape, arg }, DType::Float32)
 }
 
-/// Create a computation graph that accesses multiple buffers.
-///
-/// Creates a chain of binary ADD operations that access `num_buffers` buffers.
-/// Returns: (buffers, computation)
-fn create_multi_buffer_computation(num_buffers: usize, device: DeviceSpec) -> (Vec<Arc<UOp>>, Arc<UOp>) {
-    assert!(num_buffers > 0, "Must have at least one buffer");
-
-    let mut ctx = IndexingContext::new();
-    let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let ranges = vec![range.clone()];
-
-    // Create first buffer and index it
-    let mut buffers = Vec::new();
-    let buffer0 = create_test_buffer(40, DType::Float32, 0, device.clone());
-    let indexed0 = UOp::index().buffer(buffer0.clone()).indices(ranges.clone()).call().unwrap();
-    buffers.push(buffer0);
-
-    let mut computation = indexed0;
-
-    // Chain additional buffers with ADD operations
-    for i in 1..num_buffers {
-        let buffer = create_test_buffer(40, DType::Float32, i, device.clone());
-        let indexed = UOp::index().buffer(buffer.clone()).indices(ranges.clone()).call().unwrap();
-        computation = computation.try_add(&indexed).expect("Failed to create ADD");
-        buffers.push(buffer);
-    }
-
-    (buffers, computation)
+fn read(slot: usize, range: &Arc<UOp>) -> Arc<UOp> {
+    UOp::index().buffer(test_buffer(40, slot)).indices(vec![range.clone()]).call().expect("index")
 }
 
-/// Count the number of BUFFERIZE operations in a UOp tree.
+/// `(((b0 + b1) + b2) + ...)` over `count` distinct buffers.
+fn add_chain(count: usize, range: &Arc<UOp>) -> Arc<UOp> {
+    (1..count).fold(read(0, range), |acc, slot| acc.try_add(&read(slot, range)).expect("add"))
+}
+
 #[allow(clippy::mutable_key_type)]
-fn count_bufferizes(uop: &Arc<UOp>) -> usize {
-    let mut count = 0;
-    let mut stack = vec![uop.clone()];
-    let mut visited = HashSet::new();
-
+fn count_stages(uop: &Arc<UOp>) -> usize {
+    let (mut stack, mut visited, mut count) = (vec![uop.clone()], HashSet::new(), 0);
     while let Some(current) = stack.pop() {
-        let key = UOpKey(current.clone());
-        if !visited.insert(key) {
+        if !visited.insert(UOpKey(current.clone())) {
             continue;
         }
-
-        if matches!(current.op(), Op::Bufferize { .. }) {
-            count += 1;
-        }
-
-        for child in current.op().sources() {
-            stack.push(child);
-        }
+        count += usize::from(matches!(current.op(), Op::Stage { .. }));
+        stack.extend(current.op().sources());
     }
-
     count
 }
 
-/// Count the number of unique BUFFER/BUFFERIZE operations accessed by a computation.
-///
-/// This replicates the buffer counting logic used by buffer_limit_patterns.
-#[allow(clippy::mutable_key_type, dead_code)]
-fn count_accessed_buffers(uop: &Arc<UOp>) -> usize {
-    let mut buffers = Vec::new();
-    let mut visited = HashSet::new();
-
-    fn visit(uop: &Arc<UOp>, buffers: &mut Vec<Arc<UOp>>, visited: &mut HashSet<UOpKey>) {
-        let key = UOpKey(Arc::clone(uop));
-        if !visited.insert(key) {
-            return;
-        }
-
-        match uop.op() {
-            Op::Bufferize { opts, .. } if opts.addrspace == AddrSpace::Global => {
-                buffers.push(Arc::clone(uop));
-                return; // Stop traversal
-            }
-            Op::Buffer { .. } | Op::MStack { .. } | Op::MSelect { .. } => {
-                buffers.push(Arc::clone(uop));
-            }
-            _ => {}
-        }
-
-        for child in uop.op().sources() {
-            visit(&child, buffers, visited);
-        }
-    }
-
-    visit(uop, &mut buffers, &mut visited);
-
-    // Deduplicate
-    let mut seen = HashSet::new();
-    buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
-
-    buffers.len()
-}
-
-// ============================================================================
-// Phase 1: Device Limit Tests
-// ============================================================================
-
-#[cfg(feature = "metal")]
-#[test]
-fn test_metal_limit_at_threshold() {
-    // Metal has 31 buffer limit
-    // With 31 buffers accessed + 1 output = 32 total, should NOT trigger (31 <= 31-1 is false, but 31 <= 30 is false)
-    // Actually: if accessed > max - 1, then 31 > 30 is true, so it SHOULD trigger
-    // Let's test exactly at limit: 30 buffers accessed + 1 output = 31 total
-    let device = DeviceSpec::Metal { device_id: 0 };
-    let (_, computation) = create_multi_buffer_computation(30, device.clone());
-
-    let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
-
-    // Should NOT materialize (30 <= 30, within limit)
-    assert!(
-        Arc::ptr_eq(&result, &computation),
-        "Should not materialize when exactly at limit (30 buffers + 1 output = 31 total)"
-    );
-}
-
-#[cfg(feature = "metal")]
-#[test]
-fn test_metal_limit_exceeded() {
-    // Metal has 31 buffer limit
-    // With 31 buffers accessed + 1 output = 32 total, should trigger materialization
-    let device = DeviceSpec::Metal { device_id: 0 };
-    let (_, computation) = create_multi_buffer_computation(31, device.clone());
-
-    let before_count = count_bufferizes(&computation);
-    let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
-    let after_count = count_bufferizes(&result);
-
-    // Should have materialized some operations
-    assert!(
-        after_count > before_count,
-        "Should materialize when buffer limit exceeded (31 buffers + 1 output = 32 total)"
-    );
-}
-
-#[cfg(feature = "webgpu")]
-#[test]
-fn test_webgpu_limit_at_threshold() {
-    // WebGPU has 8 buffer limit
-    // With 7 buffers accessed + 1 output = 8 total, should NOT trigger
-    let device = DeviceSpec::WebGpu;
-    let (_, computation) = create_multi_buffer_computation(7, device);
-
-    let matcher = buffer_limit_patterns(8);
-    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
-
-    // Should NOT materialize (7 <= 7, within limit)
-    assert!(
-        Arc::ptr_eq(&result, &computation),
-        "Should not materialize when exactly at limit (7 buffers + 1 output = 8 total)"
-    );
-}
-
-#[cfg(feature = "webgpu")]
-#[test]
-fn test_webgpu_limit_exceeded() {
-    // WebGPU has 8 buffer limit
-    // With 8 buffers accessed + 1 output = 9 total, should trigger
-    let device = DeviceSpec::WebGpu;
-    let (_, computation) = create_multi_buffer_computation(8, device);
-
-    let before_count = count_bufferizes(&computation);
-    let matcher = buffer_limit_patterns(8);
-    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
-    let after_count = count_bufferizes(&result);
-
-    // Should have materialized some operations
-    assert!(
-        after_count > before_count,
-        "Should materialize when buffer limit exceeded (8 buffers + 1 output = 9 total)"
-    );
-}
-
-#[test]
-fn test_cpu_no_limit() {
-    // CPU has no buffer limit
-    let device = DeviceSpec::Cpu;
-    let (_, computation) = create_multi_buffer_computation(100, device);
-
-    // CPU returns None for max_buffers, so we manually test with a very high limit
-    // In practice, this pattern wouldn't be created for CPU
-    let before_count = count_bufferizes(&computation);
-    let result = computation.clone(); // No pattern matcher needed
-
-    // Should NOT change (no limit enforcement for CPU)
-    assert!(Arc::ptr_eq(&result, &computation), "CPU should have no buffer limit");
-    assert_eq!(count_bufferizes(&result), before_count, "CPU should not materialize buffers");
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn test_cuda_no_limit() {
-    // CUDA has no practical buffer limit
-    let device = DeviceSpec::Cuda { device_id: 0 };
-    let (_, computation) = create_multi_buffer_computation(100, device);
-
-    let before_count = count_bufferizes(&computation);
-    let result = computation.clone(); // No pattern matcher needed
-
-    // Should NOT change (no limit enforcement for CUDA)
-    assert!(Arc::ptr_eq(&result, &computation), "CUDA should have no buffer limit");
-    assert_eq!(count_bufferizes(&result), before_count, "CUDA should not materialize buffers");
-}
-
-// ============================================================================
-// Phase 2: Elementwise Materialization Tests
-// ============================================================================
-
-#[test]
-fn test_binary_op_is_elementwise() {
-    let left = UOp::native_const(1.0f32);
-    let right = UOp::native_const(2.0f32);
-    let add = left.try_add(&right).unwrap();
-
-    assert!(is_elementwise(&add), "Binary ADD should be elementwise");
-}
-
-#[test]
-fn test_ternary_op_is_elementwise() {
-    let cond = UOp::native_const(true);
-    let true_val = UOp::native_const(1.0f32);
-    let false_val = UOp::native_const(2.0f32);
-    let where_op = UOp::try_where(cond, true_val, false_val).unwrap();
-
-    assert!(is_elementwise(&where_op), "Ternary WHERE should be elementwise");
-}
-
-#[test]
-fn test_non_elementwise_operations() {
-    // Constants are not elementwise
-    let const_op = UOp::native_const(1.0f32);
-    assert!(!is_elementwise(&const_op), "CONST should not be elementwise");
-
-    // Buffers are not elementwise
-    let device = DeviceSpec::Cpu;
-    let buffer = create_test_buffer(100, DType::Float32, 1, device);
-    assert!(!is_elementwise(&buffer), "BUFFER should not be elementwise");
-}
-
-#[cfg(feature = "metal")]
-#[test]
-fn test_materialize_only_elementwise() {
-    // Create a computation with binary ops that should be materialized
-    let device = DeviceSpec::Metal { device_id: 0 };
-    let (_, computation) = create_multi_buffer_computation(31, device);
-
-    // The computation is a chain of ADD operations (elementwise)
-    let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, computation, &mut ());
-
-    // Should have created BUFFERIZE operations for elementwise ops
-    let bufferize_count = count_bufferizes(&result);
-    assert!(bufferize_count > 0, "Should have materialized elementwise operations");
-}
-
-// ============================================================================
-// Phase 3: Output Buffer Accounting Tests
-// ============================================================================
-
-#[test_case(30, false ; "at_limit_should_not_trigger")]
-#[test_case(31, true ; "over_limit_should_trigger")]
-fn test_output_buffer_accounting(num_buffers: usize, should_materialize: bool) {
-    // Test that the -1 accounting for output buffer works correctly
-    let device = DeviceSpec::Cpu; // Use CPU to avoid feature flags
-    let (_, computation) = create_multi_buffer_computation(num_buffers, device);
-
-    let before_count = count_bufferizes(&computation);
-    let matcher = buffer_limit_patterns(31); // Metal limit
-    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
-    let after_count = count_bufferizes(&result);
-
-    if should_materialize {
-        assert!(after_count > before_count, "Should materialize when num_buffers={} (> 30)", num_buffers);
-    } else {
-        assert_eq!(after_count, before_count, "Should not materialize when num_buffers={} (<= 30)", num_buffers);
-    }
-}
-
-// ============================================================================
-// Phase 4: Edge Cases
-// ============================================================================
-
-#[test]
-fn test_extract_device_no_device() {
-    // Graph with no device info
-    let const_op = UOp::native_const(1.0f32);
-    assert_eq!(extract_device_from_graph(&const_op), None, "Should return None when no device");
-}
-
-#[test]
-fn test_extract_device_from_device_op() {
-    // Graph with Op::Device
-    let device_op = UOp::device(DeviceSpec::Cpu);
-    assert_eq!(extract_device_from_graph(&device_op), Some(DeviceSpec::Cpu), "Should extract CPU device");
-}
-
-#[test]
-fn test_extract_device_from_buffer() {
-    // Graph with Buffer containing device
-    let device = DeviceSpec::Cpu;
-    let buffer = create_test_buffer(100, DType::Float32, 1, device.clone());
-    assert_eq!(extract_device_from_graph(&buffer), Some(device), "Should extract device from BUFFER");
-}
-
-#[test]
-fn test_no_double_materialization() {
-    // If a computation is already materialized, don't materialize again
-    let device = DeviceSpec::Cpu;
-    let (buffers, _) = create_multi_buffer_computation(35, device.clone());
-
-    // Create a graph with an already-materialized BUFFERIZE
+/// The output buffer takes one slot, so `max` buffers means at most `max - 1`
+/// inputs before an elementwise operand has to be materialised.
+#[test_case(30, false ; "one below the limit")]
+#[test_case(31, true ; "at the limit")]
+#[test_case(35, true ; "well over the limit")]
+fn the_output_buffer_costs_one_slot(inputs: usize, materializes: bool) {
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let ranges = vec![range.clone()];
+    let computation = add_chain(inputs, &range);
 
-    // Access first buffer
-    let indexed1 = UOp::index().buffer(buffers[0].clone()).indices(ranges.clone()).call().unwrap();
+    let result = graph_rewrite(&buffer_limit_patterns(31), computation.clone(), &mut ctx);
 
-    // Materialize it
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
-    let materialized = UOp::bufferize(indexed1, ranges.clone(), opts);
-    let indexed_materialized = UOp::index().buffer(materialized).indices(ranges).call().unwrap();
-
-    // Count BUFFERIZE operations before
-    let before_count = count_bufferizes(&indexed_materialized);
-
-    // Apply pattern (shouldn't double-materialize)
-    let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, indexed_materialized, &mut ());
-
-    let after_count = count_bufferizes(&result);
-    assert_eq!(before_count, after_count, "Should not double-materialize already-materialized operations");
+    assert_eq!(count_stages(&result) > count_stages(&computation), materializes);
+    if !materializes {
+        assert!(Arc::ptr_eq(&result, &computation));
+    }
 }
 
-// ============================================================================
-// Phase 5: Integration Tests
-// ============================================================================
-
+/// A WHERE's condition, true and false arms all count toward the same limit.
 #[test]
-fn test_integration_with_rangeify_pipeline() {
-    // Test that buffer limit enforcement works within the full rangeify pipeline
-    let device = DeviceSpec::Cpu;
-
-    // Create computation with many buffers
-    let (_, computation) = create_multi_buffer_computation(10, device);
-
-    // Run through rangeify (which includes buffer limit enforcement at Step 8.5)
-    let result = crate::rangeify::rangeify(computation.clone());
-
-    // Should complete without errors
-    assert!(result.is_ok(), "Rangeify pipeline should complete successfully with buffer limit enforcement");
-}
-
-#[test]
-fn test_multiple_binary_ops() {
-    // Test a computation with multiple binary operations
-    let device = DeviceSpec::Cpu;
+fn a_ternary_operand_tree_is_materialized_too() {
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let ranges = vec![range.clone()];
 
-    // Create 20 buffers
-    let mut buffers = Vec::new();
-    for i in 0..20 {
-        buffers.push(create_test_buffer(40, DType::Float32, i, device.clone()));
+    let mut cond = read(1, &range).try_cmplt(&read(0, &range)).expect("cmplt");
+    for slot in (2..10).step_by(2) {
+        let cmp = read(slot + 1, &range).try_cmplt(&read(slot, &range)).expect("cmplt");
+        cond = cond.try_and_op(&cmp).expect("and");
     }
+    let on_false = read(11, &range).try_add(&read(12, &range)).expect("add");
+    let where_op = UOp::try_where(cond, read(10, &range), on_false).expect("where");
 
-    // Create a complex expression: ((((b0 + b1) + b2) + b3) + ...)
-    let indexed0 = UOp::index().buffer(buffers[0].clone()).indices(ranges.clone()).call().unwrap();
-    let mut expr = indexed0;
-
-    for buffer in buffers.iter().skip(1) {
-        let indexed = UOp::index().buffer(buffer.clone()).indices(ranges.clone()).call().unwrap();
-        expr = expr.try_add(&indexed).expect("Failed to create ADD");
-    }
-
-    // Apply buffer limit (10 buffer limit)
-    let before_count = count_bufferizes(&expr);
-    let matcher = buffer_limit_patterns(10);
-    let result = graph_rewrite(&matcher, expr, &mut ());
-    let after_count = count_bufferizes(&result);
-
-    // Should have materialized some intermediate results
-    assert!(after_count > before_count, "Should materialize intermediate results to stay within buffer limit");
+    let result = graph_rewrite(&buffer_limit_patterns(10), where_op.clone(), &mut ctx);
+    assert!(count_stages(&result) > count_stages(&where_op));
 }
 
+/// Already-materialised operands are not re-staged.
 #[test]
-fn test_ternary_op_materialization() {
-    // Test that ternary operations are also checked for buffer limits
-    let device = DeviceSpec::Cpu;
+fn an_existing_stage_is_not_materialized_again() {
     let mut ctx = IndexingContext::new();
-    let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let ranges = vec![range.clone()];
+    let ranges = vec![ctx.new_range(&SInt::Const(10), AxisType::Loop)];
 
-    // Create many buffers for condition, true_val, false_val
-    let mut buffers = Vec::new();
-    for i in 0..15 {
-        buffers.push(create_test_buffer(40, DType::Float32, i, device.clone()));
-    }
+    let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
+    let staged = UOp::stage(read(0, &ranges[0]), ranges.clone(), opts);
+    let indexed = UOp::index().buffer(staged).indices(ranges).call().expect("index");
 
-    // Create ternary WHERE operation accessing many buffers
-    // cond = (b0 > b1 && b2 > b3 && ... b8 > b9)
-    let indexed0 = UOp::index().buffer(buffers[0].clone()).indices(ranges.clone()).call().unwrap();
-    let indexed1 = UOp::index().buffer(buffers[1].clone()).indices(ranges.clone()).call().unwrap();
-    let mut cond = indexed1.try_cmplt(&indexed0).unwrap(); // indexed0 > indexed1 => indexed1 < indexed0
+    let result = graph_rewrite(&buffer_limit_patterns(31), indexed.clone(), &mut ctx);
+    assert_eq!(count_stages(&result), count_stages(&indexed));
+}
 
-    for i in (2..10).step_by(2) {
-        let left = UOp::index().buffer(buffers[i].clone()).indices(ranges.clone()).call().unwrap();
-        let right = UOp::index().buffer(buffers[i + 1].clone()).indices(ranges.clone()).call().unwrap();
-        let cmp = right.try_cmplt(&left).unwrap(); // a > b => b < a
-        cond = cond.try_and_op(&cmp).unwrap();
-    }
+// ===== range-id allocation for the ranges the new STAGE carries =====
 
-    // true_val and false_val access more buffers
-    let true_val = UOp::index().buffer(buffers[10].clone()).indices(ranges.clone()).call().unwrap();
-    let false_val = {
-        let b11 = UOp::index().buffer(buffers[11].clone()).indices(ranges.clone()).call().unwrap();
-        let b12 = UOp::index().buffer(buffers[12].clone()).indices(ranges.clone()).call().unwrap();
-        b11.try_add(&b12).expect("Failed to create ADD")
-    };
+/// A range created during indexing and then collapsed by dead-axis cleanup still
+/// consumed its id: the STAGE must use the next id, not reuse the collapsed one.
+#[test]
+fn a_collapsed_range_still_consumes_its_axis_id() {
+    let mut ctx = IndexingContext::new();
+    let visible = ctx.new_range(&SInt::Const(10), AxisType::Weak);
+    let _collapsed = ctx.new_range_from_uop(&UOp::index_const(1), AxisType::Weak);
 
-    let where_op = UOp::try_where(cond, true_val, false_val).unwrap();
+    let root = add_chain(3, &visible);
+    let result = graph_rewrite(&buffer_limit_patterns(3), root, &mut ctx);
 
-    // Apply buffer limit (10 buffer limit)
-    let before_count = count_bufferizes(&where_op);
-    let matcher = buffer_limit_patterns(10);
-    let result = graph_rewrite(&matcher, where_op, &mut ());
-    let after_count = count_bufferizes(&result);
+    let stage_ids: Vec<_> = result
+        .toposort()
+        .into_iter()
+        .filter_map(|u| match u.op() {
+            Op::Stage { ranges, .. } => ranges.iter().find_map(|r| match r.op() {
+                Op::Range { axis_id, .. } => Some(axis_id.clone()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
 
-    // Should have materialized some intermediate results
-    assert!(after_count > before_count, "Should materialize intermediate results in ternary operations");
+    assert_eq!(stage_ids, vec![AxisId::Unrenumbered(2)]);
+    assert_eq!(ctx.range_counter(), 3);
+}
+
+/// A DEVICE range is a launch lane, not an allocated axis: the STAGE keeps it
+/// verbatim alongside the freshly numbered WEAK range.
+#[test]
+fn a_device_range_is_carried_through_without_renumbering() {
+    let mut ctx = IndexingContext::new();
+    let weak = ctx.new_range(&SInt::Const(10), AxisType::Weak);
+    let _collapsed = ctx.new_range_from_uop(&UOp::index_const(1), AxisType::Weak);
+    let launched = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(7), AxisType::Device);
+
+    let mixed = read(0, &weak).try_add(&read(1, &launched)).expect("add");
+    let root = mixed.try_add(&read(2, &weak)).expect("add");
+
+    let result = graph_rewrite(&buffer_limit_patterns(3), root, &mut ctx);
+    let stage_ranges = result
+        .toposort()
+        .into_iter()
+        .find_map(|u| match u.op() {
+            Op::Stage { ranges, .. } => Some(ranges.clone()),
+            _ => None,
+        })
+        .expect("buffer limit should materialize the mixed source");
+
+    assert!(stage_ranges.iter().any(|r| Arc::ptr_eq(r, &launched)));
+    assert!(
+        stage_ranges.iter().any(|r| {
+            matches!(r.op(), Op::Range { axis_id: AxisId::Unrenumbered(2), axis_type: AxisType::Weak, .. })
+        })
+    );
+    assert_eq!(ctx.range_counter(), 3);
+}
+
+// ===== helpers the pattern is built on =====
+
+/// Only elementwise nodes are candidates for materialisation — a leaf has
+/// nothing to materialise into.
+#[test]
+fn only_binary_and_ternary_nodes_are_elementwise() {
+    let (a, b) = (UOp::native_const(1.0f32), UOp::native_const(2.0f32));
+    assert!(is_elementwise(&a.try_add(&b).expect("add")));
+    assert!(is_elementwise(&UOp::try_where(UOp::native_const(true), a.clone(), b).expect("where")));
+    assert!(!is_elementwise(&a));
+    assert!(!is_elementwise(&test_buffer(100, 1)));
 }
 
 #[test]
-fn test_is_elementwise() {
-    // Binary operations are elementwise
-    let left = UOp::native_const(1.0f32);
-    let right = UOp::native_const(2.0f32);
-    let add = left.try_add(&right).unwrap();
-    assert!(is_elementwise(&add), "Binary ADD should be elementwise");
-
-    // Ternary operations are elementwise
-    let cond = UOp::native_const(true);
-    let true_val = UOp::native_const(1.0f32);
-    let false_val = UOp::native_const(2.0f32);
-    let where_op = UOp::try_where(cond, true_val, false_val).unwrap();
-    assert!(is_elementwise(&where_op), "Ternary WHERE should be elementwise");
-
-    // Constants are not elementwise
-    let const_op = UOp::native_const(1.0f32);
-    assert!(!is_elementwise(&const_op), "CONST should not be elementwise");
+fn the_device_comes_from_a_buffer_or_a_copy_target() {
+    assert_eq!(extract_device_from_graph(&test_buffer(100, 1)), Some(DeviceSpec::Cpu));
+    assert_eq!(
+        extract_device_from_graph(&UOp::native_const(1.0f32).copy_to_device(DeviceSpec::Cpu)),
+        Some(DeviceSpec::Cpu)
+    );
+    assert_eq!(extract_device_from_graph(&UOp::native_const(1.0f32)), None);
 }

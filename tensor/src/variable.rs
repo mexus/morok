@@ -6,7 +6,7 @@
 //! # Tinygrad Alignment
 //!
 //! Matches Tinygrad's `Variable = UOp` where `Variable("i", 1, 10)` creates
-//! a `DEFINE_VAR` UOp and `.bind(val)` produces a `BIND(DEFINE_VAR, CONST)` UOp.
+//! an ALU `PARAM` UOp and `.bind(val)` produces a `BIND(PARAM, CONST)` UOp.
 //!
 //! # Example
 //!
@@ -23,7 +23,6 @@
 
 use std::sync::Arc;
 
-use svod_dtype::DType;
 use svod_ir::{ConstValue, Op, SInt, UOp};
 
 use crate::error::{Result, VariableOutOfRangeSnafu};
@@ -31,7 +30,7 @@ use snafu::ensure;
 
 /// A symbolic variable for dynamic tensor dimensions.
 ///
-/// Wraps a `DEFINE_VAR` UOp with known bounds `[min_val, max_val]`.
+/// Wraps an ALU `PARAM` UOp with known bounds `[min_val, max_val]`.
 /// Variables are created unbound, then bound to concrete values via [`bind()`](Self::bind).
 ///
 /// The same `Variable` can be bound to different values for different executions,
@@ -70,7 +69,7 @@ impl Variable {
     pub fn bind(&self, val: i64) -> Result<BoundVariable> {
         let (min, max) = self.bounds();
         ensure!(val >= min && val <= max, VariableOutOfRangeSnafu { name: self.name().to_string(), val, min, max });
-        let val_uop = UOp::const_(DType::Index, ConstValue::Int(val));
+        let val_uop = UOp::const_(self.uop.dtype(), ConstValue::Int(val));
         let bind_uop = self.uop.bind(val_uop);
         Ok(BoundVariable { var: self.clone(), value: val, uop: bind_uop })
     }
@@ -78,20 +77,25 @@ impl Variable {
     /// Variable name.
     pub fn name(&self) -> &str {
         match self.uop.op() {
-            Op::DefineVar { name, .. } => name.as_str(),
-            _ => unreachable!("Variable always wraps DefineVar"),
+            Op::Param { arg, .. } => arg.name.as_deref().expect("variable PARAM has a name"),
+            _ => unreachable!("Variable always wraps Param"),
         }
     }
 
     /// Inclusive bounds `(min_val, max_val)`.
     pub fn bounds(&self) -> (i64, i64) {
         match self.uop.op() {
-            Op::DefineVar { min_val, max_val, .. } => (*min_val, *max_val),
-            _ => unreachable!("Variable always wraps DefineVar"),
+            Op::Param { arg, .. } => {
+                let (min, max) = arg.vmin_vmax.as_ref().expect("variable PARAM has bounds");
+                let ConstValue::Int(min) = min.0 else { unreachable!("integer variable minimum") };
+                let ConstValue::Int(max) = max.0 else { unreachable!("integer variable maximum") };
+                (min, max)
+            }
+            _ => unreachable!("Variable always wraps Param"),
         }
     }
 
-    /// Get the underlying `DEFINE_VAR` UOp as an `SInt`.
+    /// Get the underlying variable `PARAM` UOp as an `SInt`.
     ///
     /// This is useful for constructing shapes that use the variable's max value
     /// for buffer allocation (unbound variable → allocate to max).
@@ -99,7 +103,7 @@ impl Variable {
         SInt::Symbolic(self.uop.clone())
     }
 
-    /// Get the underlying `DEFINE_VAR` UOp.
+    /// Get the underlying variable `PARAM` UOp.
     pub fn uop(&self) -> &Arc<UOp> {
         &self.uop
     }

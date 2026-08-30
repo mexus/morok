@@ -1,382 +1,257 @@
-//! Tests for reduce_to_acc (REDUCE → accumulator pattern transformation).
-//!
-//! reduce_to_acc converts REDUCE operations to explicit accumulator patterns:
-//! - Creates DEFINE_REG for accumulator
-//! - Initializes accumulator with identity value
-//! - Loops over reduce_range with binary operations
-//! - Handles horizontal reduction for vector types
-//!
-//! Critical behavior tested:
-//! - input_ranges excludes parallel axes (Thread, Global, Local, Warp)
-//! - input_ranges includes Loop axes
-//! - reduce_range itself is excluded from input_ranges
-//!
-//! Based on Tinygrad's devectorizer.py:291-308.
+//! `reduce_to_acc`: REDUCE -> DEFINE_REG accumulator + loop, and the WMMA-add
+//! fusion that runs beside it. Ported from tinygrad `devectorizer.py:291-308`.
 
 use std::sync::Arc;
 
 use smallvec::smallvec;
 use svod_dtype::DType;
 use svod_ir::types::ConstValue;
-use svod_ir::{BinaryOp, Op, ReduceOp, UOp};
+use svod_ir::{AxisType, BinaryOp, Op, ReduceOp, RendererDevice, SInt, UOp, WmmaMetadata};
+use test_case::test_case;
 
 use super::helpers::*;
 
-// =============================================================================
-// Happy Path Tests: Basic REDUCE operations
-// =============================================================================
-
-/// Test: REDUCE(scalar, [Range], Add) → accumulator pattern with Add.
-#[test]
-fn test_reduce_scalar_add() {
-    let range = create_range_reduce(16, 0);
-    let src = create_float_const(1.0);
-    let reduce = create_reduce(src, vec![range], ReduceOp::Add);
-
-    let result = apply_pm_reduce(&reduce);
-
-    // Should transform to accumulator pattern (no longer REDUCE)
-    assert!(!matches!(result.op(), Op::Reduce { .. }), "Should transform REDUCE to accumulator pattern");
-    // Should have DEFINE_REG in the tree
-    assert!(count_define_regs(&result) > 0, "Should contain DEFINE_REG");
-    // Should have END in the tree
-    assert!(count_ends(&result) > 0, "Should contain END");
+fn test_wmma(c: Arc<UOp>) -> Arc<UOp> {
+    let operand = UOp::stack((0..6).map(|i| UOp::var(format!("operand_{i}"), DType::Float32, -100, 100)).collect());
+    UOp::wmma(
+        operand.clone(),
+        operand,
+        c,
+        WmmaMetadata {
+            name: "test".into(),
+            dims: (16, 16, 16),
+            dtype_in: DType::Float32,
+            dtype_out: DType::Float32,
+            device: RendererDevice::Cpu,
+            threads: 32,
+            upcast_axes: None,
+            reduce_axes: vec![],
+            tile_grid: (1, 1),
+        },
+    )
 }
 
-/// Test: REDUCE(scalar, [Range], Mul) → accumulator pattern with Mul.
-#[test]
-fn test_reduce_scalar_mul() {
-    let range = create_range_reduce(8, 0);
-    let src = create_float_const(2.0);
-    let reduce = create_reduce(src, vec![range], ReduceOp::Mul);
-
-    let result = apply_pm_reduce(&reduce);
-
-    assert!(!matches!(result.op(), Op::Reduce { .. }), "Should transform REDUCE");
-    assert!(count_define_regs(&result) > 0);
+fn shaped_values(prefix: &str, shape: &[usize]) -> Arc<UOp> {
+    let count = shape.iter().product();
+    UOp::stack((0..count).map(|i| UOp::var(format!("{prefix}_{i}"), DType::Float32, -100, 100)).collect())
+        .try_reshape(&shape.iter().copied().map(SInt::Const).collect())
+        .unwrap()
 }
 
-/// Test: REDUCE(scalar, [Range], Max) → accumulator pattern with Max.
-#[test]
-fn test_reduce_scalar_max() {
-    let range = create_range_reduce(32, 0);
-    let src = create_float_const(0.0);
-    let reduce = create_reduce(src, vec![range], ReduceOp::Max);
-
-    let result = apply_pm_reduce(&reduce);
-
-    assert!(!matches!(result.op(), Op::Reduce { .. }), "Should transform REDUCE");
-    // Max uses Binary::Max
-    assert!(count_define_regs(&result) > 0);
+fn fuse_wmma_add(root: Arc<UOp>) -> Arc<UOp> {
+    crate::rewrite::graph_rewrite(crate::devectorize::pm_wmma_add(), root, &mut ())
 }
 
-/// Test: REDUCE(scalar, [Range], Min) → accumulator pattern with Min (uses WHERE).
 #[test]
-fn test_reduce_scalar_min() {
-    let range = create_range_reduce(32, 0);
-    let src = create_float_const(100.0);
-    let reduce = create_reduce(src, vec![range], ReduceOp::Min);
+fn test_wmma_add_direct_moves_into_accumulator() {
+    let accumulator = shaped_values("acc", &[6]);
+    let add = shaped_values("add", &[6]);
+    let result = fuse_wmma_add(test_wmma(accumulator.clone()).add(&add));
 
-    let result = apply_pm_reduce(&reduce);
-
-    assert!(!matches!(result.op(), Op::Reduce { .. }), "Should transform REDUCE");
-    // Min uses WHERE(Lt, a, b)
-    assert!(count_define_regs(&result) > 0);
+    let Op::Wmma { c, .. } = result.op() else { panic!("direct WMMA add must fuse") };
+    assert!(matches!(c.op(), Op::Binary(BinaryOp::Add, lhs, rhs)
+        if Arc::ptr_eq(lhs, &accumulator) && Arc::ptr_eq(rhs, &add)));
 }
 
-/// Test: REDUCE(<4 x f32>, [Range], Add) → horizontal reduction then accumulator.
+/// A non-broadcastable ADD must leave the WMMA unfused rather than abort (tinygrad's
+/// `codegen/__init__.py:110` asserts inside `alu`; we decline the rewrite).
 #[test]
-fn test_reduce_vector_to_scalar() {
-    let range = create_range_reduce(16, 0);
-    // Vector source that reduces to scalar
-    let src = create_vector_float_iota(4);
-    let reduce = src.reduce(smallvec![range], ReduceOp::Add);
-    // Output dtype is scalar f32
+fn test_wmma_add_with_mismatched_operand_does_not_fuse() {
+    let fusable = test_wmma(shaped_values("acc", &[6])).add(&shaped_values("add", &[6]));
+    let root = fusable.with_sources(vec![fusable.op().sources()[0].clone(), shaped_values("bad", &[3])]);
 
-    let result = apply_pm_reduce(&reduce);
-
-    assert!(!matches!(result.op(), Op::Reduce { .. }), "Should transform REDUCE");
-    assert!(count_define_regs(&result) > 0);
+    assert!(Arc::ptr_eq(&fuse_wmma_add(root.clone()), &root), "mismatched WMMA add must stay unfused");
 }
 
-// =============================================================================
-// Horizontal Reduce Tests
-// =============================================================================
-
-/// Test: Horizontal reduce with no ranges → direct horizontal reduction.
-///
-/// REDUCE(<4 x f32>, [], Add) → tree reduction of GEPs
-/// Note: The output dtype follows the REDUCE's dtype, which may still be vector.
 #[test]
-fn test_horizontal_reduce_no_ranges() {
-    let src = create_vector_float_iota(4);
-    // Empty ranges: just horizontal reduce
-    let reduce = src.reduce(smallvec![], ReduceOp::Add);
+fn test_wmma_add_moves_through_permute() {
+    let permuted = test_wmma(shaped_values("acc", &[2, 3])).try_permute(vec![1, 0]).unwrap();
+    let result = fuse_wmma_add(permuted.add(&shaped_values("add", &[3, 2])));
 
-    let result = apply_pm_reduce(&reduce);
-
-    // With no ranges, should just be horizontal reduction (no DEFINE_REG)
-    assert!(!matches!(result.op(), Op::Reduce { .. }), "Should transform REDUCE");
-    // Note: The default reduce without explicit output dtype keeps the input dtype.
-    // This is correct behavior - horizontal reduction happens based on dtype mismatch.
-    // No accumulator needed for horizontal-only reduce
-    assert_eq!(count_define_regs(&result), 0, "Should not have DEFINE_REG for horizontal-only reduce");
-}
-
-/// Test: Vector identity (vcount in == vcount out) → no GEPs needed.
-#[test]
-fn test_horizontal_reduce_identity() {
-    let range = create_range_reduce(8, 0);
-    let src = create_vector_float_iota(4);
-    // Vec4 input with vec4 output dtype
-    let reduce = UOp::new(
-        Op::Reduce { src, ranges: smallvec![range], reduce_op: ReduceOp::Add },
-        DType::Float32.vec(4).unwrap(),
+    let Op::Permute { src, axes } = result.op() else { panic!("output permutation must remain outside WMMA") };
+    assert_eq!(axes, &[1, 0]);
+    let Op::Wmma { c, .. } = src.op() else { panic!("permuted add must fuse into WMMA") };
+    assert!(
+        matches!(c.op(), Op::Binary(BinaryOp::Add, _, moved) if matches!(moved.op(), Op::Permute { axes, .. } if axes == &[1, 0]))
     );
+}
+
+#[test]
+fn test_wmma_add_moves_through_permute_reshape() {
+    let reshaped =
+        test_wmma(shaped_values("acc", &[6])).try_reshape(&smallvec![SInt::Const(2), SInt::Const(3)]).unwrap();
+    let result = fuse_wmma_add(reshaped.try_permute(vec![1, 0]).unwrap().add(&shaped_values("add", &[3, 2])));
+
+    let Op::Permute { src, .. } = result.op() else { panic!("output permutation must remain") };
+    let Op::Reshape { src, .. } = src.op() else { panic!("output reshape must remain") };
+    let Op::Wmma { c, .. } = src.op() else { panic!("reshape-permute add must fuse into WMMA") };
+    assert!(matches!(c.op(), Op::Binary(BinaryOp::Add, _, moved) if matches!(moved.op(), Op::Reshape { src, .. }
+        if matches!(src.op(), Op::Permute { .. }))));
+}
+
+#[test]
+fn test_movement_cleanup_must_precede_reduce_local() {
+    let wmma = test_wmma(shaped_values("acc", &[6]));
+    let inner = wmma.try_reshape(&smallvec![SInt::Const(3), SInt::Const(2)]).unwrap();
+    let outer = inner.try_reshape(&smallvec![SInt::Const(2), SInt::Const(3)]).unwrap();
+    let root = outer.try_permute(vec![1, 0]).unwrap().add(&shaped_values("add", &[3, 2]));
+
+    let mut ctx = crate::devectorize::ReduceContext::default();
+    let without_cleanup = crate::rewrite::graph_rewrite(&crate::devectorize::pm_reduce_local(), root.clone(), &mut ctx);
+    assert!(matches!(without_cleanup.op(), Op::Binary(BinaryOp::Add, ..)), "counterexample must not match early");
+
+    let matcher = crate::devectorize::movement_cleanup_patterns().with_context::<crate::devectorize::ReduceContext>()
+        + crate::devectorize::pm_reduce_local();
+    let mut ctx = crate::devectorize::ReduceContext::default();
+    let ordered = crate::rewrite::graph_rewrite(&matcher, root, &mut ctx);
+    assert!(ordered.toposort().iter().any(|node| matches!(node.op(), Op::Wmma { c, .. }
+        if matches!(c.op(), Op::Binary(BinaryOp::Add, ..)))));
+}
+
+/// Every reduce op lowers to the same accumulator skeleton: a dense REG slot, a
+/// loop END and no surviving REDUCE.
+#[test_case(ReduceOp::Add, 16; "add")]
+#[test_case(ReduceOp::Mul, 8; "mul")]
+#[test_case(ReduceOp::Max, 32; "max")]
+#[test_case(ReduceOp::Min, 32; "min")]
+#[test_case(ReduceOp::Add, 1; "single element range")]
+fn reduce_lowers_to_an_accumulator_loop(reduce_op: ReduceOp, extent: i64) {
+    let reduce = create_reduce(create_float_const(1.0), vec![create_range_reduce(extent, 0)], reduce_op);
 
     let result = apply_pm_reduce(&reduce);
 
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
-    // Output should still be vec4
-    assert_eq!(result.dtype().vcount(), 4);
-}
-
-/// Test: <16 x f32> → <4 x f32> requires 4-stride horizontal GEPs.
-#[test]
-fn test_horizontal_reduce_16_to_4() {
-    let range = create_range_reduce(8, 0);
-    // 16 elements to 4 elements
-    let elements: smallvec::SmallVec<[Arc<UOp>; 4]> =
-        (0..16).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect();
-    let src = UOp::vectorize(elements);
-    let reduce = UOp::new(
-        Op::Reduce { src, ranges: smallvec![range], reduce_op: ReduceOp::Add },
-        DType::Float32.vec(4).unwrap(),
+    assert!(!matches!(result.op(), Op::Reduce { .. }), "REDUCE must be replaced by the accumulator pattern");
+    assert_eq!(result.dtype(), DType::Float32);
+    assert!(
+        result.toposort().iter().any(|node| matches!(node.op(), Op::Buffer { arg, .. }
+            if arg.addrspace == Some(svod_ir::AddrSpace::Reg) && arg.slot == 0)),
+        "the first accumulator must use dense REG slot 0"
     );
-
-    let result = apply_pm_reduce(&reduce);
-
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
-    assert_eq!(result.dtype().vcount(), 4);
+    assert!(count_ends(&result) > 0, "the reduce loop must be closed by an END");
 }
 
-// =============================================================================
-// Edge Cases
-// =============================================================================
-
-/// Test: REDUCE with empty ranges → direct horizontal reduction.
-#[test]
-fn test_reduce_empty_ranges() {
-    let src = create_vector_float_iota(4);
-    let reduce = src.reduce(smallvec![], ReduceOp::Add);
-
-    let result = apply_pm_reduce(&reduce);
-
-    // Empty ranges means no loop, just horizontal reduce
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
-}
-
-/// Test: REDUCE with scalar src and scalar out.
-#[test]
-fn test_reduce_single_element() {
-    let range = create_range_reduce(1, 0);
-    let src = create_float_const(42.0);
-    let reduce = create_reduce(src, vec![range], ReduceOp::Add);
-
-    let result = apply_pm_reduce(&reduce);
-
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
-    assert_eq!(result.dtype().vcount(), 1);
-}
-
-/// Test: REDUCE with multiple reduce ranges.
 #[test]
 fn test_reduce_multiple_ranges() {
-    let range1 = create_range_reduce(8, 0);
-    let range2 = create_range_reduce(4, 1);
-    let src = create_float_const(1.0);
-    let reduce = create_reduce(src.clone(), vec![range1, range2], ReduceOp::Add);
-
-    let result = apply_pm_reduce(&reduce);
+    let ranges = vec![create_range_reduce(8, 0), create_range_reduce(4, 1)];
+    let result = apply_pm_reduce(&create_reduce(create_float_const(1.0), ranges, ReduceOp::Add));
 
     assert!(!matches!(result.op(), Op::Reduce { .. }));
     assert!(count_define_regs(&result) > 0);
-    // Multiple ranges should all be in the END
     assert!(count_ends(&result) > 0);
 }
 
-// =============================================================================
-// Axis Type Tests (Tinygrad alignment: all ranges included in input_ranges)
-// =============================================================================
-
-/// Test: Thread ranges in topo are included in input_ranges.
-///
-/// Matches Tinygrad: input_ranges includes all RANGE ops in topo
-/// (except reduce_range itself and ended ranges).
+/// A REDUCE over a LOAD: the realistic shape, where the reduce range is also the
+/// load address.
 #[test]
-fn test_input_ranges_include_thread() {
-    let thread_range = create_range_thread(32, 0);
-    let reduce_range = create_range_reduce(16, 1);
+fn test_reduce_over_load_lowers_to_an_accumulator() {
+    let range = create_range_reduce(32, 0);
+    let index = UOp::index().buffer(UOp::param(0, 1024, DType::Float32, None)).indices(vec![range.clone()]).call();
+    let load = UOp::load().index(index.unwrap()).call();
 
-    let src = thread_range.cast(DType::Float32);
-    let reduce = create_reduce(src, vec![reduce_range], ReduceOp::Add);
-
-    let result = apply_pm_reduce(&reduce);
+    let result = apply_pm_reduce(&load.reduce(smallvec![range], ReduceOp::Add));
 
     assert!(!matches!(result.op(), Op::Reduce { .. }));
     assert!(count_define_regs(&result) > 0);
 }
 
-/// Test: Global ranges in topo are included in input_ranges.
 #[test]
-fn test_input_ranges_include_global() {
-    let global_range = create_range_global(64, 0);
-    let reduce_range = create_range_reduce(16, 1);
-
-    let src = global_range.cast(DType::Float32);
-    let reduce = create_reduce(src, vec![reduce_range], ReduceOp::Add);
+fn test_invalid_padded_lane_survives_reduction_removal() {
+    let cond = UOp::var("valid", DType::Bool, 0, 1);
+    let value = UOp::var("value", DType::Float32, 0, 100);
+    let src = UOp::try_where(cond, value, UOp::invalid_marker()).unwrap();
+    let reduce = create_reduce(src, vec![create_range_reduce(16, 0)], ReduceOp::Max);
 
     let result = apply_pm_reduce(&reduce);
 
     assert!(!matches!(result.op(), Op::Reduce { .. }));
-    assert!(count_define_regs(&result) > 0);
-}
-
-/// Test: Local ranges in topo are included in input_ranges.
-#[test]
-fn test_input_ranges_include_local() {
-    let local_range = create_range_local(16, 0);
-    let reduce_range = create_range_reduce(8, 1);
-
-    let src = local_range.cast(DType::Float32);
-    let reduce = create_reduce(src, vec![reduce_range], ReduceOp::Add);
-
-    let result = apply_pm_reduce(&reduce);
-
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
-    assert!(count_define_regs(&result) > 0);
-}
-
-/// Test: Loop ranges in topo are included in input_ranges.
-#[test]
-fn test_input_ranges_include_loop() {
-    let loop_range = create_range_loop(8, 0);
-    let reduce_range = create_range_reduce(16, 1);
-
-    let src = loop_range.cast(DType::Float32);
-    let reduce = create_reduce(src, vec![reduce_range], ReduceOp::Add);
-
-    let result = apply_pm_reduce(&reduce);
-
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
-    assert!(count_define_regs(&result) > 0);
-}
-
-/// Test: The reduce range itself is excluded from input_ranges.
-///
-/// Matches Tinygrad: `x not in reduce_range` check.
-#[test]
-fn test_input_ranges_exclude_reduce_range() {
-    let reduce_range = create_range_reduce(16, 0);
-    // Source depends on the reduce_range itself (e.g., loop variable)
-    let src = reduce_range.clone().cast(DType::Float32);
-    let reduce = create_reduce(src, vec![reduce_range], ReduceOp::Add);
-
-    let result = apply_pm_reduce(&reduce);
-
-    // reduce_range is excluded (it's the loop we iterate over)
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
-    assert!(count_define_regs(&result) > 0);
-}
-
-/// Test: Mixed axis types in source - all are included in input_ranges.
-///
-/// Matches Tinygrad: all RANGE ops in topo go into input_ranges
-/// (except reduce_range and ended ranges).
-#[test]
-fn test_input_ranges_mixed_axis_types() {
-    let global_range = create_range_global(64, 0);
-    let thread_range = create_range_thread(32, 1);
-    let loop_range = create_range_loop(8, 2);
-    let reduce_range = create_range_reduce(16, 3);
-
-    // Source depends on all three non-reduce ranges
-    let src = UOp::new(
-        Op::Binary(
-            BinaryOp::Add,
-            UOp::new(
-                Op::Binary(BinaryOp::Add, global_range.cast(DType::Float32), thread_range.cast(DType::Float32)),
-                DType::Float32,
-            ),
-            loop_range.cast(DType::Float32),
-        ),
-        DType::Float32,
+    assert!(
+        result.any_in_subtree(UOp::is_invalid_marker),
+        "reduction removal must preserve Invalid for the later gater"
     );
-    let reduce = create_reduce(src, vec![reduce_range], ReduceOp::Add);
+}
+
+#[test]
+fn test_reduce_shaped_to_scalar() {
+    let src = UOp::stack((0..4).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect());
+    let reduce = src.reduce_with_num_axes(smallvec![create_range_reduce(16, 0)], ReduceOp::Add, 1);
 
     let result = apply_pm_reduce(&reduce);
 
-    // All three ranges (global, thread, loop) are in input_ranges
     assert!(!matches!(result.op(), Op::Reduce { .. }));
     assert!(count_define_regs(&result) > 0);
+    assert!(result.toposort().iter().any(|node| {
+        matches!(node.op(), Op::Index { buffer, indices } if Arc::ptr_eq(buffer, &src) && indices.len() == 1)
+    }));
 }
 
-// =============================================================================
-// Integration Tests
-// =============================================================================
-
-/// Test: REDUCE transformation through pm_reduce + gep_pushing (combined pass).
-///
-/// This tests the REDUCE transformation in the context of a realistic
-/// LOAD → REDUCE scenario.
+/// Without a range there is no accumulator: the shaped source folds straight into
+/// a left fold of scalar INDEXes.
 #[test]
-fn test_reduce_in_full_pipeline() {
-    use crate::devectorize::pm_reduce;
-    use crate::rewrite::graph_rewrite;
-    use crate::symbolic::patterns::gep_pushing_patterns;
-    use svod_dtype::{AddrSpace, DeviceSpec};
+fn test_horizontal_reduce_no_ranges() {
+    let src = UOp::stack((0..4).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect());
 
-    // Create a realistic REDUCE scenario
-    let reduce_range = create_range_reduce(32, 0);
-    let buffer_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global).unwrap();
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 1024, buffer_dtype.clone());
-    let define = UOp::param(0, 1024, buffer_dtype, None);
+    let result = apply_pm_reduce(&src.reduce_with_num_axes(smallvec![], ReduceOp::Add, 1));
 
-    // LOAD from buffer
-    let idx = UOp::index().buffer(define).indices(vec![reduce_range.clone()]).call().unwrap();
-    let load = UOp::load().buffer(buffer.clone()).index(idx).call();
-
-    // REDUCE over load
-    let reduce = load.reduce(smallvec![reduce_range], ReduceOp::Add);
-
-    // Apply pm_reduce + gep_pushing (as done in optimizer)
-    let combined = pm_reduce() + gep_pushing_patterns().with_context();
-    let mut ctx = crate::devectorize::ReduceContext::default();
-    let result = graph_rewrite(&combined, reduce, &mut ctx);
-
-    // Should transform REDUCE to accumulator pattern
-    assert!(!matches!(result.op(), Op::Reduce { .. }), "REDUCE should be transformed");
-    assert!(count_define_regs(&result) > 0, "Should have DEFINE_REG for accumulator");
+    assert!(!matches!(result.op(), Op::Reduce { .. }));
+    assert_eq!(count_define_regs(&result), 0, "a horizontal-only reduce needs no DEFINE_REG");
+    assert_eq!(result.dtype(), DType::Float32);
+    assert_eq!(
+        count_ops(&result, |node| matches!(node.op(), Op::Index { buffer, .. } if Arc::ptr_eq(buffer, &src))),
+        4
+    );
 }
 
-/// Test: REDUCE with vectorized CONTRACT source.
 #[test]
-fn test_reduce_with_vectorized_source() {
-    let reduce_range = create_range_reduce(16, 0);
-
-    // Create a vectorized source via VECTORIZE
-    let elements: smallvec::SmallVec<[Arc<UOp>; 4]> =
-        (0..4).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect();
-    let vectorized = UOp::vectorize(elements);
-
-    // REDUCE the vectorized value to vec4 output
+fn test_horizontal_reduce_uses_target_dtype() {
+    let source_dtype = DType::BFloat16.vec(16).unwrap();
+    let target_dtype = DType::BFloat16.vec(4).unwrap();
+    let src = UOp::stack((0..4).map(|i| UOp::const_(source_dtype.clone(), ConstValue::Float(i as f64))).collect());
     let reduce = UOp::new(
-        Op::Reduce { src: vectorized, ranges: smallvec![reduce_range], reduce_op: ReduceOp::Add },
-        DType::Float32.vec(4).unwrap(),
+        Op::Reduce {
+            src: src.clone(),
+            ranges: smallvec![create_range_reduce(16, 0)],
+            reduce_op: ReduceOp::Add,
+            num_axes: 1,
+        },
+        target_dtype.clone(),
     );
 
     let result = apply_pm_reduce(&reduce);
 
+    assert_eq!(result.dtype(), target_dtype);
+    for node in result.toposort() {
+        if let Op::Index { buffer, .. } = node.op()
+            && Arc::ptr_eq(buffer, &src)
+        {
+            assert_eq!(node.dtype(), target_dtype);
+        }
+        if let Op::Binary(BinaryOp::Add, lhs, rhs) = node.op() {
+            assert_eq!(lhs.dtype(), rhs.dtype());
+        }
+    }
+    assert!(!result.toposort().iter().any(|node| matches!(node.op(), Op::Cast { .. })));
+}
+
+/// tinygrad puts every RANGE reachable from the source into `input_ranges`, whatever
+/// its axis type; only the reduce range itself (and already-ended ranges) drop out.
+#[test_case(&[AxisType::Thread]; "thread")]
+#[test_case(&[AxisType::Global]; "global")]
+#[test_case(&[AxisType::Local]; "local")]
+#[test_case(&[AxisType::Loop]; "loop axis")]
+#[test_case(&[]; "reduce range is its own only input")]
+#[test_case(&[AxisType::Global, AxisType::Thread, AxisType::Loop]; "mixed")]
+fn input_ranges_accept_every_axis_type(outer: &[AxisType]) {
+    let reduce_range = create_range_reduce(16, 9);
+    let src = outer
+        .iter()
+        .enumerate()
+        .map(|(id, &axis_type)| create_range(8 << id, id, axis_type).cast(DType::Float32))
+        .reduce(|acc, term| acc.add(&term))
+        .unwrap_or_else(|| reduce_range.cast(DType::Float32));
+    let reduce = create_reduce(src, vec![reduce_range], ReduceOp::Add);
+
+    let result = apply_pm_reduce(&reduce);
+
     assert!(!matches!(result.op(), Op::Reduce { .. }));
-    assert_eq!(result.dtype().vcount(), 4);
+    assert!(count_define_regs(&result) > 0);
 }

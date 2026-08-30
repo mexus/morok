@@ -30,8 +30,8 @@ fn chiplet_transform_chunked(wgid: &Arc<UOp>, num_wgs: i64, num_xcds: i64, chunk
     let block = num_xcds * chunk_size;
     let limit = (num_wgs / block) * block;
     let xcd = wgid.mod_(&cidx(num_xcds));
-    let local_pid = wgid.idiv(&cidx(num_xcds));
-    let chunk_idx = local_pid.idiv(&cidx(chunk_size));
+    let local_pid = wgid.floor_div(&cidx(num_xcds));
+    let chunk_idx = local_pid.floor_div(&cidx(chunk_size));
     let pos_in_chunk = local_pid.mod_(&cidx(chunk_size));
     let transformed = chunk_idx.mul(&cidx(block)).add(&xcd.mul(&cidx(chunk_size))).add(&pos_in_chunk);
     // `wgid > limit ? wgid : transformed`  (`wgid > limit` ⇔ `limit < wgid`).
@@ -46,14 +46,14 @@ fn chiplet_transform_chunked(wgid: &Arc<UOp>, num_wgs: i64, num_xcds: i64, chunk
 pub fn l2_swizzle(wgid: Arc<UOp>, num_wgs: i64, grid_m: i64, grid_n: i64) -> (Arc<UOp>, Arc<UOp>) {
     let wgid = chiplet_transform_chunked(&wgid, num_wgs, NUM_XCDS, WGM * WGM);
     let in_group = WGM * grid_n;
-    let group_id = wgid.idiv(&cidx(in_group));
+    let group_id = wgid.floor_div(&cidx(in_group));
     let first_pid_m = group_id.mul(&cidx(WGM));
     // group_size_m = min(grid_m - first_pid_m, WGM) — clamps the final M-group of
     // a non-`WGM`-multiple grid so its rows stay in range.
     let gsize_m = imin(&cidx(grid_m).sub(&first_pid_m), &cidx(WGM));
     let local = wgid.mod_(&cidx(in_group));
     let pid_m = first_pid_m.add(&local.mod_(&gsize_m));
-    let pid_n = local.idiv(&gsize_m);
+    let pid_n = local.floor_div(&gsize_m);
     (pid_m, pid_n)
 }
 

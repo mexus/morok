@@ -10,6 +10,12 @@
 //! The `executor` module remains available for explicit parallel scheduling
 //! scenarios.
 //!
+//! CPU work is submitted through `svod_device::hcq`; the compatibility queue
+//! type is intentionally absent:
+//! ```compile_fail
+//! use svod_runtime::CpuQueue;
+//! ```
+//!
 //! # Benchmarking
 //!
 //! The `benchmark` module provides timing utilities for measuring kernel
@@ -29,8 +35,7 @@ pub mod jit_loader;
 pub mod kernel_cache;
 pub mod leveling;
 pub mod llvm;
-#[cfg(feature = "mlir")]
-pub mod mlir;
+pub mod object_cache;
 pub mod profiler;
 
 #[cfg(test)]
@@ -39,12 +44,13 @@ pub mod test;
 pub use benchmark::{BenchmarkConfig, BenchmarkResult, benchmark_kernel, warmup_thread_pool};
 pub use custom_function::run_custom_function;
 pub use device_registry::DEVICE_FACTORIES;
-pub use devices::cpu::{CpuBackend, create_cpu_device, create_cpu_device_with_backend};
-pub use devices::cpu_queue::CpuQueue;
+pub use devices::{
+    cpu::{CpuBackend, cpu_device_with_backend, create_cpu_codegen, create_cpu_device, create_cpu_device_with_backend},
+    create_amd_codegen,
+};
 pub use error::*;
 pub use execution_plan::{
-    ExecutionPlan, ExecutionPlanBuilder, PreparedBufferView, PreparedCopy, PreparedCustomFunction, PreparedKernel,
-    PreparedOp,
+    ExecutionPlan, ExecutionPlanBuilder, PreparedCopy, PreparedCustomFunction, PreparedKernel, PreparedOp,
 };
 pub use executor::{
     DeviceContext, ExecutionGraph, ExecutionNode, KernelBufferAccess, SyncStrategy, UnifiedExecutor, global_executor,

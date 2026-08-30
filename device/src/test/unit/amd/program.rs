@@ -1,6 +1,301 @@
-use super::test_support::{amd_alloc_or_skip, require_multi_xcc, require_single_xcc};
+use super::test_support::{
+    MockAmdIface, amd_alloc_or_skip, ensure_hw_signal_pool, install_signal_pool, mock_device, replay_dwords,
+    require_multi_xcc, require_single_xcc, scripted_error,
+};
+use crate::allocator::RawBuffer;
+use crate::amd::AmdAllocator;
+use crate::amd::device::AmdDevice;
+use crate::amd::graph::AmdGraph;
 use crate::amd::program::*;
-use crate::amd::queue::build_dispatch_packet;
+use crate::device::{AbiParamDescriptor, AbiParamKind, GraphKernel, Program};
+use crate::error::Error;
+use std::sync::Arc;
+
+/// A kernel that stores 0.0 to `buf0[tid]` — the workhorse for every probe that
+/// only needs to observe that a dispatch reached the device.
+const STORE_ZERO_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+declare i32 @llvm.amdgcn.workitem.id.x()
+define amdgpu_kernel void @store_zero(ptr noalias %buf0) #0 {
+  %tid = tail call i32 @llvm.amdgcn.workitem.id.x()
+  %tid_ext = zext i32 %tid to i64
+  %p = getelementptr inbounds float, ptr %buf0, i64 %tid_ext
+  store float 0.0, ptr %p
+  ret void
+}
+attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
+"#;
+
+/// Kernel A of the read-after-write probes: unconditionally store 5.0.
+const RAW_SET_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @k_set(ptr noalias %buf0) #0 {
+  store float 5.0, ptr %buf0
+  ret void
+}
+attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
+"#;
+
+/// Kernel B of the read-after-write probes: load, add 1.0, store back.
+const RAW_INC_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @k_inc(ptr noalias %buf0) #0 {
+  %v = load float, ptr %buf0
+  %r = fadd float %v, 1.0
+  store float %r, ptr %buf0
+  ret void
+}
+attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
+"#;
+
+/// A kernel with no arguments at all, for the storage-accounting tests.
+const EMPTY_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @empty() #0 {
+entry:
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
+
+fn global_f32_buffer_abi() -> [AbiParamDescriptor; 1] {
+    [AbiParamDescriptor {
+        slot: 0,
+        kind: AbiParamKind::Storage(svod_dtype::AddrSpace::Global),
+        dtype: svod_dtype::DType::Float32,
+        name: None,
+    }]
+}
+
+/// Compile amdgcn IR to a code object with host `clang`. Mirrors
+/// `runtime::amd::compile` but avoids the dependency cycle; `None` when clang or
+/// the AMDGPU target is unavailable.
+fn clang_amdgcn(ir: &str, mcpu: &str) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let child = std::process::Command::new("clang")
+        .args(["-x", "ir", "-c", "-O2", "--target=amdgcn-amd-amdhsa"])
+        .arg(format!("-mcpu={mcpu}"))
+        .args(["-mcumode", "-nogpulib", "-nogpuinc", "-Wno-override-module", "-", "-o", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    child.stdin.as_ref()?.write_all(ir.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    (out.status.success() && out.stdout.starts_with(b"\x7fELF")).then_some(out.stdout)
+}
+
+struct MockProgram {
+    iface: Arc<MockAmdIface>,
+    device: Arc<AmdDevice>,
+    allocator: AmdAllocator,
+    program: AmdProgram,
+}
+
+/// Load `ir` onto a synthetic device. `graph` additionally installs a signal
+/// pool and forces PM4 graph capture on, which capture is gated behind.
+/// `None` when the host toolchain cannot build the code object.
+fn mock_program(ir: &str, name: &str, abi: &[AbiParamDescriptor], graph: bool) -> Option<MockProgram> {
+    Some(load_mock_program(&clang_amdgcn(ir, "gfx1100")?, name, abi, graph))
+}
+
+fn load_mock_program(bytes: &[u8], name: &str, abi: &[AbiParamDescriptor], graph: bool) -> MockProgram {
+    let (iface, allocator) = mock_device(1);
+    let device = Arc::clone(&allocator.dev);
+    if graph {
+        install_signal_pool(&allocator);
+        device.core().set_pm4_graph(true);
+    }
+    let program = AmdProgram::load(Arc::clone(&device), &allocator, bytes, name, abi).expect("program load");
+    MockProgram { iface, device, allocator, program }
+}
+
+fn graph_kernel(program: &AmdProgram, buffers: Vec<*mut u8>, deps: Vec<usize>) -> GraphKernel<'_> {
+    GraphKernel { program, buffers, vals: Vec::new(), global_size: Some([1, 1, 1]), local_size: Some([1, 1, 1]), deps }
+}
+
+// -------------------------------------------------------------- ELF ingestion
+
+#[test]
+fn parse_kernel_descriptor_from_compiled_elf() {
+    let Some(bytes) = clang_amdgcn(STORE_ZERO_IR, "gfx1100") else { return };
+    let parsed = parse_kernel(&bytes, "store_zero").expect("parse");
+    let kernarg_size = parsed.kd.kernarg_size;
+    assert!(kernarg_size >= 8, "kernarg_size {kernarg_size} must hold at least one pointer");
+    assert!((parsed.kd_offset as usize) < parsed.image.len(), "the descriptor must lie inside the image");
+}
+
+#[test]
+fn program_code_allocation_is_balanced_on_success_and_failure() {
+    let Some(mock) = mock_program(EMPTY_IR, "empty", &[], false) else { return };
+    assert_eq!((mock.iface.allocation_count(), mock.iface.live_handle_count()), (1, 1));
+    drop(mock.program);
+    assert_eq!((mock.iface.free_count(), mock.iface.live_handle_count()), (1, 0));
+
+    let bytes = clang_amdgcn(EMPTY_IR, "gfx1100").expect("clang succeeded above");
+    let (iface, allocator) = mock_device(1);
+    iface.script_alloc(Err(scripted_error("code allocation")));
+    assert!(AmdProgram::load(Arc::clone(&allocator.dev), &allocator, &bytes, "empty", &[]).is_err());
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (0, 0, 0));
+}
+
+/// A kernel needing SGPR dispatch-pointer setup is rejected — after its code has
+/// already been allocated, so the reclaim path runs.
+#[test]
+fn program_post_allocation_validation_reclaims_code() {
+    const DISPATCH_PTR_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
+define amdgpu_kernel void @dispatch_ptr_program() #0 {
+entry:
+  %dispatch = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
+  %value = load volatile i8, ptr addrspace(4) %dispatch, align 1
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
+    let Some(bytes) = clang_amdgcn(DISPATCH_PTR_IR, "gfx1100") else { return };
+    let (iface, allocator) = mock_device(1);
+    assert!(matches!(
+        AmdProgram::load(Arc::clone(&allocator.dev), &allocator, &bytes, "dispatch_ptr_program", &[]),
+        Err(Error::Runtime { message }) if message.contains("ENABLE_SGPR_DISPATCH_PTR")
+    ));
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (1, 1, 0));
+}
+
+// ---------------------------------------------------------- graph capture (mock)
+
+#[test]
+fn graph_capture_storage_unwinds_each_post_lane_allocation() {
+    let Some(bytes) = clang_amdgcn(EMPTY_IR, "gfx1100") else { return };
+    // Stages 0..6 belong to the lane itself (covered by the pool-queue unwind
+    // test); 6..=8 are the graph's own kernarg and command-stream buffers.
+    for fail_at in 6..=8 {
+        let mock = load_mock_program(&bytes, "empty", &[], true);
+        let (allocations, frees) = (mock.iface.allocation_count(), mock.iface.free_count());
+        for _ in 0..fail_at {
+            mock.iface.script_alloc(Ok(()));
+        }
+        mock.iface.script_alloc(Err(scripted_error("graph allocation")));
+        let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
+        assert!(AmdGraph::capture(&mock.allocator, &kernels).is_err(), "fail_at={fail_at}");
+        assert_eq!(mock.iface.allocation_count() - allocations, fail_at, "fail_at={fail_at}");
+        assert_eq!(mock.iface.free_count() - frees, fail_at - 6, "fail_at={fail_at}");
+        assert!(mock.iface.free_issues().is_empty());
+    }
+}
+
+#[test]
+fn graph_success_drop_frees_kernarg_and_both_resident_streams_once() {
+    let Some(mock) = mock_program(EMPTY_IR, "empty", &[], true) else { return };
+    let allocations = mock.iface.allocation_count();
+    let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
+    let graph = AmdGraph::capture(&mock.allocator, &kernels).unwrap().expect("graph");
+    assert_eq!(mock.iface.allocation_count() - allocations, 9);
+    drop(graph);
+    assert_eq!(mock.iface.free_count(), 3, "kernargs plus both resident streams");
+    assert!(mock.iface.free_issues().is_empty());
+}
+
+#[test]
+fn graph_replay_skips_repacking_unchanged_kernargs() {
+    const STORE_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @store_arg(ptr addrspace(1) %out) #0 {
+entry:
+  store float 0.0, ptr addrspace(1) %out, align 4
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
+    let Some(mock) = mock_program(STORE_IR, "store_arg", &global_f32_buffer_abi(), true) else { return };
+    let kernels = [graph_kernel(&mock.program, vec![0x1000 as *mut u8], Vec::new())];
+    let graph = AmdGraph::capture_amd(&mock.allocator, &kernels).unwrap().expect("graph");
+
+    assert_eq!(graph.kernarg_pack_probe(&[0x2000], &[]).unwrap(), 1);
+    assert_eq!(graph.kernarg_pack_probe(&[0x2000], &[]).unwrap(), 1, "identical arguments must not repack");
+    assert_eq!(graph.kernarg_pack_probe(&[0x3000], &[]).unwrap(), 2, "changed arguments repack");
+}
+
+#[test]
+fn graph_capture_emits_one_memory_barrier_for_the_whole_chain() {
+    use crate::amd::sys::pm4;
+    let Some(mock) = mock_program(EMPTY_IR, "empty", &[], true) else { return };
+    let kernels = std::array::from_fn::<_, 3, _>(|_| graph_kernel(&mock.program, Vec::new(), Vec::new()));
+    let graph = AmdGraph::capture_amd(&mock.allocator, &kernels).unwrap().expect("graph");
+    let dwords = replay_dwords(graph.linked_bytes());
+    let runs = |needle: &[u32]| dwords.windows(needle.len()).filter(|run| *run == needle).count();
+
+    // One HDP flush + full acquire for the whole graph (tinygrad graph/hcq.py:157)...
+    assert_eq!(runs(&pm4::hdp_flush()), 1);
+    // ...while every dispatch keeps its own CS_PARTIAL_FLUSH.
+    assert_eq!(runs(&pm4::event_write(pm4::CS_PARTIAL_FLUSH, pm4::EVENT_INDEX_PARTIAL_FLUSH)), 3);
+}
+
+#[test]
+fn graph_failed_drain_quarantines_graph_program_and_queue_storage() {
+    let Some(mock) = mock_program(EMPTY_IR, "empty", &[], true) else { return };
+    let kernels = [graph_kernel(&mock.program, Vec::new(), Vec::new())];
+    let graph = AmdGraph::capture(&mock.allocator, &kernels).unwrap().expect("graph");
+    graph.replay(&[], &[]).expect("mock publication");
+    mock.iface.script_wait(Err(Error::AmdIoctl { ioctl: "mock graph drain", errno: 5 }));
+    let allocations = mock.iface.allocation_count();
+    drop(graph);
+    drop(kernels);
+    drop(mock.program);
+    assert!(mock.device.is_poisoned());
+    assert_eq!(mock.iface.allocation_count(), allocations);
+    assert_eq!((mock.iface.free_count(), mock.iface.live_handle_count()), (0, allocations));
+}
+
+/// A linked plan owns its kernargs transactionally: nothing is allocated when
+/// capture fails, and a replay that fails before the doorbell leaves the device
+/// usable while one that fails after it poisons and quarantines.
+#[test]
+fn linked_plan_capture_and_transactional_publication_own_storage() {
+    let Some(mock) = mock_program(EMPTY_IR, "empty", &[], false) else { return };
+    install_signal_pool(&mock.allocator);
+    let pool =
+        crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(mock.device.core()), &mock.allocator).unwrap();
+    let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(mock.device.core()), mock.allocator.clone());
+    let lane = crate::hcq::LaneSubmission {
+        lane: crate::hcq::DeviceQueue {
+            device: svod_dtype::DeviceSpec::Amd { device_id: 0 },
+            queue: crate::hcq::QueueKind::Compute(0),
+        },
+        waits: Vec::new(),
+        commands: vec![crate::hcq::TopologyCommand { operation: 0, copy_leg: None }],
+        signal_value: 1,
+    };
+    let semantic = crate::hcq::SemanticLinkedPlan::from_lane_submissions(vec![lane], |_| [0x1000, 0x1008]).unwrap();
+    let calls = [crate::device::PlanCall::Program {
+        program: &mock.program,
+        buffers: &[],
+        vals: &[],
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+    }];
+
+    let allocations = mock.iface.allocation_count();
+    mock.iface.script_alloc(Err(scripted_error("linked kernarg allocation")));
+    assert!(crate::amd::AmdLinkedPlan::capture(&owner, &pool, &semantic, &calls).is_err());
+    assert_eq!(mock.iface.allocation_count(), allocations);
+
+    let mut linked =
+        crate::amd::AmdLinkedPlan::capture(&owner, &pool, &semantic, &calls).unwrap().expect("linked plan");
+    assert_eq!(mock.iface.allocation_count(), allocations + 1);
+
+    // Failing checkpoint `stage`: only a failure after the doorbell has actually
+    // published, and only that poisons the device.
+    for stage in 0..3 {
+        for _ in 0..stage {
+            mock.iface.script_publication(Ok(()));
+        }
+        mock.iface.script_publication(Err(scripted_error("linked publication")));
+        let published = stage == 2;
+        assert_eq!(linked.replay(&owner, &pool, &calls).unwrap_err().published, published, "stage={stage}");
+        assert_eq!(mock.device.is_poisoned(), published, "stage={stage}");
+    }
+    drop(linked);
+    assert_eq!(mock.iface.free_count(), 0, "linked kernargs and all device storage must be quarantined");
+}
+
+// ------------------------------------------------------------- hardware probes
 
 /// Serializes the `#[ignore]` PM4-graph probes that toggle the per-device
 /// `pm4_graph` flag. The flag lives on the process-global (`DEVICE_CACHE`-backed)
@@ -9,10 +304,9 @@ use crate::amd::queue::build_dispatch_packet;
 /// [`Pm4GraphOverride`] well-defined regardless of `--test-threads`.
 static PM4_GRAPH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Scoped enable of the per-device `pm4_graph` capture flag: records the previous
-/// value and restores it on drop, so a probe's mutation of the shared core flag
-/// never leaks into a later test in the same process. Acquire
-/// [`PM4_GRAPH_TEST_LOCK`] first so the save/restore window is exclusive.
+/// Scoped enable of the per-device `pm4_graph` capture flag (capture is opt-in
+/// by default — it regresses on gfx1151): records the previous value and
+/// restores it on drop. Acquire [`PM4_GRAPH_TEST_LOCK`] first.
 struct Pm4GraphOverride<'a> {
     core: &'a crate::amd::device::AmdDeviceCore,
     prev: bool,
@@ -32,476 +326,165 @@ impl Drop for Pm4GraphOverride<'_> {
     }
 }
 
-/// Compile a trivial amdgcn kernel via Phase 2, then parse it back and
-/// verify the kernel descriptor round-trips. Skipped when host clang
-/// lacks AMDGPU target.
-#[test]
-fn parse_kernel_descriptor_from_compiled_elf() {
-    // We can't pull svod-runtime here (dependency would cycle), so we
-    // shell out to clang ourselves with the same flags as
-    // `runtime::amd::compile`. Lighter than wiring a dev-dep.
-    let ir = r#"; ModuleID = 'p6_smoke'
-source_filename = "p6_smoke"
-target triple = "amdgcn-amd-amdhsa"
-
-declare i32 @llvm.amdgcn.workitem.id.x()
-
-define amdgpu_kernel void @p6_smoke(ptr noalias %buf0) #0 {
-entry:
-  %tid = tail call i32 @llvm.amdgcn.workitem.id.x()
-  %tid_ext = zext i32 %tid to i64
-  %p = getelementptr inbounds float, ptr %buf0, i64 %tid_ext
-  store float 0.0, ptr %p
-  ret void
+/// A host-visible output buffer plus the two addresses probes need.
+struct ProbeBuffer {
+    raw: RawBuffer,
+    gpu: u64,
+    host: std::ptr::NonNull<u8>,
 }
 
-attributes #0 = { alwaysinline nounwind "no-builtins" "amdgpu-flat-work-group-size"="1,64" "no-trapping-math"="true" }
-"#;
-    let out = match std::process::Command::new("clang")
-        .args([
-            "-x",
-            "ir",
-            "-c",
-            "-O2",
-            "--target=amdgcn-amd-amdhsa",
-            "-mcpu=gfx1100",
-            "-mcumode",
-            "-nogpulib",
-            "-nogpuinc",
-            "-Wno-override-module",
-            "-",
-            "-o",
-            "-",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("skipping: clang not available");
-            return;
-        }
-    };
-    use std::io::Write;
-    let mut out = out;
-    out.stdin.take().unwrap().write_all(ir.as_bytes()).unwrap();
-    let output = out.wait_with_output().unwrap();
-    if !output.status.success() {
-        eprintln!("skipping: clang amdgcn compile failed (target may be unavailable)");
-        return;
-    }
-    let bytes = output.stdout;
-    let parsed = parse_kernel(&bytes, "p6_smoke").expect("parse");
-    // Sanity: kernarg_size is at least one ptr (8 bytes), aligned.
-    let kernarg_size = parsed.kd.kernarg_size;
-    assert!(kernarg_size >= 8, "kernarg_size {} should hold at least one pointer", kernarg_size);
-    // Sanity: descriptor offset is inside the image.
-    assert!((parsed.kd_offset as usize) < parsed.image.len());
-}
-
-/// Shell out to `clang` to compile amdgcn IR → code object (ELF). Mirrors
-/// `runtime::amd::compile` but avoids the dep cycle (cf. the test above).
-/// Returns `None` if clang is missing or the target is unavailable.
-fn clang_amdgcn(ir: &str, mcpu: &str) -> Option<Vec<u8>> {
-    use std::io::Write;
-    let child = std::process::Command::new("clang")
-        .args(["-x", "ir", "-c", "-O2", "--target=amdgcn-amd-amdhsa"])
-        .arg(format!("-mcpu={mcpu}"))
-        .args(["-mcumode", "-nogpulib", "-nogpuinc", "-Wno-override-module", "-", "-o", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .ok()?;
-    child.stdin.as_ref()?.write_all(ir.as_bytes()).ok()?;
-    let out = child.wait_with_output().ok()?;
-    if !out.status.success() || out.stdout.len() < 4 || &out.stdout[..4] != b"\x7fELF" {
-        return None;
-    }
-    Some(out.stdout)
-}
-
-/// PHASE-0 GATE (manual hardware probe; `#[ignore]`). Dispatches a REAL kernel
-/// with a native `amd_signal_t` completion_signal — no `RELEASE_MEM`, no
-/// `PRED_EXEC`, no timeline — via [`AmdComputeQueue::dispatch_aql_native`], and
-/// reports two things the shared-queue redesign hinges on:
-///   1. **Completion fires** (and once vs once-per-XCC): the signal's `value`
-///      goes 1 -> 0 (once) or 1 -> -(xccs-1) (per-XCC); 1 (timeout) = STOP.
-///   2. **Coherence without the manual prologue**: the kernel's `store f32 0.0`
-///      reaches the host-visible output buffer purely via the AQL packet's
-///      system-scope release fence (we emit no `hdp_flush`/`acquire_mem`).
-///
-/// Run: cargo test -p svod-device --lib aql_native_kernel_dispatch_probe -- --ignored --nocapture
-#[test]
-#[ignore = "manual hardware probe; needs a real gfx942 AMD GPU + clang"]
-fn aql_native_kernel_dispatch_probe() {
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    use crate::allocator::RawBuffer;
-    use crate::amd::sys::hsa::{amd_signal_kind_t_AMD_SIGNAL_KIND_USER, amd_signal_t};
-
-    let Some(alloc) = amd_alloc_or_skip() else { return };
-    let core = alloc.dev.core();
-    let xccs = alloc.dev.node.num_xcc.max(1);
-    if !require_multi_xcc(&alloc) {
-        return;
-    }
-    if core.signal_pool().is_none() {
-        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
+impl ProbeBuffer {
+    fn new(alloc: &AmdAllocator) -> Self {
+        let raw = alloc.alloc_uncached(64).expect("output buffer");
+        let RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host), .. } = &raw else {
+            panic!("output buffer must be host-visible")
+        };
+        Self { gpu: *gpu_addr, host: *host, raw }
     }
 
-    // One-buffer kernel: workitem 0 stores 0.0 into buf0[0].
-    let ir = r#"; ModuleID = 'amd_native_probe'
-source_filename = "amd_native_probe"
-target triple = "amdgcn-amd-amdhsa"
+    fn set(&self, value: f32) {
+        // SAFETY: `host` is the host-visible mapping of a 64-byte allocation.
+        unsafe { std::ptr::write_volatile(self.host.as_ptr() as *mut f32, value) };
+    }
 
-declare i32 @llvm.amdgcn.workitem.id.x()
-
-define amdgpu_kernel void @amd_native_probe(ptr noalias %buf0) #0 {
-entry:
-  %tid = tail call i32 @llvm.amdgcn.workitem.id.x()
-  %tid_ext = zext i32 %tid to i64
-  %p = getelementptr inbounds float, ptr %buf0, i64 %tid_ext
-  store float 0.0, ptr %p
-  ret void
+    fn get(&self) -> f32 {
+        // SAFETY: as above.
+        unsafe { std::ptr::read_volatile(self.host.as_ptr() as *const f32) }
+    }
 }
 
-attributes #0 = { alwaysinline nounwind "no-builtins" "amdgpu-flat-work-group-size"="1,64" "no-trapping-math"="true" }
-"#;
-    let bytes = match clang_amdgcn(ir, "gfx942") {
-        Some(b) => b,
-        None => {
-            eprintln!("PROBE skipped: clang amdgcn (gfx942) unavailable.");
-            return;
+/// Capture a `count`-kernel chain of `store_zero` and replay it twice, each time
+/// over a fresh sentinel that the kernel must overwrite. `profile` additionally
+/// asks for a profiled replay and checks every kernel's GPU-clock span.
+fn graph_capture_replay_probe(alloc: &AmdAllocator, mcpu: &str, count: usize, profile: bool) {
+    let Some(bytes) = clang_amdgcn(STORE_ZERO_IR, mcpu) else { return };
+    let program = AmdProgram::load(alloc.dev.clone(), alloc, &bytes, "store_zero", &global_f32_buffer_abi())
+        .expect("load program");
+    let output = ProbeBuffer::new(alloc);
+    let kernels = (0..count)
+        .map(|index| graph_kernel(&program, vec![output.gpu as *mut u8], Vec::from_iter(index.checked_sub(1))))
+        .collect::<Vec<_>>();
+    let Some(graph) = AmdGraph::capture(alloc, &kernels).expect("capture") else { return };
+
+    for trial in 0..2 {
+        let sentinel = -7.5 * (trial as f32 + 1.0);
+        output.set(sentinel);
+        graph.replay(&[], &[]).expect("graph replay");
+        alloc.dev.core().synchronize_all().expect("synchronize_all");
+        assert_eq!(output.get(), 0.0, "graph replay #{trial}: the kernel store must land ({sentinel} -> ?)");
+    }
+    if profile {
+        let timestamps = graph.replay_profiled(&[], &[]).expect("profiled graph replay").expect("profile support");
+        assert_eq!(timestamps.len(), count);
+        for timestamp in timestamps {
+            let (start, end) = timestamp.timestamps_ns().expect("graph GPU timestamps");
+            assert!(end > start, "graph end ts ({end}) must exceed start ts ({start})");
         }
-    };
-    let prog = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "amd_native_probe", 1, 0).expect("load program");
-    let pool = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(core), &alloc).expect("pool queue");
-    let conn = crate::amd::connector::OwnerCtx::new(Arc::clone(&pool));
-    assert!(!conn.pool().queue().is_pm4(), "multi-XCC device must use an AQL queue");
+    }
 
-    // Output buffer (host-visible GTT), seeded with a sentinel so the kernel's
-    // store-of-0.0 is observable.
-    let out_buf = alloc.alloc_uncached(64).expect("output buffer");
-    let (out_gpu, out_host) = match &out_buf {
-        RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-        _ => panic!("output buffer must be host-visible"),
-    };
-    let sentinel: f32 = -123.5;
-    // SAFETY: out_host is the 64-byte buffer we just allocated.
-    unsafe { std::ptr::write_volatile(out_host.as_ptr() as *mut f32, sentinel) };
-
-    // Native completion signal: amd_signal_t { kind=USER, value=1 }, no mailbox.
-    let sig_buf = alloc.alloc_uncached(64).expect("signal buffer");
-    let (sig_gpu, sig_host) = match &sig_buf {
-        RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-        _ => panic!("signal buffer must be host-visible"),
-    };
-    let value_off = std::mem::offset_of!(amd_signal_t, __bindgen_anon_1);
-    // SAFETY: amd_signal_t is POD; all-zero is a valid INVALID signal.
-    let mut sig: amd_signal_t = unsafe { std::mem::zeroed() };
-    sig.kind = amd_signal_kind_t_AMD_SIGNAL_KIND_USER as i64;
-    sig.__bindgen_anon_1.value = 1;
-    // SAFETY: sig_host points at the 64-byte signal buffer.
-    unsafe { std::ptr::copy_nonoverlapping(&sig as *const _ as *const u8, sig_host.as_ptr(), 64) };
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-
-    // Kernargs: a single 64-bit pointer = the output buffer GPU VA.
-    let off = conn.pool().arena().bump(prog.kernarg_size(), 16).expect("kernarg bump");
-    // SAFETY: fresh slot, sole writer.
-    let host_base = unsafe { conn.pool().arena().host_at(off) };
-    unsafe { std::ptr::copy_nonoverlapping(out_gpu.to_le_bytes().as_ptr(), host_base, 8) };
-    let kernarg_gpu = conn.pool().arena().gpu_at(off);
-
-    // Packed-field copies (cf. execute_on) before passing by value.
-    let priv_seg = prog.kd.private_segment_fixed_size;
-    let group_seg = prog.kd.group_segment_fixed_size;
-    let packet = build_dispatch_packet(
-        [1, 1, 1],
-        [1, 1, 1],
-        priv_seg,
-        group_seg,
-        prog.aql_prog_addr,
-        kernarg_gpu,
-        /*completion_signal=*/ sig_gpu,
-    );
-    conn.pool().queue().dispatch_aql_native(&packet).expect("native dispatch");
-
-    // Poll completion: value drops below the initial 1, or time out.
-    // SAFETY: coherent GTT slot; firmware writes `value` at sig_gpu+value_off.
-    let value_ptr = unsafe { sig_host.as_ptr().add(value_off) as *const i64 };
-    let start = Instant::now();
-    let final_value = loop {
-        let v = unsafe { std::ptr::read_volatile(value_ptr) };
-        if v <= 0 || start.elapsed() > Duration::from_secs(5) {
-            break v;
-        }
-        std::hint::spin_loop();
-    };
-    let final_kind = unsafe { std::ptr::read_volatile(sig_host.as_ptr() as *const i64) };
-    let out_val = unsafe { std::ptr::read_volatile(out_host.as_ptr() as *const f32) };
-
-    eprintln!(
-        "PROBE native KERNEL dispatch (num_xcc={xccs}): completion 1 -> {final_value} in {:?}; kind={final_kind}",
-        start.elapsed()
-    );
-    eprintln!(
-        "  completion: 0 = once | <0 = per-XCC ({} decrements) | 1 = NEVER FIRED (timeout){}",
-        if final_value < 0 { (1 - final_value).to_string() } else { "n/a".into() },
-        if final_kind != amd_signal_kind_t_AMD_SIGNAL_KIND_USER as i64 {
-            " | WARNING: kind moved — handle treated as &value, not struct base"
-        } else {
-            ""
-        }
-    );
-    eprintln!(
-        "  coherence: out buffer {sentinel} -> {out_val} (expect 0.0 ⇒ release fence flushed without manual prologue)"
-    );
-
-    sig_buf.free_amd_device_in_place();
-    out_buf.free_amd_device_in_place();
+    drop(graph); // synchronize + free kernargs before the output buffer drops.
+    output.raw.free_amd_device_in_place();
 }
 
-/// PHASE-2 GATE (manual hardware probe; `#[ignore]`). Captures a static
-/// kernel chain via [`AmdGraph`] and replays it on the device's SHARED queue
-/// (single-queue mode — no multi-queue dependency), verifying the kernel runs
-/// on each replay. This is the first real validation of graph capture/replay
-/// (it was "opt-in until validated" before). A wrong batch/completion would
-/// show as a stale buffer or a synchronize timeout.
-///
-/// Run: cargo test -p svod-device --lib aql_graph_capture_replay -- --ignored --nocapture
+/// Kernel A stores 5.0, kernel B (declaring A as a dependency) loads, adds 1.0
+/// and stores back. A result of 5.0 means B ran before A's write was visible —
+/// the hazard barrier between chained dispatches is missing.
+fn graph_two_kernel_raw_probe(alloc: &AmdAllocator, mcpu: &str) {
+    let (Some(set), Some(inc)) = (clang_amdgcn(RAW_SET_IR, mcpu), clang_amdgcn(RAW_INC_IR, mcpu)) else { return };
+    let abi = global_f32_buffer_abi();
+    let set = AmdProgram::load(alloc.dev.clone(), alloc, &set, "k_set", &abi).expect("load k_set");
+    let inc = AmdProgram::load(alloc.dev.clone(), alloc, &inc, "k_inc", &abi).expect("load k_inc");
+    let output = ProbeBuffer::new(alloc);
+    output.set(-99.0);
+
+    let kernels = vec![
+        graph_kernel(&set, vec![output.gpu as *mut u8], vec![]),
+        graph_kernel(&inc, vec![output.gpu as *mut u8], vec![0]),
+    ];
+    let Some(graph) = AmdGraph::capture(alloc, &kernels).expect("capture") else { return };
+    graph.replay(&[], &[]).expect("replay");
+    alloc.dev.core().synchronize_all().expect("sync");
+    assert_eq!(output.get(), 6.0, "kernel B must observe kernel A's write inside the captured chain");
+
+    drop(graph);
+    output.raw.free_amd_device_in_place();
+}
+
+/// Run: `cargo test -p svod-device --lib aql_graph -- --ignored --nocapture --test-threads=1`
 #[test]
 #[ignore = "manual hardware probe; needs a real gfx942 AMD GPU + clang"]
 fn aql_graph_capture_replay() {
-    use crate::allocator::RawBuffer;
-    use crate::amd::AmdGraph;
-    use crate::device::{GraphKernel, Program};
-
     let Some(alloc) = amd_alloc_or_skip() else { return };
-    let core = alloc.dev.core();
     if !require_multi_xcc(&alloc) {
         return;
     }
-    if core.signal_pool().is_none() {
-        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
-    }
-
-    let ir = r#"; ModuleID = 'amd_graph_probe'
-source_filename = "amd_graph_probe"
-target triple = "amdgcn-amd-amdhsa"
-
-declare i32 @llvm.amdgcn.workitem.id.x()
-
-define amdgpu_kernel void @amd_graph_probe(ptr noalias %buf0) #0 {
-entry:
-  %tid = tail call i32 @llvm.amdgcn.workitem.id.x()
-  %tid_ext = zext i32 %tid to i64
-  %p = getelementptr inbounds float, ptr %buf0, i64 %tid_ext
-  store float 0.0, ptr %p
-  ret void
+    ensure_hw_signal_pool(&alloc);
+    graph_capture_replay_probe(&alloc, "gfx942", 1, false);
 }
 
-attributes #0 = { alwaysinline nounwind "no-builtins" "amdgpu-flat-work-group-size"="1,64" "no-trapping-math"="true" }
-"#;
-    let bytes = match clang_amdgcn(ir, "gfx942") {
-        Some(b) => b,
-        None => {
-            eprintln!("PROBE skipped: clang amdgcn (gfx942) unavailable.");
-            return;
-        }
-    };
-    let prog = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "amd_graph_probe", 1, 0).expect("load program");
-
-    let out_buf = alloc.alloc_uncached(64).expect("output buffer");
-    let (out_gpu, out_host) = match &out_buf {
-        RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-        _ => panic!("output buffer must be host-visible"),
-    };
-
-    // Capture a one-kernel static chain.
-    let kernels = vec![GraphKernel {
-        program: &prog as &dyn Program,
-        buffers: vec![out_gpu as *mut u8],
-        vals: vec![],
-        global_size: Some([1, 1, 1]),
-        local_size: Some([1, 1, 1]),
-        deps: vec![],
-    }];
-    let graph = match AmdGraph::capture(&alloc, &kernels).expect("capture") {
-        Some(g) => g,
-        None => {
-            eprintln!("PROBE skipped: chain not graphable on this device.");
-            return;
-        }
-    };
-
-    // Replay twice with a fresh sentinel each time; the kernel must overwrite it
-    // with 0.0 and `synchronize_all` must drain the graph's completion signal.
-    for trial in 0..2 {
-        let sentinel: f32 = -7.5 * (trial as f32 + 1.0);
-        // SAFETY: out_host is the host-visible output buffer.
-        unsafe { std::ptr::write_volatile(out_host.as_ptr() as *mut f32, sentinel) };
-        graph.replay(&[]).expect("graph replay");
-        core.synchronize_all().expect("synchronize_all");
-        let v = unsafe { std::ptr::read_volatile(out_host.as_ptr() as *const f32) };
-        assert_eq!(v, 0.0, "graph replay #{trial}: kernel store must land ({sentinel} -> {v})");
-    }
-    eprintln!("PROBE graph capture+replay: 2 replays on the shared queue ran the kernel correctly.");
-
-    drop(graph); // synchronize + free kernargs before the output buffer drops.
-    out_buf.free_amd_device_in_place();
-}
-
-/// DEBUG: minimal 2-kernel data-dependency graph. Kernel A stores 5.0 to buf[0];
-/// kernel B reads buf[0], adds 1.0, writes back → expect 6.0. Tests whether a
-/// batched graph honours the inter-kernel read-after-write (the QR multi-kernel
-/// failure mode), with full control over the chain.
 #[test]
 #[ignore = "manual hardware probe; needs a real gfx942 AMD GPU + clang"]
 fn aql_graph_two_kernel_raw_dependency() {
-    use crate::allocator::RawBuffer;
-    use crate::amd::AmdGraph;
-    use crate::device::{GraphKernel, Program};
-
     let Some(alloc) = amd_alloc_or_skip() else { return };
-    let core = alloc.dev.core();
     if !require_multi_xcc(&alloc) {
         return;
     }
-    if core.signal_pool().is_none() {
-        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
-    }
-
-    let ir_set = r#"target triple = "amdgcn-amd-amdhsa"
-define amdgpu_kernel void @k_set(ptr noalias %buf0) #0 {
-  store float 5.0, ptr %buf0
-  ret void
-}
-attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
-"#;
-    let ir_inc = r#"target triple = "amdgcn-amd-amdhsa"
-define amdgpu_kernel void @k_inc(ptr noalias %buf0) #0 {
-  %v = load float, ptr %buf0
-  %r = fadd float %v, 1.0
-  store float %r, ptr %buf0
-  ret void
-}
-attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
-"#;
-    let (bytes_set, bytes_inc) = match (clang_amdgcn(ir_set, "gfx942"), clang_amdgcn(ir_inc, "gfx942")) {
-        (Some(a), Some(b)) => (a, b),
-        _ => {
-            eprintln!("PROBE skipped: clang unavailable.");
-            return;
-        }
-    };
-    let prog_set = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes_set, "k_set", 1, 0).expect("load k_set");
-    let prog_inc = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes_inc, "k_inc", 1, 0).expect("load k_inc");
-
-    let out_buf = alloc.alloc_uncached(64).expect("output buffer");
-    let (out_gpu, out_host) = match &out_buf {
-        RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-        _ => panic!("host-visible"),
-    };
-    // SAFETY: seed a sentinel.
-    unsafe { std::ptr::write_volatile(out_host.as_ptr() as *mut f32, -99.0) };
-
-    let kernels = vec![
-        GraphKernel {
-            program: &prog_set as &dyn Program,
-            buffers: vec![out_gpu as *mut u8],
-            vals: vec![],
-            global_size: Some([1, 1, 1]),
-            local_size: Some([1, 1, 1]),
-            deps: vec![],
-        },
-        // Kernel B reads+writes the buffer A wrote: a true RAW (and WAW) on A.
-        // Declaring dep `0` makes DAG dispatch gate B's launch on A's completion
-        // signal via a `barrier_and`, the exact path this probe validates.
-        GraphKernel {
-            program: &prog_inc as &dyn Program,
-            buffers: vec![out_gpu as *mut u8],
-            vals: vec![],
-            global_size: Some([1, 1, 1]),
-            local_size: Some([1, 1, 1]),
-            deps: vec![0],
-        },
-    ];
-    let graph = match AmdGraph::capture(&alloc, &kernels).expect("capture") {
-        Some(g) => g,
-        None => {
-            eprintln!("PROBE skipped: not graphable.");
-            return;
-        }
-    };
-    graph.replay(&[]).expect("replay");
-    core.synchronize_all().expect("sync");
-    let v = unsafe { std::ptr::read_volatile(out_host.as_ptr() as *const f32) };
-    eprintln!(
-        "PROBE 2-kernel RAW: buf -99 -> {v} (A=5.0 then B=+1.0; expect 6.0; 5.0 ⇒ B ran before A's write was visible)"
-    );
-    assert_eq!(v, 6.0, "kernel B must observe kernel A's write in the batch");
-
-    drop(graph);
-    out_buf.free_amd_device_in_place();
+    ensure_hw_signal_pool(&alloc);
+    graph_two_kernel_raw_probe(&alloc, "gfx942");
 }
 
-/// PM4 DISPATCH TIMESTAMP PROBE (manual hardware probe; `#[ignore]`). Dispatch
-/// one trivial kernel through the per-plan `PlanContext` with `profile=true`,
-/// drain, and read back the GPU-clock `start`/`end` the two `release_mem_timestamp`
-/// probes wrote. Validates the single-XCC PM4 timestamp round-trip end to end
-/// (the path with no AQL `ENABLE_PROFILING` auto-stamp).
-///
-/// Run: SVOD_DEVICE=AMD:0 cargo test -p svod-device --lib pm4_dispatch_timestamp_probe -- --ignored --nocapture --test-threads=1
+/// Single-XCC (RDNA) analogue: a 12-kernel chain captured into one resident PM4
+/// indirect buffer, replayed normally twice and once profiled.
 #[test]
 #[ignore = "manual hardware probe; needs a real single-XCC AMD GPU + clang"]
-fn pm4_dispatch_timestamp_probe() {
-    use crate::allocator::RawBuffer;
-    use crate::device::Program;
-
+fn pm4_graph_capture_replay() {
     let Some(alloc) = amd_alloc_or_skip() else { return };
-    let core = alloc.dev.core();
     if !require_single_xcc(&alloc) {
         return;
     }
-    if core.signal_pool().is_none() {
-        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
-    }
-    let mcpu = alloc.dev.arch.mcpu();
-    let ir = r#"target triple = "amdgcn-amd-amdhsa"
-declare i32 @llvm.amdgcn.workitem.id.x()
-define amdgpu_kernel void @pm4_ts_probe(ptr noalias %buf0) #0 {
-  %tid = tail call i32 @llvm.amdgcn.workitem.id.x()
-  %tid_ext = zext i32 %tid to i64
-  %p = getelementptr inbounds float, ptr %buf0, i64 %tid_ext
-  store float 0.0, ptr %p
-  ret void
+    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
+    ensure_hw_signal_pool(&alloc);
+    graph_capture_replay_probe(&alloc, alloc.dev.arch.mcpu(), 12, true);
 }
-attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
-"#;
-    let bytes = match clang_amdgcn(ir, mcpu) {
-        Some(b) => b,
-        None => {
-            eprintln!("PROBE skipped: clang amdgcn ({mcpu}) unavailable.");
-            return;
-        }
-    };
-    let prog = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "pm4_ts_probe", 1, 0).expect("load program");
 
-    let out_buf = alloc.alloc_uncached(64).expect("output buffer");
-    let out_gpu = match &out_buf {
-        RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr,
-        _ => panic!("output buffer must be host-visible"),
-    };
+#[test]
+#[ignore = "manual hardware probe; needs a real single-XCC AMD GPU + clang"]
+fn pm4_graph_two_kernel_raw_dependency() {
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    if !require_single_xcc(&alloc) {
+        return;
+    }
+    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _pm4 = Pm4GraphOverride::enable(alloc.dev.core());
+    ensure_hw_signal_pool(&alloc);
+    graph_two_kernel_raw_probe(&alloc, alloc.dev.arch.mcpu());
+}
 
-    let ctx = prog.new_exec_context().expect("exec context").expect("AMD yields a plan context");
+/// Dispatch one kernel through the per-plan `PlanContext` with `profile=true`,
+/// drain, and read back the GPU-clock span the two `release_mem_timestamp`
+/// probes wrote — the single-XCC PM4 path, which has no AQL `ENABLE_PROFILING`
+/// auto-stamp.
+///
+/// Run: `SVOD_DEVICE=AMD:0 cargo test -p svod-device --lib pm4_dispatch_timestamp -- --ignored --test-threads=1`
+#[test]
+#[ignore = "manual hardware probe; needs a real single-XCC AMD GPU + clang"]
+fn pm4_dispatch_timestamp_probe() {
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    if !require_single_xcc(&alloc) {
+        return;
+    }
+    ensure_hw_signal_pool(&alloc);
+    let Some(bytes) = clang_amdgcn(STORE_ZERO_IR, alloc.dev.arch.mcpu()) else { return };
+    let program = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "store_zero", &global_f32_buffer_abi())
+        .expect("load program");
+    let output = ProbeBuffer::new(&alloc);
+
+    let ctx = program.new_exec_context().expect("exec context").expect("AMD yields a plan context");
     // profile=true: we hold `handle` across `synchronize`, so arming the probes
     // is safe (this is exactly the invariant the `profile` flag enforces).
     let handle = unsafe {
-        ctx.dispatch(&prog as &dyn Program, &[out_gpu as *mut u8], &[], Some([1, 1, 1]), Some([1, 1, 1]), true)
+        ctx.dispatch(&program as &dyn Program, &[output.gpu as *mut u8], &[], Some([1, 1, 1]), Some([1, 1, 1]), true)
     }
     .expect("dispatch");
     ctx.synchronize().expect("synchronize");
@@ -509,198 +492,61 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
     let (start, end) =
         handle.expect("a profiled dispatch yields a timestamp handle").timestamps_ns().expect("gpu-clock timestamps");
     assert!(end > start, "end ts ({end}) must exceed start ts ({start})");
-    let dur = end - start;
-    assert!(dur < 1_000_000_000, "a trivial kernel should run in < 1s, got {dur} ns");
-    eprintln!("PROBE PM4 dispatch timestamp: start={start} end={end} dur={dur} ns");
+    assert!(end - start < 1_000_000_000, "a trivial kernel should run in < 1s, got {} ns", end - start);
 
-    out_buf.free_amd_device_in_place();
+    output.raw.free_amd_device_in_place();
 }
 
-/// PM4 GRAPH PROBE (manual hardware probe; `#[ignore]`). Single-XCC (RDNA, e.g.
-/// gfx1151) analogue of `aql_graph_capture_replay_probe`: capture a ONE-kernel
-/// static chain into a PM4 indirect buffer and replay it twice via
-/// [`AmdGraphPm4`] (the `will_use_pm4` branch of `AmdGraph::capture`). The
-/// kernel's `store f32 0.0` must reach the host-visible buffer on each replay,
-/// and `synchronize_all` must drain the wrapping PM4 counter.
+/// Forced-AQL timeline stress: 2000 asynchronous, 128 synchronous and 128
+/// profiled dispatches through one plan context. Multi-XCC hardware uses AQL by
+/// default; single-XCC hardware must set `SVOD_AMD_AQL=1`.
 ///
-/// Run: SVOD_DEVICE=AMD:0 cargo test -p svod-device --lib pm4_graph_capture_replay_probe -- --ignored --nocapture --test-threads=1
-/// (the probe forces the per-device `pm4_graph` flag on — capture is opt-in by default).
+/// Run: `SVOD_DEVICE=AMD:0 SVOD_AMD_AQL=1 cargo test -p svod-device --lib aql_timeline_stress -- --ignored --test-threads=1`
 #[test]
-#[ignore = "manual hardware probe; needs a real single-XCC AMD GPU + clang"]
-fn pm4_graph_capture_replay_probe() {
-    use crate::allocator::RawBuffer;
-    use crate::amd::AmdGraph;
-    use crate::device::{GraphKernel, Program};
-
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang and an AQL queue"]
+fn aql_timeline_stress_probe() {
+    const STORE_ONE_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @aql_stress(ptr noalias %buf0) #0 {
+  store float 1.0, ptr %buf0
+  ret void
+}
+attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
+"#;
     let Some(alloc) = amd_alloc_or_skip() else { return };
-    let core = alloc.dev.core();
-    if !require_single_xcc(&alloc) {
-        return;
+    if crate::amd::queue::AmdComputeQueue::will_use_pm4(alloc.dev.core()) {
+        return; // set SVOD_AMD_AQL=1 on single-XCC hardware
     }
-    // PM4 graph capture is opt-in (default per-call — it regresses on gfx1151);
-    // force it on so this probe exercises the capture path. Serialize + restore:
-    // the flag lives on the shared device core, so we hold the test lock for the
-    // probe's duration and restore the prior value on drop (no leak, no race).
-    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _pm4 = Pm4GraphOverride::enable(core);
-    if core.signal_pool().is_none() {
-        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
-    }
-    let mcpu = alloc.dev.arch.mcpu();
+    ensure_hw_signal_pool(&alloc);
+    let Some(bytes) = clang_amdgcn(STORE_ONE_IR, alloc.dev.arch.mcpu()) else { return };
+    let program =
+        AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "aql_stress", &global_f32_buffer_abi()).expect("load");
+    let output = ProbeBuffer::new(&alloc);
+    let context = program.new_exec_context().expect("context").expect("AMD context");
+    let dispatch = |profile| unsafe {
+        context.dispatch(&program, &[output.gpu as *mut u8], &[], Some([1, 1, 1]), Some([1, 1, 1]), profile)
+    };
 
-    let ir = r#"target triple = "amdgcn-amd-amdhsa"
-declare i32 @llvm.amdgcn.workitem.id.x()
-define amdgpu_kernel void @pm4_graph_probe(ptr noalias %buf0) #0 {
-  %tid = tail call i32 @llvm.amdgcn.workitem.id.x()
-  %tid_ext = zext i32 %tid to i64
-  %p = getelementptr inbounds float, ptr %buf0, i64 %tid_ext
-  store float 0.0, ptr %p
-  ret void
-}
-attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
-"#;
-    let bytes = match clang_amdgcn(ir, mcpu) {
-        Some(b) => b,
-        None => {
-            eprintln!("PROBE skipped: clang amdgcn ({mcpu}) unavailable.");
-            return;
+    for _ in 0..2_000 {
+        dispatch(false).expect("asynchronous AQL dispatch");
+    }
+    context.synchronize().expect("asynchronous AQL drain");
+
+    for _ in 0..128 {
+        dispatch(false).expect("synchronous AQL dispatch");
+        context.synchronize().expect("synchronous AQL drain");
+    }
+
+    for _ in 0..4 {
+        let timestamps = (0..32)
+            .map(|_| dispatch(true).expect("profiled AQL dispatch").expect("timestamp handle"))
+            .collect::<Vec<_>>();
+        context.synchronize().expect("profiled AQL drain");
+        for timestamp in timestamps {
+            let (start, end) = timestamp.timestamps_ns().expect("AQL PM4 timestamps");
+            assert!(end > start, "end ts ({end}) must exceed start ts ({start})");
         }
-    };
-    let prog = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "pm4_graph_probe", 1, 0).expect("load program");
-
-    let out_buf = alloc.alloc_uncached(64).expect("output buffer");
-    let (out_gpu, out_host) = match &out_buf {
-        RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-        _ => panic!("output buffer must be host-visible"),
-    };
-
-    let kernels = vec![GraphKernel {
-        program: &prog as &dyn Program,
-        buffers: vec![out_gpu as *mut u8],
-        vals: vec![],
-        global_size: Some([1, 1, 1]),
-        local_size: Some([1, 1, 1]),
-        deps: vec![],
-    }];
-    let graph = match AmdGraph::capture(&alloc, &kernels).expect("capture") {
-        Some(g) => g,
-        None => {
-            eprintln!("PROBE skipped: chain not graphable on this device.");
-            return;
-        }
-    };
-
-    for trial in 0..2 {
-        let sentinel: f32 = -7.5 * (trial as f32 + 1.0);
-        // SAFETY: out_host is the host-visible output buffer.
-        unsafe { std::ptr::write_volatile(out_host.as_ptr() as *mut f32, sentinel) };
-        graph.replay(&[]).expect("graph replay");
-        core.synchronize_all().expect("synchronize_all");
-        let v = unsafe { std::ptr::read_volatile(out_host.as_ptr() as *const f32) };
-        assert_eq!(v, 0.0, "PM4 graph replay #{trial}: kernel store must land ({sentinel} -> {v})");
     }
-    eprintln!("PROBE PM4 graph capture+replay: 2 replays via one indirect buffer ran the kernel correctly.");
 
-    drop(graph);
-    out_buf.free_amd_device_in_place();
-}
-
-/// PM4 GRAPH RAW PROBE (manual hardware probe; `#[ignore]`). Single-XCC analogue
-/// of `aql_graph_two_kernel_raw_dependency`: a 2-kernel RAW chain in one PM4
-/// indirect buffer. Kernel A stores 5.0; kernel B loads, adds 1.0, stores back →
-/// expect 6.0. Validates the per-kernel `hdp_flush + acquire_mem` hazard barrier
-/// makes A's write visible to B inside the single captured IB (a `5.0` result
-/// means B ran before A's store was visible — barrier missing).
-///
-/// Run: SVOD_DEVICE=AMD:0 cargo test -p svod-device --lib pm4_graph_two_kernel_raw_dependency -- --ignored --nocapture --test-threads=1
-#[test]
-#[ignore = "manual hardware probe; needs a real single-XCC AMD GPU + clang"]
-fn pm4_graph_two_kernel_raw_dependency() {
-    use crate::allocator::RawBuffer;
-    use crate::amd::AmdGraph;
-    use crate::device::{GraphKernel, Program};
-
-    let Some(alloc) = amd_alloc_or_skip() else { return };
-    let core = alloc.dev.core();
-    if !require_single_xcc(&alloc) {
-        return;
-    }
-    // PM4 graph capture is opt-in (default per-call); force it on for this probe.
-    // Serialize + restore the shared per-device flag (no leak, no race).
-    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _pm4 = Pm4GraphOverride::enable(core);
-    if core.signal_pool().is_none() {
-        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
-    }
-    let mcpu = alloc.dev.arch.mcpu();
-
-    let ir_set = r#"target triple = "amdgcn-amd-amdhsa"
-define amdgpu_kernel void @k_set(ptr noalias %buf0) #0 {
-  store float 5.0, ptr %buf0
-  ret void
-}
-attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
-"#;
-    let ir_inc = r#"target triple = "amdgcn-amd-amdhsa"
-define amdgpu_kernel void @k_inc(ptr noalias %buf0) #0 {
-  %v = load float, ptr %buf0
-  %r = fadd float %v, 1.0
-  store float %r, ptr %buf0
-  ret void
-}
-attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
-"#;
-    let (bytes_set, bytes_inc) = match (clang_amdgcn(ir_set, mcpu), clang_amdgcn(ir_inc, mcpu)) {
-        (Some(a), Some(b)) => (a, b),
-        _ => {
-            eprintln!("PROBE skipped: clang unavailable.");
-            return;
-        }
-    };
-    let prog_set = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes_set, "k_set", 1, 0).expect("load k_set");
-    let prog_inc = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes_inc, "k_inc", 1, 0).expect("load k_inc");
-
-    let out_buf = alloc.alloc_uncached(64).expect("output buffer");
-    let (out_gpu, out_host) = match &out_buf {
-        RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-        _ => panic!("host-visible"),
-    };
-    // SAFETY: seed a sentinel.
-    unsafe { std::ptr::write_volatile(out_host.as_ptr() as *mut f32, -99.0) };
-
-    let kernels = vec![
-        GraphKernel {
-            program: &prog_set as &dyn Program,
-            buffers: vec![out_gpu as *mut u8],
-            vals: vec![],
-            global_size: Some([1, 1, 1]),
-            local_size: Some([1, 1, 1]),
-            deps: vec![],
-        },
-        GraphKernel {
-            program: &prog_inc as &dyn Program,
-            buffers: vec![out_gpu as *mut u8],
-            vals: vec![],
-            global_size: Some([1, 1, 1]),
-            local_size: Some([1, 1, 1]),
-            deps: vec![0],
-        },
-    ];
-    let graph = match AmdGraph::capture(&alloc, &kernels).expect("capture") {
-        Some(g) => g,
-        None => {
-            eprintln!("PROBE skipped: not graphable.");
-            return;
-        }
-    };
-    graph.replay(&[]).expect("replay");
-    core.synchronize_all().expect("sync");
-    let v = unsafe { std::ptr::read_volatile(out_host.as_ptr() as *const f32) };
-    eprintln!(
-        "PROBE PM4 2-kernel RAW: buf -99 -> {v} (A=5.0 then B=+1.0; expect 6.0; 5.0 ⇒ B ran before A's write was visible)"
-    );
-    assert_eq!(v, 6.0, "kernel B must observe kernel A's write in the captured IB");
-
-    drop(graph);
-    out_buf.free_amd_device_in_place();
+    assert_eq!(output.get(), 1.0);
+    output.raw.free_amd_device_in_place();
 }

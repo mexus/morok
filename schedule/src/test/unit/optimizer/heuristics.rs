@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
-use svod_dtype::{DType, DeviceSpec, ImageKind};
-use svod_ir::{AxisId, AxisType, ReduceOp, UOp};
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::{AxisId, AxisType, Op, ParamArg, ReduceOp, UOp};
+use test_case::test_case;
 
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
-use crate::optimizer::heuristics::{apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores};
+use crate::optimizer::heuristics::{
+    apply_default_upcast, apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores,
+};
 use crate::optimizer::{OptOps, Renderer, Scheduler};
 
 fn create_matvec_like_pattern(rows: i64, cols: i64) -> Arc<UOp> {
@@ -43,41 +46,33 @@ fn create_tc_retry_pattern() -> Arc<UOp> {
     UOp::sink(vec![red, m_range, n_good_range, n_bad_range])
 }
 
-#[test]
-fn test_apply_matvec_fast_path_applies_group_local_upcast() {
-    let sink = create_matvec_like_pattern(64, 128);
-    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
+/// The matvec fast path applies GROUP + LOCAL + UPCAST in one shot, unless
+/// `matvec_enabled` turns it off.
+#[test_case(true; "enabled")]
+#[test_case(false; "disabled by config")]
+fn test_apply_matvec_fast_path(enabled: bool) {
+    let mut scheduler = Scheduler::new(create_matvec_like_pattern(64, 128), Renderer::cuda());
+    let config = HeuristicsConfig::builder().matvec_enabled(enabled).build();
 
-    let config = HeuristicsConfig::default();
-    let applied = apply_matvec_fast_path(&mut scheduler, &config);
-    assert!(applied, "matvec fast-path should apply on matching pattern");
-
-    assert!(!scheduler.axes_of(&[AxisType::GroupReduce]).is_empty(), "GROUP should be applied");
-    assert!(!scheduler.axes_of(&[AxisType::Local]).is_empty(), "LOCAL should be applied");
-    assert!(!scheduler.axes_of(&[AxisType::Upcast]).is_empty(), "UPCAST should be applied");
+    assert_eq!(apply_matvec_fast_path(&mut scheduler, &config), enabled);
+    for axis in [AxisType::GroupReduce, AxisType::Local, AxisType::Upcast] {
+        assert_eq!(!scheduler.axes_of(&[axis]).is_empty(), enabled, "{axis:?}");
+    }
 }
 
-#[test]
-fn test_apply_matvec_fast_path_respects_disable_flag() {
-    let sink = create_matvec_like_pattern(64, 128);
-    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
-
-    let config = HeuristicsConfig::builder().matvec_enabled(false).build();
-    let applied = apply_matvec_fast_path(&mut scheduler, &config);
-    assert!(!applied, "matvec fast-path should be disabled by config");
-}
-
-#[test]
-fn test_apply_image_upcasts_non_stub_behavior() {
+#[test_case(DType::Image { kind: svod_dtype::ImageKind::Float, shape: vec![2, 8, 4] }, true; "image buffer")]
+#[test_case(DType::Float32, false; "plain rank three tensor")]
+fn test_apply_image_upcasts_non_stub_behavior(dtype: DType, expected: bool) {
     let g = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Global);
-    let img = UOp::new_buffer(DeviceSpec::Cpu, 64, DType::Image { kind: ImageKind::Float, shape: vec![8, 8] });
+    let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![2usize.into(), 8usize.into(), 4usize.into()]);
+    let arg = ParamArg::buffer(0, dtype.clone(), AddrSpace::Global, Some(DeviceSpec::Cpu));
+    let img = UOp::new(Op::Buffer { shape, arg }, dtype);
     let indexed = UOp::index().buffer(img).indices(vec![g.clone()]).call().expect("image index should build");
     let sink = UOp::sink(vec![indexed, g]);
 
     let mut scheduler = Scheduler::new(sink, Renderer::cpu());
-    let applied = apply_image_upcasts(&mut scheduler);
-    assert!(applied, "image upcast should apply for axis divisible by 4");
-    assert_eq!(scheduler.axes_of(&[AxisType::Upcast]).len(), 1);
+    assert_eq!(apply_image_upcasts(&mut scheduler), expected);
+    assert_eq!(scheduler.axes_of(&[AxisType::Upcast]).len(), usize::from(expected));
 }
 
 #[test]
@@ -112,4 +107,53 @@ fn test_try_tensor_cores_amx_discards_trial() {
         scheduler.applied_opts, snapshot_opts_before,
         "AMX path must leave the scheduler's applied_opts untouched (no TC commit)"
     );
+}
+
+/// Elementwise SINK with one WEAK axis plus an optional extra axis of `extra`
+/// type, so `apply_default_upcast`'s gate and axis pick can be exercised.
+fn create_default_upcast_pattern(size: i64, extra: Option<(i64, AxisType)>) -> Arc<UOp> {
+    let weak = UOp::range_axis(UOp::index_const(size), AxisId::Renumbered(0), AxisType::Weak);
+    let buf = UOp::new_buffer(DeviceSpec::Cpu, size as usize * 64, DType::Float32);
+    let (idx, mut sink_srcs) = match extra {
+        Some((extra_size, axis_type)) => {
+            let other = UOp::range_axis(UOp::index_const(extra_size), AxisId::Renumbered(1), axis_type);
+            (weak.try_add(&other).expect("index add"), vec![weak.clone(), other])
+        }
+        None => (weak.clone(), vec![weak.clone()]),
+    };
+    let val = UOp::index().buffer(buf).indices(vec![idx]).call().expect("index should build");
+    let doubled = val.try_add(&val).expect("add should succeed");
+    sink_srcs.insert(0, doubled);
+    UOp::sink(sink_srcs)
+}
+
+#[test_case(16, None, true; "divisible weak axis upcasts")]
+#[test_case(6, None, false; "size not divisible by four")]
+#[test_case(1, None, false; "size one axis is not upcastable")]
+#[test_case(16, Some((4, AxisType::Unroll)), false; "unrolled kernel skips the fallback")]
+#[test_case(16, Some((4, AxisType::Upcast)), false; "already upcast kernel skips the fallback")]
+#[test_case(16, Some((8, AxisType::Reduce)), true; "reduce axis does not block the fallback")]
+fn default_upcast_follows_tinygrad_gate(size: i64, extra: Option<(i64, AxisType)>, expected: bool) {
+    let pre_existing = usize::from(matches!(extra, Some((_, AxisType::Upcast))));
+    let mut scheduler = Scheduler::new(create_default_upcast_pattern(size, extra), Renderer::cpu());
+
+    assert_eq!(apply_default_upcast(&mut scheduler), expected);
+    assert_eq!(
+        scheduler.axes_of(&[AxisType::Upcast]).len(),
+        pre_existing + usize::from(expected),
+        "UPCAST axis count after the fallback"
+    );
+}
+
+#[test]
+fn default_upcast_picks_the_innermost_upcastable_axis() {
+    // Tinygrad takes `k.upcastable_dims[-1]`; both axes qualify here, and only
+    // the trailing one must be split.
+    let sink = create_default_upcast_pattern(16, Some((8, AxisType::Global)));
+    let mut scheduler = Scheduler::new(sink, Renderer::cpu());
+    let innermost = *scheduler.upcastable_dims().last().expect("two upcastable dims");
+
+    assert!(apply_default_upcast(&mut scheduler));
+    let opt = scheduler.applied_opts.iter().find(|opt| opt.op == OptOps::UPCAST).expect("UPCAST recorded");
+    assert_eq!(opt.axis, Some(innermost));
 }

@@ -53,17 +53,23 @@ pub fn eval_unary_op(op: UnaryOp, v: ConstValue) -> Option<ConstValue> {
 /// - Arithmetic operations preserve LHS type
 /// - Comparison operations return Bool
 /// - Bitwise operations require integer/bool types
+/// - Invalid operands propagate Invalid
 /// - Division by zero returns None
 /// - Integer operations use wrapping arithmetic
 pub fn eval_binary_op(op: BinaryOp, a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+    if a == ConstValue::Invalid || b == ConstValue::Invalid {
+        return Some(ConstValue::Invalid);
+    }
     match op {
         BinaryOp::Add => eval_add(a, b),
         BinaryOp::Mul => eval_mul(a, b),
         BinaryOp::Sub => eval_sub(a, b),
-        BinaryOp::Mod => eval_mod(a, b),
+        BinaryOp::FloorMod => eval_floor_mod(a, b),
+        BinaryOp::CMod => eval_cmod(a, b),
         BinaryOp::Max => eval_max(a, b),
         BinaryOp::Pow => eval_pow(a, b),
-        BinaryOp::Idiv => eval_idiv(a, b),
+        BinaryOp::FloorDiv => eval_floor_div(a, b),
+        BinaryOp::CDiv => eval_cdiv(a, b),
         BinaryOp::Fdiv => eval_fdiv(a, b),
         BinaryOp::Lt => eval_lt(a, b),
         BinaryOp::Le => eval_le(a, b),
@@ -320,9 +326,9 @@ pub fn eval_sub(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
 }
 
 #[inline]
-fn eval_mod(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+fn eval_cmod(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
     match (a, b) {
-        (ConstValue::Int(x), ConstValue::Int(y)) if y != 0 => Some(ConstValue::Int(x % y)),
+        (ConstValue::Int(x), ConstValue::Int(y)) if y != 0 => x.checked_rem(y).map(ConstValue::Int),
         (ConstValue::UInt(x), ConstValue::UInt(y)) if y != 0 => Some(ConstValue::UInt(x % y)),
         _ => None,
     }
@@ -356,10 +362,35 @@ fn eval_pow(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
 }
 
 #[inline]
-fn eval_idiv(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+fn eval_cdiv(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
     match (a, b) {
-        (ConstValue::Int(x), ConstValue::Int(y)) if y != 0 => Some(ConstValue::Int(x / y)),
+        (ConstValue::Int(x), ConstValue::Int(y)) if y != 0 => x.checked_div(y).map(ConstValue::Int),
         (ConstValue::UInt(x), ConstValue::UInt(y)) if y != 0 => Some(ConstValue::UInt(x / y)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_floor_div(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+    match (a, b) {
+        (ConstValue::Int(x), ConstValue::Int(y)) if y != 0 => {
+            let q = x.checked_div(y)?;
+            let r = x.checked_rem(y)?;
+            Some(ConstValue::Int(if r != 0 && (x < 0) != (y < 0) { q - 1 } else { q }))
+        }
+        (ConstValue::UInt(x), ConstValue::UInt(y)) if y != 0 => Some(ConstValue::UInt(x / y)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_floor_mod(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+    match (a, b) {
+        (ConstValue::Int(x), ConstValue::Int(y)) if y != 0 => {
+            let r = x.checked_rem(y)?;
+            Some(ConstValue::Int(if r != 0 && (r < 0) != (y < 0) { r + y } else { r }))
+        }
+        (ConstValue::UInt(x), ConstValue::UInt(y)) if y != 0 => Some(ConstValue::UInt(x % y)),
         _ => None,
     }
 }
@@ -524,12 +555,17 @@ fn eval_mulacc(a: ConstValue, b: ConstValue, c: ConstValue) -> Option<ConstValue
 
 use svod_dtype::ScalarDType;
 
+#[inline]
+fn commit_eval_result(value: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
+    value.cast(&svod_dtype::DType::Scalar(dtype))
+}
+
 /// Evaluate unary op with dtype-aware truncation (for constant folding).
 ///
 /// Applies truncation after evaluation to ensure results fit within dtype boundaries.
 #[inline]
 pub fn eval_unary_op_typed(op: UnaryOp, v: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
-    eval_unary_op(op, v).map(|r| r.truncate(dtype))
+    eval_unary_op(op, v).and_then(|r| commit_eval_result(r, dtype))
 }
 
 /// Evaluate binary op with dtype-aware truncation (for constant folding).
@@ -537,7 +573,7 @@ pub fn eval_unary_op_typed(op: UnaryOp, v: ConstValue, dtype: ScalarDType) -> Op
 /// Applies truncation after evaluation to ensure results fit within dtype boundaries.
 #[inline]
 pub fn eval_binary_op_typed(op: BinaryOp, a: ConstValue, b: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
-    eval_binary_op(op, a, b).map(|r| r.truncate(dtype))
+    eval_binary_op(op, a, b).and_then(|r| commit_eval_result(r, dtype))
 }
 
 /// Evaluate ternary op with dtype-aware truncation (for constant folding).
@@ -551,25 +587,25 @@ pub fn eval_ternary_op_typed(
     c: ConstValue,
     dtype: ScalarDType,
 ) -> Option<ConstValue> {
-    eval_ternary_op(op, a, b, c).map(|r| r.truncate(dtype))
+    eval_ternary_op(op, a, b, c).and_then(|r| commit_eval_result(r, dtype))
 }
 
 /// Evaluate addition with dtype-aware truncation.
 #[inline]
 pub fn eval_add_typed(a: ConstValue, b: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
-    eval_add(a, b).map(|r| r.truncate(dtype))
+    eval_add(a, b).and_then(|r| commit_eval_result(r, dtype))
 }
 
 /// Evaluate multiplication with dtype-aware truncation.
 #[inline]
 pub fn eval_mul_typed(a: ConstValue, b: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
-    eval_mul(a, b).map(|r| r.truncate(dtype))
+    eval_mul(a, b).and_then(|r| commit_eval_result(r, dtype))
 }
 
 /// Evaluate subtraction with dtype-aware truncation.
 #[inline]
 pub fn eval_sub_typed(a: ConstValue, b: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
-    eval_sub(a, b).map(|r| r.truncate(dtype))
+    eval_sub(a, b).and_then(|r| commit_eval_result(r, dtype))
 }
 
 // ============================================================================

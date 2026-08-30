@@ -504,7 +504,7 @@ impl WhisperRecognizer {
             // ── Encode: one dispatch for b windows ───────────────────────────
             if profile {
                 let graph_started = Instant::now();
-                let kernels = self.encoder_jit.execute_profiled().context(JitSnafu)?;
+                let kernels = self.encoder_jit.execute_profiled_static().context(JitSnafu)?;
                 self.encoder_jit.output().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
                 encoder_profile.record(graph_started.elapsed(), kernels);
             } else {
@@ -539,7 +539,7 @@ impl WhisperRecognizer {
                 }
                 if profile {
                     let graph_started = Instant::now();
-                    let kernels = self.cross_kv_jit.execute_profiled().context(JitSnafu)?;
+                    let kernels = self.cross_kv_jit.execute_profiled_static().context(JitSnafu)?;
                     self.cross_kv_jit.cross_k().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
                     cross_kv_profile.record(graph_started.elapsed(), kernels);
                 } else {

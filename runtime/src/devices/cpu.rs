@@ -8,8 +8,11 @@
 //! - `SVOD_CPU_BACKEND` environment variable ("clang" or "llvm")
 //! - Explicit `create_cpu_device_with_backend()` call
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use svod_device::Result;
 use svod_device::device::{Compiler, Device, Program, ProgramSpec, Renderer, RuntimeFactory};
 use svod_device::registry::DeviceRegistry;
@@ -17,11 +20,12 @@ use svod_dtype::DeviceSpec;
 use svod_ir::UOp;
 
 use crate::LlvmKernel;
-use crate::clang::ClangKernel;
+use crate::clang::{ClangKernel, ClangToolchain, c_object_flags, compile_c_object, validate_c_object};
 use crate::dispatch::KernelCif;
+use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA, ObjectCache, ObjectCacheKey};
 
 /// CPU backend selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CpuBackend {
     /// Clang C codegen backend (default).
     /// Generates C source, compiles with clang, loads via dlopen.
@@ -30,10 +34,6 @@ pub enum CpuBackend {
     /// LLVM JIT backend.
     /// Maximum optimization, slower compilation.
     Llvm,
-    /// MLIR backend.
-    /// Generates MLIR, lowers to LLVM IR, then JIT compiles.
-    #[cfg(feature = "mlir")]
-    Mlir,
 }
 
 impl CpuBackend {
@@ -42,8 +42,6 @@ impl CpuBackend {
         match std::env::var("SVOD_CPU_BACKEND").as_deref() {
             Ok("clang") | Ok("CLANG") => CpuBackend::Clang,
             Ok("llvm") | Ok("LLVM") => CpuBackend::Llvm,
-            #[cfg(feature = "mlir")]
-            Ok("mlir") | Ok("MLIR") => CpuBackend::Mlir,
             _ => CpuBackend::default(),
         }
     }
@@ -91,18 +89,19 @@ unsafe fn execute_parallel(
         for core_id in 0..core_count {
             let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
             unsafe {
-                cif.dispatch(fn_ptr_usize as *const (), bufs, vals, Some((core_id_idx, core_id)));
+                cif.dispatch(fn_ptr_usize as *const (), bufs, vals, Some((core_id_idx, core_id)))?;
             }
         }
         return Ok(());
     }
 
-    (0..core_count).into_par_iter().for_each(|core_id| {
+    (0..core_count).into_par_iter().try_for_each(|core_id| -> Result<()> {
         let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
         unsafe {
-            cif.dispatch(fn_ptr_usize as *const (), bufs, vals, Some((core_id_idx, core_id)));
+            cif.dispatch(fn_ptr_usize as *const (), bufs, vals, Some((core_id_idx, core_id)))?;
         }
-    });
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -124,7 +123,7 @@ unsafe fn execute_kernel(
     if let Some(count) = core_count {
         unsafe { execute_parallel(cif, fn_ptr, buffers, vals, var_names, count) }
     } else {
-        unsafe { cif.dispatch(fn_ptr, buffers, vals, None) };
+        unsafe { cif.dispatch(fn_ptr, buffers, vals, None)? };
         Ok(())
     }
 }
@@ -162,6 +161,19 @@ struct ClangRendererWrapper {
     device: DeviceSpec,
 }
 
+fn renderer_supported_ops() -> svod_ir::RendererOps {
+    let mut ops = svod_ir::RendererOps::all();
+    ops.binary.remove(&svod_ir::BinaryOp::Threefry);
+    ops.binary.remove(&svod_ir::BinaryOp::Max);
+    ops
+}
+
+fn llvm_renderer_supported_ops() -> svod_ir::RendererOps {
+    let mut ops = renderer_supported_ops();
+    ops.unary.remove(&svod_ir::UnaryOp::Erf);
+    ops
+}
+
 impl Renderer for ClangRendererWrapper {
     fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
         let rendered = svod_codegen::c::render(ast, name.or(Some("kernel")))
@@ -170,7 +182,7 @@ impl Renderer for ClangRendererWrapper {
         let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
 
         spec.set_var_names(rendered.var_names.clone());
-        spec.apply_derived_metadata_from_ast();
+        spec.abi = rendered.abi.clone();
         if spec.buf_count == 0 {
             spec.buf_count = rendered.buffer_args.len();
         }
@@ -181,38 +193,60 @@ impl Renderer for ClangRendererWrapper {
     fn device(&self) -> &DeviceSpec {
         &self.device
     }
+
+    fn supported_ops(&self) -> svod_ir::RendererOps {
+        renderer_supported_ops()
+    }
 }
 
-/// Clang compiler - passes C source through for clang compilation.
-struct ClangCompiler;
+/// Clang compiler. Unlike LLVM JIT, this boundary emits reusable object bytes;
+/// the runtime factory only validates and loads those bytes.
+struct ClangCompiler {
+    cache: Option<Arc<ObjectCache>>,
+    toolchain: ClangToolchain,
+    flags: Vec<String>,
+    identity: CompilerIdentity,
+    cache_key: String,
+}
 
 impl Compiler for ClangCompiler {
     fn compile(&self, spec: &ProgramSpec) -> Result<svod_device::device::CompiledSpec> {
-        let mut compiled = svod_device::device::CompiledSpec::from_source(
+        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
+        let bytes = if let Some(cache) = &self.cache {
+            cache.get_or_compile(
+                &key,
+                |bytes| validate_c_object(bytes, &spec.name),
+                || compile_c_object(&self.toolchain, &spec.src, &self.flags),
+            )
+        } else {
+            compile_c_object(&self.toolchain, &spec.src, &self.flags)
+                .and_then(|bytes| validate_c_object(&bytes, &spec.name).map(|()| bytes))
+        }
+        .map_err(runtime_as_device)?;
+        let mut compiled = svod_device::device::CompiledSpec::from_bytes(
             spec.name.clone(),
-            spec.src.clone(),
+            bytes,
             spec.ast.clone(),
-            spec.buf_count,
-        );
-        compiled.var_names = spec.var_names.clone();
+            spec.abi.clone(),
+        )?;
         compiled.global_size = spec.global_size.clone();
         compiled.local_size = spec.local_size.clone();
         Ok(compiled)
     }
 
-    fn cache_key(&self) -> &'static str {
-        "clang"
+    fn cache_key(&self) -> &str {
+        &self.cache_key
     }
 }
 
 /// Runtime factory for creating Clang programs.
 fn create_clang_program(spec: &svod_device::device::CompiledSpec) -> Result<Box<dyn Program>> {
-    let src = spec.src.as_ref().ok_or_else(|| svod_device::Error::Runtime {
-        message: "Clang backend requires source code in CompiledSpec".to_string(),
-    })?;
-
-    let kernel = ClangKernel::compile(src, &spec.name, spec.var_names.clone(), spec.buf_count)
-        .map_err(|e| svod_device::Error::Runtime { message: format!("Clang compilation failed: {}", e) })?;
+    svod_device::device::validate_abi_descriptors(&spec.abi, spec.buf_count, &spec.var_names)?;
+    if spec.bytes.is_empty() {
+        return Err(svod_device::Error::Runtime { message: "Clang backend requires compiled object bytes".into() });
+    }
+    let kernel = ClangKernel::load_object_with_abi(&spec.bytes, &spec.name, spec.var_names.clone(), &spec.abi)
+        .map_err(|e| svod_device::Error::Runtime { message: format!("Clang object load failed: {e}") })?;
 
     Ok(Box::new(ClangProgram { kernel }))
 }
@@ -245,25 +279,42 @@ impl Program for LlvmProgram {
     }
 }
 
-/// LLVM compiler implementing the Compiler trait.
-struct LlvmCompiler;
+/// LLVM-text compiler backed by external Clang object emission.
+struct LlvmCompiler {
+    cache: Option<Arc<ObjectCache>>,
+    toolchain: ClangToolchain,
+    flags: Vec<String>,
+    identity: CompilerIdentity,
+    cache_key: String,
+}
 
 impl Compiler for LlvmCompiler {
     fn compile(&self, spec: &svod_device::device::ProgramSpec) -> Result<svod_device::device::CompiledSpec> {
-        let mut compiled = svod_device::device::CompiledSpec::from_source(
+        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
+        let bytes = if let Some(cache) = &self.cache {
+            cache.get_or_compile(
+                &key,
+                |bytes| crate::clang::validate_relocatable_object(bytes, &spec.name),
+                || crate::llvm::compile_ir_to_object_with(&self.toolchain, &spec.src, &self.flags),
+            )
+        } else {
+            crate::llvm::compile_ir_to_object_with(&self.toolchain, &spec.src, &self.flags)
+                .and_then(|bytes| crate::clang::validate_relocatable_object(&bytes, &spec.name).map(|()| bytes))
+        }
+        .map_err(runtime_as_device)?;
+        let mut compiled = svod_device::device::CompiledSpec::from_bytes(
             spec.name.clone(),
-            spec.src.clone(),
+            bytes,
             spec.ast.clone(),
-            spec.buf_count,
-        );
-        compiled.var_names = spec.var_names.clone();
+            spec.abi.clone(),
+        )?;
         compiled.global_size = spec.global_size.clone();
         compiled.local_size = spec.local_size.clone();
         Ok(compiled)
     }
 
-    fn cache_key(&self) -> &'static str {
-        "llvm-jit"
+    fn cache_key(&self) -> &str {
+        &self.cache_key
     }
 }
 
@@ -280,7 +331,7 @@ impl Renderer for LlvmRendererWrapper {
         let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
 
         spec.set_var_names(rendered.var_names.clone());
-        spec.apply_derived_metadata_from_ast();
+        spec.abi = rendered.abi.clone();
         if spec.buf_count == 0 {
             spec.buf_count = rendered.buffer_args.len();
         }
@@ -291,184 +342,28 @@ impl Renderer for LlvmRendererWrapper {
     fn device(&self) -> &DeviceSpec {
         &self.device
     }
+
+    fn supported_ops(&self) -> svod_ir::RendererOps {
+        llvm_renderer_supported_ops()
+    }
+
+    fn extra_matcher(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
+        Some(svod_codegen::llvm::cpu_extra_matcher())
+    }
 }
 
 /// Runtime factory for creating LLVM programs.
 fn create_llvm_program(spec: &svod_device::device::CompiledSpec) -> Result<Box<dyn Program>> {
-    let src = spec.src.as_ref().ok_or_else(|| svod_device::Error::Runtime {
-        message: "LLVM JIT requires source code in CompiledSpec".to_string(),
-    })?;
-
-    let kernel = crate::LlvmKernel::compile_ir(src, &spec.name, &spec.name, spec.var_names.clone(), spec.buf_count)
-        .map_err(|e| svod_device::Error::Runtime { message: format!("LLVM JIT compilation failed: {}", e) })?;
+    svod_device::device::validate_abi_descriptors(&spec.abi, spec.buf_count, &spec.var_names)?;
+    if spec.bytes.is_empty() {
+        return Err(svod_device::Error::Runtime { message: "LLVM backend requires compiled object bytes".into() });
+    }
+    let kernel =
+        crate::LlvmKernel::load_object_with_abi(&spec.bytes, &spec.name, &spec.name, spec.var_names.clone(), &spec.abi)
+            .map_err(|e| svod_device::Error::Runtime { message: format!("LLVM JIT compilation failed: {}", e) })?;
 
     Ok(Box::new(LlvmProgram { kernel }))
 }
-
-// =============================================================================
-// MLIR Backend
-// =============================================================================
-
-#[cfg(feature = "mlir")]
-mod mlir_backend {
-    use std::ffi::c_void;
-
-    use super::*;
-
-    type MlirKernelFn = unsafe extern "C" fn(*const *mut u8, *const i64);
-
-    unsafe fn dispatch_mlir_fn(fn_ptr: *const c_void, buffers: &[*mut u8], vals: &[i64]) {
-        let kernel: MlirKernelFn = unsafe { std::mem::transmute(fn_ptr) };
-        let buffer_usizes: Vec<usize> = buffers.iter().map(|&ptr| ptr as usize).collect();
-        let bufs_ptr = buffer_usizes.as_ptr() as *const *mut u8;
-        unsafe {
-            kernel(bufs_ptr, vals.as_ptr());
-        }
-    }
-
-    unsafe fn execute_mlir_parallel(
-        fn_ptr: *const c_void,
-        buffers: &[*mut u8],
-        vals: &[i64],
-        var_names: &[String],
-        core_count: usize,
-    ) -> Result<()> {
-        use rayon::prelude::*;
-
-        let core_id_idx = var_names.iter().position(|n| n == "core_id").ok_or_else(|| svod_device::Error::Runtime {
-            message: "parallel MLIR CPU launch requires core_id runtime variable".to_string(),
-        })?;
-        let fn_ptr_usize = fn_ptr as usize;
-
-        // Convert raw pointers to usize for Send-safe cross-thread sharing.
-        let buf_ptr = buffers.as_ptr() as usize;
-        let buf_len = buffers.len();
-        let vals = vals.to_vec();
-
-        // Avoid nested parallelism when already executing inside rayon worker.
-        if rayon::current_thread_index().is_some() {
-            for core_id in 0..core_count {
-                let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
-                let mut thread_vals = vals.clone();
-                thread_vals[core_id_idx] = core_id as i64;
-                unsafe { dispatch_mlir_fn(fn_ptr_usize as *const c_void, bufs, &thread_vals) };
-            }
-            return Ok(());
-        }
-
-        (0..core_count).into_par_iter().for_each(|core_id| {
-            let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
-            let mut thread_vals = vals.clone();
-            thread_vals[core_id_idx] = core_id as i64;
-            unsafe { dispatch_mlir_fn(fn_ptr_usize as *const c_void, bufs, &thread_vals) };
-        });
-
-        Ok(())
-    }
-
-    /// MLIR program wrapper using ExecutionEngine.
-    pub struct MlirProgram {
-        pub kernel: crate::mlir::MlirKernel,
-    }
-
-    impl Program for MlirProgram {
-        unsafe fn execute(
-            &self,
-            buffers: &[*mut u8],
-            vals: &[i64],
-            global_size: Option<[usize; 3]>,
-            _local_size: Option<[usize; 3]>,
-            _wait: bool,
-        ) -> Result<()> {
-            let core_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
-            let fn_ptr = self
-                .kernel
-                .fn_ptr()
-                .map_err(|e| svod_device::Error::Runtime { message: format!("MLIR kernel lookup failed: {e}") })?;
-
-            if let Some(count) = core_count {
-                unsafe { execute_mlir_parallel(fn_ptr, buffers, vals, self.kernel.var_names(), count) }
-            } else {
-                unsafe { dispatch_mlir_fn(fn_ptr, buffers, vals) };
-                Ok(())
-            }
-        }
-
-        fn name(&self) -> &str {
-            self.kernel.name()
-        }
-    }
-
-    /// MLIR renderer wrapper implementing the Renderer trait.
-    pub struct MlirRendererWrapper {
-        pub device: DeviceSpec,
-    }
-
-    impl Renderer for MlirRendererWrapper {
-        fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
-            let rendered = svod_codegen::mlir::render(ast, name.or(Some("kernel")))
-                .map_err(|e| svod_device::Error::Runtime { message: format!("MLIR rendering failed: {}", e) })?;
-
-            let mut spec =
-                ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
-
-            spec.set_var_names(rendered.var_names.clone());
-            spec.apply_derived_metadata_from_ast();
-            if spec.buf_count == 0 {
-                spec.buf_count = rendered.buffer_args.len();
-            }
-
-            Ok(spec)
-        }
-
-        fn device(&self) -> &DeviceSpec {
-            &self.device
-        }
-
-        fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
-            use svod_ir::decompositions::ptrcat_decomposition_patterns;
-            Some(ptrcat_decomposition_patterns())
-        }
-    }
-
-    /// MLIR compiler implementing the Compiler trait.
-    pub struct MlirCompiler;
-
-    impl Compiler for MlirCompiler {
-        fn compile(&self, spec: &svod_device::device::ProgramSpec) -> Result<svod_device::device::CompiledSpec> {
-            let mut compiled = svod_device::device::CompiledSpec::from_source(
-                spec.name.clone(),
-                spec.src.clone(),
-                spec.ast.clone(),
-                spec.buf_count,
-            );
-            compiled.var_names = spec.var_names.clone();
-            compiled.global_size = spec.global_size.clone();
-            compiled.local_size = spec.local_size.clone();
-            Ok(compiled)
-        }
-
-        fn cache_key(&self) -> &'static str {
-            "mlir-exec-engine"
-        }
-    }
-
-    /// Runtime factory for creating MLIR programs.
-    pub fn create_mlir_program(spec: &svod_device::device::CompiledSpec) -> Result<Box<dyn Program>> {
-        let src = spec.src.as_ref().ok_or_else(|| svod_device::Error::Runtime {
-            message: "MLIR backend requires source code (MLIR text) in CompiledSpec".to_string(),
-        })?;
-
-        let kernel = crate::mlir::MlirKernel::compile(src, &spec.name, spec.var_names.clone()).map_err(|e| {
-            svod_device::Error::Runtime { message: format!("MLIR ExecutionEngine compilation failed: {}", e) }
-        })?;
-
-        Ok(Box::new(MlirProgram { kernel }))
-    }
-}
-
-#[cfg(feature = "mlir")]
-use mlir_backend::{MlirCompiler, MlirRendererWrapper, create_mlir_program};
 
 // =============================================================================
 // Public API
@@ -487,26 +382,102 @@ pub fn create_cpu_device(registry: &DeviceRegistry) -> Result<Device> {
 pub fn create_cpu_device_with_backend(registry: &DeviceRegistry, backend: CpuBackend) -> Result<Device> {
     let device_spec = DeviceSpec::Cpu;
     let allocator = registry.get(&device_spec)?;
+    let (renderer, compiler) = create_cpu_codegen(backend)?;
+    let runtime: RuntimeFactory = match backend {
+        CpuBackend::Clang => Arc::new(create_clang_program),
+        CpuBackend::Llvm => Arc::new(create_llvm_program),
+    };
+    Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
+}
 
+/// CPU devices memoized per backend, for the process-global allocator registry.
+///
+/// Building a CPU device probes the clang toolchain (`ClangToolchain::discover`
+/// plus `target_identity`), which costs ~20 ms. Callers that resolve a device
+/// per schedule item must not pay that per item.
+static CPU_DEVICES: Lazy<RwLock<HashMap<CpuBackend, Arc<Device>>>> = Lazy::new(Default::default);
+
+/// Get or create the shared CPU device for `backend`.
+///
+/// Repeated calls with the process-global allocator registry return the same
+/// `Arc`; distinct backends get distinct devices. Any other registry bypasses
+/// the cache, since a cached device holds the allocators it was built with.
+pub fn cpu_device_with_backend(registry: &DeviceRegistry, backend: CpuBackend) -> Result<Arc<Device>> {
+    if !std::ptr::eq(registry, svod_device::registry::registry()) {
+        return Ok(Arc::new(create_cpu_device_with_backend(registry, backend)?));
+    }
+    if let Some(device) = CPU_DEVICES.read().get(&backend) {
+        return Ok(Arc::clone(device));
+    }
+    let mut devices = CPU_DEVICES.write();
+    if let Some(device) = devices.get(&backend) {
+        return Ok(Arc::clone(device));
+    }
+    let device = Arc::new(create_cpu_device_with_backend(registry, backend)?);
+    devices.insert(backend, Arc::clone(&device));
+    Ok(device)
+}
+
+/// Construct CPU renderer/compiler components without creating an allocator or
+/// executable runtime. Clean BEAM workers use this device-disabled path.
+pub fn create_cpu_codegen(backend: CpuBackend) -> Result<(Arc<dyn Renderer>, Arc<dyn Compiler>)> {
+    let device_spec = DeviceSpec::Cpu;
     match backend {
         CpuBackend::Clang => {
-            let renderer = Arc::new(ClangRendererWrapper { device: device_spec.clone() });
-            let compiler = Arc::new(ClangCompiler);
-            let runtime: RuntimeFactory = Arc::new(create_clang_program);
-            Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
+            let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
+            let toolchain = ClangToolchain::discover(cache.as_deref()).map_err(runtime_as_device)?;
+            let flags = c_object_flags();
+            let target_architecture = toolchain.target_identity(cache.as_deref(), &flags).map_err(runtime_as_device)?;
+            let identity = CompilerIdentity {
+                schema: OBJECT_CACHE_SCHEMA,
+                backend: "cpu-clang".into(),
+                target_architecture,
+                toolchain: toolchain.identity().into(),
+                flags: flags.clone(),
+                abi: format!(
+                    "svod-c-kernel-abi-v1;pointer-width={};endian={}",
+                    usize::BITS,
+                    if cfg!(target_endian = "little") { "little" } else { "big" }
+                ),
+                object_format: if cfg!(feature = "dlopen-fallback") {
+                    "elf-shared-dlopen-v1".into()
+                } else {
+                    "elf-relocatable-svod-jit-loader-v1".into()
+                },
+            };
+            let cache_key = identity.cache_key();
+            Ok((
+                Arc::new(ClangRendererWrapper { device: device_spec }),
+                Arc::new(ClangCompiler { cache, toolchain, flags, identity, cache_key }),
+            ))
         }
         CpuBackend::Llvm => {
-            let renderer = Arc::new(LlvmRendererWrapper { device: device_spec.clone() });
-            let compiler = Arc::new(LlvmCompiler);
-            let runtime: RuntimeFactory = Arc::new(create_llvm_program);
-            Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
-        }
-        #[cfg(feature = "mlir")]
-        CpuBackend::Mlir => {
-            let renderer = Arc::new(MlirRendererWrapper { device: device_spec.clone() });
-            let compiler = Arc::new(MlirCompiler);
-            let runtime: RuntimeFactory = Arc::new(create_mlir_program);
-            Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
+            let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
+            let toolchain = ClangToolchain::discover(cache.as_deref()).map_err(runtime_as_device)?;
+            let flags = crate::llvm::llvm_object_flags();
+            let target_architecture = toolchain.target_identity(cache.as_deref(), &flags).map_err(runtime_as_device)?;
+            let identity = CompilerIdentity {
+                schema: OBJECT_CACHE_SCHEMA,
+                backend: "cpu-llvm-clang".into(),
+                target_architecture,
+                toolchain: toolchain.identity().into(),
+                flags: flags.clone(),
+                abi: format!(
+                    "svod-llvm-kernel-abi-v1;pointer-width={};endian={}",
+                    usize::BITS,
+                    if cfg!(target_endian = "little") { "little" } else { "big" }
+                ),
+                object_format: "elf-relocatable-svod-jit-loader-v1".into(),
+            };
+            let cache_key = identity.cache_key();
+            Ok((
+                Arc::new(LlvmRendererWrapper { device: device_spec }),
+                Arc::new(LlvmCompiler { cache, toolchain, flags, identity, cache_key }),
+            ))
         }
     }
+}
+
+fn runtime_as_device(error: crate::Error) -> svod_device::Error {
+    svod_device::Error::Runtime { message: error.to_string() }
 }

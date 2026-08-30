@@ -259,7 +259,7 @@ Store {
 }
 ```
 
-Write value to buffer. The buffer is accessed through the INDEX node (via `index.src[0]`), not a separate field. STORE closes the specified ranges, which represent output iteration dimensions. The ranges field is used for output upcasting: when a `Range(Upcast)` is included, it becomes `UNROLL` during expansion, then contracted via `CONTRACT`.
+Write value to buffer. The buffer is accessed through the INDEX node (via `index.src[0]`), not a separate field. STORE closes the specified ranges, which represent output iteration dimensions. UPCAST and UNROLL remain range axis classifications during expansion.
 
 For gated stores, use an INDEX with a gate (INDEX has an optional `gate` field).
 
@@ -347,7 +347,7 @@ Program {
 Carries a kernel through the `SINK → LINEAR → SOURCE → PROGRAM_BINARY`
 staging enforced by `codegen/src/program_pipeline.rs`
 (`do_linearize`/`do_render`/`do_compile`/`get_program`). Each stage fills in
-the next field. The C/LLVM/MLIR renderers expect `Op::Linear` input and
+the next field. The C/LLVM renderers expect `Op::Linear` input and
 surface `Error::InvalidGraph` via per-context `pending_error` rather than
 panicking; multi-index `INDEX`s must be lowered with `pm_linearize_multi_index`
 before render.
@@ -364,7 +364,7 @@ directly without re-walking the graph.
 ### SOURCE / PROGRAM_BINARY — Compilation Artifacts
 
 ```rust
-Source { code: String }              // rendered source (C / LLVM-IR / MLIR)
+Source { code: String }              // rendered source (C / LLVM-IR)
 ProgramBinary { bytes: Vec<u8> }     // compiled artifact
 ```
 
@@ -476,69 +476,9 @@ VConst {
 
 Vector of compile-time constants. More efficient than `VECTORIZE` of `CONST` nodes.
 
-### CAT — Concatenate Vectors
-
-```rust
-Cat {
-    sources: SmallVec<[Arc<UOp>; 4]>,
-}
-```
-
-Concatenates vectors into a larger vector. Output `vcount` = sum of input `vcount`s.
-
-**Example:**
-```mermaid
-flowchart TD
-  CAT["CAT : 8 x Float32"] --> V1["VECTORIZE : 4 x Float32"]
-  CAT --> V2["VECTORIZE : 4 x Float32"]
-```
-
-### PtrCat — Concatenate Pointers
-
-```rust
-PtrCat {
-    sources: SmallVec<[Arc<UOp>; 4]>,
-}
-```
-
-Groups memory accesses for vectorized load/store. Used by the devectorizer pass.
-
----
-
-## Expansion: UNROLL and CONTRACT
-
-### UNROLL — Expand Computation Across Iterations
-
-```rust
-Unroll {
-    src: Arc<UOp>,                       // computation to expand
-    unroll_axes: Vec<(usize, usize)>,    // (axis_index, factor) pairs
-}
-```
-
-Creates multiple versions of computation for different iteration values. Used for loop unrolling optimization.
-
-**Example:** `UNROLL(unroll_axes=[(0, 4)])` expands computation 4 times with different index values.
-
-### CONTRACT — Collapse Unrolled Values to Vector
-
-```rust
-Contract {
-    src: Arc<UOp>,                       // unrolled computation
-    upcast_ranges: Vec<(usize, usize)>,  // (axis_index, factor) pairs
-}
-```
-
-The inverse of UNROLL—collects expanded scalar values into a vector. Output vector size = product of factors.
-
-**Example:**
-```mermaid
-flowchart TD
-  CT["CONTRACT(upcast_ranges=[(0, 4)]) : 4 x Float32"] --> U["UNROLL(unroll_axes=[(0, 4)])"]
-  U --> L["LOAD(...)"]
-```
-
-This pattern vectorizes a load: expand 4 iterations, then pack results into a 4-element vector.
+Lane aggregation uses `STACK`; lane and address selection use `INDEX`. Loop
+unrolling is represented by `Range` with `AxisType::Unroll`, not a separate
+operation. Tensor-core expansion axes live in `WmmaMetadata`.
 
 ---
 
@@ -742,7 +682,7 @@ The following operations exist in the `Op` enum but are either internal or rarel
 | Operation | Purpose |
 |-----------|---------|
 | `Copy` | Explicit copy of a value |
-| `BufferView` | `{ buffer, size, offset }` — slice of an existing buffer at an offset |
+| `Slice` | `{ buffer, offset, size }` - contiguous typed slice metadata over a buffer |
 | `MStack` | Memory stack allocation |
 | `MSelect` | Memory select (conditional memory access) |
 | `Multi` | Multi-output operation |
@@ -764,10 +704,10 @@ The following operations exist in the `Op` enum but are either internal or rarel
 |----------|------------|
 | **Loop Control** | `RANGE`, `END` |
 | **Reduction** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **Memory** | `BUFFER`, `BUFFER_VIEW`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
+| **Memory** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE` |
 | **Kernel & Callable** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
-| **Vector** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
-| **Expansion** | `UNROLL`, `CONTRACT` |
+| **Vector** | `STACK`, `INDEX`, `VCONST` |
+| **Expansion** | `RANGE` with `AxisType::Upcast` or `AxisType::Unroll` |
 | **Hardware** | `WMMA`, `SPECIAL` |
 | **Control** | `IF`, `ENDIF` |
 | **Definition** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `LUNIQUE`, `DEVICE` |

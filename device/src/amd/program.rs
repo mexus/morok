@@ -15,10 +15,9 @@ use object::read::elf::FileHeader;
 use object::{LittleEndian, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget};
 use tracing::debug;
 
-use crate::allocator::{Allocator, BufferSpec, RawBuffer};
+use crate::allocator::{Allocator, AmdBufferGuard, BufferSpec, RawBuffer};
 use crate::amd::AmdAllocator;
 use crate::amd::device::AmdDevice;
-use crate::amd::queue::build_dispatch_packet;
 use crate::amd::sys::hsa::AmdHsaKernelDescriptor;
 use crate::device::Program;
 use crate::error::{Error, Result};
@@ -232,6 +231,17 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
 /// graph callers downcast to `AmdProgram` and route through
 /// `execute_on(&OwnerCtx, …)` with their OWN owner context — so one cached
 /// program safely services any number of plans on the same physical AMD:N.
+#[derive(Debug)]
+pub(crate) struct CodeObject {
+    buffer: RawBuffer,
+}
+
+impl Drop for CodeObject {
+    fn drop(&mut self) {
+        self.buffer.free_amd_device_in_place();
+    }
+}
+
 pub struct AmdProgram {
     name: String,
     /// Device handle — used by the `Program::execute` trait method to assign an
@@ -271,21 +281,23 @@ pub struct AmdProgram {
     buf_count: usize,
     /// Number of scalar (i64) variable arguments.
     var_count: usize,
-    /// Keep the VRAM code-object buffer alive for the program's lifetime.
-    _code_buf: RawBuffer,
+    abi: Vec<crate::device::AbiParamDescriptor>,
+    /// Shared by the program and every captured/in-flight command that can
+    /// execute it. The allocation is released only after the last GPU use.
+    code: Arc<CodeObject>,
 }
 
 impl AmdProgram {
     /// Load `bytes` (an AMDGPU code object from clang) into VRAM and resolve
-    /// the named kernel.
+    /// the named kernel using its complete, ordered PARAM ABI.
     pub fn load(
         device: Arc<AmdDevice>,
         allocator: &AmdAllocator,
         bytes: &[u8],
         kernel_name: &str,
-        buf_count: usize,
-        var_count: usize,
+        abi: &[crate::device::AbiParamDescriptor],
     ) -> Result<Self> {
+        let (abi, buf_count, var_count) = retain_program_abi(abi)?;
         let parsed = parse_kernel(bytes, kernel_name)?;
 
         // Scratch is no longer ensured here — there is no shared "default
@@ -299,8 +311,8 @@ impl AmdProgram {
         // AmdAllocator alloc; clang's amdgcn output runs on the GPU side).
         let size = parsed.image.len().next_multiple_of(0x1000);
         let opts = BufferSpec { cpu_access: true, nolru: true, ..Default::default() };
-        let code_buf = allocator.alloc(size, &opts, /*zero=*/ false)?;
-        let (code_gpu, code_host) = match &code_buf {
+        let code_buf = AmdBufferGuard::new(allocator.alloc(size, &opts, /*zero=*/ false)?);
+        let (code_gpu, code_host) = match code_buf.buffer() {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => return Err(Error::NotHostVisible { what: "code object" }),
         };
@@ -452,7 +464,8 @@ impl AmdProgram {
             kd: parsed.kd,
             buf_count,
             var_count,
-            _code_buf: code_buf,
+            abi,
+            code: Arc::new(CodeObject { buffer: code_buf.into_inner() }),
         })
     }
 
@@ -463,11 +476,24 @@ impl AmdProgram {
     }
 }
 
+pub(crate) fn retain_program_abi(
+    abi: &[crate::device::AbiParamDescriptor],
+) -> Result<(Vec<crate::device::AbiParamDescriptor>, usize, usize)> {
+    let abi = abi.to_vec();
+    let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
+    let var_count = abi.len() - buf_count;
+    let var_names = abi
+        .iter()
+        .filter_map(|arg| (!arg.is_storage()).then(|| arg.name.clone().unwrap_or_default()))
+        .collect::<Vec<_>>();
+    crate::device::validate_abi_descriptors(&abi, buf_count, &var_names)?;
+    Ok((abi, buf_count, var_count))
+}
+
 /// Graph-capture accessors. The AMD graph factory (`amd/graph.rs`) downcasts a
-/// `dyn Program` to `AmdProgram` via [`Program::as_any`] and reads these to
-/// pre-build the PM4 indirect-buffer chain once — same fields the per-call
-/// `execute` path feeds into `dispatch_pm4`. Buffer VAs + vals are baked at
-/// capture; only the timeline wait/signal value dwords change on replay.
+/// `dyn Program` to `AmdProgram` and uses the same metadata as per-call HCQ
+/// submission lowering. Program addresses are linked once; invocation and
+/// system-owned fields are patched at replay.
 impl AmdProgram {
     /// Device handle. Used by the `Program::execute` trait fallback to lease a
     /// connector per call, and by `AmdGraph::capture` to reach the shared
@@ -520,47 +546,20 @@ impl AmdProgram {
         (self.buf_count, self.var_count)
     }
 
+    pub fn abi(&self) -> &[crate::device::AbiParamDescriptor] {
+        &self.abi
+    }
+
+    pub(crate) fn code_object(&self) -> Arc<CodeObject> {
+        Arc::clone(&self.code)
+    }
+
     /// Required private (scratch) segment size in bytes-per-thread, from the
     /// kernel descriptor (`kd.private_segment_fixed_size`). Used by callers
     /// to size the queue's scratch before dispatch
     /// (`PoolQueue::ensure_has_local_memory`).
     pub fn private_segment_size(&self) -> u32 {
         self.kd.private_segment_fixed_size
-    }
-
-    /// Bake one kernarg slot for graph capture: writes the buffer GPU VAs
-    /// (8 bytes each) then scalar vals (`i32`, 4 bytes each) into `slot_host`,
-    /// matching the renderer's `(ptr.., i32..)` layout — identical to the
-    /// per-call path in `execute_on`. The captured chain is static, so the
-    /// values are baked once; the graph owns the page for its lifetime.
-    ///
-    /// # Safety
-    /// `slot_host` must point at a writable region of at least
-    /// `kernarg_record_size()` bytes that the caller owns for the graph's life.
-    pub unsafe fn write_kernargs(&self, slot_host: *mut u8, bufs: &[u64], vals: &[i64]) -> Result<()> {
-        let needed = bufs.len() * 8 + vals.len() * 4;
-        if needed > self.kernarg_size() {
-            return Err(Error::Runtime {
-                message: format!(
-                    "AmdProgram '{}': graph kernarg layout {needed} > kd.kernarg_size {}",
-                    self.name,
-                    self.kernarg_size()
-                ),
-            });
-        }
-        let mut cursor = 0usize;
-        // SAFETY: cursor stays within `needed <= kernarg_size() <= slot size`.
-        unsafe {
-            for b in bufs {
-                std::ptr::copy_nonoverlapping(b.to_le_bytes().as_ptr(), slot_host.add(cursor), 8);
-                cursor += 8;
-            }
-            for v in vals {
-                std::ptr::copy_nonoverlapping((*v as i32).to_le_bytes().as_ptr(), slot_host.add(cursor), 4);
-                cursor += 4;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -575,13 +574,10 @@ impl std::fmt::Debug for AmdProgram {
 }
 
 impl AmdProgram {
-    /// Owner-scoped dispatch entry point. Reads queue / kernarg arena / scratch
-    /// / PM4 counter from the owner's shared `PoolQueue`. Holds the queue's
-    /// dispatch lock across the WHOLE op (kernarg bump + write + dispatch) so on
-    /// a shared queue the kernarg-slot order matches the ring order. The
-    /// `Program::execute` trait fallback below assigns an owner from the device
-    /// pool and delegates here for callers that don't supply one. Callers must
-    /// have sized the pool's scratch (`ensure_has_local_memory`) before calling.
+    /// Lane-scoped dispatch entry point. Reads the queue, kernarg arena, scratch,
+    /// and PM4 counter from the exclusively leased `PoolQueue`. The lease spans
+    /// kernarg bump, write, and publication, so kernarg order matches ring order.
+    /// Callers must size lane scratch before calling.
     ///
     /// # Safety
     ///
@@ -589,17 +585,13 @@ impl AmdProgram {
     /// VAs that outlive the dispatch, `vals` must match the kernel's variable
     /// arity, and launch dims must be valid for the kernel descriptor.
     ///
-    /// Returns a signal carrying the dispatch's `start_ts`/`end_ts` so a profiler
-    /// can read on-device kernel time after retirement. On AQL the CP auto-stamps
-    /// it (queues run with ENABLE_PROFILING). On the single-XCC PM4 path the CP
-    /// does not auto-stamp, so when `profile` is set we bracket the dispatch with
-    /// two GPU-clock RELEASE_MEM probes into a scratch signal's ts fields and
-    /// return it; `None` on the PM4 path when `profile` is unset (fire-and-forget,
-    /// no extra signal/packets).
+    /// Profiling ownership is delegated to the HCQ queue finalizer. Both AQL and
+    /// PM4 own an optional timestamp slot and insert PM4 probes around `Compute`.
     #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
-    pub unsafe fn execute_on(
+    pub(crate) unsafe fn execute_on(
         &self,
         owner: &crate::amd::connector::OwnerCtx,
+        pool: &crate::amd::connector::PoolQueue,
         buffers: &[*mut u8],
         vals: &[i64],
         global_size: Option<[usize; 3]>,
@@ -607,20 +599,19 @@ impl AmdProgram {
         wait: bool,
         profile: bool,
     ) -> Result<Option<Arc<dyn crate::sync::DispatchTimestamps>>> {
-        let pool = owner.pool();
         // Device poisoned by an earlier fault: refuse to dispatch (the GPU
         // state and any cached buffer mappings are no longer trustworthy).
         if let Some(err) = pool.core().poison_error() {
             return Err(err);
         }
         if buffers.len() != self.buf_count {
-            return Err(Error::Runtime {
-                message: format!("AmdProgram: expected {} buffers, got {}", self.buf_count, buffers.len()),
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!("AmdProgram expected {} compact buffers, got {}", self.buf_count, buffers.len()),
             });
         }
         if vals.len() != self.var_count {
-            return Err(Error::Runtime {
-                message: format!("AmdProgram: expected {} scalar vals, got {}", self.var_count, vals.len()),
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!("AmdProgram expected {} compact scalar vals, got {}", self.var_count, vals.len()),
             });
         }
         // Kernarg layout:
@@ -632,7 +623,8 @@ impl AmdProgram {
         // %v0, i32 %v1)` has `kernarg_size = bufs*8 + vars*4`, NOT bufs*8 +
         // vars*8. Packing each val as 8 bytes here would overflow the
         // descriptor and corrupt the next kernarg slot in the arena.
-        let needed = self.buf_count * 8 + self.var_count * 4;
+        let layout = crate::hcq::ClikeKernargLayout::from_abi(&self.abi);
+        let needed = layout.packed_size();
         if needed > self.kernarg_size() {
             return Err(Error::Runtime {
                 message: format!(
@@ -647,38 +639,22 @@ impl AmdProgram {
             });
         }
 
-        // Hold the queue's dispatch lock across the WHOLE op (kernarg bump +
-        // write + dispatch). On a shared queue this makes the kernarg-slot
-        // order identical to the ring submission order, so the packet the
-        // doorbell publishes references the slot we just bumped (no cursor-vs-
-        // ring hazard between co-tenant owners). Lock order: dispatch_lock →
-        // queue inner Mutex (taken inside dispatch_*).
-        let _disp = pool.dispatch_guard();
-
-        // 1. Bump the queue's kernarg arena under the dispatch lock — the
-        // ordering above guarantees the slot stays valid through dispatch.
+        // The caller's non-clone QueueLease is the sole publication authority,
+        // so kernarg reservation order is queue submission order.
         let arena = pool.arena();
-        let off = arena.bump(self.kernarg_size(), 16)?;
-        // SAFETY: arena returned a valid slot; the dispatch lock serializes
+        let off = arena.bump(self.kernarg_size(), crate::hcq::KERNARG_ALIGN)?;
+        // SAFETY: arena returned a valid slot; the exclusive lane serializes
         // writers, so no concurrent writer holds the same offset.
         let host_base = unsafe { arena.host_at(off) };
-        let mut cursor = 0usize;
-        for buf in buffers {
-            let bytes = (*buf as u64).to_le_bytes();
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host_base.add(cursor), 8) };
-            cursor += 8;
-        }
-        for v in vals {
-            // Truncate i64 → i32 to match the kernel's `i32` var dtype.
-            let bytes = (*v as i32).to_le_bytes();
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host_base.add(cursor), 4) };
-            cursor += 4;
-        }
+        let addresses: smallvec::SmallVec<[u64; 8]> = buffers.iter().map(|p| *p as u64).collect();
+        // SAFETY: arena returned a writable record of kernarg_size bytes.
+        let dst = unsafe { std::slice::from_raw_parts_mut(host_base, self.kernarg_size()) };
+        layout.pack(dst, &addresses, vals)?;
         let kernarg_gpu = arena.gpu_at(off);
 
         // 2. Submit sequence:
         //   PM4: wait(counter, prev) → memory_barrier → exec → signal(counter, next)
-        //   AQL: native kernel-dispatch packet with its own completion signal
+        //   AQL: vendor-IB wait/barrier → native dispatch → vendor-IB timeline store
         let g = global_size.unwrap_or([1, 1, 1]);
         let l = local_size.unwrap_or([1, 1, 1]);
 
@@ -702,127 +678,100 @@ impl AmdProgram {
             );
         }
 
-        // USER_DATA SGPR pre-load: kernarg pointer only — the optional scratch
-        // SGPR descriptor is prepended inside `dispatch_pm4` from the live
-        // `pool.scratch_gpu_va()` in the same place as
-        // `COMPUTE_DISPATCH_SCRATCH_BASE`.
-        let mut user_data: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
-        user_data.push(kernarg_gpu as u32);
-        user_data.push((kernarg_gpu >> 32) as u32);
-
         let queue = pool.queue();
-        if queue.is_pm4() {
-            // PM4 single-XCC path: completion via the queue's monotonic PM4
-            // counter (RELEASE_MEM); record this owner's high value so its
-            // owner-local `synchronize` waits exactly this dispatch.
-            //
-            // The PM4 CP does not auto-stamp dispatches (no ENABLE_PROFILING as
-            // on AQL), so for a profiling dispatch we acquire a scratch signal,
-            // `arm(0)` it (value 0 → `is_done()`, ts fields zeroed), and bracket
-            // the dispatch with two GPU-clock RELEASE_MEM probes into its
-            // start/end ts fields. `profile` is threaded from the caller and is
-            // set ONLY by callers that retain the returned handle until after
-            // `synchronize` (the fire-and-forget execute path passes `false`), so
-            // the slot can't be reused while the GPU is still writing it.
-            let ts = if profile {
-                let s = pool.acquire_signal()?;
-                s.arm(0);
-                Some(s)
-            } else {
-                None
-            };
-            let ts_addrs = ts.as_ref().map(|s| (s.start_ts_addr(), s.end_ts_addr()));
-            // PMC: when counters are armed (gfx11 only) on a profiling dispatch,
-            // allocate a host-visible GTT readback buffer and build the PM4
-            // program/read streams that bracket the dispatch.
-            let pmc_counters = if profile && self.target_major == 11 { owner.pmc_counters() } else { Vec::new() };
-            let pmc = if pmc_counters.is_empty() {
-                None
-            } else {
-                let grid = crate::amd::pmc::PmcGrid::from_node(&self.dev.node);
-                let bytes = crate::amd::pmc::readback_bytes(pmc_counters.len(), &grid);
-                let buf = crate::amd::AmdAllocator::new(self.device_id)?.alloc_uncached(bytes.max(64))?;
-                let (gpu, host) = match &buf {
-                    crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-                    _ => return Err(Error::Runtime { message: "PMC readback buffer not host-visible".into() }),
-                };
-                let (start, read) = crate::amd::pmc::build_streams(&pmc_counters, &grid, gpu);
-                Some((buf, host, grid, start, read))
-            };
-            let (pmc_start, pmc_read): (&[u32], &[u32]) = pmc.as_ref().map_or((&[], &[]), |(_, _, _, s, r)| (s, r));
-            let v = queue.dispatch_pm4(
-                pool,
-                self.rsrc1,
-                self.rsrc2,
-                self.rsrc3,
-                self.pm4_prog_addr,
-                self.enable_private_segment_sgpr,
-                &user_data,
-                [l[0] as u32, l[1] as u32, l[2] as u32],
-                [g[0] as u32, g[1] as u32, g[2] as u32],
-                self.wave32,
-                self.target_major,
-                ts_addrs,
-                pmc_start,
-                pmc_read,
-            )?;
-            owner.set_pm4_high(v);
-            // Release the dispatch lock before the (up to 30 s) blocking wait so
-            // co-tenant owners on this shared queue aren't serialized behind our
-            // wait — the dispatch is already published to the ring.
-            drop(_disp);
-            if wait {
-                owner.synchronize()?;
-            }
-            // Build the returned handle: a PMC handle (timestamps + counters) when
-            // counters were collected, else the bare timestamp signal.
-            let handle: Option<Arc<dyn crate::sync::DispatchTimestamps>> = match (ts, pmc) {
-                (Some(sig), Some((buf, host, grid, _, _))) => {
-                    Some(Arc::new(crate::amd::pmc::PmcHandle::new(sig, buf, host, pmc_counters, grid.instances())))
-                }
-                (Some(sig), None) => Some(sig),
-                (None, _) => None,
-            };
-            Ok(handle)
+        let is_pm4 = queue.is_pm4();
+        let pmc_counters = if profile && is_pm4 && self.target_major == 11 { owner.pmc_counters() } else { Vec::new() };
+        let pmc = if pmc_counters.is_empty() {
+            None
         } else {
-            // AQL path: completion via the kernel packet's own native
-            // `completion_signal` (the packet processor decrements the countdown
-            // signal on retirement). The dispatch-header BARRIER bit serialises
-            // execution against the prior packet, and its system-scope
-            // acquire/release fences provide coherence on the in-order queue.
-            let priv_seg = self.kd.private_segment_fixed_size;
-            let group_seg = self.kd.group_segment_fixed_size;
-            let sig = pool.acquire_signal()?;
-            let packet = build_dispatch_packet(
-                [l[0] as u16, l[1] as u16, l[2] as u16],
-                [(g[0] * l[0]) as u32, (g[1] * l[1]) as u32, (g[2] * l[2]) as u32],
-                priv_seg,
-                group_seg,
-                self.aql_prog_addr,
-                kernarg_gpu,
-                /*completion_signal=*/ sig.signal_handle(),
-            );
-            queue.dispatch_aql_native(&packet)?;
-            pool.register_inflight(Arc::clone(&sig));
-            owner.set_newest(Arc::clone(&sig));
-            // Release the dispatch lock before the blocking wait (see PM4 arm).
-            drop(_disp);
-            if wait && let Err(e) = sig.wait_done(30_000) {
-                // If the CP halted the queue on an exception (e.g. 0x401
-                // insufficient-scratch), surface that code instead of a blind
-                // timeout.
+            let grid = crate::amd::pmc::PmcGrid::from_node(&self.dev.node);
+            let bytes = crate::amd::pmc::readback_bytes(pmc_counters.len(), &grid);
+            let buf =
+                AmdBufferGuard::new(crate::amd::AmdAllocator::new(self.device_id)?.alloc_uncached(bytes.max(64))?);
+            let (gpu, host) = match buf.buffer() {
+                crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
+                _ => return Err(Error::Runtime { message: "PMC readback buffer not host-visible".into() }),
+            };
+            let (start, read) = crate::amd::pmc::build_streams(&pmc_counters, &grid, gpu);
+            Some((buf, host, grid, start, read))
+        };
+        let (pmc_start, pmc_read): (&[u32], &[u32]) = pmc.as_ref().map_or((&[], &[]), |(_, _, _, s, r)| (s, r));
+
+        let dispatch = crate::hcq::ComputeDispatch {
+            workgroup_size: [l[0] as u32, l[1] as u32, l[2] as u32],
+            grid_size: [(g[0] * l[0]) as u32, (g[1] * l[1]) as u32, (g[2] * l[2]) as u32],
+            private_segment_size: self.kd.private_segment_fixed_size,
+            group_segment_size: self.kd.group_segment_fixed_size,
+            kernel_object: self.aql_prog_addr,
+            kernarg_address: kernarg_gpu,
+            // Native completion ownership is assigned by the queue finalizer.
+            completion_signal: 0,
+            barrier: true,
+            amd_pm4: Some(crate::hcq::AmdPm4Dispatch {
+                rsrc: [self.rsrc1, self.rsrc2, self.rsrc3],
+                program_address: self.pm4_prog_addr,
+                enable_private_segment_sgpr: self.enable_private_segment_sgpr,
+                workgroup_count: [g[0] as u32, g[1] as u32, g[2] as u32],
+                wave32: self.wave32,
+                target_major: self.target_major,
+            }),
+        };
+        let mut submission = crate::hcq::Submission::new(crate::hcq::QueueKind::Compute(0));
+        submission.push(crate::hcq::Command::MemoryBarrier).push(crate::hcq::Command::Compute(dispatch));
+        if profile {
+            submission.request_profile();
+        }
+        let result = queue.submit_hcq_dispatch(pool, &submission, pmc_start, pmc_read)?;
+        result.finalizer.retain_code(self.code_object());
+        pool.register_inflight(Arc::clone(&result.finalizer));
+        owner.set_newest(Arc::clone(&result.finalizer));
+
+        if wait {
+            if is_pm4 {
+                owner.synchronize()?;
+            } else if let Err(e) = owner.synchronize() {
                 if let Some(code) = queue.inactive_exception() {
                     return Err(Error::Runtime {
                         message: format!(
-                            "AQL dispatch '{}' did not complete: queue halted with \
-                             exception {code:#x}",
+                            "AQL dispatch '{}' did not complete: queue halted with exception {code:#x}",
                             self.name
                         ),
                     });
                 }
                 return Err(e);
             }
-            Ok(Some(sig as Arc<dyn crate::sync::DispatchTimestamps>))
+        }
+
+        if is_pm4 {
+            // PM4 single-XCC path: completion via the queue's monotonic PM4
+            // counter (RELEASE_MEM); the submission finalizer retains this
+            // owner's exact timeline point.
+            //
+            // The PM4 CP does not auto-stamp dispatches (no ENABLE_PROFILING as
+            // on AQL), so for a profiling dispatch the finalizer acquires and
+            // resets a timestamp slot, then brackets
+            // the dispatch with two GPU-clock RELEASE_MEM probes into its
+            // start/end ts fields. `profile` is threaded from the caller and is
+            // set ONLY by callers that retain the returned handle until after
+            // `synchronize` (the fire-and-forget execute path passes `false`), so
+            // the slot can't be reused while the GPU is still writing it.
+            // Build the returned handle: a PMC handle (timestamps + counters) when
+            // counters were collected, else the bare timestamp signal.
+            let handle: Option<Arc<dyn crate::sync::DispatchTimestamps>> = match (result.timestamps, pmc) {
+                (Some(sig), Some((buf, host, grid, _, _))) => Some(Arc::new(crate::amd::pmc::PmcHandle::new(
+                    sig,
+                    Arc::clone(&result.finalizer),
+                    buf.into_inner(),
+                    host,
+                    pmc_counters,
+                    grid.instances(),
+                ))),
+                (Some(sig), None) => Some(sig),
+                (None, _) => None,
+            };
+            Ok(handle)
+        } else {
+            Ok(result.timestamps.map(|signal| signal as Arc<dyn crate::sync::DispatchTimestamps>))
         }
     }
 }
@@ -836,18 +785,10 @@ impl Program for AmdProgram {
         local_size: Option<[usize; 3]>,
         wait: bool,
     ) -> Result<()> {
-        // Fallback path for callers that don't supply an owner (e.g.
-        // `benchmark_kernel` during BEAM). Assign a shared `PoolQueue`, ensure
-        // its scratch, dispatch, then drop the owner context. Distinct owners
-        // spread onto distinct queues (cross-queue parallelism) until the pool
-        // is full, then co-tenant the least-loaded queue; the dispatch lock
-        // serializes a whole op (bump + write + dispatch) on a shared queue.
-        // `ExecutionPlan` and `AmdGraph` bypass this by downcasting via
-        // `as_any()` and calling `execute_on` with an owner they hold for their
-        // own lifetime.
+        // Fallback callers use a logical context whose direct session acquires
+        // one exclusive queue lane.
         let alloc = crate::amd::AmdAllocator::new(self.device_id)?;
-        let owner = self.dev.core().assign_owner(&alloc)?;
-        owner.pool().ensure_has_local_memory(self.kd.private_segment_fixed_size)?;
+        let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(self.dev.core()), alloc);
         // Dispatch and (when waiting) drain through the poisoning owner-local
         // `synchronize`, exactly like the plan/graph paths. A faulting/hung
         // candidate latches the device error (`poison`) and BEAM fast-fails the
@@ -855,9 +796,22 @@ impl Program for AmdProgram {
         // candidate. A KFD queue can't be recovered once faulted; the search
         // stays useful by *avoiding* faults (resource caps in the action
         // filter).
-        unsafe {
-            self.execute_on(&owner, buffers, vals, global_size, local_size, wait, /*profile=*/ false)?
+        let _ = unsafe {
+            crate::device::PlanContext::dispatch(
+                &owner,
+                self,
+                buffers,
+                vals,
+                global_size,
+                local_size,
+                /*profile=*/ false,
+            )?
         };
+        if wait {
+            owner.synchronize()?;
+        } else {
+            crate::device::PlanContext::finish_replay(&owner)?;
+        }
         Ok(())
     }
 
@@ -872,13 +826,11 @@ impl Program for AmdProgram {
         self
     }
 
-    /// Lease a shared `PoolQueue` from the per-core pool and hand it back as the
-    /// plan's reusable execution context. Distinct plans spread onto distinct
-    /// queues (cross-queue parallelism); the lease is held for the plan's
-    /// lifetime. Mirrors the per-call lease in `execute`, but the plan keeps it.
+    /// Create logical per-plan state. Hardware queue ownership is acquired by
+    /// the context at a replay/session boundary.
     fn new_exec_context(&self) -> Result<Option<Box<dyn crate::device::PlanContext>>> {
         let alloc = crate::amd::AmdAllocator::new(self.device_id)?;
-        let owner = self.dev.core().assign_owner(&alloc)?;
+        let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(self.dev.core()), alloc);
         Ok(Some(Box::new(owner)))
     }
 

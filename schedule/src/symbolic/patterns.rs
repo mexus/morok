@@ -18,7 +18,7 @@ use svod_ir::uop::eval::{
     eval_add_typed, eval_binary_op, eval_binary_op_broadcast, eval_binary_op_broadcast_typed, eval_mul_typed,
     eval_sub_typed, eval_unary_op_vec_typed,
 };
-use svod_ir::uop::properties::VminVmaxProperty;
+use svod_ir::uop::properties::{HasWeakFloatProperty, SoundVminVmaxProperty, VminVmaxProperty};
 use svod_ir::{IntoUOp, Op, UOp};
 
 use crate::TypedPatternMatcher;
@@ -26,37 +26,227 @@ use crate::rangeify::indexing::get_const_value;
 use crate::symbolic::dce::is_empty_range;
 
 use smallvec::SmallVec;
+use std::cmp::Ordering;
 use std::sync::Arc;
 use tracing::trace;
+
+/// Weak integers select an exact i32/i64 representation, so inspecting their
+/// mathematical values before lowering is safe and required by index rewrites.
+/// Weak floats select the default float and can change value at commitment.
+///
+/// Memoised per node via [`HasWeakFloatProperty`]: the guard runs on every
+/// pattern-match attempt, so a per-attempt graph walk would be quadratic.
+pub(crate) fn weak_float_values_are_committed(root: &Arc<UOp>) -> bool {
+    !*HasWeakFloatProperty::get(root)
+}
+
+fn value_sensitive(patterns: &TypedPatternMatcher) -> TypedPatternMatcher {
+    patterns.guarded(weak_float_values_are_committed)
+}
+
+fn integer_dtype_bounds(dtype: &DType) -> Option<(i128, i128)> {
+    Some(match dtype.base() {
+        ScalarDType::Int8 => (i8::MIN as i128, i8::MAX as i128),
+        ScalarDType::Int16 => (i16::MIN as i128, i16::MAX as i128),
+        ScalarDType::Int32 => (i32::MIN as i128, i32::MAX as i128),
+        ScalarDType::Int64 | ScalarDType::WeakInt | ScalarDType::Index => (i64::MIN as i128, i64::MAX as i128),
+        ScalarDType::UInt8 => (0, u8::MAX as i128),
+        ScalarDType::UInt16 => (0, u16::MAX as i128),
+        ScalarDType::UInt32 => (0, u32::MAX as i128),
+        ScalarDType::UInt64 => (0, u64::MAX as i128),
+        _ => return None,
+    })
+}
+
+fn integer_value(value: ConstValue) -> Option<i128> {
+    match value {
+        ConstValue::Int(value) => Some(value as i128),
+        ConstValue::UInt(value) => Some(value as i128),
+        _ => None,
+    }
+}
+
+fn sound_integer_range(value: &Arc<UOp>) -> Option<(i128, i128)> {
+    let dtype_bounds = integer_dtype_bounds(&value.dtype())?;
+    let (min, max) = (*SoundVminVmaxProperty::get(value))?;
+    let (min, max) = (integer_value(min)?, integer_value(max)?);
+    (dtype_bounds.0 <= min && min <= max && max <= dtype_bounds.1).then_some((min, max))
+}
+
+fn integer_binary_does_not_wrap(op: BinaryOp, lhs: &Arc<UOp>, rhs: &Arc<UOp>, result_dtype: &DType) -> bool {
+    if lhs.dtype() != *result_dtype || rhs.dtype() != *result_dtype {
+        return false;
+    }
+    let Some((dtype_min, dtype_max)) = integer_dtype_bounds(result_dtype) else { return false };
+    let Some((lhs_min, lhs_max)) = sound_integer_range(lhs) else { return false };
+    let Some((rhs_min, rhs_max)) = sound_integer_range(rhs) else { return false };
+    let in_dtype = |value: i128| dtype_min <= value && value <= dtype_max;
+
+    match op {
+        BinaryOp::Add => lhs_min
+            .checked_add(rhs_min)
+            .zip(lhs_max.checked_add(rhs_max))
+            .is_some_and(|(min, max)| in_dtype(min) && in_dtype(max)),
+        BinaryOp::Sub => lhs_min
+            .checked_sub(rhs_max)
+            .zip(lhs_max.checked_sub(rhs_min))
+            .is_some_and(|(min, max)| in_dtype(min) && in_dtype(max)),
+        BinaryOp::Mul => [
+            lhs_min.checked_mul(rhs_min),
+            lhs_min.checked_mul(rhs_max),
+            lhs_max.checked_mul(rhs_min),
+            lhs_max.checked_mul(rhs_max),
+        ]
+        .into_iter()
+        .all(|value| value.is_some_and(in_dtype)),
+        BinaryOp::FloorDiv | BinaryOp::FloorMod => {
+            if rhs_min <= 0 && rhs_max >= 0 {
+                return false;
+            }
+            [lhs_min, lhs_max].into_iter().all(|lhs| {
+                [rhs_min, rhs_max].into_iter().all(|rhs| {
+                    let value = if op == BinaryOp::FloorDiv {
+                        lhs.checked_div_euclid(rhs)
+                    } else {
+                        lhs.checked_rem_euclid(rhs)
+                    };
+                    value.is_some_and(in_dtype)
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
+fn integer_arithmetic_does_not_wrap(value: &Arc<UOp>) -> bool {
+    match value.op() {
+        Op::Binary(
+            op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::FloorDiv | BinaryOp::FloorMod),
+            lhs,
+            rhs,
+        ) => {
+            integer_arithmetic_does_not_wrap(lhs)
+                && integer_arithmetic_does_not_wrap(rhs)
+                && integer_binary_does_not_wrap(*op, lhs, rhs, &value.dtype())
+        }
+        Op::Unary(svod_ir::UnaryOp::Neg, src) => {
+            let Some((dtype_min, dtype_max)) = integer_dtype_bounds(&value.dtype()) else { return false };
+            let Some((src_min, src_max)) = sound_integer_range(src) else { return false };
+            integer_arithmetic_does_not_wrap(src)
+                && src_max
+                    .checked_neg()
+                    .zip(src_min.checked_neg())
+                    .is_some_and(|(min, max)| dtype_min <= min && min <= max && max <= dtype_max)
+        }
+        _ => true,
+    }
+}
+
+fn typed_integer_rewrite_is_exact(original: &Arc<UOp>, replacement: &Arc<UOp>) -> bool {
+    let same_shape = match (original.shape(), replacement.shape()) {
+        (Ok(original), Ok(replacement)) => original == replacement,
+        _ => false,
+    };
+    original.dtype() == replacement.dtype()
+        && same_shape
+        && integer_dtype_bounds(&original.dtype()).is_some()
+        && integer_arithmetic_does_not_wrap(original)
+        && integer_arithmetic_does_not_wrap(replacement)
+}
+
+/// Python's `divmod`: the `(q, r)` pair with `c == q*d + r` and `r` carrying the
+/// sign of `d`. This is the semantics of `Op::Binary(FloorDiv | FloorMod)`
+/// (`ir/uop/eval.rs`) and of tinygrad's `//`/`%`, so the divmod normalisation
+/// rules split a constant exactly the way upstream does.
+fn floor_divmod(c: i64, d: i64) -> Option<(i64, i64)> {
+    let (quotient, remainder) = (c.checked_div(d)?, c.checked_rem(d)?);
+    if remainder != 0 && (remainder < 0) != (d < 0) {
+        Some((quotient.checked_sub(1)?, remainder + d))
+    } else {
+        Some((quotient, remainder))
+    }
+}
+
+fn exact_integer_rewrite(original: &Arc<UOp>, replacement: Arc<UOp>) -> Option<Arc<UOp>> {
+    typed_integer_rewrite_is_exact(original, &replacement).then_some(replacement)
+}
+
+macro_rules! value_sensitive_matchers {
+    ($($visibility:vis fn $name:ident => $unchecked:ident;)+) => {$
+        (
+            $visibility fn $name() -> &'static TypedPatternMatcher {
+                static CACHED: std::sync::LazyLock<TypedPatternMatcher> =
+                    std::sync::LazyLock::new(|| value_sensitive($unchecked()));
+                &CACHED
+            }
+        )+
+    };
+}
+
+value_sensitive_matchers! {
+    pub fn constant_folding_dsl_patterns => constant_folding_dsl_patterns_unchecked;
+    pub fn vconst_folding_patterns => vconst_folding_patterns_unchecked;
+    pub fn identity_and_zero_patterns => identity_and_zero_patterns_unchecked;
+    pub fn division_dsl_patterns => division_dsl_patterns_unchecked;
+    pub fn term_combining_dsl_patterns => term_combining_dsl_patterns_unchecked;
+    pub fn alu_folding_dsl_patterns => alu_folding_dsl_patterns_unchecked;
+    pub fn vmin_vmax_collapse_patterns => vmin_vmax_collapse_patterns_unchecked;
+    pub fn dce_dsl_simple_patterns => dce_dsl_simple_patterns_unchecked;
+    pub fn comparison_dsl_patterns => comparison_dsl_patterns_unchecked;
+    pub fn minmax_dsl_patterns => minmax_dsl_patterns_unchecked;
+    pub fn where_bound_patterns => where_bound_patterns_unchecked;
+    pub fn power_dsl_patterns => power_dsl_patterns_unchecked;
+}
+
+/// Materialise a folded constant at `dtype`.
+///
+/// tinygrad's `fold_const_alu` (uop/symbolic.py:31-33) evaluates with
+/// `exec_alu(a.op, a.dtype, vals, False)` — `truncate=False` — and returns
+/// `a.const_like(...)`, so it folds every dtype including the weak ones. Weak dtypes
+/// have no storage width to wrap at, so they take the untruncated value directly;
+/// strong dtypes still commit through their scalar format.
+fn folded_const(dtype: DType, value: ConstValue) -> Option<Arc<UOp>> {
+    let value = if dtype.is_weak() { value } else { value.cast(&DType::Scalar(dtype.base()))? };
+    Some(UOp::const_(dtype, value))
+}
 
 /// Constant folding patterns.
 ///
 /// Folds constant expressions at compile time for unary, binary, and ternary operations.
 /// Uses dtype-aware evaluation to ensure results respect type boundaries (e.g., Int32 wraps at 32 bits).
-pub fn constant_folding_dsl_patterns() -> &'static TypedPatternMatcher {
-    use svod_ir::uop::eval::{eval_binary_op_typed, eval_ternary_op_typed, eval_unary_op_typed};
+fn constant_folding_dsl_patterns_unchecked() -> &'static TypedPatternMatcher {
+    use svod_ir::uop::eval::{eval_ternary_op, eval_unary_op};
 
     crate::cached_patterns! {
         // Unary constant folding - 6 operations in one declaration
         // Neg is not here: neg() produces MUL(x, -1), folded by binary constant folding.
         for op in unary [Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
             op(c @const(c_val))
-              => eval_unary_op_typed(op, c_val, c.dtype().base()).map(|r| UOp::const_(c.dtype(), r)),
+              => eval_unary_op(op, c_val).and_then(|r| folded_const(c.dtype(), r)),
         },
 
         // Binary constant folding - 13 operations in one declaration
-        for op in binary [Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr] {
+        for op in binary [Add, Mul, Sub, FloorMod, Max, Pow, FloorDiv, Fdiv, And, Or, Xor, Shl, Shr] {
             op(a @const(a_val), _b @const(b_val))
-              => eval_binary_op_typed(op, a_val, b_val, a.dtype().base()).map(|r| UOp::const_(a.dtype(), r)),
+              => eval_binary_op(op, a_val, b_val).and_then(|r| folded_const(a.dtype(), r)),
+        },
+
+        for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
+            op(a @const(a_val), _b @const(b_val))
+              => {
+                  let dtype = DType::Bool.vec(a.dtype().vcount())?;
+                  eval_binary_op(op, a_val, b_val).map(|r| UOp::const_(dtype, r))
+              },
         },
 
         // Ternary constant folding - 2 operations in one declaration
-        for op in ternary [Where, MulAcc] {
-            // For Where: use second operand's dtype (true branch)
-            // For MulAcc: use first operand's dtype (all same dtype)
-            op(_a @const(a_val), b @const(b_val), _c @const(c_val))
-              => eval_ternary_op_typed(op, a_val, b_val, c_val, b.dtype().base()).map(|r| UOp::const_(b.dtype(), r)),
-        },
+        Where(_a @const(a_val), b @const(b_val), _c @const(c_val))
+          => eval_ternary_op(svod_ir::TernaryOp::Where, a_val, b_val, c_val)
+              .and_then(|r| folded_const(b.dtype(), r)),
+
+        MulAcc(_a @const(a_val), b @const(b_val), _c @const(c_val))
+          => eval_ternary_op(svod_ir::TernaryOp::MulAcc, a_val, b_val, c_val)
+              .and_then(|r| folded_const(b.dtype(), r)),
     }
 }
 
@@ -68,11 +258,13 @@ pub fn constant_folding_dsl_patterns() -> &'static TypedPatternMatcher {
 /// - Unary operations on VConst
 ///
 /// Based on exec_alu for VCONST handling.
-pub fn vconst_folding_patterns() -> &'static TypedPatternMatcher {
+fn vconst_folding_patterns_unchecked() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
+        // Weak lanes must first commit at their consumer's concrete dtype.
         // Binary VConst folding: VConst op VConst → VConst
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
-            op(a @vconst(vals_a), _b @vconst(vals_b))
+        for op in binary [Add, Mul, Sub, FloorMod, Max, FloorDiv, And, Or, Xor, Shl, Shr] {
+            op(a @vconst(vals_a), b @vconst(vals_b))
+              if !a.dtype().is_weak() && !b.dtype().is_weak()
               => {
                   let dt = a.dtype().scalar_dtype();
                   eval_binary_op_broadcast_typed(op, &vals_a, &vals_b, a.dtype().base())
@@ -82,7 +274,8 @@ pub fn vconst_folding_patterns() -> &'static TypedPatternMatcher {
 
         // Comparison VConst folding: VConst cmp VConst → VConst(Bool)
         for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
-            op(_a @vconst(vals_a), _b @vconst(vals_b))
+            op(a @vconst(vals_a), b @vconst(vals_b))
+              if !a.dtype().is_weak() && !b.dtype().is_weak()
               => {
                   eval_binary_op_broadcast(op, &vals_a, &vals_b)
                       .map(|v| UOp::vconst(v, DType::Bool))
@@ -90,9 +283,9 @@ pub fn vconst_folding_patterns() -> &'static TypedPatternMatcher {
         },
 
         // Mixed Const + VConst folding (broadcast): Const op VConst → VConst
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
-            op(a @anyconst(vals_a), _b @anyconst(vals_b))
-              if vals_a.len() != vals_b.len()
+        for op in binary [Add, Mul, Sub, FloorMod, Max, FloorDiv, And, Or, Xor, Shl, Shr] {
+            op(a @anyconst(vals_a), b @anyconst(vals_b))
+              if vals_a.len() != vals_b.len() && !a.dtype().is_weak() && !b.dtype().is_weak()
               => {
                   let dt = a.dtype().scalar_dtype();
                   eval_binary_op_broadcast_typed(op, &vals_a, &vals_b, a.dtype().base()).map(|v| UOp::vconst(v, dt))
@@ -101,33 +294,19 @@ pub fn vconst_folding_patterns() -> &'static TypedPatternMatcher {
 
         // Comparison mixed Const + VConst folding (broadcast)
         for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
-            op(_a @anyconst(vals_a), _b @anyconst(vals_b))
-              if vals_a.len() != vals_b.len()
+            op(a @anyconst(vals_a), b @anyconst(vals_b))
+              if vals_a.len() != vals_b.len() && !a.dtype().is_weak() && !b.dtype().is_weak()
               => eval_binary_op_broadcast(op, &vals_a, &vals_b).map(|v| UOp::vconst(v, DType::Bool)),
         },
 
         // Unary VConst folding
         for op in unary [Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
             op(a @vconst(vals))
+              if !a.dtype().is_weak()
               => {
                   let dt = a.dtype().scalar_dtype();
                   eval_unary_op_vec_typed(op, &vals, a.dtype().base()).map(|v| UOp::vconst(v, dt))
               },
-        },
-    }
-}
-
-/// VECTORIZE(CONST, CONST, ...) → VCONST.
-///
-/// Collapses a VECTORIZE of all-constant elements into a single VCONST node.
-pub fn vectorize_to_vconst_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        Vectorize { elements } if !elements.is_empty() && elements.iter().all(|e| matches!(e.op(), Op::Const(_))) => {
-            let scalar_dt = elements[0].dtype();
-            let values: Vec<ConstValue> = elements.iter().filter_map(|e| {
-                if let Op::Const(cv) = e.op() { Some(cv.0) } else { None }
-            }).collect();
-            if values.len() == elements.len() { Some(UOp::vconst(values, scalar_dt)) } else { None }
         },
     }
 }
@@ -152,20 +331,26 @@ pub fn bool_arithmetic_patterns() -> &'static TypedPatternMatcher {
 /// NOTE: For floats, x * 0 is NOT simplified because IEEE 754 requires:
 /// - NaN * 0 = NaN
 /// - Inf * 0 = NaN
-pub fn identity_and_zero_patterns() -> &'static TypedPatternMatcher {
+fn identity_and_zero_patterns_unchecked() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // ========== Identity folding (commutative) ==========
-        Add[x, @zero] ~> x.clone(),
+        Add[x, zero @ @zero]
+            if !x.dtype().is_float()
+                || matches!(zero.op(), Op::Const(ConstValueHash(ConstValue::Float(v))) if v.is_sign_negative())
+            ~> x.clone(),
         Mul[x, @one] ~> x.clone(),
         Or[x, @zero] ~> x.clone(),
         Xor[x, @zero] ~> x.clone(),
 
         // ========== Identity folding (non-commutative) ==========
-        Sub(x, @zero) ~> x.clone(),
-        Idiv(x, @one) ~> x.clone(),
+        Sub(x, zero @ @zero)
+            if !x.dtype().is_float()
+                || matches!(zero.op(), Op::Const(ConstValueHash(ConstValue::Float(v))) if v.is_sign_positive())
+            ~> x.clone(),
+        FloorDiv(x, @one) ~> x.clone(),
         Fdiv(x, @one) ~> x.clone(),
         // x % 1 → 0 (anything mod 1 is 0)
-        Mod(x, @one) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
+        FloorMod(x, @one) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
 
         // ========== Rounding identity for integer types ==========
         // Floor/Ceil/Trunc/Round on integers is identity — rounding is a no-op.
@@ -177,13 +362,8 @@ pub fn identity_and_zero_patterns() -> &'static TypedPatternMatcher {
         // x * 0 → 0
         // For float consts that are NaN/Inf: fold to NaN (IEEE 754: nan*0=nan, inf*0=nan).
         // NOTE: can be wrong for loaded NaN (same caveat as upstream).
-        Mul[x, _zero @ @zero] => {
-            if let Op::Const(ConstValueHash(ConstValue::Float(f))) = x.op()
-                && (f.is_nan() || f.is_infinite()) {
-                    return Some(UOp::const_(x.dtype(), ConstValue::Float(f64::NAN)));
-                }
-            x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt)))
-        },
+        Mul[x, _zero @ @zero] if !x.dtype().is_float() =>
+            x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
         And[_, zero @ @zero] ~> zero.clone(),
     }
 }
@@ -194,16 +374,26 @@ pub fn identity_and_zero_patterns() -> &'static TypedPatternMatcher {
 /// - CAST(WHERE(cond, x, Invalid)) → WHERE(cond, CAST(x), Invalid)
 /// - ALU(WHERE(cond, x, Invalid), y) → WHERE(cond, ALU(x, y), Invalid)
 /// - ALU(y, WHERE(cond, x, Invalid)) → WHERE(cond, ALU(y, x), Invalid)
-/// - ALU(Invalid, y) → Invalid  (only when y is Index dtype, left position only)
+/// - ALU(Invalid, y) → Invalid (non-comparison binary ops, left position only)
 ///
-/// Note: Upstream only propagates bare Invalid from the LEFT position and requires
-/// the right operand to be Index dtype (upstream symbolic_simple). Right-position bare Invalid
-/// is NOT propagated to avoid contaminating non-index computations.
+/// Upstream only propagates bare Invalid from the left position. Right-position
+/// bare Invalid is not propagated.
 ///
 /// MUST be first in `symbolic_simple()` — before `x*0→0` which would eat
 /// `MUL(0, WHERE(cond, x, Invalid))` → `0`, losing validity tracking.
 pub fn propagate_invalid() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
+        // Invalid control flow poisons the selected value.
+        Where(invalid, _a, _b) if UOp::is_invalid_marker(invalid)
+            ~> UOp::invalid_marker(),
+
+        // A condition that is valid only under `cond` lifts that validity out.
+        Where(Where(cond, x, invalid), a, b) if UOp::is_invalid_marker(invalid) => {
+            let inner = UOp::try_where(x.clone(), a.clone(), b.clone()).ok()?;
+            let marker = UOp::invalid_marker();
+            UOp::try_where(cond.clone(), inner, marker).ok()
+        },
+
         // Canonicalize: WHERE(cond, INVALID, x) → WHERE(NOT(cond), x, INVALID)
         // INVALID must be in the false branch for downstream patterns to match.
         //
@@ -212,8 +402,16 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
         // engine rebuilds the parent WHERE via with_sources, placing bare INVALID in the true branch.
         // Upstream avoids this because their pattern ordering resolves it during reconstruction;
         // Svod needs explicit canonicalization.
-        Where(cond, inv, x) if matches!(inv.op(), Op::Invalid) => {
-            let invalid = if inv.dtype() == x.dtype() { inv.clone() } else { UOp::new(Op::Invalid, x.dtype()) };
+        Where(cond, inv, x) if UOp::is_invalid_marker(inv) => {
+            // Both branches INVALID: the gate is irrelevant, so collapse instead of
+            // flipping. Without this the canonicalization ping-pongs forever —
+            // WHERE(c, INV, INV) → WHERE(NOT c, INV, INV) → WHERE(c, INV, INV) —
+            // because the inline NOT simplification below undoes the previous flip.
+            // Tinygrad relies on `where(_, val, val) → val` (symbolic.py) firing first.
+            if UOp::is_invalid_marker(x) {
+                return Some(Arc::clone(x));
+            }
+            let invalid = inv.clone();
             // Inline NOT simplification: if cond is already NOT(c), flipping gives c (not NOT(NOT(c))).
             // Without this, repeated canonicalization creates NOT(NOT(NOT(...))) chains because
             // the rewrite engine doesn't process children between pattern applications on the same node.
@@ -231,65 +429,119 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
             UOp::try_where(combined, x.clone(), d.clone()).expect("failed to create WHERE")
         },
 
-        // Drop WHERE-Invalid through CAST
-        // CAST(WHERE(cond, x, Invalid)) → CAST(x)
-        // INVALID only lives in Index dtype for INDEX addresses. After CAST to a
-        // different type, the protection is irrelevant — the outer value-level WHERE
-        // on the PAD/Concat handles correctness.
-        Cast { src: Where(_cond, x, invalid), dtype } if matches!(invalid.op(), Op::Invalid) ~> x.cast(dtype.clone()),
+        // Preserve the live outer branch while lifting nested validity.
+        Where(a, Where(cond, x, invalid), c)
+            if UOp::is_invalid_marker(invalid) && !UOp::is_invalid_marker(c)
+            => {
+                let inner = UOp::try_where(a.clone(), x.clone(), c.clone()).ok()?;
+                let combined = a.not().or_(cond);
+                let marker = UOp::invalid_marker();
+                UOp::try_where(combined, inner, marker).ok()
+            },
+        Where(a, b, Where(cond, x, invalid))
+            if UOp::is_invalid_marker(invalid) && !UOp::is_invalid_marker(b)
+            => {
+                let inner = UOp::try_where(a.clone(), b.clone(), x.clone()).ok()?;
+                let combined = a.or_(cond);
+                let marker = UOp::invalid_marker();
+                UOp::try_where(combined, inner, marker).ok()
+            },
 
-        // Push binary ALU (non-comparison) through WHERE-with-Invalid (left operand)
+        // Unary/cast operations preserve Invalid and move inside its gate.
+        for op in unary [*] {
+            op(invalid) if UOp::is_invalid_marker(invalid)
+                ~> { let _ = op; UOp::invalid_marker() },
+            r @ op(Where(cond, x, invalid)) if UOp::is_invalid_marker(invalid) => {
+                let inner = UOp::new(Op::Unary(op, x.clone()), r.dtype());
+                let marker = UOp::invalid_marker();
+                UOp::try_where(cond.clone(), inner, marker).ok()
+            },
+        },
+
+        Cast { src: invalid, .. } if UOp::is_invalid_marker(invalid)
+            ~> UOp::invalid_marker(),
+        Cast { src: Where(cond, x, invalid), dtype } if UOp::is_invalid_marker(invalid) => {
+            let inner = x.cast(dtype.clone());
+            let marker = UOp::invalid_marker();
+            UOp::try_where(cond.clone(), inner, marker).ok()
+        },
+        BitCast { src: invalid, .. } if UOp::is_invalid_marker(invalid)
+            ~> UOp::invalid_marker(),
+        BitCast { src: Where(cond, x, invalid), dtype } if UOp::is_invalid_marker(invalid) => {
+            let inner = x.bitcast(dtype.clone());
+            let marker = UOp::invalid_marker();
+            UOp::try_where(cond.clone(), inner, marker).ok()
+        },
+
+        // Push binary ALU through WHERE-with-Invalid (left operand)
         // ALU(WHERE(cond, x, Invalid), y) → WHERE(cond, ALU(x, y), Invalid)
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
-            r @ op(Where(cond, x, invalid), y)
-                if matches!(invalid.op(), Op::Invalid)
+        for op in binary [*] {
+            op(Where(cond, x, invalid), y)
+                if UOp::is_invalid_marker(invalid)
                 ~> {
-                    let inner = UOp::new(Op::Binary(op, x.clone(), y.clone()), r.dtype());
-                    UOp::try_where(cond.clone(), inner, invalid.clone()).expect("failed to create WHERE")
+                    let inner_op = Op::Binary(op, x.clone(), y.clone());
+                    let inner = UOp::new(inner_op.clone(), svod_ir::dtype_from_op(&inner_op).expect("binary dtype inference"));
+                    let marker = UOp::invalid_marker();
+                    UOp::try_where(cond.clone(), inner, marker).expect("failed to create WHERE")
                 },
         },
 
-        // Push binary ALU (non-comparison) through WHERE-with-Invalid (right operand)
+        // Push binary ALU through WHERE-with-Invalid (right operand)
         // ALU(y, WHERE(cond, x, Invalid)) → WHERE(cond, ALU(y, x), Invalid)
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
-            r @ op(y, Where(cond, x, invalid))
-                if matches!(invalid.op(), Op::Invalid)
+        for op in binary [*] {
+            op(y, Where(cond, x, invalid))
+                if UOp::is_invalid_marker(invalid)
                 ~> {
-                    let inner = UOp::new(Op::Binary(op, y.clone(), x.clone()), r.dtype());
-                    UOp::try_where(cond.clone(), inner, invalid.clone()).expect("failed to create WHERE")
+                    let inner_op = Op::Binary(op, y.clone(), x.clone());
+                    let inner = UOp::new(inner_op.clone(), svod_ir::dtype_from_op(&inner_op).expect("binary dtype inference"));
+                    let marker = UOp::invalid_marker();
+                    UOp::try_where(cond.clone(), inner, marker).expect("failed to create WHERE")
                 },
         },
 
-        // Strip WHERE-Invalid from comparison inputs
-        // CMP(WHERE(cond, x, Invalid), y) → CMP(x, y)
-        // When comparing padded values, the Invalid region is already gated downstream,
-        // so we can safely compare just the valid part.
-        for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
-            r @ op(Where(_cond, x, invalid), y)
-                if matches!(invalid.op(), Op::Invalid)
-                ~> UOp::new(Op::Binary(op, x.clone(), y.clone()), r.dtype()),
-        },
-
-        // CMP(y, WHERE(cond, x, Invalid)) → CMP(y, x) (right operand variant)
-        for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
-            r @ op(y, Where(_cond, x, invalid))
-                if matches!(invalid.op(), Op::Invalid)
-                ~> UOp::new(Op::Binary(op, y.clone(), x.clone()), r.dtype()),
-        },
-
-        // ALU with bare Invalid → Invalid
-        // upstream: only from left position with auto-commutation.
-        // Left position (all ops):
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
-            op(invalid, y) if matches!(invalid.op(), Op::Invalid) && y.dtype() == DType::Index
-                ~> { let _ = op; invalid.clone() },
-        },
-        // Right position (commutative ops only — upstream auto-commutation):
-        for op in binary [Add, Mul, Max, And, Or, Xor] {
-            op(y, invalid) if matches!(invalid.op(), Op::Invalid) && y.dtype() == DType::Index
-                ~> { let _ = op; invalid.clone() },
+        // ALU with bare Invalid → Invalid, in either operand position
+        // (tinygrad `uop/symbolic.py:77` matches `src=[invalid_pat, UPat()]`
+        // order-insensitively). Comparisons are excluded there and here: they
+        // keep the gate via the two rules above (`symbolic.py:75-76`), which
+        // cover every binary op including `GroupOp.Comparison`.
+        //
+        // Tinygrad's Invalid is the bottom of the promotion lattice. Svod uses
+        // a typed marker, so create one with the operation's result dtype.
+        for op in binary [Add, Mul, Sub, FloorMod, Max, FloorDiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
+            op(invalid, _y) if UOp::is_invalid_marker(invalid)
+                ~> { let _ = op; UOp::invalid_marker() },
+            op(_y, invalid) if UOp::is_invalid_marker(invalid)
+                ~> { let _ = op; UOp::invalid_marker() },
         },
     }
+}
+
+/// Final-only cleanup of Invalid validity markers.
+///
+/// Invalid must survive optimization and gate lowering, but cannot reach a
+/// rendered program. Typed data Invalid becomes typed zero; Index Invalid is
+/// retained for late memory gate lowering.
+pub fn pm_remove_invalid() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
+        r @ Where(cond, x, invalid) if UOp::is_invalid_marker(invalid) && r.dtype().base() != ScalarDType::Index =>
+            UOp::try_where(cond.clone(), x.clone(), r.const_like(0)).ok(),
+        r @ Stack { sources } if sources.iter().any(UOp::is_invalid_marker) && r.dtype().base() != ScalarDType::Index => {
+            let zero = UOp::const_(r.dtype().scalar_dtype(), ConstValue::Int(0));
+            Some(UOp::stack(sources.iter().map(|x| if UOp::is_invalid_marker(x) { zero.clone() } else { x.clone() }).collect()))
+        },
+    }
+}
+
+fn const_like_shape(u: &Arc<UOp>, value: ConstValue) -> Arc<UOp> {
+    fn fill(value: &Arc<UOp>, shape: &[svod_ir::SInt]) -> Option<Arc<UOp>> {
+        let (&svod_ir::SInt::Const(count), tail) = shape.split_first()? else { return None };
+        let lane = if tail.is_empty() { value.clone() } else { fill(value, tail)? };
+        Some(UOp::stack((0..count).map(|_| lane.clone()).collect()))
+    }
+
+    let scalar = UOp::const_(u.dtype().scalar_dtype(), value);
+    let Ok(Some(shape)) = u.shape() else { return scalar };
+    if shape.is_empty() { scalar } else { fill(&scalar, &shape).unwrap_or(scalar) }
 }
 
 /// Fold LOAD/STORE with fully-Invalid INDEX.
@@ -306,49 +558,50 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
 /// causing WHERE(valid, idx, Invalid) to simplify to just Invalid when valid is always false.
 pub fn fold_invalid_load_store() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        // LOAD(INDEX(buf, ...Invalid...)) → const 0 (any per-dimension Invalid means OOB)
-        load @ Load { index: Index { indices, .. }, .. }
-            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
+        // LOAD(INDEX(buf, Invalid, ...)) → const 0
+        load @ Load { index: Index { indices, .. }, alt, .. }
+            if indices.first().is_some_and(UOp::is_invalid_marker)
             => {
-                let zero = ConstValue::zero(load.dtype().scalar()?);
-                Some(load.const_like(zero))
+                if let Some(alt) = alt { return Some(alt.clone()); }
+                 Some(const_like_shape(load, ConstValue::zero(load.dtype().base())))
             },
 
-        // LOAD(CAST(INDEX(buf, ...Invalid...))) → const 0
-        load @ Load { index: Cast { src: Index { indices, .. }, .. }, .. }
-            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
+        // LOAD(CAST(INDEX(buf, Invalid, ...))) → const 0
+        load @ Load { index: Cast { src: Index { indices, .. }, .. }, alt, .. }
+            if indices.first().is_some_and(UOp::is_invalid_marker)
             => {
-                let zero = ConstValue::zero(load.dtype().scalar()?);
-                Some(load.const_like(zero))
+                if let Some(alt) = alt { return Some(alt.clone()); }
+                 Some(const_like_shape(load, ConstValue::zero(load.dtype().base())))
             },
 
-        // STORE(INDEX(buf, ...Invalid...), value) → NOOP
-        Store { index: Index { indices, .. }, .. }
-            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
+        // STORE(INDEX(buf, Invalid, ...), value) → NOOP
+        Store { index: Index { indices, .. }, value: _, gate: None }
+            if indices.first().is_some_and(UOp::is_invalid_marker)
             ~> UOp::new(Op::Noop, DType::Void),
 
-        // STORE(CAST(INDEX(buf, ...Invalid...)), value) → NOOP
-        Store { index: Cast { src: Index { indices, .. }, .. }, .. }
-            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
+        // STORE(CAST(INDEX(buf, Invalid, ...)), value) → NOOP
+        Store { index: Cast { src: Index { indices, .. }, .. }, value: _, gate: None }
+            if indices.first().is_some_and(UOp::is_invalid_marker)
             ~> UOp::new(Op::Noop, DType::Void),
     }
 }
 
 /// Tier-1 algebraic identities + constant folding WITHOUT the trivial-loop
-/// collapse ([`dead_loop_patterns`]). The shared base for [`symbolic_simple`]
-/// (which re-adds the collapse) and [`symbolic_no_dead_loop`].
+/// collapse ([`dead_loop_patterns`]). The base for [`symbolic_simple`], which
+/// re-adds the collapse.
 ///
 /// Contains algebraic identities and zero propagation rules:
 /// - x + 0 → x, 0 + x → x
 /// - x - 0 → x
 /// - x * 1 → x, 1 * x → x
-/// - x / 1 → x (both Idiv and Fdiv)
+/// - x / 1 → x (both FloorDiv and Fdiv)
 /// - x | 0 → x, 0 | x → x
 /// - x ^ 0 → x, 0 ^ x → x
 /// - x * 0 → 0, 0 * x → 0
 /// - x & 0 → 0, 0 & x → 0
 fn symbolic_simple_base() -> TypedPatternMatcher {
     propagate_invalid()
+        + fold_invalid_load_store()
         + constant_folding_dsl_patterns()
         + vconst_folding_patterns() // CONST and VCONST folded together at this tier
         + bool_arithmetic_patterns()
@@ -357,10 +610,26 @@ fn symbolic_simple_base() -> TypedPatternMatcher {
         + zero_folding_dsl_patterns()
         + division_dsl_patterns()
         + cast_dsl_patterns()
+        + uint_pack_dsl_patterns()
         + div_mod_recombine_dsl_patterns()
         + power_dsl_patterns()
         + boolean_dsl_simple_patterns()
         + dce_dsl_simple_patterns()
+}
+
+/// Collapse `CAST(dtype, CONST(value))` into a constant shaped and typed like
+/// the cast.
+///
+/// Tinygrad `uop/symbolic.py:101` keeps this standalone rather than inside
+/// `symbolic_simple`, and composes it explicitly at every site that wants it
+/// (`codegen/__init__.py:304,349,360`, `codegen/simplify.py:35`, `uop/ops.py:533`,
+/// `schedule/rangeify.py:587`). Morok mirrors that composition one for one, so
+/// devectorize and the image/load rewrites deliberately do not fold cast
+/// constants.
+pub fn pm_fold_cast_const() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
+        root @ Cast { src: _c @const(c_val), dtype: _ } ~> root.const_like(c_val.clone()),
+    }
 }
 
 /// Tier-1 algebraic identities + constant folding + the size-1 RANGE collapse.
@@ -375,75 +644,41 @@ pub fn symbolic_simple() -> &'static TypedPatternMatcher {
 /// rewrite engine applies them. The order is load-bearing: each group may expose
 /// matches for a later one (e.g. commutative canonicalization before term
 /// combining, ALU folding before the comparison/range rules).
-///
-/// `alu_folding` (the two-stage ALU / const push-down group) is gated: it is
-/// omitted on the hand-lowered path (see [`symbolic_no_dead_loop`]).
-fn with_tier2(tier1: TypedPatternMatcher, alu_folding: bool) -> TypedPatternMatcher {
+fn with_tier2(tier1: TypedPatternMatcher) -> TypedPatternMatcher {
     let head = tier1
         + commutative_canonicalization()
         + boolean_dsl_patterns() // x | !x → true
-        + term_combining_dsl_patterns() // combine like terms
+        + term_combining_dsl_patterns() // combine like terms and weak-int distribution
         + dce_dsl_patterns() // WHERE(!cond) branch swap
         + where_alu_combining_patterns() // hoist ALU through WHERE
         + vmin_vmax_collapse_patterns() // vmin == vmax → const
-        + minmax_dsl_patterns(); // bound-based max/min selection
-    let head = if alu_folding {
-        head + alu_folding_dsl_patterns() // two-stage ALU, const push-down
-    } else {
-        head
-    };
+        + minmax_dsl_patterns() // bound-based max/min selection
+        + alu_folding_dsl_patterns(); // two-stage ALU, const push-down
     head + comparison_dsl_patterns() // lt/le/eq simplification
         + range_based_mod_div_patterns() // mod/div against a range bound
         + advanced_division_dsl_patterns() // symbolic div-and-mod
         + range_based_cast_patterns() // range-based double-cast
         + long_to_int_narrowing_patterns() // i64 → i32 when range fits
-        + vectorize_to_vconst_patterns() // VECTORIZE(CONST..) → VCONST
         + after_simplification_patterns() // drop redundant AFTER ordering
         + where_bound_patterns() // WHERE(Lt) elimination via vmin/vmax
-        + gep_pushing_patterns()
 }
 
 pub fn symbolic() -> &'static TypedPatternMatcher {
     static CACHED: std::sync::LazyLock<TypedPatternMatcher> =
-        std::sync::LazyLock::new(|| with_tier2(symbolic_simple_base() + dead_loop_patterns(), true));
-    &CACHED
-}
-
-/// [`symbolic`] for **hand-lowered tk kernels** — the post-index simplification
-/// they run after `pm_lower_index_dtype`. Like the generic pipeline it folds the
-/// degenerate index arithmetic (`x*0`, `x*1`, `x/1`, `x%1`, redundant casts) that
-/// lowering regenerates; left unfolded, those loop-invariant values reach the
-/// renderer stranded in non-dominating blocks (LLVM "does not dominate all uses").
-///
-/// It differs from [`symbolic`] by exactly two omitted folds, both rooted in the
-/// same gap: hand-built kernels carry loop state through END/AFTER and lane state
-/// through SPECIAL-derived indices, whereas the generic path goes through reduce
-/// accumulators and warp-axis RANGEs. Each omission has a concrete failure:
-///
-/// * **`dead_loop`** (size-1 RANGE→const) — FA's online-softmax `m`/`l`/`o`
-///   recurrence rides a single-trip RANGE; collapsing it to a constant severs the
-///   carry and the kernel returns wrong values.
-/// * **`alu_folding`** (two-stage ALU / const push-down) — it factors per-position
-///   address arithmetic into one range-derived index (`range·stride`) shared
-///   across sibling reduces. The generic path tolerates this because `dead_loop`
-///   then collapses the trivial range away; here, with no collapse, the shared
-///   index is emitted once inside the first reduce's region and fails to dominate
-///   the others (the knn `mul(r,stride)` "does not dominate all uses").
-///
-/// Every other Tier-2 fold runs, matching the generic `symbolic` as closely as the
-/// hand-lowered carry structure allows.
-pub fn symbolic_no_dead_loop() -> &'static TypedPatternMatcher {
-    static CACHED: std::sync::LazyLock<TypedPatternMatcher> =
-        std::sync::LazyLock::new(|| with_tier2(symbolic_simple_base(), false));
+        std::sync::LazyLock::new(|| with_tier2(symbolic_simple_base() + dead_loop_patterns()));
     &CACHED
 }
 
 /// Maximum symbolic matcher (tier 3).
 ///
-/// Matches `sym` (upstream symbolic_simple):
+/// Matches upstream `sym` (`uop/symbolic.py:429`):
 /// symbolic + pm_simplify_valid + store/load fold + cast-through-WHERE +
-/// ALU/VECTORIZE reorder + x!=0 fold + reciprocal distribution +
-/// opinionated combine terms + reduce hoist.
+/// ALU/STACK reorder + x!=0 fold + opinionated combine terms + reduce hoist.
+///
+/// Upstream's reciprocal distribution (`uop/symbolic.py:448-453`) is deliberately
+/// absent: all six rules are IEEE-inexact, and
+/// `unknown_float_division_power_and_reciprocal_are_not_algebraically_rewritten`
+/// pins the non-rewrite.
 ///
 /// Used at: pre-opt initial, post-opt (Stage 8), expander (Stage 9), devectorize (Stage 14).
 pub fn sym() -> &'static TypedPatternMatcher {
@@ -451,32 +686,27 @@ pub fn sym() -> &'static TypedPatternMatcher {
         symbolic()
             + super::valid_simplification::pm_simplify_valid()
             + alu_vectorize_reorder_patterns()
-            + ne_zero_fold_patterns()
+            + value_sensitive(ne_zero_fold_patterns())
             + cast_where_dsl_patterns()
-            + fold_invalid_load_store()
             + store_load_folding_patterns()
-            + reciprocal_patterns()
-            + reduce_sym_patterns()
+            + value_sensitive(reduce_sym_patterns())
             + sym_phase3_patterns()
     });
     &CACHED
 }
 
-/// Commutative operand canonicalization for index-type operations.
-///
-/// Ensures commutative binary ops have operands in canonical order (smaller
-/// id on the left). Without this, mathematically equivalent expressions like
-/// `R1*8000 + R2*16` and `R2*16 + R1*8000` won't be deduplicated by hash
-/// consing, breaking grouping in `expand_vector_index`.
-///
-/// Follows upstream symbolic_simple: only applies to
-/// index-type operations to avoid breaking vector math merging.
-fn commutative_canonicalization() -> &'static TypedPatternMatcher {
+/// Pinned Tinygrad's structural commutative ordering for weak-integer index expressions.
+/// Source order remains authored for every other dtype.
+pub(crate) fn commutative_canonicalization() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         for op in binary [Add, Mul, Max, Eq, Ne, And, Or, Xor] {
             r @ op(a, b)
-                if r.dtype() == DType::Index && b.id < a.id
-                ~> UOp::new(Op::Binary(op, b.clone(), a.clone()), r.dtype()),
+                if crate::linearize::tinygrad_weakint_expr(r)
+                    && crate::linearize::tinygrad_tuplize_cmp(b, a) == Some(Ordering::Less)
+                ~> {
+                    let _ = op;
+                    r.replace().src(vec![b.clone(), a.clone()]).call()
+                },
         },
     }
 }
@@ -491,11 +721,11 @@ fn commutative_canonicalization() -> &'static TypedPatternMatcher {
 pub fn self_folding_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // x // x → 1
-        Idiv(x, x) ~> 1.into_uop(x.dtype()),
+        original @ FloorDiv(x, x) => exact_integer_rewrite(original, 1.into_uop(x.dtype())),
         // x // -1 → -x
-        Idiv(x, _c @const(c_val)) if c_val.is_neg_one() ~> x.neg(),
+        original @ FloorDiv(x, _c @const(c_val)) if c_val.is_neg_one() => exact_integer_rewrite(original, x.neg()),
         // (x % y) % y → x % y
-        Mod(Mod(x, y), y) ~> x.mod_(y),
+        original @ FloorMod(FloorMod(x, y), y) => exact_integer_rewrite(original, x.mod_(y)),
         // Idempotent: x op x → x (GroupOp.Idempotent = {AND, OR, MAX})
         And(x, x) ~> x.clone(),
         Max(x, x) ~> x.clone(),
@@ -507,15 +737,19 @@ pub fn self_folding_dsl_patterns() -> &'static TypedPatternMatcher {
 /// Zero folding patterns.
 ///
 /// Patterns that fold to zero or false:
-/// - x < x → False (, no dtype guard)
+/// - x < x → False when NaN is impossible
 /// - x % x → 0
 /// - x != x → False (, ints+bool+index only)
 pub fn zero_folding_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // x % x → 0
-        Mod(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
-        // x < x → False (no dtype guard, returns bool.vec(count))
-        Lt(x, x) => Some(UOp::const_(DType::Bool.vec(x.dtype().vcount()).expect("Bool is a scalar"), ConstValue::Bool(false))),
+        original @ FloorMod(x, x) => {
+            let replacement = x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt)))?;
+            exact_integer_rewrite(original, replacement)
+        },
+        // Float x<x is false only when the analysis proves x cannot be NaN.
+        Lt(x, x) if !x.dtype().is_float() || SoundVminVmaxProperty::get(x).is_some() =>
+            Some(UOp::const_(DType::Bool.vec(x.dtype().vcount()).expect("Bool is a scalar"), ConstValue::Bool(false))),
         // x != x → False (ints+bool+index, returns bool.vec(count))
         Ne(x, x) if x.dtype().is_int() || x.dtype().is_bool() =>
             Some(UOp::const_(DType::Bool.vec(x.dtype().vcount()).expect("Bool is a scalar"), ConstValue::Bool(false))),
@@ -532,37 +766,20 @@ pub fn zero_folding_dsl_patterns() -> &'static TypedPatternMatcher {
 pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // Range(end) % end → Range(end) (identity: range values are [0, end), always < end)
-        Mod(range @ Range { end, .. }, end) ~> range,
+        original @ FloorMod(range @ Range { end, .. }, end) => exact_integer_rewrite(original, range.clone()),
         // Range(end) // end → 0 (all values in [0, end) divide by end to 0)
-        Idiv(Range { end, .. }, end)  ~> UOp::index_const(0),
-
-        // Negative operand canonicalization (upstream divandmod, 110-111).
-        // Canonicalize div/mod with negative operands into positive-operand form
-        // so downstream simplification patterns (which assume positive) can fire.
-        //
-        // x // d → -(x // (-d)) when d is always negative
-        Idiv(x, d) if x.dtype() == DType::Index && matches!(d.vmax(), ConstValue::Int(v) if *v < 0)
-            => Some(x.idiv(&d.neg()).neg()),
-        // x // d → -((-x) // d) when x is always non-positive
-        Idiv(x, d) if x.dtype() == DType::Index && matches!(x.vmax(), ConstValue::Int(v) if *v <= 0)
-            => Some(x.neg().idiv(d).neg()),
-        // x % d → -((-x) % d) when x is always non-positive
-        Mod(x, d) if x.dtype() == DType::Index && matches!(x.vmax(), ConstValue::Int(v) if *v <= 0)
-            => Some(x.neg().mod_(d).neg()),
-        // x % d → x % (-d) when d is always negative
-        Mod(x, d) if x.dtype() == DType::Index && matches!(d.vmax(), ConstValue::Int(v) if *v < 0)
-            => Some(x.mod_(&d.neg())),
+        original @ FloorDiv(Range { end, .. }, end) => exact_integer_rewrite(original, original.const_like(0)),
 
         // x % n → x when 0 <= vmin(x) && vmax(x) < n
         // This handles cases like Range(3) % 3 → Range(3)
-        Mod(x, _n @const(n_val)) => {
-            let (vmin, vmax) = VminVmaxProperty::get(x);
+        FloorMod(x, _n @const(n_val)) => {
+            let (vmin, vmax) = SoundVminVmaxProperty::get(x).as_ref()?;
             trace!(
                 x.id = x.id,
                 vmin = ?vmin,
                 vmax = ?vmax,
                 n_val = ?n_val,
-                "Mod simplification check"
+                "FloorMod simplification check"
             );
             // Check if x is always non-negative and less than n
             if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
@@ -583,17 +800,18 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
         // Since (a * n) % n = 0, the Mul term can be dropped.
         // Using commutative [] for Add to match both orderings.
         // Note: We compare m_val and n_val by VALUE, not pointer, since they may be separate UOps.
-        // (a * n + b) % n → b % n when b >= 0 (truncated mod is correct only for non-negative).
-        Mod(Add[Mul[_a, n @const(_m_val)], b], n @const(_n_val)) => {
-            if !matches!(b.vmin(), ConstValue::Int(v) if *v >= 0) { return None; }
-            Some(b.mod_(n))
+        // Keep this legacy rule in the non-negative indexing domain.
+        original @ FloorMod(Add[Mul[_a, n @const(_m_val)], b], n @const(_n_val)) => {
+            if !matches!(SoundVminVmaxProperty::get(b), Some((ConstValue::Int(v), _)) if *v >= 0) { return None; }
+            exact_integer_rewrite(original, b.mod_(n))
         },
 
         // ((a * n) + b + c) % n → (b + c) % n when (b + c) >= 0.
-        Mod(Add[Add[Mul[_a, n @const(_m_val)], b], c], n @const(_n_val)) => {
+        original @ FloorMod(Add[Add[Mul[_a, n @const(_m_val)], b], c], n @const(_n_val)) => {
             let bc = b.add(c);
-            if !matches!(bc.vmin(), ConstValue::Int(v) if *v >= 0) { return None; }
-            Some(bc.mod_(n))
+            if !matches!(SoundVminVmaxProperty::get(&bc), Some((ConstValue::Int(v), _)) if *v >= 0) { return None; }
+            let replacement = bc.mod_(n);
+            exact_integer_rewrite(original, replacement)
         },
 
         // (a * m + b) / n → a + b / n when m == n (distribute division over sum)
@@ -601,11 +819,11 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
         // Specifically: (a * n + b) / n = a when 0 <= b < n
         // Using commutative [] for Add to match both orderings.
         // Note: We compare m_val and n_val by VALUE, not pointer, since they may be separate UOps.
-        Idiv(Add[Mul[a, n @const(_m_val)], b], n @const(n_val)) => {
+        original @ FloorDiv(Add[Mul[a, n @const(_m_val)], b], n @const(n_val)) => {
             let n_int = n_val.try_int()?;
             if n_int <= 0 { return None; }
 
-            let (vmin, vmax) = VminVmaxProperty::get(b);
+            let (vmin, vmax) = SoundVminVmaxProperty::get(b).as_ref()?;
             if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax)
                 && *min >= 0 && *max < n_int {
                     // b is in [0, n), so (a * n + b) / n = a
@@ -614,14 +832,14 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
                         a.id = a.id,
                         min = *min,
                         max = *max,
-                        "Idiv factor-out: (a * n + b) / n → a (when 0 <= b < n)"
+                        "FloorDiv factor-out: (a * n + b) / n → a (when 0 <= b < n)"
                     );
-                    return Some(Arc::clone(a));
+                    return exact_integer_rewrite(original, Arc::clone(a));
                 }
-            // Fall through: compute a + b / n (only valid when b >= 0 for truncated division)
-            if !matches!(b.vmin(), ConstValue::Int(v) if *v >= 0) { return None; }
-            let b_div_n = b.idiv(n);
-            Some(a.add(&b_div_n))
+            // Fall through in the non-negative indexing domain.
+            if !matches!(SoundVminVmaxProperty::get(b), Some((ConstValue::Int(v), _)) if *v >= 0) { return None; }
+            let b_div_n = b.floor_div(n);
+            exact_integer_rewrite(original, a.add(&b_div_n))
         },
 
         // x / n → k when all values of x are in the same bucket [k*n, (k+1)*n)
@@ -629,84 +847,21 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
         // Examples:
         //   Range(3) / 3 → 0 (since Range(3) is 0,1,2 and all /3 = 0)
         //   (64 + Range(8)) / 64 → 1 (since 64..71 all /64 = 1)
-        Idiv(x, _n @const(n_val)) => {
-            let (vmin, vmax) = VminVmaxProperty::get(x);
+        FloorDiv(x, _n @const(n_val)) => {
+            let (vmin, vmax) = SoundVminVmaxProperty::get(x).as_ref()?;
             if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
                 && n_int > 0 {
-                    // Truncation division (Rust's `/` rounds toward zero) matches Svod's
-                    // IDIV semantics. n_int > 0 is already guarded above.
-                    let min_div = *min / n_int;
-                    let max_div = *max / n_int;
+                    let min_div = min.checked_div_euclid(n_int)?;
+                    let max_div = max.checked_div_euclid(n_int)?;
                     if min_div == max_div {
                         trace!(
                             min = *min,
                             max = *max,
                             n_int,
                             result = min_div,
-                            "Idiv cancel: x / n → k (all values in same bucket)"
+                            "FloorDiv cancel: x / n → k (all values in same bucket)"
                         );
                         return Some(UOp::const_(x.dtype(), ConstValue::Int(min_div)));
-                    }
-                }
-            None
-        },
-
-        // Idiv(add_chain, n) → Idiv(add_chain_minus_const, n) when the constant doesn't affect floor division
-        // This handles: Idiv(Add(Add(base, 1), inner), 64) → Idiv(Add(base, inner), 64)
-        // when base is aligned to 64 and 1 < 64
-        Idiv(x @ Add(_, _), n @const(n_val)) => {
-            // Extract total constant offset from Add chain
-            fn extract_const_sum(uop: &Arc<UOp>) -> (Arc<UOp>, i64) {
-                match uop.op() {
-                    Op::Binary(BinaryOp::Add, left, right) => {
-                        if let Op::Const(cv) = right.op()
-                            && let ConstValue::Int(v) = cv.0 {
-                                let (inner, inner_sum) = extract_const_sum(left);
-                                return (inner, inner_sum + v);
-                            }
-                        if let Op::Const(cv) = left.op()
-                            && let ConstValue::Int(v) = cv.0 {
-                                let (inner, inner_sum) = extract_const_sum(right);
-                                return (inner, inner_sum + v);
-                        }
-                        // Recurse into both sides for nested adds
-                        let (left_inner, left_sum) = extract_const_sum(left);
-                        let (right_inner, right_sum) = extract_const_sum(right);
-                        if left_sum != 0 || right_sum != 0 {
-                            // Rebuild Add without the extracted constants
-                            let new_add = left_inner.try_add(&right_inner).ok();
-                            if let Some(rebuilt) = new_add {
-                                return (rebuilt, left_sum + right_sum);
-                            }
-                        }
-                        (Arc::clone(uop), 0)
-                    }
-                    _ => (Arc::clone(uop), 0),
-                }
-            }
-
-            let (x_without_const, const_sum) = extract_const_sum(x);
-            if const_sum == 0 {
-                return None;  // No constant to remove
-            }
-
-            let (vmin, vmax) = VminVmaxProperty::get(&x_without_const);
-            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
-                && n_int > 0 {
-                    // Check if adding const_sum doesn't change floor division result
-                    let min_div = *min / n_int;
-                    let max_div = *max / n_int;
-
-                    // CRITICAL: All values must be in the same bucket for safe removal.
-                    if min_div != max_div {
-                        return None;
-                    }
-
-                    // Check that adding const_sum keeps values in the same bucket
-                    let min_c_div = (*min + const_sum).div_euclid(n_int);
-                    let max_c_div = (*max + const_sum).div_euclid(n_int);
-                    if min_div == min_c_div && max_div == max_c_div {
-                        return x_without_const.try_div(&Arc::clone(n)).ok();
                     }
                 }
             None
@@ -715,11 +870,11 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
         // (a + (x // n) * n) // n → x // n  when 0 <= vmin(a) and vmax(a) < n
         // This eliminates redundant idiv chains in address calculations
         // Using [] for both Add and Mul to match all permutations
-        Idiv(Add[a, Mul[Idiv(x, n @const(n_val)), n]], n) => {
-            let (vmin, vmax) = VminVmaxProperty::get(a);
+        original @ FloorDiv(Add[a, Mul[FloorDiv(x, n @const(n_val)), n]], n) => {
+            let (vmin, vmax) = SoundVminVmaxProperty::get(a).as_ref()?;
             if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
                 && *min >= 0 && *max < n_int && n_int > 0 {
-                    return Some(x.idiv(n));
+                    return exact_integer_rewrite(original, x.floor_div(n));
                 }
             None
         },
@@ -728,12 +883,12 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
         // Condition: for ALL v in [vmin(x), vmax(x)], (v+c)//d == v//d.
         // A value v crosses a boundary when v%d + c >= d. So the rule is safe iff
         // the maximum remainder in [min, max] satisfies max_rem + c < d.
-        Idiv(Add[x, _c @const(c_val)], d @const(d_val)) => {
+        original @ FloorDiv(Add[x, _c @const(c_val)], d @const(d_val)) => {
             let c_int = c_val.try_int()?;
             let d_int = d_val.try_int()?;
             if d_int <= 0 || c_int <= 0 { return None; }
 
-            let (vmin, vmax) = VminVmaxProperty::get(x);
+            let (vmin, vmax) = SoundVminVmaxProperty::get(x).as_ref()?;
             if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax)
                 && *min >= 0
             {
@@ -741,61 +896,47 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
                 // - if range spans a full cycle (max - min >= d - 1), max_rem = d - 1
                 // - if min%d > max%d (modular wrap), max_rem = d - 1
                 // - otherwise, max_rem = max%d
-                let max_rem = if max - min >= d_int - 1 || *min % d_int > *max % d_int {
-                    d_int - 1
+                let d_minus_one = d_int.checked_sub(1)?;
+                let max_rem = if max.checked_sub(*min)? >= d_minus_one
+                    || min.checked_rem(d_int)? > max.checked_rem(d_int)?
+                {
+                    d_minus_one
                 } else {
-                    *max % d_int
+                    max.checked_rem(d_int)?
                 };
 
-                if max_rem + c_int < d_int {
-                    return Some(x.idiv(d));
+                if max_rem.checked_add(c_int).is_some_and(|sum| sum < d_int) {
+                    return exact_integer_rewrite(original, x.floor_div(d));
                 }
             }
             None
         },
 
-        // Phase 1: (x + c) // d → (x + (c % d)) // d + (c // d)
-        // When c >= d, split the offset into quotient and remainder parts.
-        // This canonicalizes large offsets, allowing further simplification.
-        // Based on upstream divandmod
-        Idiv(Add[x, _c @const(c_val)], d @const(d_val)) => {
-            let c_int = c_val.try_int()?;
-            let d_int = d_val.try_int()?;
-            if d_int <= 0 { return None; }
+        // (x + c) // d -> (x + c%d) // d + c//d, for any d != 0
+        // (`uop/divandmod.py:102-105`): "split the multiple of d out of the
+        // const, holds for any d!=0". Floor division satisfies
+        // `(x + r + q*d)//d == (x + r)//d + q` for every integer `x` and every
+        // `d != 0`, so upstream's only guard is `c.val%d.val==c.val`.
+        original @ FloorDiv(Add[x, _c @const(c_val)], d @const(d_val)) => {
+            let (c_div_d, c_mod_d) = floor_divmod(c_val.try_int()?, d_val.try_int()?)?;
+            if c_mod_d == c_val.try_int()? { return None; }
 
-            let c_mod_d = c_int % d_int;
-            let c_div_d = c_int / d_int;
-
-            // Only apply if remainder differs from original (i.e., c >= d or c < 0)
-            if c_mod_d == c_int { return None; }
-
-            // Guard: BOTH (x + c) AND (x + c%d) must be non-negative.
-            // The transform splits: (x+c)//d = (x+c%d)//d + c//d
-            // This is only correct when truncated div == floor div (non-negative numerator).
-            let (vmin, _) = VminVmaxProperty::get(x);
-            if let ConstValue::Int(min) = vmin {
-                if min + c_int < 0 || min + c_mod_d < 0 { return None; }
-            } else { return None; }
-
-            // Transform: (x + c) // d → (x + c%d) // d + c//d
             let remainder_const = UOp::const_(d.dtype(), ConstValue::Int(c_mod_d));
-            let inner = x.add(&remainder_const);
-            let div_result = inner.idiv(d);
             let quotient_const = UOp::const_(d.dtype(), ConstValue::Int(c_div_d));
-            Some(div_result.add(&quotient_const))
+            exact_integer_rewrite(original, x.add(&remainder_const).floor_div(d).add(&quotient_const))
         },
 
         // Phase 1b: (x + c) // d for negative x
         // When x <= 0 but (x + c) >= 0, split using adjusted formula:
         // (x + c) // d → -(-(c%d + x - (d-1)) // d) + c//d
-        Idiv(Add[x, _c @const(c_val)], d @const(d_val)) => {
+        original @ FloorDiv(Add[x, _c @const(c_val)], d @const(d_val)) => {
             let c_int = c_val.try_int()?;
             let d_int = d_val.try_int()?;
             if d_int <= 0 { return None; }
 
-            let (x_vmin, x_vmax) = VminVmaxProperty::get(x);
+            let (x_vmin, x_vmax) = SoundVminVmaxProperty::get(x).as_ref()?;
             let n_expr = x.add(&UOp::const_(x.dtype(), c_val));
-            let n_vmin = n_expr.vmin();
+            let (n_vmin, _) = SoundVminVmaxProperty::get(&n_expr).as_ref()?;
 
             if let (ConstValue::Int(_), ConstValue::Int(xmax)) = (x_vmin, x_vmax)
                 && let ConstValue::Int(nmin) = n_vmin
@@ -805,23 +946,18 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
                 let c_div_d = c_int.div_euclid(d_int);
                 // inner = -(c%d + x - (d-1))
                 let c_mod_const = UOp::const_(d.dtype(), ConstValue::Int(c_mod_d));
-                let d_minus_1 = UOp::const_(d.dtype(), ConstValue::Int(d_int - 1));
+                let d_minus_1 = UOp::const_(d.dtype(), ConstValue::Int(d_int.checked_sub(1)?));
                 let inner = c_mod_const.add(x).sub(&d_minus_1).neg();
-                let div_result = inner.idiv(d).neg();
+                let div_result = inner.floor_div(d).neg();
                 let quotient_const = UOp::const_(d.dtype(), ConstValue::Int(c_div_d));
-                return Some(div_result.add(&quotient_const));
+                return exact_integer_rewrite(original, div_result.add(&quotient_const));
             }
             None
         },
 
-        // Unified divmod simplification (catch-all for IDIV/MOD on Index dtype).
-        // Based on upstream fold_divmod_general (divandmod.py:8-93).
-        // Tries rules in priority order: cancel_divmod → remove_nested_mod →
-        // fold_binary_numerator → fold_divmod_congruence → gcd_with_remainder →
-        // divide_by_gcd → factor_remainder.
-        for op in binary [Idiv, Mod] {
-            d @ op(x, y) if d.dtype() == DType::Index => crate::symbolic::divmod::fold_divmod_general(op, x, y),
-        },
+        // The broad WeakInt div/mod decomposition is intentionally disabled. Its
+        // speculative reassociation cannot establish no-wrap for every generated
+        // intermediate; the explicit proven rules above cover safe index cases.
     }
 }
 
@@ -832,7 +968,7 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
 /// - x / x → 1.0 (float division)
 /// - (x * y) / y → x
 /// - (x * y) // y → x
-pub fn division_dsl_patterns() -> &'static TypedPatternMatcher {
+fn division_dsl_patterns_unchecked() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // 0 / 0 → NaN (IEEE 754: 0/0 is indeterminate)
         // NOTE: This must come before x/x → 1 pattern to take priority
@@ -841,13 +977,19 @@ pub fn division_dsl_patterns() -> &'static TypedPatternMatcher {
         // (x * 0) / 0 → NaN (anything times zero divided by zero is NaN)
         Fdiv(Mul[_, zero1 @ @zero], @zero) if zero1.dtype().is_float()
             ~> UOp::const_(zero1.dtype(), ConstValue::Float(f64::NAN)),
-        // x / x → 1.0 (float division)
-        Fdiv(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
-        // (x * y) / y → x
-        Fdiv(Mul(x, y), y) ~> x.clone(),
+        // x / x → 1.0 only when x is provably finite and non-zero.
+        Fdiv(x, x) if sound_finite_nonzero(x) =>
+            x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
         // (x * y) // y → x
-        Idiv(Mul(x, y), y) ~> x.clone(),
+        original @ FloorDiv(Mul(x, y), y) => exact_integer_rewrite(original, x.clone()),
     }
+}
+
+fn sound_finite_nonzero(value: &Arc<UOp>) -> bool {
+    let Some((ConstValue::Float(min), ConstValue::Float(max))) = SoundVminVmaxProperty::get(value) else {
+        return false;
+    };
+    min.is_finite() && max.is_finite() && (*max < 0.0 || *min > 0.0)
 }
 
 /// Check if casting from `from` to `to` can safely preserve all values.
@@ -873,19 +1015,6 @@ fn can_safe_cast(to: &DType, from: &DType) -> bool {
     // Same type is always safe
     if to_scalar == from_scalar {
         return true;
-    }
-
-    // Index is the unbounded index type, so an intermediate of type Index holds
-    // every value of any integer `to`. This lets the double-cast collapse fire on
-    // the `int.cast(Index).cast(int)` chains `pm_lower_index_dtype` regenerates
-    // (e.g. the bpermute lane address). The reverse is NOT lossless: a concrete
-    // int cannot hold an arbitrary Index, so `Index.cast(int).cast(..)` may narrow
-    // and must not collapse — `to == Index` falls through to `false` below.
-    if from_scalar == ScalarDType::Index {
-        return to_scalar.is_int();
-    }
-    if to_scalar == ScalarDType::Index {
-        return false;
     }
 
     // Get bit widths and signedness
@@ -949,7 +1078,6 @@ fn can_safe_cast(to: &DType, from: &DType) -> bool {
 
 /// Cast optimization patterns.
 ///
-/// - cast(const) → const (constant folding)
 /// - x.cast(dtype) → x if same dtype (noop cast)
 /// - x.cast(a).cast(b) → x.cast(b) when safe (collapse double cast)
 ///
@@ -958,8 +1086,6 @@ fn can_safe_cast(to: &DType, from: &DType) -> bool {
 ///   int64.cast(int8).cast(int64) → int64  // WRONG: loses truncation!
 pub fn cast_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        // cast(const) → const
-        Cast { src: _c @const(c_val), dtype } => c_val.cast(dtype).map(|v| UOp::const_(dtype.clone(), v)),
         // x.cast(dtype) → x if same dtype
         Cast { src: x, dtype } if x.dtype() == *dtype ~> x.clone(),
         // x.cast(a).cast(b) → x when x.dtype == b and a preserves all values of b
@@ -975,6 +1101,57 @@ pub fn cast_dsl_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
+/// Unpack a uint64 packed from two uint32 (Tinygrad `uop/symbolic.py:170-173`).
+///
+/// THREEFRY packs its operands as `(hi.cast(u64) << 32) | lo.cast(u64)` and its
+/// callers immediately take one half back out. Cancelling the pair keeps the
+/// whole PRNG in 32-bit ALU.
+pub fn uint_pack_dsl_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
+        // ((_:u64 << 32) | y.cast(u64)).cast(u32) → y.cast(u32)
+        Cast { src: Or[shifted @ Shl(_, _s @const(s)), lo], dtype: narrowed }
+            if *narrowed == DType::UInt32 && shifted.dtype() == DType::UInt64 && is_shift_32(s)
+            => |lo| Some(low_half_payload(lo)?.cast(DType::UInt32)),
+        // ((x.cast(u64) << 32) | _.cast(u64)) >> 32 → x.cast(u64)
+        Shr(Or[Shl(high, _s @const(s)), lo], _t @const(t))
+            if is_shift_32(s) && is_shift_32(t)
+            => |high, lo| {
+                let payload = low_half_payload(high)?;
+                low_half_payload(lo)?;
+                Some(payload.cast(DType::UInt64))
+            },
+    }
+}
+
+/// A shift amount of exactly 32, whatever integer flavour the constant carries.
+fn is_shift_32(value: ConstValue) -> bool {
+    matches!(value, ConstValue::Int(32) | ConstValue::UInt(32))
+}
+
+/// The 32-bit payload behind a widening cast into uint64, when the source
+/// provably holds in the low 32 bits — so the high half of the widened value is
+/// zero. Tinygrad spells this as a literal `uint32 → uint64` cast; morok's
+/// earlier cast folding can leave a signed-but-non-negative source instead.
+fn low_half_payload(value: &Arc<UOp>) -> Option<&Arc<UOp>> {
+    let Op::Cast { src, dtype } = value.op() else { return None };
+    (*dtype == DType::UInt64 && (src.dtype() == DType::UInt32 || fits_in_u32(src))).then_some(src)
+}
+
+/// Provable `0 ..= u32::MAX` bounds — the range-analysis stand-in for a literal
+/// uint32 source.
+fn fits_in_u32(value: &Arc<UOp>) -> bool {
+    fn bound(value: &ConstValue) -> Option<i128> {
+        match value {
+            ConstValue::Int(v) => Some(i128::from(*v)),
+            ConstValue::UInt(v) => Some(i128::from(*v)),
+            _ => None,
+        }
+    }
+    let bounds = SoundVminVmaxProperty::get(value);
+    let Some((low, high)) = bounds.as_ref() else { return false };
+    matches!((bound(low), bound(high)), (Some(low), Some(high)) if low >= 0 && high <= i128::from(u32::MAX))
+}
+
 /// Range-based double-cast collapse.
 ///
 /// x:ints.cast(ints, a).cast(b) → x.cast(b) when a.min <= x.vmin and x.vmax <= a.max.
@@ -982,11 +1159,11 @@ pub fn cast_dsl_patterns() -> &'static TypedPatternMatcher {
 fn range_based_cast_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         Cast { src: Cast { src: x, dtype: intermediate }, dtype: outer }
-            if (x.dtype().is_int() || x.dtype() == DType::Index)
-            && (intermediate.is_int() || *intermediate == DType::Index)
+            if x.dtype().is_int()
+            && intermediate.is_int()
             => {
                 // Check if x's value range fits within the intermediate type
-                let (vmin, vmax) = VminVmaxProperty::get(x);
+                let (vmin, vmax) = SoundVminVmaxProperty::get(x).as_ref()?;
                 let (imin, imax) = match intermediate.scalar() {
                     Some(ScalarDType::Int8) => (i8::MIN as i64, i8::MAX as i64),
                     Some(ScalarDType::Int16) => (i16::MIN as i64, i16::MAX as i64),
@@ -1007,7 +1184,7 @@ fn range_based_cast_patterns() -> &'static TypedPatternMatcher {
 }
 
 /// Term combining patterns.
-pub fn term_combining_dsl_patterns() -> &'static TypedPatternMatcher {
+fn term_combining_dsl_patterns_unchecked() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // x + x → 2*x
         Add(x, x) => x.try_mul(&x.const_like(2i64)).ok(),
@@ -1050,14 +1227,16 @@ pub fn term_combining_dsl_patterns() -> &'static TypedPatternMatcher {
             let x2 = x.try_mul(&x.const_like(2i64)).ok()?;
             y.try_add(&x2).ok()
         },
-        // (x/x2)/x3 → x/(x2*x3) — flatten nested float division
-        // Guard: x2 must not be same UOp as x3 (prevents loop with x/x→1)
-        Fdiv(Fdiv(x, x2), x3)
-            if !Arc::ptr_eq(x2, x3)
-            => {
-                let denom = x2.try_mul(x3).ok()?;
-                x.try_div(&denom).ok()
-            },
+        // Nested float division is not reassociated: doing so changes IEEE
+        // rounding, overflow, underflow, and special-value behavior.
+        // -(x+c) → -x + -c. This must precede the generic weak-int distribution.
+        Mul[_neg @const(nv), Add[x, c @const(cv)]] if nv.is_neg_one() => {
+            let neg_one = ConstValue::neg_one(c.dtype().base())?;
+            let neg_cv = eval_mul_typed(cv, neg_one, c.dtype().base()).expect("failed to negate constant");
+            Some(x.neg().add(&UOp::const_(c.dtype(), neg_cv)))
+        },
+        // y * (x + c) → y*x + y*c for weak integers.
+        Mul[y @const(_yv), Add[x, c @const(_cv)]] if x.dtype() == DType::WeakInt ~> y.mul(x).add(&y.mul(c)),
     }
 }
 
@@ -1073,45 +1252,83 @@ pub fn term_combining_dsl_patterns() -> &'static TypedPatternMatcher {
 pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // (a // b) // c → a // (b * c) if b,c non-zero
-        Idiv(Idiv(a, b @const(b_val)), _c @const(c_val)) if !b_val.is_zero() && !c_val.is_zero() ~> {
+        original @ FloorDiv(FloorDiv(a, b @const(b_val)), _c @const(c_val)) if !b_val.is_zero() && !c_val.is_zero() => {
+            let Op::Binary(BinaryOp::FloorDiv, _, c) = original.op() else { return None };
+            if c_val.try_int()? <= 0 { return None; }
+            if !integer_binary_does_not_wrap(BinaryOp::Mul, b, c, &b.dtype()) { return None; }
             let mul = eval_mul_typed(b_val, c_val, b.dtype().base()).expect("failed to multiply constants");
-            a.idiv(&UOp::const_(b.dtype(), mul))
+            exact_integer_rewrite(original, a.floor_div(&UOp::const_(b.dtype(), mul)))
         },
         // expr // divisor → expr.divides(divisor) (generic exact division)
-        Idiv(expr, _divisor @const(d_val)) => d_val.try_int().and_then(|d| expr.divides(d)),
-        // Decomposes x into sum(factor_i * term_i) + const, computes centered remainders,
-        // and folds if the remainder range fits in one bucket (rem.vmin//c == rem.vmax//c).
-        Mod(x, c @const(c_val)) => crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, true),
-        Idiv(x, c @const(c_val)) => crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, false),
-        // (a + b) // c → (a // c) + (b // c) when both divide evenly
-        Idiv(Add(a, b), _c @const(c_val)) => {
-            let d = c_val.try_int()?;
-            Some(a.divides(d)?.add(&b.divides(d)?))
+        original @ FloorDiv(expr, _divisor @const(d_val)) => {
+            let replacement = expr.divides(d_val.try_int()?)?;
+            exact_integer_rewrite(original, replacement)
         },
-        // (a - b) // c → (a // c) - (b // c) when both divide evenly
-        Idiv(Sub(a, b), _c @const(c_val)) => {
-            let d = c_val.try_int()?;
-            Some(a.divides(d)?.sub(&b.divides(d)?))
+        // (a + b) % c may drop an exactly divisible term when all source and
+        // replacement arithmetic is proven not to wrap.
+        original @ FloorMod(Add(a, b), divisor @const(d_val)) => {
+            let divisor_value = d_val.try_int()?;
+            let replacement = if a.divides(divisor_value).is_some() {
+                b.mod_(divisor)
+            } else if b.divides(divisor_value).is_some() {
+                a.mod_(divisor)
+            } else {
+                return None;
+            };
+            exact_integer_rewrite(original, replacement)
         },
-        // y * (x + c) → y*x + y*c for index dtype
-        // Only distributes when x is Index dtype to avoid float inf*0=nan issues.
-        Mul[y @const(_yv), Add[x, c @const(_cv)]] if x.dtype() == DType::Index ~> y.mul(x).add(&y.mul(c)),
+        // (x + c) % d → (x + c%d) % d for d > 0 (`uop/divandmod.py:102-105`).
+        // The FLOORDIV half lives in `range_based_mod_div_patterns`.
+        original @ FloorMod(Add[x, _c @const(c_val)], d @const(d_val)) => {
+            let c_int = c_val.try_int()?;
+            let d_int = d_val.try_int()?;
+            if d_int <= 0 { return None; }
+            let reduced = c_int.rem_euclid(d_int);
+            if reduced == c_int { return None; }
+            let replacement = x.add(&UOp::const_(d.dtype(), ConstValue::Int(reduced))).mod_(d);
+            exact_integer_rewrite(original, replacement)
+        },
+        // Tinygrad's single div/mod folding entry point (`uop/divandmod.py:108`):
+        // constant and symbolic divisors take the same path. The helper only
+        // constructs a candidate; every source and replacement arithmetic node
+        // is proven exact here.
+        original @ FloorMod(x, y) => {
+            let replacement = crate::symbolic::divmod::fold_divmod_general(BinaryOp::FloorMod, x, y)?;
+            exact_integer_rewrite(original, replacement)
+        },
+        original @ FloorDiv(x, y) => {
+            let replacement = crate::symbolic::divmod::fold_divmod_general(BinaryOp::FloorDiv, x, y)?;
+            exact_integer_rewrite(original, replacement)
+        },
+        // (a - b) // c → (a // c) - (b // c) when both divide evenly.
+        // The ADD counterpart is subsumed: `UOp::divides` recurses through ADD,
+        // so `expr // divisor → expr.divides(divisor)` above already covers it.
+        original @ FloorDiv(Sub(a, b), _c @const(c_val)) => {
+            let d = c_val.try_int()?;
+            let replacement = a.divides(d)?.sub(&b.divides(d)?);
+            exact_integer_rewrite(original, replacement)
+        },
         // (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3)
         // Moved from symbolic_simple to symbolic tier to avoid infinite loop with fast_division_patterns
         // in Stage 18-19 (fast div creates wider expr → nested div re-fires → ever-growing constants).
         // Guards: c1>0, c3>0, and (a>=0 && c2>=0) or (a<=0 && c2<=0) (same-sign requirement)
-        Idiv(Add[Idiv(a, c1 @const(c1_val)), _c2 @const(c2_val)], _c3 @const(c3_val)) => {
-            let c1_int = c1_val.try_int().expect("failed to extract int");
-            let c2_int = c2_val.try_int().expect("failed to extract int");
-            let c3_int = c3_val.try_int().expect("failed to extract int");
+        original @ FloorDiv(Add[FloorDiv(a, c1 @const(c1_val)), _c2 @const(c2_val)], _c3 @const(c3_val)) => {
+            let c1_int = c1_val.try_int()?;
+            let c2_int = c2_val.try_int()?;
+            let c3_int = c3_val.try_int()?;
             if c1_int <= 0 || c3_int <= 0 { return None; }
-            let a_vmin = a.vmin().try_int().expect("failed to extract int from vmin");
-            let a_vmax = a.vmax().try_int().expect("failed to extract int from vmax");
+            let (a_vmin, a_vmax) = SoundVminVmaxProperty::get(a).as_ref()?;
+            let (a_vmin, a_vmax) = (a_vmin.try_int()?, a_vmax.try_int()?);
             if !((a_vmin >= 0 && c2_int >= 0) || (a_vmax <= 0 && c2_int <= 0)) { return None; }
+            let Op::Binary(BinaryOp::FloorDiv, _, c3) = original.op() else { return None };
+            if !integer_binary_does_not_wrap(BinaryOp::Mul, c1, c3, &c1.dtype()) { return None; }
+            let c2 = UOp::const_(c1.dtype(), c2_val);
+            if !integer_binary_does_not_wrap(BinaryOp::Mul, c1, &c2, &c1.dtype()) { return None; }
             let c1_times_c2 = eval_mul_typed(c1_val, c2_val, c1.dtype().base()).expect("failed to evaluate cprod");
             let c1_times_c3 = eval_mul_typed(c1_val, c3_val, c1.dtype().base()).expect("failed to evaluate cprod");
-            Some(a.add(&UOp::const_(c1.dtype(), c1_times_c2))
-             .idiv(&UOp::const_(c1.dtype(), c1_times_c3)))
+            let replacement = a.add(&UOp::const_(c1.dtype(), c1_times_c2))
+                .floor_div(&UOp::const_(c1.dtype(), c1_times_c3));
+            exact_integer_rewrite(original, replacement)
         },
     }
 }
@@ -1120,7 +1337,7 @@ pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
 ///
 /// For all associative ops: (x op c1) op c2 → x op (c1 op c2)
 /// : GroupOp.Associative = {Add, Mul, And, Or, Xor, Max}
-pub fn alu_folding_dsl_patterns() -> &'static TypedPatternMatcher {
+fn alu_folding_dsl_patterns_unchecked() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // (x + c1) + c2 → x + (c1 + c2) - commutative outer Add
         Add[Add[x, c1 @const(c1_val)], _c2 @const(c2_val)] ~> {
@@ -1176,13 +1393,6 @@ pub fn alu_folding_dsl_patterns() -> &'static TypedPatternMatcher {
         },
         // SUB canonicalization: a - (b - x) → x + (a - b)
         Sub(a, Sub(b, x)) ~> x.add(&a.sub(b)),
-        // Const negation distribution: (-1) * (x + c) → x.neg() + (-c)
-        // Only when the Add operand is a const — avoids infinite loop with sym_phase3.
-        Mul[_neg @const(nv), Add[x, c @const(cv)]] if nv.is_neg_one() => {
-            let neg_one = ConstValue::neg_one(c.dtype().base())?;
-            let neg_cv = eval_mul_typed(cv, neg_one, c.dtype().base()).expect("failed to negate constant");
-            Some(UOp::neg(x).add(&UOp::const_(c.dtype(), neg_cv)))
-        },
     }
 }
 
@@ -1220,27 +1430,27 @@ pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
 ///
 /// When a node's vmin equals vmax, it's provably constant. Restricted to the
 /// upstream op set — comparisons (`Lt`/`Le`/`Eq`/`Ne`/`Gt`/`Ge` → Bool), integer
-/// `Idiv`/`Mod`, index `Special`/`DefineVar` (PARAM/BIND/SPECIAL) — plus `Mul`
+/// `FloorDiv`/`FloorMod`, index `Param`/`Special` (PARAM/BIND/SPECIAL) — plus `Mul`
 /// (size-1 grid `Special·stride → 0`, needed to fold hand-built index arithmetic).
 ///
 /// Two op classes are deliberately EXCLUDED:
 ///   * **Float arithmetic** — a sound `[c, c]` integer-style bound does not transfer
 ///     to IEEE floats, where `inf - inf`, `0 * inf`, etc. carry a degenerate range
 ///     but evaluate to NaN at runtime. (Guarded by `!is_float`.)
-///   * **`Add`/`Sub`/`Max`** on integers — upstream does NOT collapse these via the
-///     vmin==vmax rule. Collapsing an integer `Add` whose operands are bounded to a
-///     single value replicates the trivial-RANGE collapse that `symbolic_no_dead_loop`
-///     intentionally omits: a hand-built kernel's trip-1 loop-carry index folds to a
-///     constant and the recurrence breaks (the FA online-softmax `m`/`l`/`o` carry
+///   * **`Add`/`Sub`/`Max`** on integers — upstream (`uop/symbolic.py:248-249`, whose
+///     op set is `{CMPLT, CMPNE, FLOORDIV, FLOORMOD, PARAM, BIND, SPECIAL}`) does NOT
+///     collapse these via the vmin==vmax rule. Collapsing an integer `Add` whose operands
+///     are bounded to a single value would fold a hand-built kernel's trip-1 loop-carry
+///     index to a constant and break the recurrence (the FA online-softmax `m`/`l`/`o` carry
 ///     reads a stale slot → NaN). `Mul` is safe because `0 · x = 0` and `c · c` are
 ///     exact regardless of the operand's loop structure.
-pub fn vmin_vmax_collapse_patterns() -> &'static TypedPatternMatcher {
+fn vmin_vmax_collapse_patterns_unchecked() -> &'static TypedPatternMatcher {
     use svod_ir::uop::properties::SoundVminVmaxProperty;
 
     // Collapse only computation nodes whose result is non-float (int/bool/index).
     // Structural nodes (Range, Buffer) and float arithmetic are excluded.
     fn is_collapsible(uop: &Arc<UOp>) -> bool {
-        matches!(uop.op(), Op::Binary(..) | Op::DefineVar { .. } | Op::Special { .. }) && !uop.dtype().is_float()
+        matches!(uop.op(), Op::Binary(..) | Op::Param { .. } | Op::Special { .. }) && !uop.dtype().is_float()
     }
 
     fn try_collapse(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -1249,14 +1459,14 @@ pub fn vmin_vmax_collapse_patterns() -> &'static TypedPatternMatcher {
     }
 
     crate::cached_patterns! {
-        // Comparisons (→ Bool), integer Idiv/Mod, and Mul with sound vmin == vmax → const.
+        // Comparisons (→ Bool), integer FloorDiv/FloorMod, and Mul with sound vmin == vmax → const.
         // SoundVminVmaxProperty returns None for unsound ops (LOAD/Pow/Fdiv); `is_collapsible`
         // excludes float results; Add/Sub/Max are omitted (see fn doc).
-        for op in binary [Mul, Idiv, Mod, Lt, Le, Eq, Ne, Gt, Ge] {
+        for op in binary [Mul, FloorDiv, FloorMod, Lt, Le, Eq, Ne, Gt, Ge] {
             r @ op(_, _) if is_collapsible(r) => { let _ = op; try_collapse(r) },
         },
-        // DefineVar/Special with vmin == vmax → const (e.g., Variable with min==max after binding)
-        r @ DefineVar { name: _, min_val: _, max_val: _ } if is_collapsible(r) => try_collapse(r),
+        // Param/Special with vmin == vmax → const (e.g., Variable with min==max after binding)
+        r @ Param { shape: _, arg: _ } if is_collapsible(r) => try_collapse(r),
         r @ Special { end: _, name: _ } if is_collapsible(r) => try_collapse(r),
     }
 }
@@ -1274,13 +1484,13 @@ pub fn vmin_vmax_collapse_patterns() -> &'static TypedPatternMatcher {
 /// DCE patterns for `symbolic_simple` tier — basic WHERE simplifications.
 ///
 /// These patterns don't introduce NOT or swap branches, safe for all stages.
-pub fn dce_dsl_simple_patterns() -> &'static TypedPatternMatcher {
+fn dce_dsl_simple_patterns_unchecked() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // WHERE with constant condition → select appropriate branch
         Where(cond, true_val, false_val) => {
-            match VminVmaxProperty::get(cond) {
-                (ConstValue::Bool(true), ConstValue::Bool(true)) => Some(Arc::clone(true_val)),
-                (ConstValue::Bool(false), ConstValue::Bool(false)) => Some(Arc::clone(false_val)),
+            match SoundVminVmaxProperty::get(cond) {
+                Some((ConstValue::Bool(true), ConstValue::Bool(true))) => Some(Arc::clone(true_val)),
+                Some((ConstValue::Bool(false), ConstValue::Bool(false))) => Some(Arc::clone(false_val)),
                 _ => None,
             }
         },
@@ -1316,7 +1526,7 @@ pub fn dce_dsl_patterns() -> &'static TypedPatternMatcher {
         // WHERE(!cond, t, f) → WHERE(cond, f, t) - negated condition swap
         // Guard: don't swap when f contains Invalid — PAD creates WHERE(valid, idx, Invalid),
         // and swapping would move Invalid to the true branch where downstream patterns can't match it.
-        // Handles both scalar Invalid and vectorized VECTORIZE(Invalid, ...) from expansion.
+        // Handles scalar Invalid and STACK(Invalid, ...) from expansion.
         //  has this same guard.
         Where(Not(cond), t, f)
             if !has_invalid(f)
@@ -1337,7 +1547,7 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
             let mut changed = false;
             for dep in deps {
                 // Side-effect boundaries that survive AFTER inlining.
-                // Matches tinygrad: {RANGE, STORE, CALL, FUNCTION, BARRIER, END, UNROLL, LINEAR, STAGE}
+                // Side-effecting operations survive dependency inlining.
                 if matches!(
                     dep.op(),
                     Op::Range { .. }
@@ -1345,7 +1555,6 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
                         | Op::End { .. }
                         | Op::Call { .. }
                         | Op::Barrier { .. }
-                        | Op::Unroll { .. }
                         | Op::Custom { .. }
                         | Op::Function { .. }
                 ) {
@@ -1398,10 +1607,10 @@ fn is_noop_after_dep(u: &Arc<UOp>) -> bool {
     }
 }
 
-/// Move WHERE condition to LOAD gate patterns.
+/// Move WHERE conditions into index validity.
 ///
-/// Transforms `WHERE(cond, LOAD(INDEX(buf, idx)), 0)` to `LOAD(INDEX(buf, idx, gate=cond), alt=0)`
-/// when the condition can be safely moved into the INDEX's gate field.
+/// Transforms `WHERE(cond, INDEX(buf, idx), 0)` by moving safe conditions into
+/// `INDEX(buf, WHERE(cond, idx, Invalid))`.
 ///
 /// This optimization:
 /// 1. Eliminates the WHERE operation overhead
@@ -1416,9 +1625,7 @@ fn is_noop_after_dep(u: &Arc<UOp>) -> bool {
 /// (UPat.var("c1").where(UPat.var("buf").index(UPat.var("x")), 0), where_on_load),
 /// ```
 ///
-/// Moved clauses are embedded as `WHERE(cond, idx, Invalid)` in `indices[0]` instead of
-/// the gate field. This prevents gate vectorization during expansion — pm_lower_index_dtype
-/// extracts the scalar gate after devectorize.
+/// Moved clauses are embedded as `WHERE(cond, idx, Invalid)` in `indices[0]`.
 ///
 /// The condition can be moved if:
 /// - All RANGE dependencies in the condition are within the INDEX's range scope
@@ -1428,13 +1635,13 @@ pub fn pm_move_where_on_load() -> &'static TypedPatternMatcher {
         // Pattern 1: WHERE(cond, INDEX(buf, idx, None), 0)
         // Embed cond clauses as WHERE-Invalid in INDEX indices[0]
         // Note: Matches INDEX directly (no LOAD), since this runs at Stage 8
-        Where(cond, idx @ Index { buffer, indices, gate: None }, f @ const(false_val)) if false_val.is_zero() => {
+        Where(cond, idx @ Index { buffer, indices }, f @ const(false_val)) if false_val.is_zero() => {
             where_on_load_index_transform(cond, buffer, indices, f, idx.dtype())
         },
 
         // Pattern 2: WHERE(cond, 0, INDEX(buf, idx, None)) - inverted pattern
         // Use !cond embedded as WHERE-Invalid
-        Where(cond, f @ const(false_val), idx @ Index { buffer, indices, gate: None }) if false_val.is_zero() => {
+        Where(cond, f @ const(false_val), idx @ Index { buffer, indices }) if false_val.is_zero() => {
             let not_cond = cond.not();
             where_on_load_index_transform(&not_cond, buffer, indices, f, idx.dtype())
         },
@@ -1444,8 +1651,8 @@ pub fn pm_move_where_on_load() -> &'static TypedPatternMatcher {
 /// Check if a UOp is or contains Invalid (scalar or vectorized).
 fn has_invalid(uop: &Arc<UOp>) -> bool {
     match uop.op() {
-        Op::Invalid => true,
-        Op::Vectorize { elements } => elements.iter().any(|e| matches!(e.op(), Op::Invalid)),
+        Op::Const(ConstValueHash(ConstValue::Invalid)) => true,
+        Op::Stack { sources } => sources.iter().any(UOp::is_invalid_marker),
         _ => false,
     }
 }
@@ -1461,9 +1668,7 @@ fn has_invalid(uop: &Arc<UOp>) -> bool {
 /// - Keeps remaining clauses in outer WHERE
 /// - Deduplicates clauses already present in indices[0]'s existing WHERE-Invalid validity
 ///
-/// Instead of setting the INDEX gate field (which gets vectorized by the expander),
-/// embeds moved clauses as WHERE(combined_cond, clean_idx, Invalid) in indices[0].
-/// pm_lower_index_dtype extracts this after devectorize when the gate is always scalar.
+/// Embeds moved clauses as WHERE(combined_cond, clean_idx, Invalid) in indices[0].
 fn where_on_load_index_transform(
     cond: &Arc<UOp>,
     idx_buf: &Arc<UOp>,
@@ -1562,7 +1767,7 @@ fn where_on_load_index_transform(
     let mut validity_clauses: Vec<Arc<UOp>> = actually_moved;
     validity_clauses.extend(c2_clauses);
 
-    // Step 8: Create INDEX with WHERE-Invalid in indices[0], NO gate field
+    // Step 8: Create INDEX with WHERE-Invalid in indices[0]
     let clean_idx = indices.first()?.get_idx();
     let new_idx = if validity_clauses.is_empty() {
         clean_idx
@@ -1623,7 +1828,7 @@ pub fn cast_where_dsl_patterns() -> &'static TypedPatternMatcher {
 /// - Range-based analysis via vmin/vmax
 /// - Const offset: (c0 + x) < c1 → x < (c1 - c0)
 /// - Negation flip: -x < -y → y < x
-pub fn comparison_dsl_patterns() -> &'static TypedPatternMatcher {
+fn comparison_dsl_patterns_unchecked() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
             op(x, y) => {
@@ -1638,14 +1843,19 @@ pub fn comparison_dsl_patterns() -> &'static TypedPatternMatcher {
                 }
 
                 // 2. Constant folding
-                if let (Some(a_val), Some(b_val)) = (get_const_value(x), get_const_value(y))
+                if !x.dtype().is_weak()
+                    && !y.dtype().is_weak()
+                    && let (Some(a_val), Some(b_val)) = (get_const_value(x), get_const_value(y))
                     && let Some(result) = eval_binary_op(op, a_val, b_val)
                 {
                     return Some(UOp::const_(DType::Bool, result));
                 }
 
                 // 3. Range-based analysis
-                if let Some(result) = ComparisonAnalyzer::analyze(op, x, y) {
+                if !x.dtype().is_weak()
+                    && !y.dtype().is_weak()
+                    && let Some(result) = ComparisonAnalyzer::analyze(op, x, y)
+                {
                     return Some(result.into_uop(DType::Bool));
                 }
 
@@ -1668,46 +1878,35 @@ pub fn comparison_dsl_patterns() -> &'static TypedPatternMatcher {
         // Phase 6: (x // d) < c → x < (c * d) when d > 0
         // This lifts division out of comparisons, enabling further simplification.
         // Based on upstream
-        Lt(Idiv(x, _d @const(d_val)), _c @const(c_val)) => {
+        Lt(quotient @ FloorDiv(x, _d @const(d_val)), _c @const(c_val)) => {
             let d_int = d_val.try_int()?;
             let c_int = c_val.try_int()?;
-            if d_int <= 0 { return None; }
+            if d_int <= 0 || !integer_arithmetic_does_not_wrap(quotient) { return None; }
 
-            // For x // d < c:
-            // - If c > 0: equivalent to x < c * d
-            // - If c <= 0: equivalent to x < c * d - (d - 1) = c * d - d + 1
-            let bound = if c_int > 0 {
-                c_int * d_int
-            } else {
-                c_int * d_int - (d_int - 1)
-            };
+            // For positive d, floor(x / d) < c is exactly x < c * d.
+            let product = (c_int as i128).checked_mul(d_int as i128)?;
+            let bound = product;
+            let (dtype_min, dtype_max) = integer_dtype_bounds(&x.dtype())?;
+            if bound < dtype_min || bound > dtype_max { return None; }
 
-            Some(x.try_cmplt(&UOp::const_(x.dtype(), ConstValue::Int(bound))).expect("failed to create cmplt"))
+            Some(x.try_cmplt(&UOp::const_(x.dtype(), ConstValue::Int(bound as i64))).expect("failed to create cmplt"))
         },
 
-        // c0*x < c1 → x < ceil(c1/c0) for positive c0, c1 with Index dtype
+        // c0*x < c1 → sign(c0)*x < ceil(c1/abs(c0)) for weak integers
         Lt(Mul[_c0 @const(c0_val), x], _c1 @const(c1_val))
-          if x.dtype() == DType::Index
+          if x.dtype() == DType::WeakInt
           => {
             let c0 = c0_val.try_int()?;
             let c1 = c1_val.try_int()?;
-            if c0 > 0 && c1 > 0 {
-                let ceil_div = (c1 + c0 - 1) / c0;
-                return Some(x.try_cmplt(&UOp::index_const(ceil_div)).expect("failed to create cmplt"));
-            }
-            // Negative c0: c0*x < c1 → (-x) < -(floor(-c1/-c0))
-            //
-            if c0 < 0 && c0 != -1 && c1 <= 0 {
-                let neg_c0 = -c0;
-                let neg_c1 = -c1;
-                let floor_div = neg_c1 / neg_c0; // both positive, integer division = floor
-                return Some(x.neg().try_cmplt(&UOp::index_const(-floor_div)).expect("failed to create cmplt"));
-            }
-            None
+            let abs_c0 = (c0 as i128).abs();
+            if abs_c0 <= 1 { return None; }
+            let ceil_div = -(-(c1 as i128)).div_euclid(abs_c0);
+            let lhs = if c0 > 0 { x.clone() } else { x.neg() };
+            Some(lhs.try_cmplt(&UOp::const_(x.dtype(), ConstValue::Int(ceil_div as i64))).expect("failed to create cmplt"))
           },
 
-        // Lt(x, c) with GCD-based folding for Index dtype (, 236)
-        Lt(x, _c @const(cv)) if x.dtype() == DType::Index => {
+        // Lt(x, c) with GCD-based folding for weak integers.
+        Lt(x, _c @const(cv)) if x.dtype() == DType::WeakInt => {
             let c_int = cv.try_int()?;
             if c_int <= 0 { return None; }
             lt_folding(x, c_int)
@@ -1842,16 +2041,18 @@ pub fn boolean_dsl_patterns() -> &'static TypedPatternMatcher {
 ///
 /// Based on :
 ///   `max(x, y) → x if x.vmin >= y.vmax else y if x.vmax <= y.vmin`
-pub fn minmax_dsl_patterns() -> &'static TypedPatternMatcher {
+fn minmax_dsl_patterns_unchecked() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // Max(x, x) → x is now in self_folding_dsl_patterns (GroupOp.Idempotent)
         Max(x, y) => {
-            let (x_vmin, x_vmax) = VminVmaxProperty::get(x);
-            let (y_vmin, y_vmax) = VminVmaxProperty::get(y);
-            if cv_ge(x_vmin, y_vmax) {
+            let (x_vmin, x_vmax) = SoundVminVmaxProperty::get(x).as_ref()?;
+            let (y_vmin, y_vmax) = SoundVminVmaxProperty::get(y).as_ref()?;
+            // Equality is enough for integers, but not floats: selecting one
+            // operand across an equal endpoint can change the sign of zero.
+            if bounds_select_left(x_vmin, y_vmax, &x.dtype()) {
                 return Some(Arc::clone(x));
             }
-            if cv_ge(y_vmin, x_vmax) {
+            if bounds_select_left(y_vmin, x_vmax, &y.dtype()) {
                 return Some(Arc::clone(y));
             }
             None
@@ -1859,15 +2060,19 @@ pub fn minmax_dsl_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
+fn bounds_select_left(lhs_min: &ConstValue, rhs_max: &ConstValue, dtype: &DType) -> bool {
+    if dtype.is_float() { cv_gt(lhs_min, rhs_max) } else { cv_ge(lhs_min, rhs_max) }
+}
+
 /// WHERE condition elimination via bounds analysis.
 ///
 /// Eliminates WHERE(Lt) when the condition is provably always true or false.
 /// Uses vmin/vmax to determine if x < c holds for all possible values.
-pub fn where_bound_patterns() -> &'static TypedPatternMatcher {
+fn where_bound_patterns_unchecked() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         Where(Lt(x, c), t, f) => {
-            let (x_vmin, x_vmax) = VminVmaxProperty::get(x);
-            let (c_vmin, c_vmax) = VminVmaxProperty::get(c);
+            let (x_vmin, x_vmax) = SoundVminVmaxProperty::get(x).as_ref()?;
+            let (c_vmin, c_vmax) = SoundVminVmaxProperty::get(c).as_ref()?;
             // Always true: x.vmax < c.vmin → take true branch
             if cv_lt(x_vmax, c_vmin) { return Some(Arc::clone(t)); }
             // Always false: x.vmin >= c.vmax → take false branch
@@ -1897,10 +2102,20 @@ fn cv_lt(a: &ConstValue, b: &ConstValue) -> bool {
     }
 }
 
+/// Compare ConstValue: a > b
+fn cv_gt(a: &ConstValue, b: &ConstValue) -> bool {
+    match (a, b) {
+        (ConstValue::Int(a), ConstValue::Int(b)) => a > b,
+        (ConstValue::UInt(a), ConstValue::UInt(b)) => a > b,
+        (ConstValue::Float(a), ConstValue::Float(b)) => a > b,
+        _ => false,
+    }
+}
+
 /// Power patterns (, 103-105).
 ///
 /// Handles: x^0→1, x^1→x, negative/half-integer/integer exponents, const-base.
-pub fn power_dsl_patterns() -> &'static TypedPatternMatcher {
+fn power_dsl_patterns_unchecked() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // x ** c (scalar const exponent) — upstream simplify_pow
         Pow(x, c @const(cv)) => simplify_pow(x, c, cv),
@@ -1910,7 +2125,7 @@ pub fn power_dsl_patterns() -> &'static TypedPatternMatcher {
 }
 
 /// upstream `simplify_pow` (upstream symbolic_simple).
-fn simplify_pow(x: &Arc<UOp>, c: &Arc<UOp>, cv: ConstValue) -> Option<Arc<UOp>> {
+fn simplify_pow(x: &Arc<UOp>, _c: &Arc<UOp>, cv: ConstValue) -> Option<Arc<UOp>> {
     // Only scalar consts (cvar vec=False)
     if x.dtype().vcount() > 1 {
         return None;
@@ -1928,35 +2143,13 @@ fn simplify_pow(x: &Arc<UOp>, c: &Arc<UOp>, cv: ConstValue) -> Option<Arc<UOp>> 
         // x^1 → x
         return Some(Arc::clone(x));
     }
-    if f < 0.0 {
-        // x^(-c) → (1/x)^c
-        let recip = UOp::try_reciprocal(x).ok()?;
-        let neg_c = UOp::const_(c.dtype(), ConstValue::Float(-f));
-        return recip.try_pow(&neg_c).ok();
-    }
-    // Half-integer: c = n+0.5 → x^n * sqrt(x)
-    let half_check = (f - 0.5).floor() + 0.5;
-    if half_check == f {
-        let n = UOp::const_(c.dtype(), ConstValue::Float(f - 0.5));
-        let pow_n = x.try_pow(&n).ok()?;
-        let sqrt_x = x.try_sqrt().ok()?;
-        return pow_n.try_mul(&sqrt_x).ok();
-    }
-    // Integer: c = n → (x^(n/2))^2 * (x if odd)
-    if f == f.floor() {
-        let half = UOp::const_(c.dtype(), ConstValue::Float((f as i64 / 2) as f64));
-        let y = x.try_pow(&half).ok()?;
-        let y2 = y.try_mul(&y).ok()?;
-        if (f as i64) % 2 == 1 {
-            return y2.try_mul(x).ok();
-        }
-        return Some(y2);
-    }
+    // Reciprocal, sqrt, and repeated-multiply decompositions change IEEE
+    // rounding and special-value behavior. Keep POW unless it is an identity.
     None
 }
 
 /// Const-base power (upstream symbolic_simple).
-fn simplify_pow_const_base(c: &Arc<UOp>, cv: ConstValue, x: &Arc<UOp>) -> Option<Arc<UOp>> {
+fn simplify_pow_const_base(c: &Arc<UOp>, cv: ConstValue, _x: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Only scalar consts
     if c.dtype().vcount() > 1 {
         return None;
@@ -1970,24 +2163,20 @@ fn simplify_pow_const_base(c: &Arc<UOp>, cv: ConstValue, x: &Arc<UOp>) -> Option
         // 1^x → 1
         return Some(Arc::clone(c));
     }
-    if f > 0.0 {
-        // c^x → exp2(x * log2(c))
-        let log2_c = UOp::const_(x.dtype(), ConstValue::Float(f.log2()));
-        let product = x.try_mul(&log2_c).ok()?;
-        return UOp::try_exp2(&product).ok();
-    }
+    // exp2(x*log2(c)) is not an exact replacement for POW under IEEE
+    // rounding, overflow, and transcendental domain behavior.
     None
 }
 
-/// ALU(VECTORIZE, VECTORIZE) → VECTORIZE(scalar_ALU) reordering (upstream sym).
+/// ALU(STACK, STACK) → STACK(scalar_ALU) reordering (upstream sym).
 ///
-/// When both operands of an ALU are VECTORIZE of identical-src (broadcast),
-/// collapse to VECTORIZE of scalar operation replicated N times.
+/// When both operands are broadcast STACK nodes, collapse to a STACK of the
+/// scalar operation replicated N times.
 /// This enables better constant folding and scalar optimization.
 fn alu_vectorize_reorder_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, Fdiv, Pow, And, Or, Xor, Shl, Shr, Lt, Le, Eq, Ne, Gt, Ge] {
-            r @ op(Vectorize { elements: x_elems }, Vectorize { elements: y_elems })
+        for op in binary [Add, Mul, Sub, FloorMod, Max, FloorDiv, Fdiv, Pow, And, Or, Xor, Shl, Shr, Lt, Le, Eq, Ne, Gt, Ge] {
+            r @ op(Stack { sources: x_elems }, Stack { sources: y_elems })
                 if x_elems.len() == y_elems.len()
                 && x_elems.len() > 1
                 && x_elems.windows(2).all(|w| Arc::ptr_eq(&w[0], &w[1]))
@@ -1997,7 +2186,7 @@ fn alu_vectorize_reorder_patterns() -> &'static TypedPatternMatcher {
                     let count = x_elems.len();
                     let scalar_alu = UOp::new(Op::Binary(op, x_elems[0].clone(), y_elems[0].clone()), scalar_dtype);
                     let elems: SmallVec<[Arc<UOp>; 4]> = std::iter::repeat_n(scalar_alu, count).collect();
-                    Some(UOp::vectorize(elems))
+                    Some(UOp::stack(elems))
                 },
         },
     }
@@ -2015,58 +2204,6 @@ fn ne_zero_fold_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
-/// Reciprocal distribution patterns (upstream sym).
-///
-/// Algebraic transformations for reciprocal expressions:
-/// - 1/(x*x) → (1/x) * (1/x)
-/// - 1/(x*x*x) → (1/x) * (1/x) * (1/x)
-/// - 1/(x*c) → (1/x) * (1/c)
-/// - x/(1+x) → 1 - 1/(1+x)
-/// - x * (y/(1+x)) → y * (1 - 1/(1+x))
-/// - x * (y + 1/(1+x)) → (1 - 1/(1+x)) + x*y
-fn reciprocal_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        // 1/(x*x) → (1/x)*(1/x): reciprocal of square
-        Reciprocal(Mul(x, x)) => {
-            let rx = UOp::try_reciprocal(x).ok()?;
-            rx.try_mul(&rx).ok()
-        },
-        // 1/(x*x*x) → (1/x)*(1/x)*(1/x): reciprocal of cube
-        Reciprocal(Mul(Mul(x, x), x)) => {
-            let rx = UOp::try_reciprocal(x).ok()?;
-            let rx2 = rx.try_mul(&rx).ok()?;
-            rx2.try_mul(&rx).ok()
-        },
-        // 1/(x*c) → (1/x)*(1/c): reciprocal distributes over const mul
-        Reciprocal(Mul[x, c @const(_cv)]) => {
-            let rx = UOp::try_reciprocal(x).ok()?;
-            let rc = UOp::try_reciprocal(c).ok()?;
-            rx.try_mul(&rc).ok()
-        },
-        // x * 1/(1+x) → 1 - 1/(1+x)
-        Mul[x, Reciprocal(Add[one @const(ov), x])] if ov.is_one() => {
-            let d = UOp::try_reciprocal(&one.add(x)).ok()?;
-            let one_uop = 1.0.into_uop(d.dtype());
-            one_uop.try_sub(&d).ok()
-        },
-        // x * (1/(1+x) * y) → y * (1 - 1/(1+x))
-        Mul[x, Mul[Reciprocal(Add[one @const(ov), x]), y]] if ov.is_one() => {
-            let d = UOp::try_reciprocal(&one.add(x)).ok()?;
-            let one_uop = 1.0.into_uop(d.dtype());
-            let one_minus_d = one_uop.try_sub(&d).ok()?;
-            y.try_mul(&one_minus_d).ok()
-        },
-        // x * (1/(1+x) + y) → (1 - 1/(1+x)) + x*y
-        Mul[x, Add(Reciprocal(Add[one @const(ov), x]), y)] if ov.is_one() => {
-            let d = UOp::try_reciprocal(&one.add(x)).ok()?;
-            let one_uop = 1.0.into_uop(d.dtype());
-            let one_minus_d = one_uop.try_sub(&d).ok()?;
-            let xy = x.try_mul(y).ok()?;
-            one_minus_d.try_add(&xy).ok()
-        },
-    }
-}
-
 /// Reduce patterns for sym tier (upstream sym).
 ///
 /// - (x*c).reduce(ADD) → reduce(x, ADD) * c  (move const multiply after reduce)
@@ -2078,11 +2215,12 @@ fn reduce_sym_patterns() -> &'static TypedPatternMatcher {
         // Pull scalar const OUT of reduce: REDUCE(x * c, ADD) → REDUCE(x, ADD) * c
         // : (x*c).reduce(ADD) → reduce(x)*c
         // `vec=False` means scalar const — `@const` already matches Op::Const only.
-        Reduce { src: Mul[x, c @const(_cv)], ranges, reduce_op }
+        Reduce { src: Mul[x, c @const(_cv)], ranges, reduce_op, num_axes }
             if *reduce_op == ReduceOp::Add
             && c.dtype().vcount() == 1
+            && !x.dtype().is_float()
             => {
-                let new_reduce = x.reduce(ranges.clone(), ReduceOp::Add);
+                let new_reduce = x.reduce_with_num_axes(ranges.clone(), ReduceOp::Add, *num_axes);
                 // Cast const to reduce output dtype if needed
                 let c_typed = if c.dtype() == new_reduce.dtype() {
                     Arc::clone(c)
@@ -2096,12 +2234,13 @@ fn reduce_sym_patterns() -> &'static TypedPatternMatcher {
         //  + reduce_mul_chain (line 332-341)
         // Guard: r.dtype != r.src[0].dtype → return None (upstream)
         // This prevents firing on horizontal reduces (body has wider dtype than output).
-        reduce @ Reduce { src, ranges, reduce_op }
+        reduce @ Reduce { src, ranges, reduce_op, num_axes }
             if matches!(reduce_op, ReduceOp::Add | ReduceOp::Max)
             && matches!(src.op(), Op::Binary(BinaryOp::Mul, _, _))
             && reduce.dtype() == src.dtype()
+            && !src.dtype().is_float()
             => {
-                reduce_mul_chain_sym(src, ranges, *reduce_op)
+                reduce_mul_chain_sym(src, ranges, *reduce_op, *num_axes)
             },
     }
 }
@@ -2114,6 +2253,7 @@ fn reduce_mul_chain_sym(
     src: &Arc<UOp>,
     ranges: &SmallVec<[Arc<UOp>; 4]>,
     reduce_op: svod_ir::types::ReduceOp,
+    num_axes: usize,
 ) -> Option<Arc<UOp>> {
     use svod_ir::types::ReduceOp;
 
@@ -2133,7 +2273,10 @@ fn reduce_mul_chain_sym(
     for factor in &factors {
         let factor_ids = factor.backward_slice_ids();
         let depends_on_range = range_ids.iter().any(|rid| factor_ids.contains(rid));
-        if !depends_on_range && (reduce_op != ReduceOp::Max || matches!(factor.vmin(), ConstValue::Int(v) if *v >= 0)) {
+        if !depends_on_range
+            && (reduce_op != ReduceOp::Max
+                || matches!(SoundVminVmaxProperty::get(factor), Some((ConstValue::Int(v), _)) if *v >= 0))
+        {
             outside.push(Arc::clone(factor));
         } else {
             inside.push(Arc::clone(factor));
@@ -2152,14 +2295,14 @@ fn reduce_mul_chain_sym(
     };
 
     // Create reduced inside, multiply by outside factors
-    let reduced = inside_prod.reduce(ranges.clone(), reduce_op);
+    let reduced = inside_prod.reduce_with_num_axes(ranges.clone(), reduce_op, num_axes);
     let outside_prod = outside.into_iter().reduce(|a, b| a.try_mul(&b).expect("mul failed")).unwrap();
     reduced.try_mul(&outside_prod).ok()
 }
 
-/// REMOVE_FROM_SINK_LIKE = {Ops.UNROLL, Ops.NOOP, Ops.VECTORIZE, Ops.SINK}
+/// REMOVE_FROM_SINK_LIKE = {Ops.NOOP, Ops.STACK, Ops.SINK}
 fn is_remove_from_sink_like(u: &Arc<UOp>) -> bool {
-    matches!(u.op(), Op::Unroll { .. } | Op::Noop | Op::Vectorize { .. } | Op::Sink { .. })
+    matches!(u.op(), Op::Noop | Op::Stack { .. } | Op::Sink { .. })
 }
 
 /// Phase 3 symbolic patterns (full symbolic() only, not symbolic_simple()).
@@ -2172,17 +2315,15 @@ pub fn sym_phase3_patterns() -> &'static TypedPatternMatcher {
         // General negation distribution: (-1) * (x + y) → neg(x) + neg(y)
         Mul[_neg @const(nv), Add(x, y)] if nv.is_neg_one() ~> x.neg().add(&y.neg()),
 
-        // (x + y) * c → x*c + y*c for index dtype only (upstream sym)
-        // Float has inf*0=nan issue, so only safe for integers/index.
-        Mul[Add(x, y), c @const(_cv)] if x.dtype() == DType::Index ~> x.mul(c).add(&y.mul(c)),
+        // (x + y) * c → x*c + y*c for weak integers (upstream sym)
+        Mul[Add[x, y], c @const(_cv)] if x.dtype() == DType::WeakInt ~> x.mul(c).add(&y.mul(c)),
 
         // GROUP(x) → x: single-element GROUP is identity (upstream sym)
         Group { sources } if sources.len() == 1 ~> sources[0].clone(),
 
-        // SINK/GROUP flatten: unwrap NOOP/UNROLL/VECTORIZE/SINK children (upstream sym)
-        // REMOVE_FROM_SINK_LIKE = {UNROLL, NOOP, VECTORIZE, SINK}
+        // SINK/GROUP flatten: unwrap NOOP/STACK/SINK children.
         // Note: GROUP is NOT in this set — it survives to renderers which skip it.
-        // REMOVE_FROM_SINK_LIKE = {Ops.UNROLL, Ops.NOOP, Ops.VECTORIZE, Ops.SINK}
+        // REMOVE_FROM_SINK_LIKE = {Ops.UNROLL, Ops.NOOP, Ops.STACK, Ops.SINK}
         // For matching children, replace with x.src (all children). NOOP has no children → removed.
         Sink { sources } if sources.iter().any(is_remove_from_sink_like) => {
             let new_srcs: Vec<Arc<UOp>> = sources.iter().flat_map(|s| {
@@ -2212,6 +2353,20 @@ pub fn sym_phase3_patterns() -> &'static TypedPatternMatcher {
 ///   (gated store rewrite: selective overwrite becomes gated store with alternative value)
 pub fn store_load_folding_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
+        // Invalid values suppress writes.
+        Store { index: _index, value: invalid } if UOp::is_invalid_marker(invalid)
+            ~> UOp::new(Op::Noop, DType::Void),
+
+        // STORE(index, WHERE(cond, value, Invalid)) becomes a gated store.
+        Store { index: Index { buffer, indices }, value: Where(cond, value, invalid) }
+            if UOp::is_invalid_marker(invalid) && !indices.is_empty()
+            => {
+                let mut gated_indices = indices.clone();
+                gated_indices[0] = gated_indices[0].valid(cond.clone());
+                let index = UOp::index().buffer(buffer.clone()).indices(gated_indices).call().ok()?;
+                Some(index.store(value.clone()))
+            },
+
         // STORE(idx, LOAD(idx)) → NOOP when the INDEX nodes are ptr_eq
         Store { index, value: Load { index, .. } } ~> UOp::new(Op::Noop, DType::Void),
 
@@ -2219,11 +2374,11 @@ pub fn store_load_folding_patterns() -> &'static TypedPatternMatcher {
         // upstream sym: converts selective overwrite into gated store.
         // When we store WHERE(gate, alt_value, load_from_same_index), the store only
         // matters where gate is true. Convert to a gated INDEX with alt as the value.
-        Store { index: idx @ Index { buffer: buf, indices, gate: None }, value: Where(gate, alt, Load { index: idx2, .. }) }
+        Store { index: idx @ Index { buffer: buf, indices }, value: Where(gate, alt, Load { index: idx2, .. }) }
             if idx.id == idx2.id && !indices.is_empty()
             => {
                 let original_idx = indices[0].clone();
-                let invalid = UOp::new(Op::Invalid, original_idx.dtype());
+                let invalid = UOp::invalid_marker();
                 let gated_idx = UOp::try_where(gate.clone(), original_idx, invalid).ok()?;
 
                 let mut new_indices: SmallVec<[Arc<UOp>; 4]> = indices.clone();
@@ -2283,240 +2438,147 @@ pub fn where_alu_combining_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
-/// GEP pushing patterns for devectorize pass.
+// INDEX cleanup is handled by movement_cleanup_patterns in the canonical shaped IR.
+
+/// The `B` with `q == B//div` and `B%div == base%div`, or `None`.
 ///
-/// Push GEP through ALU operations to simplify vector index extraction.
-/// Based on upstream gep_pushing.
-pub fn gep_pushing_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        // 0. GEP on void: GEP(x, _) where x is void → x
-        // Removes GEP on GROUP, STORE, and other void-typed nodes.
-        // Matches upstream: GEP on void-dtype → identity.
-        Gep { vector, .. } if vector.dtype() == DType::Void ~> Arc::clone(vector),
+/// Line-for-line port of tinygrad `_quotient_base` (`uop/symbolic.py:35-45`):
+///
+/// ```text
+/// def _quotient_base(q:UOp, base:UOp, div:int) -> UOp|None:
+///   (q, s), (num, a) = q.pop_const(), base.pop_const()
+///   if q.op is not Ops.FLOORDIV or q.src[1].op is not Ops.CONST: return None
+///   if div > 0 and num.op is Ops.FLOORDIV and num.src[1].op is Ops.CONST and q.src[1].val == (c:=num.src[1].val)*div:
+///     num, a, D = num.src[0], a*c, c*div
+///   elif q.src[1].val == div: D = div
+///   else: return None
+///   (x, xa), (p, pa) = num.pop_const(), q.src[0].pop_const()
+///   if p is not x or (t:=xa + a - pa) % D: return None
+///   return base - k*div if (k:=t//D - s) else base
+/// ```
+///
+/// Only that congruence is needed to recombine: canonicalization moves consts
+/// freely, so the quotient may be merged (`(x//c + a)//div -> (x + a*c)//(c*div)`
+/// for `div > 0`) and shifted (`(y + k*D)//D == y//D + k`).
+fn quotient_base(q: &Arc<UOp>, base: &Arc<UOp>, div: i128) -> Option<Arc<UOp>> {
+    let (q, s) = q.pop_const(BinaryOp::Add);
+    let (num, a) = base.pop_const(BinaryOp::Add);
+    let (s, a) = (integer_value(s)?, integer_value(a)?);
+    let Op::Binary(BinaryOp::FloorDiv, q_num, q_div) = q.op() else { return None };
+    let q_div = integer_value(get_const_value(q_div)?)?;
 
-        // 1. GEP composition: GEP(GEP(x, inner), outer) → GEP(x, inner[outer])
-        // Note: nested struct patterns require UOp first field, so we extract inner manually
-        Gep { vector: Gep { vector: inner_vec, indices: inner_indices }, indices } => {
-            let composed: Vec<usize> = indices.iter().map(|&o| inner_indices.get(o).copied()).collect::<Option<Vec<_>>>()?;
-            Some(inner_vec.gep(composed))
-        },
-
-        // 2. GEP through VECTORIZE: extract element(s)
-        // : handles both single-element extraction and multi-element
-        Gep { vector: Vectorize { elements, .. }, indices } if indices.len() == 1 => elements.get(indices[0]).cloned(),
-        Gep { vector: Vectorize { elements, .. }, indices } if indices.len() > 1 => {
-            let selected: SmallVec<[Arc<UOp>; 4]> = indices.iter().filter_map(|&i| elements.get(i).cloned()).collect();
-            (selected.len() == indices.len()).then(|| UOp::vectorize(selected))
-        },
-
-        // 3. GEP on scalar CONST: GEP(const:scalar, _) → const_like(const.arg)
-        //
-        Gep { vector: c @const(_cv), .. } if c.dtype().vcount() == 1 ~> Arc::clone(c),
-
-        // 4. GEP through VConst: extract element(s)
-        //
-        Gep { vector: v @ VConst { values }, indices } => {
-            let scalar_dtype = v.dtype().scalar_dtype();
-            if indices.len() == 1 {
-                values.get(indices[0]).map(|v| UOp::const_(scalar_dtype.clone(), *v))
-            } else {
-                let selected: Vec<_> = indices.iter().filter_map(|&i| values.get(i).cloned()).collect();
-                (selected.len() == indices.len()).then(|| UOp::vconst(selected, scalar_dtype.clone()))
+    // Merged quotient: `num == x//c` and `q_div == c*div`.
+    let merged = match num.op() {
+        Op::Binary(BinaryOp::FloorDiv, n_num, n_div) if div > 0 => {
+            match get_const_value(n_div).and_then(integer_value) {
+                Some(c) if c.checked_mul(div) == Some(q_div) => Some((n_num.clone(), a.checked_mul(c)?, q_div)),
+                _ => None,
             }
-        },
+        }
+        _ => None,
+    };
+    let (num, a, d) = match merged {
+        Some(merged) => merged,
+        None if q_div == div && div != 0 => (num, a, div),
+        None => return None,
+    };
 
-        // 5. GEP in order is removed: GEP(x, [0,1,...,n-1]) → x
-        //
-        Gep { vector, indices }
-            if !matches!(vector.dtype(), DType::Ptr { .. })
-            && indices.iter().enumerate().all(|(i, &idx)| i == idx) && indices.len() == vector.dtype().vcount()
-            ~> Arc::clone(vector),
-
-        // 6. Push GEP through ALU/CAST/BITCAST for index dtype
-        // : ONE unified pattern for ALL GroupOp.ALU + CAST + BITCAST
-        // Guard: GEP dtype=dtypes.index, !PtrDType on both GEP and ALU
-        gep @ Gep { vector, indices }
-            if !indices.is_empty()
-            && gep.dtype().base() == ScalarDType::Index
-            && !matches!(gep.dtype(), DType::Ptr { .. })
-            && !matches!(vector.dtype(), DType::Ptr { .. })
-            && matches!(vector.op(),
-                Op::Binary(..) | Op::Unary(..) | Op::Ternary(..)
-                | Op::Cast { .. } | Op::BitCast { .. })
-            => {
-                let sources = vector.op().sources();
-                let new_sources: Vec<Arc<UOp>> = sources.iter().map(|s| s.gep(indices.clone())).collect();
-                let gep_count = indices.len();
-                let scalar_base = vector.dtype().base();
-                let result_dtype = DType::Scalar(scalar_base).vec(gep_count).expect("scalar dtype is vectorizable");
-                // For CAST/BITCAST: need to update the target dtype in the Op
-                let new_op = match vector.op() {
-                    Op::Cast { .. } => {
-                        let scalar_dt = vector.dtype().scalar_dtype();
-                        return Some(new_sources[0].cast(scalar_dt));
-                    }
-                    Op::BitCast { .. } => {
-                        let scalar_dt = vector.dtype().scalar_dtype();
-                        return Some(new_sources[0].bitcast(scalar_dt));
-                    }
-                    _ => vector.replace().dtype(result_dtype).src(new_sources).call(),
-                };
-                Some(new_op)
-            },
-
-        // 7. CAT → VECTORIZE with GEPs
-        Cat { sources } if !matches!(sources.first().map(|s| s.dtype()), Some(DType::Ptr { .. })) => {
-            let elements: SmallVec<[Arc<UOp>; 4]> = sources.iter()
-                .flat_map(|s| (0..s.dtype().vcount()).map(move |i| s.gep(vec![i])))
-                .collect();
-            if elements.is_empty() { return None; }
-            Some(UOp::vectorize(elements))
-        },
-
-        // 8. VECTORIZE on same GEP
-        Vectorize { elements }
-            if elements.len() > 1 && matches!(elements[0].op(), Op::Gep { .. })
-            => {
-                let Op::Gep { vector: first_src, indices: first_idx } = elements[0].op() else { return None };
-                if first_idx.len() != 1 { return None; }
-                let mut combined = Vec::with_capacity(elements.len());
-                combined.push(first_idx[0]);
-                for elem in elements.iter().skip(1) {
-                    let Op::Gep { vector, indices } = elem.op() else { return None };
-                    if indices.len() != 1 || vector.id != first_src.id { return None; }
-                    combined.push(indices[0]);
-                }
-                Some(first_src.gep(combined))
-            },
-
-        // 9. GEP through WMMA
-        // Based on upstream gep_through_wmma.
-        //
-        // GEP(WMMA(a, b, c), indices) → WMMA(GEP(a, ...), GEP(b, ...), GEP(c, ...))
-        //
-        // The GEP indices must form regular groups of `out_sz` consecutive elements,
-        // where `out_sz` is the product of the output upcast_axes sizes. Each group
-        // maps to a "tile" of the WMMA output. The pattern remaps these tile indices
-        // to the corresponding input tiles for each source, scaled by that source's
-        // vector count.
-        Gep { vector: Wmma { a, b, c, metadata }, indices } if !indices.is_empty() => {
-            // out_sz: number of output elements per tile (from C/accumulator upcast axes)
-            let out_sz: usize = metadata.upcast_axes.c.iter().map(|(_, s)| s).product();
-            if out_sz == 0 || indices.len() % out_sz != 0 { return None; }
-
-            // Extract tile base indices: every out_sz-th element from GEP indices
-            let tile_idxs: Vec<usize> = indices.iter().step_by(out_sz).copied().collect();
-
-            // Validate: GEP indices must form regular groups of out_sz consecutive elements.
-            // For each offset i within a tile, indices[i::out_sz] - i must equal tile_idxs.
-            for i in 1..out_sz {
-                let adjusted: Option<Vec<usize>> = indices
-                    .iter()
-                    .skip(i)
-                    .step_by(out_sz)
-                    .map(|&x| x.checked_sub(i))
-                    .collect();
-                if adjusted.as_deref() != Some(tile_idxs.as_slice()) { return None; }
-            }
-
-            // For each WMMA source, compute the corresponding input GEP indices.
-            // Each source has its own per-source size from upcast_axes (A, B, C differ).
-            let map_source = |src: &Arc<UOp>, src_idx: usize| -> Arc<UOp> {
-                let ssz = metadata.upcast_axes.source_size(src_idx);
-                let mut src_indices = Vec::with_capacity(tile_idxs.len() * ssz);
-                for &w in &tile_idxs {
-                    let group = w / out_sz;
-                    let start = group * ssz;
-                    src_indices.extend(start..start + ssz);
-                }
-                src.gep(src_indices)
-            };
-
-            // Result dtype matches the GEP output: scalar base × number of extracted elements
-            let scalar_base = metadata.dtype_out.base();
-            let result_dtype = DType::Scalar(scalar_base).vec(indices.len()).expect("scalar dtype is vectorizable");
-
-            Some(UOp::new(
-                Op::Wmma {
-                    a: map_source(a, 0),
-                    b: map_source(b, 1),
-                    c: map_source(c, 2),
-                    metadata: metadata.clone(),
-                },
-                result_dtype,
-            ))
-        },
+    let (x, xa) = num.pop_const(BinaryOp::Add);
+    let (p, pa) = q_num.pop_const(BinaryOp::Add);
+    if !Arc::ptr_eq(&p, &x) {
+        return None;
     }
+    let t = integer_value(xa)?.checked_add(a)?.checked_sub(integer_value(pa)?)?;
+    if t % d != 0 {
+        return None;
+    }
+    // `t % d == 0`, so the exact quotient is the floor quotient.
+    let k = (t / d).checked_sub(s)?;
+    if k == 0 {
+        return Some(base.clone());
+    }
+    // `base - k*div`: upstream negates the host int, keeping the const on the right.
+    let offset = i64::try_from(k.checked_mul(div)?.checked_neg()?).ok()?;
+    base.try_add(&base.const_like(offset)).ok()
 }
 
-/// Div/Mod recombination patterns.
+/// `(b*mul).usum(*rest)` — `mul == 1` is the identity `pop_const` seeds, and
+/// upstream's redundant `x*1` is folded by `identity_and_zero_patterns` in the
+/// same tier.
+fn scaled_usum(b: &Arc<UOp>, mul: i128, rest: &[Arc<UOp>]) -> Option<Arc<UOp>> {
+    let scaled = if mul == 1 { b.clone() } else { b.try_mul(&b.const_like(i64::try_from(mul).ok()?)).ok()? };
+    rest.iter().try_fold(scaled, |sum, term| sum.try_add(term).ok())
+}
+
+/// Recombine a scaled mod with the partner carrying its quotient.
 ///
-/// Uses automatic ptr_eq checks via duplicate variable names in patterns.
+/// Line-for-line port of tinygrad `fold_add_divmod_recombine`
+/// (`uop/symbolic.py:47-63`), registered on every `ADD` at `uop/symbolic.py:114`:
 ///
-/// Flat (2-operand) variants:
-/// - x%n + (x//n)*n → x
-/// - ((x//a) % c) + (x // b) * c → x // a  when a*c == b
-/// - (x % c1) * c2 + (x // c1) * c3 → x * c2  when c1*c2 == c3
+/// ```text
+/// def fold_add_divmod_recombine(x:UOp) -> UOp|None:
+///   terms = list(x.split_uop(Ops.ADD))
+///   for i,u in enumerate(terms):
+///     mod, mul = u.pop_const(Ops.MUL)
+///     if mod.op is not Ops.FLOORMOD or mod.src[1].op is not Ops.CONST: continue
+///     base, div = mod.src[0], mod.src[1].val
+///     for j,v in enumerate(terms):
+///       q, scale = v.pop_const(Ops.MUL)
+///       if i == j or scale != div*mul: continue
+///       rest = [t for k,t in enumerate(terms) if k not in (i,j)]
+///       if (b:=_quotient_base(q, base, div)) is not None: return (b*mul).usum(*rest)
+///       if q.op is Ops.FLOORMOD and q.src[1].op is Ops.CONST and (d:=q.src[1].val) > 0 and \
+///          (b:=_quotient_base(q.src[0], base, div)) is not None:
+///         return ((b % (div*d))*mul).usum(*rest)
+///   return None
+/// ```
 ///
-/// Nested-Add (3-operand) variants for expressions with an extra addend:
-/// - y + (x//n)*n + x%n → y + x
-/// - y + x%n + (x//n)*n → y + x
-/// - y + (x // c1) * c3 + (x % c1) * c2 → y + x * c2  when c1*c2 == c3
-/// - y + (x % c1) * c2 + (x // c1) * c3 → y + x * c2  when c1*c2 == c3
+/// A scaled mod `(base%div)*mul` recombines with a partner `q*(div*mul)`
+/// carrying the quotient of a `b == base (mod div)`:
+/// `q == b//div` gives `b*mul` (full recombine), `q == (b//div)%d` gives
+/// `(b%(div*d))*mul` (partial recombine into a wider mod, needs `d > 0`).
+///
+/// Flattening the ADD chain is what lets the `x//c*c` and `x%c` partners be
+/// separated by unrelated terms; upstream's `dtypes.weakint` guard is morok's
+/// `exact_integer_rewrite` no-wrap proof on the concrete dtype.
+fn fold_add_divmod_recombine(x: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let terms = x.split_uop(BinaryOp::Add);
+    for (i, u) in terms.iter().enumerate() {
+        let (m, mul) = u.pop_const(BinaryOp::Mul);
+        let Some(mul) = integer_value(mul) else { continue };
+        let Op::Binary(BinaryOp::FloorMod, base, mod_div) = m.op() else { continue };
+        let Some(div) = get_const_value(mod_div).and_then(integer_value) else { continue };
+        let Some(want) = div.checked_mul(mul) else { continue };
+
+        for (j, v) in terms.iter().enumerate() {
+            let (q, scale) = v.pop_const(BinaryOp::Mul);
+            if i == j || integer_value(scale) != Some(want) {
+                continue;
+            }
+            let rest: Vec<Arc<UOp>> =
+                terms.iter().enumerate().filter(|(k, _)| *k != i && *k != j).map(|(_, t)| t.clone()).collect();
+
+            if let Some(b) = quotient_base(&q, base, div) {
+                return exact_integer_rewrite(x, scaled_usum(&b, mul, &rest)?);
+            }
+            if let Op::Binary(BinaryOp::FloorMod, q_src, q_div) = q.op()
+                && let Some(d) = get_const_value(q_div).and_then(integer_value)
+                && d > 0
+                && let Some(b) = quotient_base(q_src, base, div)
+            {
+                let wide = i64::try_from(div.checked_mul(d)?).ok()?;
+                let wider = b.try_mod(&b.const_like(wide)).ok()?;
+                return exact_integer_rewrite(x, scaled_usum(&wider, mul, &rest)?);
+            }
+        }
+    }
+    None
+}
+
+/// Variations of `(x%c) + (x//c)*c = x` (tinygrad `uop/symbolic.py:114`).
 pub fn div_mod_recombine_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        // x%n + (x//n)*n → x (div-mod identity)
-        // Note: duplicate variable names (x, n) auto-generate Arc::ptr_eq checks
-        Add[Mod(x, n), Mul[Idiv(x, n), n]]
-          ~> |x| Arc::clone(x),
-
-        // ((x//a) % c) + (x // b) * c → x // a
-        // Condition: a * c == b (divisor composition)
-        // Note: x appears twice, c appears twice → auto ptr_eq checks
-        Add[Mod(Idiv(x, a @const(a_val)), c @const(c_val)), Mul[Idiv(x, _b @const(b_val)), c]] => {
-            let a_int = a_val.try_int()?;
-            let c_int = c_val.try_int()?;
-            let b_int = b_val.try_int()?;
-            if a_int * c_int == b_int {
-                return x.try_div(a).ok();
-            }
-            None
-        },
-
-        // (x % c1) * c2 + (x // c1) * c3 → x * c2
-        // Condition: c1 * c2 == c3
-        // Note: x appears twice, c1 appears twice → auto ptr_eq checks
-        Add[Mul[Mod(x, c1 @const(c1_val)), c2 @const(c2_val)], Mul[Idiv(x, c1), _c3 @const(c3_val)]] => {
-            let c1_int = c1_val.try_int()?;
-            let c2_int = c2_val.try_int()?;
-            let c3_int = c3_val.try_int()?;
-            if c1_int * c2_int == c3_int {
-                return Some(x.mul(c2));
-            }
-            None
-        },
-
-        // y + (x//n)*n + x%n → y + x
-        Add[Add[y, Mul[Idiv(x, n), n]], Mod(x, n)] ~> y.add(x),
-
-        // y + x%n + (x//n)*n → y + x
-        Add[Add[y, Mod(x, n)], Mul[Idiv(x, n), n]] ~> y.add(x),
-
-        // y + (x // c1) * c3 + (x % c1) * c2 → y + x * c2  when c1*c2 == c3
-        Add[Add[y, Mul[Idiv(x, c1 @const(c1_val)), _c3 @const(c3_val)]], Mul[Mod(x, c1), c2 @const(c2_val)]] => {
-            let c1_int = c1_val.try_int()?;
-            let c2_int = c2_val.try_int()?;
-            let c3_int = c3_val.try_int()?;
-            (c1_int * c2_int == c3_int).then(|| y.add(&x.mul(c2)))
-        },
-
-        // y + (x % c1) * c2 + (x // c1) * c3 → y + x * c2  when c1*c2 == c3
-        Add[Add[y, Mul[Mod(x, c1 @const(c1_val)), c2 @const(c2_val)]], Mul[Idiv(x, c1), _c3 @const(c3_val)]] => {
-            let c1_int = c1_val.try_int()?;
-            let c2_int = c2_val.try_int()?;
-            let c3_int = c3_val.try_int()?;
-            (c1_int * c2_int == c3_int).then(|| y.add(&x.mul(c2)))
-        },
+        original @ Add(_, _) => fold_add_divmod_recombine(original),
     }
 }
 
@@ -2537,7 +2599,7 @@ pub fn long_to_int_narrowing_patterns() -> &'static TypedPatternMatcher {
     }
 
     crate::cached_patterns! {
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
+        for op in binary [Add, Mul, Sub, FloorMod, Max, FloorDiv, And, Or, Xor, Shl, Shr] {
             result @ op(x, y)
                 if x.dtype() == DType::Scalar(ScalarDType::Int64)
                 && fits_i32(x) && fits_i32(y) && fits_i32(result)
@@ -2555,7 +2617,7 @@ pub fn long_to_int_narrowing_patterns() -> &'static TypedPatternMatcher {
         // Distribute signed-int cast over addition with constant.
         // Enables further simplification of cast-of-index expressions.
         Cast { src: Add(x, c @const(_cv)), dtype: cast_dt }
-            if x.dtype() == DType::Index && cast_dt.scalar().is_some_and(|s| s.is_signed() && s.is_int())
+            if x.dtype() == DType::WeakInt && cast_dt.scalar().is_some_and(|s| s.is_signed() && s.is_int())
             => x.cast(cast_dt.clone()).try_add(&c.cast(cast_dt.clone())).ok(),
     }
 }

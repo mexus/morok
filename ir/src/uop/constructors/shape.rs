@@ -5,6 +5,9 @@
 
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+use svod_dtype::DType;
+
 use crate::Result;
 use crate::op::Op;
 use crate::uop::UOp;
@@ -12,6 +15,21 @@ use crate::uop::UOp;
 // Low-level constructors (pub(crate) - not yet used but will be needed for optimization passes)
 #[allow(dead_code)]
 impl UOp {
+    /// Build a shaped value while retaining a scalar element dtype.
+    pub fn stack(sources: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        let dtype = if sources.is_empty() {
+            DType::Void
+        } else {
+            crate::dtype_from_op(&Op::Stack { sources: sources.clone() })
+                .expect("STACK sources must have a promotable dtype")
+        };
+        let sources = sources
+            .into_iter()
+            .map(|source| if Self::is_invalid_marker(&source) { source } else { source.cast(dtype.clone()) })
+            .collect();
+        Self::new(Op::Stack { sources }, dtype)
+    }
+
     /// Reshape tensor to new shape (low-level, UOp-based constructor).
     ///
     /// Takes a UOp for the shape parameter (used internally by compiler passes).
@@ -51,9 +69,9 @@ impl UOp {
     ///
     /// Takes UOps for range parameters (used internally by compiler passes).
     /// For the public API with validation, use `try_shrink`.
-    pub(crate) fn shrink(src: Arc<Self>, begins: Arc<Self>, ends: Arc<Self>) -> Arc<Self> {
+    pub(crate) fn shrink(src: Arc<Self>, offsets: Arc<Self>, sizes: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
-        Self::new(Op::Shrink { src, begins, ends }, dtype)
+        Self::new(Op::Shrink { src, offsets, sizes }, dtype)
     }
 
     /// Flip (reverse) axes (low-level, UOp-based constructor).
@@ -230,9 +248,10 @@ impl UOp {
             }
         }
 
-        let (begins, ends) = ranges_to_uops(ranges);
+        let offsets_and_sizes: Vec<_> = ranges.iter().map(|(begin, end)| (begin.clone(), end - begin)).collect();
+        let (offsets, sizes) = ranges_to_uops(&offsets_and_sizes);
         let dtype = self.dtype();
-        let result = Self::new(Op::Shrink { src: self.clone(), begins, ends }, dtype);
+        let result = Self::new(Op::Shrink { src: self.clone(), offsets, sizes }, dtype);
         // Tinygrad (movement.py:128): return self if ret.shape == self.shape else ret
         if result.shape().ok().flatten() == self.shape().ok().flatten() {
             return Ok(self.clone());

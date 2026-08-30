@@ -2,7 +2,7 @@
 //!
 //! This module contains all pattern matchers used during scheduling/rangeify:
 //! - Early cleanup rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
-//! - Movement op → BUFFERIZE conversion
+//! - Movement op → STAGE conversion
 //! - Buffer folding and removal
 //! - Kernel splitting patterns (BUFFER → PARAM, AFTER handling)
 //! - Codegen preparation (NOOP removal, INDEX linearization)
@@ -11,23 +11,39 @@
 //! Consolidated from: patterns.rs, codegen_patterns.rs, movement_patterns.rs,
 //! split_patterns.rs, buffer_limits.rs
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-use crate::argsort;
 
 use smallvec::SmallVec;
 use svod_device::DeviceSpec;
 use svod_dtype::{AddrSpace, DType, ScalarDType};
+use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::properties::SoundVminVmaxProperty;
 use svod_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey, UnaryOp};
 use tracing::trace;
 
 use crate::TypedPatternMatcher;
 use crate::rangeify::transforms::{cast_to_dtype, get_range_size, partition_reduce_ranges};
 
+pub use crate::devectorize::pm_add_loads;
+
+fn is_codegen_param(node: &Arc<UOp>) -> bool {
+    matches!(node.op(), Op::Param { .. })
+        && node.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_CODEGEN_PARAM))
+}
+
+fn mark_codegen_param(node: Arc<UOp>) -> Arc<UOp> {
+    let mut tags = node.tag().clone().unwrap_or_default();
+    if !tags.contains(&svod_ir::uop::canonical::TAG_CODEGEN_PARAM) {
+        tags.push(svod_ir::uop::canonical::TAG_CODEGEN_PARAM);
+    }
+    node.with_tag(tags)
+}
+
 // Forward declarations for types from other modules
 use super::indexing::IndexingContext;
-use super::indexing::{is_dead_axis, ranges_equal};
+use super::indexing::no_range;
+use super::indexing::ranges_equal;
 use super::kernel::{LocalAddBufferContext, RangeifyBufferContext};
 use super::kernel::{SplitReduceOpConfig, split_reduceop};
 use super::transforms::transform_sources_with_bufferize;
@@ -35,14 +51,6 @@ use super::transforms::transform_sources_with_bufferize;
 // ============================================================================
 // HELPER FUNCTIONS (private)
 // ============================================================================
-
-/// Check if a shape UOp represents a scalar (empty or Vectorize with 0 elements).
-fn is_scalar_shape(shape: &Arc<UOp>) -> bool {
-    match shape.op() {
-        Op::Vectorize { elements } => elements.is_empty(),
-        _ => false,
-    }
-}
 
 /// Check if a UOp has zero total size (any shape dimension is 0).
 fn has_zero_size(uop: &Arc<UOp>) -> bool {
@@ -55,6 +63,38 @@ fn has_zero_size(uop: &Arc<UOp>) -> bool {
 /// Ops whose buffers must materialize and therefore cannot be inlined.
 pub fn is_always_run_op(op: &Op) -> bool {
     matches!(op, Op::Contiguous { .. } | Op::Copy { .. } | Op::Noop)
+}
+
+/// Element count of a shaped UOp, or `None` when a dimension is symbolic.
+fn static_numel(uop: &Arc<UOp>) -> Option<usize> {
+    uop.shape().ok().flatten()?.iter().try_fold(1usize, |count, dim| count.checked_mul(dim.as_const()?))
+}
+
+/// Whether a COPY over this movement op needs its source materialised.
+///
+/// Tinygrad `schedule/rangeify.py:150` asks for `r.numel() != r.base.numel()` — the
+/// view resizes — or a source with no contiguous view offset, i.e. one a movement
+/// op reorders. Morok has no view-offset model, so PERMUTE/FLIP anywhere in the
+/// chain stands in for the second half; a symbolic extent resolves to `False`
+/// exactly as `resolve(..., False)` does upstream.
+fn copy_needs_contiguous(src: &Arc<UOp>) -> bool {
+    if let (Some(moved), Some(base)) = (static_numel(src), static_numel(&src.base()))
+        && moved != base
+    {
+        return true;
+    }
+    let mut node = src.clone();
+    loop {
+        match node.op() {
+            Op::Permute { .. } | Op::Flip { .. } => return true,
+            Op::Reshape { src, .. }
+            | Op::Expand { src, .. }
+            | Op::Pad { src, .. }
+            | Op::Shrink { src, .. }
+            | Op::Multi { src, .. } => node = src.clone(),
+            _ => return false,
+        }
+    }
 }
 
 /// Check if operation is elementwise (Binary or Ternary).
@@ -71,8 +111,6 @@ pub fn is_elementwise(uop: &Arc<UOp>) -> bool {
 /// This handles schedule-specific cleanup:
 /// - DETACH removal (gradient computation marker no longer needed)
 /// - CONTIGUOUS_BACKWARD removal (gradient computation marker no longer needed)
-/// - RESHAPE to scalar (empty shape) removal
-/// - RESHAPE on REDUCE removal (REDUCE output doesn't need reshaping)
 /// - Zero-size tensor folding
 pub fn early_rewrites() -> TypedPatternMatcher {
     crate::patterns! {
@@ -83,106 +121,32 @@ pub fn early_rewrites() -> TypedPatternMatcher {
         },
         Detach(x) ~> |x| x.clone(),
         ContiguousBackward(x) ~> |x| x.clone(),
-        Reshape { src, new_shape } => |src, new_shape| {
-            // RESHAPE to scalar - always remove
-            if is_scalar_shape(new_shape) {
-                return Some(src.clone());
-            }
-
-            // RESHAPE on REDUCE - the reduce output is already "indexed" by its ranges
-            // The reshape just changes the view of the buffer, which can be done in STORE indexing
-            if matches!(src.op(), Op::Reduce { .. }) {
-                return Some(src.clone());
-            }
-
-            None
-        },
-
+        // A COPY transfers one contiguous range, so a source that is resized or
+        // reordered by a movement op must be materialised first (tinygrad
+        // `schedule/rangeify.py:149`). Without this the transfer is sized by the
+        // base, not the moved view, and the destination is under-allocated.
+        copy @ Copy { src, .. } if src.op().is_movement() && copy_needs_contiguous(src)
+            => |copy, src| Some(copy.with_sources(vec![src.contiguous()])),
+        // Same-device COPY is a no-op and returns its source verbatim, tag included
+        // (tinygrad `schedule/rangeify.py:153`). The barrier role a tagged COPY used
+        // to carry is covered by `is_always_run_op(Copy)`.
+        Copy { src, device } if src.device_spec().as_ref() == Some(device)
+            ~> |src| src.clone(),
         // Reduce of zero-sized input → identity element.
-        reduce @ ReduceAxis { src: x } if has_zero_size(x) && !has_zero_size(reduce) => {
-            let Op::ReduceAxis { reduce_op, .. } = reduce.op() else { return None };
-            Some(crate::symbolic::dce::reduce_identity(*reduce_op, reduce.dtype()))
+        reduce @ Reduce { src: x, ranges: _, reduce_op: _, num_axes: _ }
+            if has_zero_size(x) && !has_zero_size(reduce) => {
+            let Op::Reduce { reduce_op, .. } = reduce.op() else { return None };
+            let identity = crate::symbolic::dce::reduce_identity(*reduce_op, reduce.dtype());
+            let Op::Const(value) = identity.op() else { unreachable!("reduction identity must be constant") };
+            Some(reduce.const_like(value.0))
         },
 
         // Any non-SINK op with zero size → const 0.
         x if !matches!(x.op(), Op::Sink { .. }) && has_zero_size(x) => {
-            Some(x.const_like(0))
+            let replacement = x.const_like(0).rtag(x.tag().clone());
+            (!Arc::ptr_eq(&replacement, x)).then_some(replacement)
         }
     }
-}
-
-// ============================================================================
-// REPLACE_CONTIGUOUS PATTERNS
-// ============================================================================
-
-/// Context for replace_contiguous: maps base UOps to their contiguous copies.
-pub type ReplaceContiguousCtx = std::collections::HashMap<UOpKey, Arc<UOp>>;
-
-/// Push CONTIGUOUS inward through movement ops to the base buffer.
-///
-/// - `CONTIGUOUS(PERMUTE(RESHAPE(...(BASE))))` → adjust contiguous through the
-///   chain, then `ctx[BASE] = adjusted_contig`.
-/// - For ALU ops: replace any source that appears in `ctx`.
-///
-/// Only handles PERMUTE and RESHAPE movement ops; bails on anything else.
-pub fn replace_contiguous() -> TypedPatternMatcher<ReplaceContiguousCtx> {
-    crate::patterns! {
-        @context ReplaceContiguousCtx;
-
-        // Match CONTIGUOUS wrapping a movement op chain
-        contig @ Contiguous { src, .. } if src.op().is_movement() => |contig, src, ctx| {
-            found_contiguous(ctx, contig, src)
-        },
-
-        // ALU ops: replace sources that are in ctx (base → contiguous).
-        x if matches!(x.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..)) => |x, ctx| {
-            if ctx.is_empty() { return None; }
-            let sources = x.op().sources();
-
-            let mut new_sources = Vec::with_capacity(sources.len());
-            let mut any_changed = false;
-            for src in sources.iter() {
-                let key = UOpKey(src.clone());
-                if let Some(replacement) = ctx.get(&key) {
-                    new_sources.push(replacement.clone());
-                    any_changed = true;
-                } else {
-                    new_sources.push(src.clone());
-                }
-            }
-            if any_changed { Some(x.with_sources(new_sources)) } else { None }
-        },
-    }
-}
-
-/// Walk from a movement op chain toward its base, adjusting the contiguous marker.
-#[allow(clippy::mutable_key_type)] // UOpKey Hash/Eq is stable despite interior OnceLock
-fn found_contiguous(ctx: &mut ReplaceContiguousCtx, contig: &Arc<UOp>, src: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let base = src.base();
-    let mut adjusted_contig = contig.clone();
-    let mut x = src.clone();
-
-    while !Arc::ptr_eq(&x, &base) {
-        match x.op() {
-            Op::Permute { src: inner, axes } => {
-                // Apply inverse permutation: contig = contig.permute(argsort(axes))
-                let inv = argsort(axes);
-                adjusted_contig = adjusted_contig.try_permute(inv).ok()?;
-                x = inner.clone();
-            }
-            Op::Reshape { src: inner, .. } => {
-                // Reshape contig to pre-reshape shape (inner source's shape)
-                let inner_shape = inner.shape().ok()??;
-                adjusted_contig = adjusted_contig.try_reshape(inner_shape).ok()?;
-                x = inner.clone();
-            }
-            _ => return None, // Unsupported movement op — bail
-        }
-    }
-
-    // Map the base to the adjusted contiguous
-    ctx.insert(UOpKey(base.clone()), adjusted_contig);
-    None // Don't transform the CONTIGUOUS node itself; ALU pattern does the replacement
 }
 
 // ============================================================================
@@ -192,34 +156,28 @@ fn found_contiguous(ctx: &mut ReplaceContiguousCtx, contig: &Arc<UOp>, src: &Arc
 /// Create patterns for applying rangeify transformation with IndexingContext.
 ///
 /// Pattern order:
-/// 1. ReduceAxis → REDUCE conversion
+/// 1. Tensor REDUCE → ranged REDUCE conversion
 /// 2. PAD → WHERE conversion (convert_pad_to_where_to_keep_behavior_local)
 /// 3. ALL ops get source bufferization (including movement ops)
 /// 4. Movement ops get removed (simple - just return source)
 pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
     crate::patterns! {
         @context IndexingContext;
-        // ReduceAxis conversion MUST come first - before bufferize wraps it
-        x @ ReduceAxis { src: _ } => |x, ctx| convert_reduceaxis_with_context(x, ctx),
+        // Tensor REDUCE conversion MUST come first, before STAGE wraps it.
+        x @ Reduce { src: _, ranges: _, reduce_op: _, num_axes: _ }
+            => |x, ctx| convert_reduce_with_context(x, ctx),
         // PAD → WHERE conversion BEFORE bufferization.
         x @ Pad { src: _, begin_pads: _, end_pads: _ } => |x, ctx| convert_pad_to_where(x, ctx),
+        // STACK → WHERE select on the leading range, BEFORE bufferization.
+        x @ Stack { sources: _ } => |x, ctx| convert_stack_to_where(x, ctx),
         // ALL ops (including movement) get source bufferization.
         x => |x, ctx| apply_bufferize_transform(x, ctx),
         // Movement ops get removed AFTER bufferization - simple logic
         x if x.op().is_movement() => |x, ctx| remove_movement_op(x, ctx),
-        // Const/DefineVar shouldn't keep accidental sources after rangeify.
-        x @ Const(_) | x @ DefineVar { name: _ } => |x, ctx| cleanup_const_define_var_sources(x, ctx),
     }
 }
 
-fn cleanup_const_define_var_sources(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
-    if ctx.get_ranges(x).is_none() || x.op().sources().is_empty() {
-        return None;
-    }
-    Some(x.with_sources(Vec::new()))
-}
-
-/// Apply BUFFERIZE transformation to op sources.
+/// Apply STAGE transformation to op sources.
 ///
 /// When sources change, the new node gets a different Arc identity. We must
 /// transfer range_map + realize_map so downstream patterns (e.g. `remove_movement_op`)
@@ -244,52 +202,37 @@ fn apply_bufferize_transform(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<
 /// Extracts validity conditions from PAD's input ranges (WHERE-Invalid patterns)
 /// and wraps the PAD's data source in a WHERE that produces 0 for padded regions.
 fn convert_pad_to_where(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
-    let (input_ranges, output_ranges) = if let Some((input_ranges, output_ranges)) = ctx.get_ranges(x) {
-        (input_ranges.clone(), output_ranges.clone())
-    } else {
-        ctx.record_pad_fallback();
+    let (input_ranges, _) = ctx.get_ranges(x)?.clone();
+    let sources = transform_sources_with_bufferize(x, ctx).unwrap_or_else(|| x.op().sources().into_iter().collect());
+    let bx = x.with_sources(sources);
 
-        // Rare fallback: the rewrite engine may reconstruct a semantically equivalent PAD
-        // node (hash-consed to an existing global UOp) that wasn't present during
-        // assign_ranges. Recover using the PAD source's output ranges.
-        trace!(uop_id = x.id, "convert_pad_to_where: using PAD fallback from source ranges");
-        let pad_src = x.op().sources().first()?.clone();
-        let (_, src_out) = ctx.get_ranges(&pad_src)?;
-        if src_out.is_empty() {
-            return None;
-        }
-        (src_out.clone(), src_out.clone())
-    };
-
-    // Extract validity from each input range and AND them together.
-    // Ranges from PAD are WHERE(valid, adjusted_idx, Invalid) → get_valid() extracts valid.
-    // Non-pad ranges return constant true.
-    let mut combined_valid: Option<Arc<UOp>> = None;
+    let mut valid = UOp::const_(DType::Bool, ConstValue::Bool(true));
     for r in &input_ranges {
-        let valid = r.get_valid();
-        combined_valid = Some(match combined_valid {
-            None => valid,
-            Some(acc) => acc.try_and_op(&valid).unwrap_or(valid),
-        });
+        valid = valid.try_and_op(&r.get_valid()).ok()?;
     }
 
-    let combined_valid = combined_valid?;
-
-    // PAD source is the first source
-    let pad_src = x.op().sources().first()?.clone();
-
-    // Create WHERE(combined_valid, pad_source, const_0).
-    // The scalar zero is compatible with any-shaped pad_src via implicit broadcast.
     let base = x.dtype().scalar()?;
     let zero = UOp::const_(x.dtype(), ConstValue::zero(base));
-    let Ok(ret) = UOp::try_where(combined_valid, pad_src, zero) else { return None };
+    UOp::try_where(valid, bx.op().sources().first()?.clone(), zero).ok()
+}
 
-    // Transfer range_map as-is, keeping WHERE-Invalid in ranges.
-    // pm_lower_index_dtype later converts INDEX(buf, WHERE(cond, idx, Invalid))
-    // into gated INDEX(buf, idx, gate=cond).
-    ctx.set_ranges(&ret, input_ranges, output_ranges);
-
-    Some(ret)
+/// Convert a shaped STACK into a WHERE chain selecting on its leading range.
+///
+/// Every source is indexed at the *same* trailing ranges, so producers shared
+/// between the stacked slices collapse to one node (Tinygrad
+/// `convert_stack_to_where`). Shape-payload STACKs carry no ranges and are left
+/// alone.
+fn convert_stack_to_where(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
+    if x.dtype() == DType::Void {
+        return None;
+    }
+    let selector = ctx.get_ranges(x)?.1.first()?.clone();
+    let sources = transform_sources_with_bufferize(x, ctx).unwrap_or_else(|| x.op().sources().into_iter().collect());
+    let (last, rest) = sources.split_last()?;
+    rest.iter().enumerate().try_rfold(last.clone(), |acc, (k, source)| {
+        let key = UOp::const_(selector.dtype(), ConstValue::Int(k as i64));
+        UOp::try_where(selector.try_cmpeq(&key).ok()?, source.clone(), acc).ok()
+    })
 }
 
 /// Remove movement ops after source bufferization.
@@ -305,43 +248,25 @@ fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp
     None
 }
 
-/// Convert ReduceAxis → REDUCE using IndexingContext.
+/// Convert tensor-form REDUCE to ranged loop-form REDUCE using IndexingContext.
 ///
-/// - Filter input ranges by axis index (no AxisType validation needed)
-/// - Create REDUCE if we have ranges, return source otherwise
+/// - Tensor form has no ranges and `num_axes > 0`.
+/// - Loop form carries the leading input ranges and has `num_axes == 0`.
 /// - Transfer range_map + realize_map to new identity
-fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
-    let Op::ReduceAxis { src, reduce_op, axes } = x.op() else {
+fn convert_reduce_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
+    let Op::Reduce { src, ranges, reduce_op, num_axes } = x.op() else {
         return None;
     };
+    if *num_axes == 0 {
+        return None;
+    }
+    debug_assert!(ranges.is_empty(), "tensor-form REDUCE must not already have loop ranges");
 
-    let (input_ranges, output_ranges) = if let Some((input_ranges, output_ranges)) = ctx.get_ranges(x) {
-        (input_ranges.clone(), output_ranges.clone())
-    } else {
-        ctx.record_reduceaxis_fallback();
-
-        // Fallback for ReduceAxis nodes that didn't get range assignment (typically
-        // index/shape side paths). Still lower to REDUCE to avoid leaking high-level ops.
-        trace!(uop_id = x.id, "convert_reduceaxis_with_context: using ReduceAxis fallback");
-        let src_shape = src.shape().ok()??;
-        let reduce_ranges: SmallVec<[Arc<UOp>; 4]> =
-            axes.iter().filter_map(|&i| src_shape.get(i)).map(|s| ctx.new_range(s, AxisType::Reduce)).collect();
-
-        let target = if reduce_ranges.is_empty() { Arc::clone(src) } else { src.reduce(reduce_ranges, *reduce_op) };
-        let target = if let Some(t) = x.tag() { target.with_tag(t.clone()) } else { target };
-        if let Some(realize_axes) = ctx.get_realize_axes(x).cloned() {
-            ctx.mark_realize(&target, realize_axes);
-        }
-        return Some(target);
-    };
-
-    // Filter ranges by axis index (no AxisType check needed).
-    let reduce_ranges: SmallVec<[Arc<UOp>; 4]> =
-        input_ranges.iter().enumerate().filter(|(i, _)| axes.contains(i)).map(|(_, r)| Arc::clone(r)).collect();
-
-    // Determine target: REDUCE if we have ranges, source otherwise
-    let target = if reduce_ranges.is_empty() { Arc::clone(src) } else { src.reduce(reduce_ranges, *reduce_op) };
-    // Preserve tag from ReduceAxis.
+    let (input_ranges, output_ranges) = ctx.get_ranges(x)?.clone();
+    let bx_sources = transform_sources_with_bufferize(x, ctx).unwrap_or_else(|| x.op().sources().into_iter().collect());
+    let indexed_src = bx_sources.first().cloned().unwrap_or_else(|| src.clone());
+    let reduce_ranges: SmallVec<[Arc<UOp>; 4]> = input_ranges.iter().take(*num_axes).cloned().collect();
+    let target = indexed_src.reduce(reduce_ranges, *reduce_op);
     let target = if let Some(t) = x.tag() { target.with_tag(t.clone()) } else { target };
 
     // Transfer context to new identity (range_map + realize_map only)
@@ -357,12 +282,12 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
 // BUFFER FOLDING PATTERNS
 // ============================================================================
 
-/// Const folding through BUFFERIZE / INDEX / COPY / MSTACK and noop-bufferize
+/// Const folding through STAGE / INDEX / COPY / MSTACK and noop-stage
 /// removal.
 #[tracing::instrument]
 pub fn buffer_folding() -> TypedPatternMatcher {
     crate::patterns! {
-        Bufferize { compute: c @ Const(_), .. } ~> |c| c.clone(),
+        Stage { compute: c @ Const(_), .. } ~> |c| c.clone(),
         Index { buffer: c @ Const(_), .. } ~> |c| c.clone(),
         Copy { src: c @ Const(_), .. } ~> |c| c.clone(),
         idx @ Index { buffer: MStack { buffers }, .. }
@@ -375,10 +300,10 @@ pub fn buffer_folding() -> TypedPatternMatcher {
                     None
                 }
             },
-        Index { buffer: buf @ Bufferize { compute, ranges, .. }, indices, gate: None }
-            if ranges_equal(ranges, indices) && !matches!(compute.op(), Op::BufferView { .. })
+        Index { buffer: buf @ Stage { compute, ranges, .. }, indices }
+            if ranges_equal(ranges, indices) && !matches!(compute.op(), Op::Slice { .. })
             => |compute, buf, ranges| {
-                // Merge tags, shrink to bufferize shape.
+                // Merge tags, shrink to stage shape.
                 let mut merged = SmallVec::<[usize; 2]>::new();
                 if let Some(t) = compute.tag() { merged.extend(t.iter().copied()); }
                 if let Some(t) = buf.tag() { merged.extend(t.iter().copied()); }
@@ -400,27 +325,27 @@ pub fn buffer_folding() -> TypedPatternMatcher {
     }
 }
 
-/// Strip dead axes (size-1 or unreferenced ranges) from BUFFERIZE,
+/// Strip dead axes (size-1 or unreferenced ranges) from STAGE,
 /// preserving the original shape via RESHAPE + EXPAND.
 pub fn dead_axis_removal() -> TypedPatternMatcher {
     crate::patterns! {
-        // Filter dead axes from BUFFERIZE with shape preservation
-        bufferize @ Bufferize { compute, ranges, opts } => |bufferize, compute, ranges, opts| {
-            cleanup_dead_axes_bufferize(bufferize, compute, ranges, opts)
+        // Filter dead axes from STAGE with shape preservation
+        stage @ Stage { compute, ranges, opts } => |stage, compute, ranges, opts| {
+            cleanup_dead_axes_bufferize(stage, compute, ranges, opts)
         },
     }
 }
 
-/// Clean up dead axes from BUFFERIZE with shape preservation.
+/// Clean up dead axes from STAGE with shape preservation.
 ///
 /// When removing dead axes (ranges with size 1 or ranges not used by compute):
-/// 1. Create new BUFFERIZE with only live ranges
+/// 1. Create new STAGE with only live ranges
 /// 2. RESHAPE to insert size-1 dims for dead axes
 /// 3. EXPAND to restore original shape
 ///
 /// This preserves shape semantics for downstream operations.
 fn cleanup_dead_axes_bufferize(
-    bufferize: &Arc<UOp>,
+    stage: &Arc<UOp>,
     compute: &Arc<UOp>,
     ranges: &SmallVec<[Arc<UOp>; 4]>,
     opts: &BufferizeOpts,
@@ -428,16 +353,18 @@ fn cleanup_dead_axes_bufferize(
     use svod_ir::SInt;
     use svod_ir::shape::Shape;
 
-    // Don't optimize ALWAYS_RUN_OPS (CONTIGUOUS, COPY, NOOP) or AFTER. AFTER
-    // is a buffer-identity wrapper: ranges define consumer access, not the
+    // Don't optimize ALWAYS_RUN_OPS or AFTER (tinygrad `schedule/rangeify.py:198`).
+    // AFTER is a buffer-identity wrapper: ranges define consumer access, not the
     // computation's own shape, so dead-axis pruning would mangle assign-chain
-    // semantics.
-    if matches!(compute.op(), Op::Contiguous { .. } | Op::Copy { .. } | Op::Noop | Op::After { .. }) {
+    // semantics. COPY joins them via `is_always_run_op`, matching the guard
+    // `remove_bufferize` already applies: shrinking a copy's destination would
+    // under-allocate the transfer.
+    if !opts.removable || is_always_run_op(compute.op()) || matches!(compute.op(), Op::After { .. }) {
         return None;
     }
 
-    // Get original BUFFERIZE shape (now available after Fix 1)
-    let original_shape = bufferize.shape().ok().flatten()?;
+    // Get original STAGE shape (now available after Fix 1)
+    let original_shape = stage.shape().ok().flatten()?;
 
     // Get compute's ranges to check if a range is used
     let compute_ranges = compute.ranges();
@@ -460,10 +387,9 @@ fn cleanup_dead_axes_bufferize(
         // 2. OR it's a RANGE with size 1
         // 3. OR it's a RANGE not in compute's ranges
         let is_const = matches!(range.op(), Op::Const(_));
-        let is_size_one = is_dead_axis(range);
         let is_unused = matches!(range.op(), Op::Range { .. }) && !compute_ranges.iter().any(|r| Arc::ptr_eq(r, range));
 
-        if is_const || is_size_one || is_unused {
+        if is_const || is_unused {
             reshape_dims.push(SInt::Const(1)); // Dead axis → size 1
             had_dead = true;
         } else {
@@ -480,13 +406,8 @@ fn cleanup_dead_axes_bufferize(
         return None;
     }
 
-    // NOTE: Even when ALL ranges are dead (scalar output), we MUST keep the
-    // BUFFERIZE. The BUFFERIZE will be converted to STORE by
-    // pm_add_buffers_local_patterns later — removing it here would cause
-    // NoKernelsFound since no STORE gets created.
-
-    // Create BUFFERIZE with fewer (or zero) ranges
-    let reduced = UOp::bufferize(compute.clone(), new_ranges, opts.clone());
+    // Create STAGE with fewer (or zero) ranges
+    let reduced = UOp::stage(compute.clone(), new_ranges, opts.clone());
 
     // RESHAPE to insert size-1 dims for dead axes
     let reshaped = reduced.try_reshape(&reshape_dims).ok()?;
@@ -499,13 +420,13 @@ fn cleanup_dead_axes_bufferize(
 // BUFFER REMOVAL PATTERNS
 // ============================================================================
 
-/// Cost-bounded inlining of `INDEX(BUFFERIZE(...))` plus two cleanup rules
+/// Cost-bounded inlining of `INDEX(STAGE(...))` plus two cleanup rules
 /// that fire after substitution:
 /// - `STORE(x, x) → NOOP`
 /// - `END(NOOP, ..) → NOOP`
 pub fn pm_remove_bufferize() -> TypedPatternMatcher {
     crate::patterns! {
-        Index { buffer: Bufferize { compute: src, ranges: buf_ranges, opts }, indices: idx_ranges, .. }
+        Index { buffer: Stage { compute: src, ranges: buf_ranges, opts }, indices: idx_ranges, .. }
             => |src, buf_ranges, idx_ranges, opts| {
                 remove_bufferize(src, buf_ranges, idx_ranges, opts)
             },
@@ -514,12 +435,12 @@ pub fn pm_remove_bufferize() -> TypedPatternMatcher {
     }
 }
 
-/// Inline a BUFFERIZE into its INDEX consumer by substituting buffer ranges
+/// Inline a STAGE into its INDEX consumer by substituting buffer ranges
 /// with the consumer's index ranges. Bails when:
-/// 1. `src` is an always-run op or the Bufferize is non-removable
+/// 1. `src` is an always-run op or the Stage is non-removable
 ///    (multi-consumer realize boundary).
 /// 2. The compute touches more than 3 distinct GLOBAL Bufferizes / MStacks /
-///    Params (would expand kernel input pressure).
+///    Params / AFTER buffers (would expand kernel input pressure).
 /// 3. Any reduce body reads a buffer (would compound reads inside the loop).
 ///
 /// CONST range keys are skipped during substitution — they're broadcast slots,
@@ -533,10 +454,10 @@ fn remove_bufferize(
 ) -> Option<Arc<UOp>> {
     use std::collections::{HashMap, HashSet};
 
-    debug_assert_eq!(buf_ranges.len(), idx_ranges.len(), "INDEX/BUFFERIZE range arity mismatch");
+    debug_assert_eq!(buf_ranges.len(), idx_ranges.len(), "INDEX/STAGE range arity mismatch");
     debug_assert!(
         buf_ranges.iter().all(|r| matches!(r.op(), Op::Range { .. } | Op::Const(_))),
-        "BUFFERIZE ranges must be Range or Const"
+        "STAGE ranges must be Range or Const"
     );
 
     if is_always_run_op(src.op()) || !opts.removable {
@@ -557,10 +478,16 @@ fn remove_bufferize(
             return;
         }
         match uop.op() {
+            // AFTER is a buffer identity: it costs its own buffer, once, and the
+            // producers it orders against are not read by this compute.
+            Op::After { .. } => {
+                buffers.push(uop.buf_uop());
+                return;
+            }
             // STORE doesn't count, and we don't look inside it.
             Op::Store { .. } => return,
-            // GLOBAL Bufferize and MStack count + stop traversal.
-            Op::Bufferize { opts, .. } if opts.addrspace == AddrSpace::Global => {
+            // GLOBAL Stage and MStack count + stop traversal.
+            Op::Stage { opts, .. } if opts.addrspace == AddrSpace::Global => {
                 buffers.push(Arc::clone(uop));
                 return;
             }
@@ -602,7 +529,7 @@ fn remove_bufferize(
         if !reduce_sources.is_empty() {
             let sink = UOp::sink(reduce_sources);
             let buffer_in_reduce =
-                sink.any_in_subtree(|n| matches!(n.op(), Op::Param { .. } | Op::Buffer { .. } | Op::Bufferize { .. }));
+                sink.any_in_subtree(|n| matches!(n.op(), Op::Param { .. } | Op::Buffer { .. } | Op::Stage { .. }));
             if buffer_in_reduce {
                 tracing::debug!(
                     src_id = src.id,
@@ -619,7 +546,7 @@ fn remove_bufferize(
     let subs_map: HashMap<UOpKey, Arc<UOp>> = buf_ranges
         .iter()
         .zip(idx_ranges.iter())
-        .filter(|(k, v)| !matches!(k.op(), Op::Const(_)) && !matches!(v.op(), Op::Invalid))
+        .filter(|(k, v)| !matches!(k.op(), Op::Const(_)) && !UOp::is_invalid_marker(v))
         .map(|(k, v)| (UOpKey(Arc::clone(k)), Arc::clone(v)))
         .collect();
     Some(src.substitute_gated(&subs_map))
@@ -629,12 +556,13 @@ fn remove_bufferize(
 // REDUCTION SIMPLIFY PATTERNS
 // ============================================================================
 
-/// Pattern matcher for splitting large ReduceAxis operations.
-/// Must run BEFORE ReduceAxis → REDUCE conversion (Step 2.5).
+/// Pattern matcher for splitting large tensor-form REDUCE operations.
+/// Must run before tensor REDUCE → ranged REDUCE conversion.
 pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
     crate::patterns! {
         @context SplitReduceOpConfig;
-        reduce @ ReduceAxis { src: _ } => |reduce, ctx| split_reduceop(reduce, ctx),
+        reduce @ Reduce { src: _, ranges: _, reduce_op: _, num_axes: _ }
+            => |reduce, ctx| split_reduceop(reduce, ctx),
     }
 }
 
@@ -642,9 +570,9 @@ pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
 ///
 /// Factored out so it can be shared between `pm_reduce_simplify` and the inner
 /// `reduce_collapse` pattern matchers without duplication.
-fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
+pub(crate) fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        reduce @ Reduce { src, ranges, reduce_op: Add | Mul | Max | Min } => |reduce, src, ranges, reduce_op| {
+        reduce @ Reduce { src, ranges, reduce_op: Add | Max | Mul, num_axes } => |reduce, src, ranges, reduce_op, num_axes| {
             assert!(
                 ranges.iter().all(|r| matches!(r.op(), Op::Range { .. })),
                 "reduce_unparented: all reduce ranges must be RANGE ops, got: {:?}",
@@ -659,7 +587,7 @@ fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
             }
 
             let mut result = if !parented.is_empty() || reduce.dtype() != src.dtype() {
-                src.reduce(parented, *reduce_op)
+                src.reduce_with_num_axes(parented, *reduce_op, *num_axes)
             } else {
                 Arc::clone(src)
             };
@@ -679,7 +607,8 @@ fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
                         result = result.try_pow(&size_casted).ok()?;
                     }
                 }
-                ReduceOp::Max | ReduceOp::Min => {}
+                ReduceOp::Max => {}
+                _ => unreachable!("pattern only accepts ADD, MAX, and MUL"),
             }
 
             Some(result)
@@ -715,7 +644,15 @@ fn split_mul_factors(uop: &Arc<UOp>) -> SmallVec<[Arc<UOp>; 4]> {
 ///
 /// For ADD reduce: `REDUCE(x * c, ADD, ranges)` → `REDUCE(x, ADD, ranges) * c`
 /// For MAX reduce: same, but only if the outside factor's vmin >= 0.
-fn reduce_mul_chain(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>, reduce_op: ReduceOp) -> Option<Arc<UOp>> {
+fn reduce_mul_chain(
+    src: &Arc<UOp>,
+    ranges: &SmallVec<[Arc<UOp>; 4]>,
+    reduce_op: ReduceOp,
+    num_axes: usize,
+) -> Option<Arc<UOp>> {
+    if src.dtype().is_float() {
+        return None;
+    }
     let factors = split_mul_factors(src);
     if factors.len() < 2 {
         return None;
@@ -730,11 +667,12 @@ fn reduce_mul_chain(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>, reduce_op:
         } else {
             // For MAX reduce, only factor out non-negative values
             if reduce_op == ReduceOp::Max {
-                let is_non_negative = match factor.vmin() {
-                    ConstValue::Int(v) => *v >= 0,
-                    ConstValue::UInt(_) => true,
-                    ConstValue::Float(v) => *v >= 0.0,
-                    ConstValue::Bool(_) => true,
+                let is_non_negative = match SoundVminVmaxProperty::get(factor).as_ref().map(|bounds| &bounds.0) {
+                    Some(ConstValue::Int(v)) => *v >= 0,
+                    Some(ConstValue::UInt(_)) => true,
+                    Some(ConstValue::Float(v)) => *v >= 0.0,
+                    Some(ConstValue::Bool(_)) => true,
+                    _ => false,
                 };
                 if !is_non_negative {
                     inside.push(factor.clone());
@@ -751,7 +689,7 @@ fn reduce_mul_chain(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>, reduce_op:
 
     // Reconstruct inside product (if all factors are outside, reduce over const 1)
     let inner = inside.into_iter().reduce(|a, b| a.mul(&b)).unwrap_or_else(|| src.const_like(1i64));
-    let reduced = inner.reduce(ranges.clone(), reduce_op);
+    let reduced = inner.reduce_with_num_axes(ranges.clone(), reduce_op, num_axes);
 
     // Multiply by outside product
     let mut result = reduced;
@@ -774,13 +712,13 @@ pub fn pm_reduce_simplify() -> &'static TypedPatternMatcher {
     static CACHED: std::sync::LazyLock<TypedPatternMatcher> = std::sync::LazyLock::new(|| {
         pm_reduce_unparented()
             + crate::patterns! {
-                Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add
-                    => |src, ranges| super::transforms::reduce_collapse(src, ranges),
+                Reduce { src, ranges, reduce_op, num_axes } if *reduce_op == ReduceOp::Add && *num_axes == 0
+                    => |src, ranges, _num_axes| super::transforms::reduce_collapse(src, ranges),
 
-                Reduce { src, ranges, reduce_op }
+                Reduce { src, ranges, reduce_op, num_axes }
                     if matches!(reduce_op, ReduceOp::Add | ReduceOp::Max)
                     && matches!(src.op(), Op::Binary(BinaryOp::Mul, _, _))
-                    => |src, ranges, reduce_op| reduce_mul_chain(src, ranges, *reduce_op),
+                    => |src, ranges, reduce_op, num_axes| reduce_mul_chain(src, ranges, *reduce_op, *num_axes),
             }
     });
     &CACHED
@@ -792,113 +730,22 @@ pub fn pm_reduce_simplify() -> &'static TypedPatternMatcher {
 
 /// Push movement ops (RESHAPE / PERMUTE / EXPAND / PAD / SHRINK / FLIP)
 /// through INDEX, AFTER, and END so they can be folded into surrounding
-/// loop-range arithmetic. Also flattens redundantly nested INDEX nodes.
+/// loop-range arithmetic.
 pub fn movement_op_patterns() -> TypedPatternMatcher {
     crate::patterns! {
-        idx @ Index { buffer: mop, indices, gate } if mop.op().is_movement() => |idx, mop, indices, gate| {
-            transform_movement_through_index(mop, indices, gate, idx.dtype())
+        idx @ Index { buffer: mop, indices } if mop.op().is_movement() => |idx, mop, indices| {
+            transform_movement_through_index(mop, indices, idx)
         },
-        after @ After { passthrough: mop, deps } if mop.op().is_movement()
-            => |after, mop, deps| {
-                super::transforms::push_movement_through_after(after, mop, deps)
+        after @ After { passthrough: r, deps }
+            if r.op().is_movement() || matches!(r.op(), Op::Index { .. })
+            => |after, r, deps| {
+                super::transforms::push_op_through_after(after, r, deps)
             },
-        after @ After { passthrough: idx @ Index { buffer, indices, gate }, deps }
-            => |after, idx, buffer, indices, gate, deps| {
-                super::transforms::push_index_through_after(after, idx, buffer, indices, gate, deps)
-            },
-        End { computation: mop, ranges } if mop.op().is_movement()
-            => |mop, ranges| {
+        end @ End { computation: mop, ranges } if mop.op().is_movement()
+            => |end, mop, ranges| {
                 let src = &mop.op().sources()[0];
-                Some(src.end(ranges.clone()))
+                Some(end.with_sources(std::iter::once(src.clone()).chain(ranges.iter().cloned()).collect()))
             },
-        Index {
-            buffer: inner @ Index { indices: inner_indices, gate: None },
-            indices: outer_indices,
-            gate: None
-        } if inner_indices.len() == 1 && outer_indices.len() == 1
-             && inner_indices[0].id == outer_indices[0].id
-            ~> |inner| inner.clone(),
-    }
-}
-
-/// Pattern matcher for INDEX concatenation.
-///
-/// Matches INDEX on ptr INDEX and concatenates their indices:
-/// ```text
-/// INDEX(INDEX(buffer, indices1..., gate1?), indices2..., gate2?)
-/// → INDEX(buffer, indices1... + indices2..., combined_gate?)
-/// ```
-///
-/// This only applies when:
-/// - Inner INDEX has PtrDType (is a pointer)
-/// - Outer INDEX doesn't have PtrDType (is an element access)
-pub fn pm_syntactic_sugar() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        // Early rangeify: INDEX(elementwise, ranges) → elementwise(INDEX(src, ranges)).
-        // pm_syntactic_sugar runs before optimization to avoid treating elementwise
-        // tensor expressions as pointer-like INDEX buffers.
-        Index { buffer: x, indices, gate }
-            if is_indexable_elementwise_or_const(x)
-            => |x, indices, gate| {
-                push_index_through_elementwise(x, indices, gate)
-            },
-        // INDEX on ptr INDEX concats them
-        outer @ Index { buffer: inner @ Index { buffer: base_buffer, indices: inner_indices, gate: inner_gate }, indices: outer_indices, gate: outer_gate }
-            if matches!(inner.dtype(), DType::Ptr { .. }) && !matches!(outer.dtype(), DType::Ptr { .. })
-            => |outer, inner, base_buffer, inner_indices, outer_indices, inner_gate, outer_gate| {
-                concat_index_indices(base_buffer, inner_indices, outer_indices, inner_gate, outer_gate, outer.dtype())
-            },
-    }
-}
-
-fn is_indexable_elementwise_or_const(uop: &Arc<UOp>) -> bool {
-    matches!(
-        uop.op(),
-        Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. } | Op::Const(_)
-    )
-}
-
-fn push_index_through_elementwise(
-    x: &Arc<UOp>,
-    indices: &SmallVec<[Arc<UOp>; 4]>,
-    gate: &Option<Arc<UOp>>,
-) -> Option<Arc<UOp>> {
-    if matches!(x.op(), Op::Const(_)) {
-        return Some(x.clone());
-    }
-
-    let mut new_sources = Vec::with_capacity(x.op().sources().len());
-    for src in x.op().sources() {
-        let indexed = UOp::index().buffer(src.clone()).indices(indices.clone()).maybe_gate(gate.clone()).call().ok()?;
-        new_sources.push(indexed);
-    }
-    Some(x.with_sources(new_sources))
-}
-
-/// Concatenate indices from nested INDEX operations.
-fn concat_index_indices(
-    base_buffer: &Arc<UOp>,
-    inner_indices: &SmallVec<[Arc<UOp>; 4]>,
-    outer_indices: &SmallVec<[Arc<UOp>; 4]>,
-    inner_gate: &Option<Arc<UOp>>,
-    outer_gate: &Option<Arc<UOp>>,
-    result_dtype: DType,
-) -> Option<Arc<UOp>> {
-    // Concatenate: inner indices + outer indices
-    let mut combined: SmallVec<[Arc<UOp>; 4]> = inner_indices.clone();
-    combined.extend(outer_indices.iter().cloned());
-
-    // Combine gates: if both exist, AND them; if one exists, use that; if neither, None
-    let combined_gate = match (inner_gate, outer_gate) {
-        (Some(g1), Some(g2)) => Some(g1.and_(g2)),
-        (Some(g), None) | (None, Some(g)) => Some(g.clone()),
-        (None, None) => None,
-    };
-
-    // Build new INDEX with combined indices
-    match combined_gate {
-        Some(g) => UOp::index().buffer(base_buffer.clone()).indices(combined).dtype(result_dtype).gate(g).call().ok(),
-        None => UOp::index().buffer(base_buffer.clone()).indices(combined).dtype(result_dtype).call().ok(),
     }
 }
 
@@ -906,25 +753,35 @@ fn concat_index_indices(
 pub(crate) fn transform_movement_through_index(
     mop: &Arc<UOp>,
     indices: &SmallVec<[Arc<UOp>; 4]>,
-    gate: &Option<Arc<UOp>>,
-    result_dtype: DType,
+    index: &Arc<UOp>,
 ) -> Option<Arc<UOp>> {
-    use super::indexing::{SimplifyCache, apply_movement_op};
+    use super::indexing::{apply_movement_op, apply_reshape_ranges};
 
     let src = &mop.op().sources()[0];
     let src_shape = src.shape().ok()??;
+    let mop_shape = mop.shape().ok()??;
 
-    // Temporary cache — this call site is outside the scoped assign_ranges cache
-    let mut cache = SimplifyCache::default();
-    let transformed = apply_movement_op(mop.op(), src_shape, indices.as_slice(), &mut cache);
-
-    match gate {
-        Some(g) => {
-            UOp::index().buffer(src.clone()).indices(transformed).dtype(result_dtype.clone()).gate(g.clone()).call()
-        }
-        None => UOp::index().buffer(src.clone()).indices(transformed).dtype(result_dtype).call(),
+    if indices.len() == mop_shape.len() {
+        let transformed = apply_movement_op(mop.op(), src_shape, indices.as_slice());
+        return UOp::index().buffer(src.clone()).indices(transformed).dtype(index.dtype()).call().ok();
     }
-    .ok()
+
+    if !matches!(mop.op(), Op::Reshape { .. }) {
+        return None;
+    }
+
+    let suffix_len = mop_shape.len().checked_sub(indices.len())?;
+    let src_prefix = src_shape.len().checked_sub(suffix_len)?;
+    if src_shape[src_prefix..] != mop_shape[indices.len()..] {
+        return None;
+    }
+    if src_prefix == 0 {
+        return (src.dtype() == index.dtype()).then(|| src.clone());
+    }
+
+    let transformed = apply_reshape_ranges(&src_shape[..src_prefix], &mop_shape[..indices.len()], indices);
+    let ret = UOp::index().buffer(src.clone()).indices(transformed).dtype(index.dtype()).call().ok()?;
+    (ret.shape().ok()? == index.shape().ok()?).then_some(ret)
 }
 
 // ============================================================================
@@ -936,7 +793,7 @@ fn dtype_zero(dtype: DType) -> Arc<UOp> {
     let base = dtype.base();
     let zero = ConstValue::zero(base);
     if dtype.is_vector() {
-        UOp::vectorize((0..dtype.count()).map(|_| UOp::const_(DType::Scalar(base), zero)).collect())
+        UOp::stack((0..dtype.count()).map(|_| UOp::const_(DType::Scalar(base), zero)).collect())
     } else {
         UOp::const_(dtype, zero)
     }
@@ -986,24 +843,6 @@ pub fn rangeify_codegen_simple() -> TypedPatternMatcher {
     }
 }
 
-/// rangeify_codegen that accepts RangeifyBufferContext for combining with pm_add_buffers_local.
-///
-/// Same as `rangeify_codegen_simple` but accepts `RangeifyBufferContext` so it
-/// can be composed with `pm_add_buffers_local_patterns` in a single pass.
-pub fn rangeify_codegen_with_kernel_ctx() -> TypedPatternMatcher<super::kernel::RangeifyBufferContext> {
-    crate::patterns! {
-        @context super::kernel::RangeifyBufferContext;
-        // NOOP → zero constant (scalar or vector)
-        noop @ Noop() if noop.dtype().base() != svod_dtype::ScalarDType::Void => |noop, _ctx| {
-            Some(dtype_zero(noop.dtype()))
-        },
-        // CONTIGUOUS → source (strip wrapper, no opts to extract at this stage)
-        Contiguous { src, .. } => |src, _ctx| {
-            Some(src.clone())
-        },
-    }
-}
-
 // ============================================================================
 // CALL-WRAPPER SPLITTING PATTERNS
 // ============================================================================
@@ -1025,6 +864,16 @@ fn extract_buffer_from_after(passthrough: &Arc<UOp>) -> Arc<UOp> {
     }
 }
 
+fn storage_addrspace(node: &Arc<UOp>) -> Option<AddrSpace> {
+    match node.op() {
+        Op::Buffer { arg, .. } | Op::Param { arg, .. } => arg.addrspace,
+        Op::Slice { buffer, .. } | Op::MSelect { buffer, .. } => storage_addrspace(buffer),
+        Op::After { passthrough, .. } => storage_addrspace(passthrough),
+        Op::MStack { buffers } => buffers.first().and_then(storage_addrspace),
+        _ => None,
+    }
+}
+
 /// Find output PARAM from a CALL body AST.
 fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
     for node in ast.toposort() {
@@ -1034,7 +883,7 @@ fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
                 Op::Index { buffer: inner_buf, .. } => inner_buf.clone(),
                 _ => buffer.clone(),
             };
-            if matches!(output_buf.op(), Op::Param { device: None, .. }) {
+            if is_codegen_param(&output_buf) {
                 return Some(output_buf);
             }
         }
@@ -1043,11 +892,6 @@ fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 fn map_after_like_node(node: &Arc<UOp>, ctx: &mut LocalAddBufferContext) -> Option<Arc<UOp>> {
-    // Skip local pointer passthroughs.
-    if matches!(node.dtype(), DType::Ptr { addrspace: AddrSpace::Local, .. }) {
-        return None;
-    }
-
     // buf = after.buf_uop(); if buf is MSTACK/MSELECT, descend into its first source.
     let mut buf = node.buf_uop();
     buf = match buf.op() {
@@ -1055,6 +899,14 @@ fn map_after_like_node(node: &Arc<UOp>, ctx: &mut LocalAddBufferContext) -> Opti
         Op::MSelect { buffer, .. } => buffer.clone(),
         _ => buf,
     };
+
+    // Only global storage participates in the CALL tuple. Internal storage is
+    // unwrapped for kernel use without consuming a PARAM slot or CALL argument.
+    match storage_addrspace(&buf) {
+        Some(AddrSpace::Global) => {}
+        Some(AddrSpace::Local | AddrSpace::Reg) => return Some(buf),
+        None => return None,
+    }
 
     // A reused buffer (the level-interval planner aliases non-overlapping
     // lifetimes) can be the target of more than one AFTER within a kernel's
@@ -1070,10 +922,10 @@ fn map_after_like_node(node: &Arc<UOp>, ctx: &mut LocalAddBufferContext) -> Opti
 pub fn to_param_patterns() -> TypedPatternMatcher<RangeifyBufferContext> {
     crate::patterns! {
         @context RangeifyBufferContext;
-        // Buffer → codegen PARAM
-        buf @ Buffer { size, unique: _ } => |buf, size, ctx| {
-            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global)?;
-            let replacement = UOp::param(ctx.next_global(), *size, ptr_dtype, None);
+        // Only global buffers participate in the CALL ABI.
+        buf @ Buffer { arg } if arg.addrspace == Some(AddrSpace::Global) => |buf, ctx| {
+            let size = buf.buffer_size()?;
+            let replacement = UOp::param(ctx.next_global(), size, extract_base_dtype(buf.dtype()), arg.device.clone());
             ctx.map_buffer(buf.clone(), replacement.clone());
             Some(replacement)
         },
@@ -1089,24 +941,15 @@ pub fn to_param_patterns() -> TypedPatternMatcher<RangeifyBufferContext> {
         // Handle AFTER: extract buffer and track dependency
         after @ After { passthrough } => |after, passthrough, ctx| {
             let buf = extract_buffer_from_after(passthrough);
-            if matches!(buf.dtype(), DType::Ptr { addrspace: AddrSpace::Local, .. }) {
+            if matches!(storage_addrspace(&buf), Some(AddrSpace::Local | AddrSpace::Reg)) {
                 return Some(buf);
             }
             ctx.map_buffer(buf.clone(), after.clone());
             Some(buf)
         },
-        // Remove spurious sources from CONST and DEFINE_VAR
-        c @ Const(_) | c @ DefineVar { name: _ } => |c, _ctx| {
-            let sources = c.op().sources();
-            if sources.is_empty() { return None; }
-            Some(match c.op() {
-                Op::Const(val) => UOp::const_(c.dtype(), val.0),
-                Op::DefineVar { name, min_val, max_val } => UOp::var(name.clone(), c.dtype(), *min_val, *max_val),
-                _ => return None,
-            })
-        },
         // Replace RANGE(end=0) with CONST(0)
-        Range { end } if matches!(end.op(), Op::Const(v) if v.0.is_zero()) => |_r, _ctx| {
+        Range { end } if matches!(end.op(), Op::Const(v) if v.0.is_zero()) => |_r, ctx| {
+            ctx.next_range();
             Some(UOp::index_const(0))
         },
         // Renumber RANGE axis_id (Unrenumbered → Renumbered)
@@ -1120,24 +963,34 @@ pub fn to_param_patterns() -> TypedPatternMatcher<RangeifyBufferContext> {
 
 /// Create patterns for to_param transformation using LocalAddBufferContext.
 ///
-/// Creates per-kernel codegen PARAMs with sequential slots and PtrDType.
+/// Creates per-kernel codegen PARAMs with sequential slots.
 pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
     crate::patterns! {
         @context LocalAddBufferContext;
-        // Buffer → codegen PARAM.
-        buf @ Buffer { size, unique: _ } => |buf, size, ctx| {
-            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global)?;
-            let replacement = UOp::param(ctx.next_param_slot(), *size, ptr_dtype, None);
+        // Only global storage is part of the CALL ABI. REG/LOCAL BUFFERs remain
+        // structured compiler-managed allocations and must not consume slots.
+        buf @ Buffer { arg } if arg.addrspace == Some(AddrSpace::Global) => |buf, ctx| {
+            let size = buf.buffer_size()?;
+            let replacement = mark_codegen_param(UOp::param(
+                ctx.next_param_slot(),
+                size,
+                extract_base_dtype(buf.dtype()),
+                arg.device.clone(),
+            ));
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
             }
             Some(replacement)
         },
-        // Pre-kernel Param (device: Some) → codegen PARAM (device: None)
-        // Guard: skip codegen PARAMs (device: None) to prevent infinite loop
-        buf @ Param { slot: _, size } if matches!(buf.op(), Op::Param { device: Some(_), .. }) => |buf, size, ctx| {
-            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global)?;
-            let replacement = UOp::param(ctx.next_param_slot(), *size, ptr_dtype, None);
+        // Pre-kernel PARAM → codegen PARAM. The missing device metadata prevents
+        // this rule from repeatedly matching its own replacement.
+        buf @ Param { arg }
+            if !is_codegen_param(buf) && arg.device.is_some() && arg.addrspace == Some(AddrSpace::Global)
+            => |buf, arg, ctx| {
+            let Op::Param { shape, .. } = buf.op() else { unreachable!() };
+            let mut arg = arg.clone();
+            arg.slot = ctx.next_param_slot();
+            let replacement = mark_codegen_param(UOp::new(Op::Param { shape: shape.clone(), arg }, buf.dtype()).rtag(buf.tag().clone()));
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
             }
@@ -1145,29 +998,26 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
         },
         // Remove BIND in AST while preserving the binding as a CALL source.
         b @ Bind { var, value } => |b, var, value, ctx| {
+            let _ = b;
             let bound_val = match value.op() {
                 Op::Const(cv) => cv.0.try_int(),
                 _ => None,
             };
-            ctx.add_var(b.clone(), var.clone(), bound_val);
+            let mut tags = var.tag().clone().unwrap_or_default();
+            if !tags.contains(&svod_ir::uop::canonical::TAG_CALL_BIND_PARAM) {
+                tags.push(svod_ir::uop::canonical::TAG_CALL_BIND_PARAM);
+            }
+            let call_var = var.with_tag(tags);
+            ctx.add_var(call_var.bind(value.clone()), call_var, bound_val);
             Some(var.clone())
         },
         // Handle AFTER, MSTACK, MSELECT uniformly.
         after @ After { passthrough: _ } => |after, _ctx_passthrough, ctx| map_after_like_node(after, ctx),
         m @ MStack { buffers: _ } => |m, ctx| map_after_like_node(m, ctx),
         m @ MSelect { buffer: _, device_index: _ } => |m, ctx| map_after_like_node(m, ctx),
-        // Remove spurious sources from CONST and DEFINE_VAR
-        c @ Const(_) | c @ DefineVar { name: _ } => |c, _ctx| {
-            let sources = c.op().sources();
-            if sources.is_empty() { return None; }
-            Some(match c.op() {
-                Op::Const(val) => UOp::const_(c.dtype(), val.0),
-                Op::DefineVar { name, min_val, max_val } => UOp::var(name.clone(), c.dtype(), *min_val, *max_val),
-                _ => return None,
-            })
-        },
         // Replace RANGE(end=0) with CONST(0)
-        Range { end } if matches!(end.op(), Op::Const(v) if v.0.is_zero()) => |_r, _ctx| {
+        Range { end } if matches!(end.op(), Op::Const(v) if v.0.is_zero()) => |_r, ctx| {
+            ctx.next_range();
             Some(UOp::index_const(0))
         },
         // Renumber Unrenumbered Range axis_id.
@@ -1205,13 +1055,9 @@ pub fn extract_device_from_graph(root: &Arc<UOp>) -> Option<DeviceSpec> {
         }
 
         match uop.op() {
-            Op::Device(spec) => return Some(spec.clone()),
-            Op::Buffer { device, .. } => {
-                if let Op::Device(spec) = device.op() {
-                    return Some(spec.clone());
-                }
-            }
-            Op::Bufferize { opts, .. } => {
+            Op::Buffer { arg, .. } => return arg.device.clone(),
+            Op::Copy { device, .. } | Op::AllReduce { device, .. } => return Some(device.clone()),
+            Op::Stage { opts, .. } => {
                 if let Some(device_spec) = &opts.device {
                     return Some(device_spec.clone());
                 }
@@ -1237,24 +1083,30 @@ pub fn extract_device_from_graph(root: &Arc<UOp>) -> Option<DeviceSpec> {
 /// checks if they access too many buffers, and forces bufferization of
 /// elementwise sources to GLOBAL memory if so.
 #[allow(unused_variables)] // `op` is used by macro expansion
-pub fn buffer_limit_patterns(max_buffers: usize) -> TypedPatternMatcher<()> {
+pub fn buffer_limit_patterns(max_buffers: usize) -> TypedPatternMatcher<IndexingContext> {
     crate::patterns! {
+        @context IndexingContext;
         for op in binary [*] {
-            tree@op(a, b) => |tree, a, b| {
-                check_buffer_limit(tree, &[a.clone(), b.clone()], max_buffers)
+            tree@op(a, b) => |tree, a, b, ctx| {
+                check_buffer_limit(tree, &[a.clone(), b.clone()], max_buffers, ctx)
             },
         }
 
         for op in ternary [*] {
-            tree@op(a, b, c) => |tree, a, b, c| {
-                check_buffer_limit(tree, &[a.clone(), b.clone(), c.clone()], max_buffers)
+            tree@op(a, b, c) => |tree, a, b, c, ctx| {
+                check_buffer_limit(tree, &[a.clone(), b.clone(), c.clone()], max_buffers, ctx)
             },
         }
     }
 }
 
 /// Check buffer limit and force bufferization if exceeded.
-fn check_buffer_limit(tree: &Arc<UOp>, sources: &[Arc<UOp>], max_buffers: usize) -> Option<Arc<UOp>> {
+fn check_buffer_limit(
+    tree: &Arc<UOp>,
+    sources: &[Arc<UOp>],
+    max_buffers: usize,
+    ctx: &mut IndexingContext,
+) -> Option<Arc<UOp>> {
     let all_buffers = collect_accessed_buffers(sources);
 
     if all_buffers.len() > max_buffers.saturating_sub(1) {
@@ -1263,7 +1115,7 @@ fn check_buffer_limit(tree: &Arc<UOp>, sources: &[Arc<UOp>], max_buffers: usize)
             .iter()
             .map(|src| {
                 if is_elementwise(src) {
-                    let new = force_bufferize(src);
+                    let new = force_bufferize(src, ctx);
                     if !Arc::ptr_eq(&new, src) {
                         any_changed = true;
                     }
@@ -1294,9 +1146,9 @@ fn collect_accessed_buffers(sources: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
             return;
         }
         match uop.op() {
-            Op::Bufferize { opts, .. } if opts.addrspace == AddrSpace::Global => {
+            Op::Stage { opts, .. } if opts.addrspace == AddrSpace::Global => {
                 buffers.push(Arc::clone(uop));
-                return; // Stop at GLOBAL bufferize
+                return; // Stop at GLOBAL stage
             }
             Op::Buffer { .. } | Op::MStack { .. } | Op::MSelect { .. } => {
                 buffers.push(Arc::clone(uop));
@@ -1320,57 +1172,30 @@ fn collect_accessed_buffers(sources: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
 }
 
 /// Force bufferization of a computation to GLOBAL memory.
-fn force_bufferize(src: &Arc<UOp>) -> Arc<UOp> {
-    let ranges = src.ranges().clone();
-    if ranges.is_empty() {
+fn force_bufferize(src: &Arc<UOp>, ctx: &mut IndexingContext) -> Arc<UOp> {
+    let original_ranges = src.ranges().clone();
+    if original_ranges.is_empty() {
         return Arc::clone(src);
     }
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
-    let bufferized = UOp::bufferize(Arc::clone(src), ranges.clone(), opts);
-    UOp::index().buffer(bufferized).indices(ranges).call().unwrap_or_else(|_| Arc::clone(src))
-}
-
-// ============================================================================
-// PM_ADD_LOADS - Wrap INDEX with LOAD for arithmetic ops
-// ============================================================================
-
-/// Pattern matcher to wrap INDEX sources with LOAD for arithmetic operations.
-///
-/// Transforms INDEX → LOAD(INDEX) at source, then cleans up STORE.
-///
-/// Bottom-up rewriting propagates the transformation to all consumers automatically:
-/// 1. INDEX → LOAD(buffer, INDEX) - wrap every INDEX with LOAD
-/// 2. STORE cleanup - remove LOAD from index position (STORE needs raw INDEX)
-pub fn pm_add_loads() -> &'static TypedPatternMatcher<()> {
-    crate::cached_patterns! {
-        // Pattern 1: INDEX with non-Ptr dtype → LOAD(buffer, INDEX with Ptr dtype).
-        // Guard prevents re-matching: after transformation, INDEX has Ptr dtype.
-        // Also skip Image dtype — image access handled separately in codegen.
-        // dtype.base for non-Ptr returns self — preserving vectorization.
-        idx @ Index { buffer, indices } if !matches!(idx.dtype(), DType::Ptr { .. } | DType::Image { .. }) => |idx, buffer, indices| {
-            // Use INDEX's own dtype as LOAD result type. The expander has already set
-            // the correct vectorization (e.g. Float32.vec(3) for UPCAST=3).
-            let result_dtype = idx.dtype().clone();
-
-            // Create INDEX with Ptr dtype (buffer's dtype) — won't match pattern again.
-            let gate = match idx.op() {
-                Op::Index { gate, .. } => gate.clone(),
-                _ => None,
-            };
-            let ptr_index = UOp::new(
-                Op::Index { buffer: buffer.clone(), indices: indices.clone(), gate },
-                buffer.dtype().clone(),  // Use buffer dtype (Ptr), not original INDEX dtype
-            );
-
-            Some(UOp::load().buffer(buffer.clone()).index(ptr_index).dtype(result_dtype).call())
-        },
-
-        // Pattern 2: Cleanup STORE - remove LOAD from index position
-        Store { index: Load { index: real_index, .. }, value } =>
-            |real_index, value| {
-                Some(real_index.store(value.clone()))
-            },
-    }
+    let end_ranges: Vec<_> = original_ranges
+        .iter()
+        .map(|range| match range.op() {
+            Op::Range { axis_type: AxisType::Device, .. } => range.clone(),
+            Op::Range { end, .. } => ctx.new_range_from_uop(end, AxisType::Weak),
+            _ => range.clone(),
+        })
+        .collect();
+    #[allow(clippy::mutable_key_type)]
+    let substitutions: HashMap<_, _> = original_ranges
+        .iter()
+        .zip(&end_ranges)
+        .filter(|(old, new)| !Arc::ptr_eq(old, new))
+        .map(|(old, new)| (UOpKey(old.clone()), new.clone()))
+        .collect();
+    let compute = src.substitute(&substitutions);
+    let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
+    let bufferized = UOp::stage(compute, end_ranges, opts);
+    UOp::index().buffer(bufferized).indices(original_ranges).call().unwrap_or_else(|_| Arc::clone(src))
 }
 
 // ============================================================================
@@ -1388,7 +1213,7 @@ fn is_vectorized_bool(dtype: &DType) -> bool {
 /// Unified devectorize for any binary op producing vectorized output.
 ///
 /// Handles scalar-vector operand mix (from comparisons like `vec < scalar`).
-/// Converts: OP(<N x T>, <N x T>) → VECTORIZE(OP(gep(a,0), gep(b,0)), ...)
+/// Converts: OP(<N x T>, <N x T>) → STACK(OP(INDEX(a, 0), INDEX(b, 0)), ...)
 fn devectorize_binary(op: &BinaryOp, result: &Arc<UOp>, a: &Arc<UOp>, b: &Arc<UOp>) -> Option<Arc<UOp>> {
     let out_vcount = result.dtype().vcount();
     if out_vcount <= 1 {
@@ -1401,14 +1226,14 @@ fn devectorize_binary(op: &BinaryOp, result: &Arc<UOp>, a: &Arc<UOp>, b: &Arc<UO
 
     let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..out_vcount)
         .map(|i| {
-            // Handle scalar-vector mix: only GEP if operand is vectorized
-            let a_elem = if a_vcount > 1 { a.gep(vec![i]) } else { a.clone() };
-            let b_elem = if b_vcount > 1 { b.gep(vec![i]) } else { b.clone() };
+            // Handle scalar-vector mix: only INDEX hardware-vector operands.
+            let a_elem = if a_vcount > 1 { a.index_axes(vec![i]) } else { a.clone() };
+            let b_elem = if b_vcount > 1 { b.index_axes(vec![i]) } else { b.clone() };
             UOp::new(Op::Binary(*op, a_elem, b_elem), scalar_dtype.clone())
         })
         .collect();
 
-    Some(UOp::vectorize(scalar_ops))
+    Some(UOp::stack(scalar_ops))
 }
 
 /// Unified devectorize for any unary op producing vectorized output.
@@ -1422,12 +1247,12 @@ fn devectorize_unary(op: &UnaryOp, result: &Arc<UOp>, src: &Arc<UOp>) -> Option<
 
     let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..out_vcount)
         .map(|i| {
-            let elem = src.gep(vec![i]);
+            let elem = src.index_axes(vec![i]);
             UOp::new(Op::Unary(*op, elem), scalar_dtype.clone())
         })
         .collect();
 
-    Some(UOp::vectorize(scalar_ops))
+    Some(UOp::stack(scalar_ops))
 }
 
 /// Generic devectorize for any op (INDEX, CAST, BITCAST, etc).
@@ -1442,8 +1267,10 @@ fn devectorize_generic(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
         .map(|i| {
-            let new_sources: Vec<Arc<UOp>> =
-                sources.iter().map(|s| if s.dtype().vcount() > 1 { s.gep(vec![i]) } else { s.clone() }).collect();
+            let new_sources: Vec<Arc<UOp>> = sources
+                .iter()
+                .map(|s| if s.dtype().vcount() > 1 { s.index_axes(vec![i]) } else { s.clone() })
+                .collect();
 
             // CAST and BITCAST need special handling: Op::Cast/BitCast has its own dtype field
             // that must be updated to scalar, not just the UOp's result dtype.
@@ -1456,21 +1283,21 @@ fn devectorize_generic(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         })
         .collect();
 
-    Some(UOp::vectorize(elements))
+    Some(UOp::stack(elements))
 }
 
 /// Pattern matcher for bool devectorization.
 ///
 /// LLVM's `<N x i1>` vectors are broken (no formal ABI, segfaults in codegen).
 /// This pass converts vectorized bool operations into scalar ops wrapped in
-/// VECTORIZE.
+/// STACK.
 ///
 /// Transforms:
-/// - Any binary op producing vectorized bool → scalar ops + VECTORIZE
-/// - Any unary op producing vectorized bool → scalar ops + VECTORIZE
-/// - WHERE with vectorized condition → scalar WHERE + VECTORIZE
-/// - INDEX with vectorized bool dtype → scalar INDEX + VECTORIZE
-/// - CAST to/from vectorized bool → scalar CAST + VECTORIZE
+/// - Any binary op producing vectorized bool → scalar ops + STACK
+/// - Any unary op producing vectorized bool → scalar ops + STACK
+/// - WHERE with vectorized condition → scalar WHERE + STACK
+/// - INDEX with vectorized bool dtype → scalar INDEX + STACK
+/// - CAST to/from vectorized bool → scalar CAST + STACK
 pub fn pm_bool_devectorize() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
         // Any binary op that produces vectorized bool output
@@ -1507,9 +1334,9 @@ pub fn pm_bool_devectorize() -> &'static TypedPatternMatcher<()> {
     }
 }
 
-/// Devectorize WHERE operation by extracting elements with GEP and rebuilding with VECTORIZE.
+/// Devectorize WHERE by extracting elements with INDEX and rebuilding with STACK.
 ///
-/// Transforms: WHERE(<N x i1>, <N x T>, <N x T>) → VECTORIZE(WHERE(i1, T, T), ...)
+/// Transforms: WHERE(<N x i1>, <N x T>, <N x T>) → STACK(WHERE(i1, T, T), ...)
 fn devectorize_where(cond: &Arc<UOp>, t: &Arc<UOp>, f: &Arc<UOp>) -> Option<Arc<UOp>> {
     let vcount = cond.dtype().vcount();
     if vcount <= 1 {
@@ -1521,153 +1348,22 @@ fn devectorize_where(cond: &Arc<UOp>, t: &Arc<UOp>, f: &Arc<UOp>) -> Option<Arc<
 
     let scalar_wheres: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
         .map(|i| {
-            let cond_elem = cond.gep(vec![i]);
-            let t_elem = if t_vcount > 1 { t.gep(vec![i]) } else { t.clone() };
-            let f_elem = if f_vcount > 1 { f.gep(vec![i]) } else { f.clone() };
+            let cond_elem = cond.index_axes(vec![i]);
+            let t_elem = if t_vcount > 1 { t.index_axes(vec![i]) } else { t.clone() };
+            let f_elem = if f_vcount > 1 { f.index_axes(vec![i]) } else { f.clone() };
             UOp::try_where(cond_elem, t_elem, f_elem).expect("WHERE construction should succeed")
         })
         .collect();
 
-    Some(UOp::vectorize(scalar_wheres))
+    Some(UOp::stack(scalar_wheres))
 }
 
 // ============================================================================
 // HORIZONTAL REDUCE
 // ============================================================================
 
-/// Apply binary reduce operation between two values (scalar or vector).
-///
-/// Handles all ReduceOp types:
-/// - Add, Mul, Max: Direct binary ops
-/// - Min: Implemented as Where(a < b, a, b) since BinaryOp::Min doesn't exist
-///
-/// Works with both scalar and vector dtypes - `Op::Binary` preserves input dtype,
-/// performing element-wise operations for vectors.
-fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DType) -> Arc<UOp> {
-    // Verify operand dtypes match for reduction chaining.
-    debug_assert!(
-        a.dtype() == b.dtype(),
-        "apply_reduce_binary: dtype mismatch between operands: a={:?}, b={:?}",
-        a.dtype(),
-        b.dtype()
-    );
-
-    match reduce_op {
-        ReduceOp::Add => UOp::new(Op::Binary(BinaryOp::Add, a, b), dtype.clone()),
-        ReduceOp::Mul => UOp::new(Op::Binary(BinaryOp::Mul, a, b), dtype.clone()),
-        ReduceOp::Max => UOp::new(Op::Binary(BinaryOp::Max, a, b), dtype.clone()),
-        ReduceOp::Min => {
-            // Min(a, b) = Where(a < b, a, b)
-            // Comparison dtype must match operand vector width:
-            // - Scalar operands -> DType::Bool
-            // - Vector operands -> DType::Bool.vec(vcount)
-            let cond_dtype = DType::Bool.vec(dtype.vcount()).expect("Bool is a scalar");
-            let cond = UOp::new(Op::Binary(BinaryOp::Lt, a.clone(), b.clone()), cond_dtype);
-            UOp::try_where(cond, a, b).unwrap()
-        }
-    }
-}
-
-/// Perform horizontal reduction from `src` dtype to `out_dtype`.
-///
-/// Uses stride pattern GEPs when reducing from larger to smaller vector.
-///
-/// Example: `<16 x float>` → `<4 x float>`
-///   horizontal_amount = 16 / 4 = 4
-///   Creates 4 GEPs with stride pattern:
-///     gep([0, 4, 8, 12])  → `<4 x float>` (each output's 1st partial sum)
-///     gep([1, 5, 9, 13])  → `<4 x float>` (each output's 2nd partial sum)
-///     gep([2, 6, 10, 14]) → `<4 x float>` (each output's 3rd partial sum)
-///     gep([3, 7, 11, 15]) → `<4 x float>` (each output's 4th partial sum)
-///   Returns list of 4 `<4 x float>` vectors to be chained with ALU ops.
-///
-/// # Arguments
-/// * `src` - The vectorized source (e.g., `<16 x float>`)
-/// * `out_dtype` - Target output dtype (e.g., `<4 x float>` or scalar)
-/// * `reduce_op` - The reduction operation (Add, Mul, Max, Min)
-///
-/// # Returns
-/// A list of GEP operations, each producing `out_dtype` elements.
-fn horizontal_reduce(src: &Arc<UOp>, out_dtype: &DType, reduce_op: ReduceOp) -> Vec<Arc<UOp>> {
-    let src_count = src.dtype().vcount();
-    let out_count = out_dtype.vcount();
-    let horizontal_amount = src_count / out_count;
-
-    // Edge case: uneven division - fall back to full scalar reduction
-    // (Can happen with non-power-of-2 upcast amounts like 3)
-    if !src_count.is_multiple_of(out_count) || horizontal_amount == 0 {
-        let scalar_dtype = src.dtype().scalar_dtype();
-        let elements: Vec<Arc<UOp>> = (0..src_count).map(|i| src.gep(vec![i])).collect();
-        return vec![
-            elements
-                .into_iter()
-                .reduce(|acc, elem| apply_reduce_binary(reduce_op, acc, elem, &scalar_dtype))
-                .expect("src_count >= 2 guaranteed by guard"),
-        ];
-    }
-
-    // Create stride pattern GEPs: range(i, src_count, horizontal_amount) for each i.
-    (0..horizontal_amount)
-        .map(|i| {
-            let indices: Vec<usize> = (i..src_count).step_by(horizontal_amount).collect();
-            src.gep(indices)
-        })
-        .collect()
-}
-
-/// Transform REDUCE with vectorized source to horizontal reduce + matching-dtype REDUCE.
-///
-/// When REDUCE has a vectorized input with different vcount than output dtype:
-/// 1. First do horizontal reduction on the vector (extract stride-pattern elements, chain with ALU)
-/// 2. Then REDUCE the result with the ranges (if any)
-fn transform_vectorized_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, ranges, reduce_op } = reduce.op() else {
-        return None;
-    };
-
-    let src_vcount = src.dtype().vcount();
-    let out_vcount = reduce.dtype().vcount();
-
-    // Only transform when source has more elements than output (need horizontal reduction).
-    // Other cases (K-vectorized, bool reduce) are handled by pm_reduce_devectorize's branching.
-    if src_vcount <= out_vcount {
-        return None;
-    }
-
-    // Preserve the REDUCE's declared output dtype
-    let out_dtype = reduce.dtype();
-
-    trace!(
-        src_vcount,
-        out_vcount,
-        reduce_op = ?reduce_op,
-        out_dtype = ?out_dtype,
-        "horizontal reducing vectorized REDUCE source"
-    );
-
-    // Get stride pattern GEPs
-    let gep_list = horizontal_reduce(src, &out_dtype, *reduce_op);
-
-    // Chain all GEPs: ((gep0 + gep1) + gep2) + gep3
-    let chained = gep_list
-        .into_iter()
-        .reduce(|acc, elem| apply_reduce_binary(*reduce_op, acc, elem, &out_dtype))
-        .expect("horizontal_reduce always returns non-empty list");
-
-    // Wrap in REDUCE if ranges exist
-    if ranges.is_empty() {
-        Some(chained)
-    } else {
-        Some(UOp::new(Op::Reduce { src: chained, ranges: ranges.clone(), reduce_op: *reduce_op }, out_dtype))
-    }
-}
-
-/// Unified guard: check if REDUCE needs any form of devectorization.
-///
-/// Combines three mutually exclusive cases:
-/// 1. K-vectorized: CONTRACT source with vector output (SLP optimization)
-/// 2. Bool reduce: matching vcounts, bool dtype, no CONTRACT (LLVM `<N x i1>` workaround)
-/// 3. Horizontal: source has more elements than output (needs stride-pattern GEPs)
+/// Check for a vectorized bool reduction that must use scalar accumulators to
+/// avoid LLVM `<N x i1>` accumulator issues.
 fn needs_reduce_devectorize(reduce: &Arc<UOp>) -> bool {
     let Op::Reduce { src, .. } = reduce.op() else {
         return false;
@@ -1676,58 +1372,21 @@ fn needs_reduce_devectorize(reduce: &Arc<UOp>) -> bool {
     let src_vcount = src.dtype().vcount();
     let out_vcount = reduce.dtype().vcount();
     let is_bool = reduce.dtype().base() == ScalarDType::Bool;
-    let has_contract = matches!(src.op(), Op::Contract { .. });
-
-    // K-vectorized: CONTRACT source with vector output
-    // Bool reduce: matching vcounts, bool dtype, no CONTRACT
-    // Horizontal: source has more elements than output (but NOT vector→scalar, codegen handles that)
-    has_contract && out_vcount > 1
-        || out_vcount > 1 && is_bool && src_vcount == out_vcount
-        || src_vcount > out_vcount && out_vcount > 1
-}
-
-/// Inline helper: check if REDUCE is K-vectorized (CONTRACT source).
-#[inline]
-fn is_k_vectorized(reduce: &Arc<UOp>, src: &Arc<UOp>) -> bool {
-    reduce.dtype().vcount() > 1 && matches!(src.op(), Op::Contract { .. })
+    out_vcount > 1 && is_bool && src_vcount == out_vcount
 }
 
 /// Inline helper: check if REDUCE is vectorized bool with matching vcounts.
 #[inline]
 fn is_bool_reduce(reduce: &Arc<UOp>, src: &Arc<UOp>) -> bool {
     let out_vcount = reduce.dtype().vcount();
-    out_vcount > 1
-        && reduce.dtype().base() == ScalarDType::Bool
-        && src.dtype().vcount() == out_vcount
-        && !matches!(src.op(), Op::Contract { .. })
+    out_vcount > 1 && reduce.dtype().base() == ScalarDType::Bool && src.dtype().vcount() == out_vcount
 }
 
-/// Unified pattern matcher for REDUCE devectorization.
-///
-/// Combines three mutually exclusive REDUCE devectorization transforms:
-///
-/// 1. **K-vectorized** (CONTRACT source with vector output):
-///    Transforms to N scalar REDUCEs + tree_reduce for SLP optimization.
-///    Example: REDUCE(CONTRACT(src<4>), Add) → tree_reduce([REDUCE(gep(0)), ...])
-///
-/// 2. **Bool reduce** (matching vcounts, bool dtype, no CONTRACT):
-///    Transforms to N scalar REDUCEs + VECTORIZE to avoid LLVM `<N x i1>` bugs.
-///    Example: REDUCE(<2 x bool> src) → VECTORIZE(REDUCE(gep(0)), REDUCE(gep(1)))
-///
-/// 3. **Horizontal reduce** (src_vcount > out_vcount):
-///    Transforms using stride-pattern GEPs + ALU chain.
-///    Example: `REDUCE(<16 x f32> → <4 x f32>)` → `chain(gep[0,4,8,12], gep[1,5,9,13], ...)`
+/// Devectorize matching bool reductions into scalar REDUCEs plus STACK.
 pub fn pm_reduce_devectorize() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
         reduce @ Reduce { src } if needs_reduce_devectorize(reduce) => |reduce, src| {
-            // Branch to appropriate transform based on case
-            if is_k_vectorized(reduce, src) {
-                devectorize_to_scalar_accumulators(reduce)
-            } else if is_bool_reduce(reduce, src) {
-                devectorize_bool_reduce(reduce)
-            } else {
-                transform_vectorized_reduce(reduce)
-            }
+            is_bool_reduce(reduce, src).then(|| devectorize_bool_reduce(reduce)).flatten()
         },
     }
 }
@@ -1739,18 +1398,18 @@ pub fn pm_reduce_devectorize() -> &'static TypedPatternMatcher<()> {
 /// Devectorize REDUCE with vectorized bool output to N scalar REDUCEs.
 ///
 /// Avoids LLVM's `<N x i1>` accumulator issues by creating independent scalar
-/// bool accumulators for each vector lane, then combining with VECTORIZE.
+/// bool accumulators for each vector lane, then combining with STACK.
 ///
 /// Transforms:
 /// ```text
 /// REDUCE(Min, <2 x bool> src, ranges)
-/// → VECTORIZE(
-///     REDUCE(Min, GEP(src, 0), ranges),  // lane 0: scalar bool accumulator
-///     REDUCE(Min, GEP(src, 1), ranges)   // lane 1: scalar bool accumulator
+/// → STACK(
+///     REDUCE(Min, INDEX(src, 0), ranges),  // lane 0: scalar bool accumulator
+///     REDUCE(Min, INDEX(src, 1), ranges)   // lane 1: scalar bool accumulator
 ///   )
 /// ```
 fn devectorize_bool_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, ranges, reduce_op } = reduce.op() else {
+    let Op::Reduce { src, ranges, reduce_op, num_axes } = reduce.op() else {
         return None;
     };
 
@@ -1771,88 +1430,16 @@ fn devectorize_bool_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Create N scalar REDUCEs, one for each vector lane
     let scalar_reduces: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
         .map(|i| {
-            let src_elem = src.gep(vec![i]);
-            UOp::new(Op::Reduce { src: src_elem, ranges: ranges.clone(), reduce_op: *reduce_op }, scalar_dtype.clone())
+            let src_elem = src.index_axes(vec![i]);
+            UOp::new(
+                Op::Reduce { src: src_elem, ranges: ranges.clone(), reduce_op: *reduce_op, num_axes: *num_axes },
+                scalar_dtype.clone(),
+            )
         })
         .collect();
 
-    // Wrap in VECTORIZE to produce the expected vector output
-    Some(UOp::vectorize(scalar_reduces))
-}
-
-/// Devectorize K-vectorized REDUCE to N scalar REDUCEs for SLP optimization.
-///
-/// This transforms vectorized accumulators (created by K-vectorization)
-/// into independent scalar accumulators that LLVM's SLP vectorizer can group.
-///
-/// Input:
-///   REDUCE(CONTRACT(vec_src<N>, upcast_axes), ranges, Add, Vector<N>)
-///
-/// Output:
-///   tree_reduce([
-///     REDUCE(GEP(vec_src, 0), ranges, Add, scalar),
-///     REDUCE(GEP(vec_src, 1), ranges, Add, scalar),
-///     ...
-///     REDUCE(GEP(vec_src, N-1), ranges, Add, scalar),
-///   ], Add)
-fn devectorize_to_scalar_accumulators(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, ranges, reduce_op } = reduce.op() else {
-        return None;
-    };
-
-    let vec_count = reduce.dtype().vcount();
-    if vec_count <= 1 {
-        return None;
-    }
-
-    // Unwrap CONTRACT to get vectorized source
-    let vec_src = if let Op::Contract { src: inner, .. } = src.op() { inner.clone() } else { src.clone() };
-
-    let scalar_dtype = reduce.dtype().scalar_dtype();
-
-    trace!(
-        vec_count,
-        reduce_op = ?reduce_op,
-        src_dtype = ?vec_src.dtype(),
-        "devectorizing K-vectorized REDUCE to scalar accumulators"
-    );
-
-    // Create N scalar REDUCEs, each extracting one lane from vectorized source
-    let scalar_reduces: Vec<Arc<UOp>> = (0..vec_count)
-        .map(|i| {
-            let src_elem = vec_src.gep(vec![i]);
-            UOp::new(Op::Reduce { src: src_elem, ranges: ranges.clone(), reduce_op: *reduce_op }, scalar_dtype.clone())
-        })
-        .collect();
-
-    // Tree reduction: combine scalar REDUCEs with binary ops
-    // ((r0 + r1) + (r2 + r3)) for balanced tree
-    Some(tree_reduce(&scalar_reduces, *reduce_op, &scalar_dtype))
-}
-
-/// Perform tree reduction on elements using binary reduce operations.
-///
-/// Creates balanced tree: ((e0 op e1) op (e2 op e3)) instead of linear chain.
-/// This is more efficient for parallel execution.
-fn tree_reduce(elements: &[Arc<UOp>], reduce_op: ReduceOp, dtype: &DType) -> Arc<UOp> {
-    if elements.len() == 1 {
-        return elements[0].clone();
-    }
-
-    // Pairwise combine for balanced tree
-    let mut level: Vec<Arc<UOp>> = elements.to_vec();
-    while level.len() > 1 {
-        let mut next_level = Vec::with_capacity(level.len().div_ceil(2));
-        for chunk in level.chunks(2) {
-            if chunk.len() == 2 {
-                next_level.push(apply_reduce_binary(reduce_op, chunk[0].clone(), chunk[1].clone(), dtype));
-            } else {
-                next_level.push(chunk[0].clone());
-            }
-        }
-        level = next_level;
-    }
-    level.remove(0)
+    // Wrap in STACK to produce the expected shaped output.
+    Some(UOp::stack(scalar_reduces))
 }
 
 // ============================================================================
@@ -1878,17 +1465,13 @@ pub fn pm_fma_decomposition() -> &'static TypedPatternMatcher<()> {
 // PM_LOAD_COLLAPSE - Collapse REDUCE with conditional loads
 // ============================================================================
 
-/// Check if UOp has no RANGE in backward slice (loop-invariant).
-fn no_range(u: &Arc<UOp>) -> bool {
-    !u.any_in_subtree(|x| matches!(x.op(), Op::Range { .. }))
-}
-
 /// Check if UOp has no INDEX (load) in backward slice.
 ///
 /// Used for index overflow protection pattern - we want to ensure
 /// we don't do math on a loaded index since that can cause overflow.
-fn no_load(u: &Arc<UOp>) -> bool {
-    !u.any_in_subtree(|x| matches!(x.op(), Op::Index { .. }))
+/// Backed by the cached `has_index_in_sources` flag rather than a per-call DFS.
+pub(crate) fn no_load(u: &Arc<UOp>) -> bool {
+    !u.has_index_in_sources()
 }
 
 /// Check if a UOp represents a zero constant.
@@ -2110,11 +1693,10 @@ fn extract_lt_upper_bound(cond: &Arc<UOp>, range: &Arc<UOp>) -> Option<Arc<UOp>>
     None
 }
 
-/// Try to collapse a REDUCE when DEFINE_VAR can be factored out.
+/// Try to collapse a REDUCE when a scalar PARAM can be factored out.
 ///
-/// Pattern: (DEFINE_VAR & y).where(c, 0).reduce(ADD) → y.where(c, 0).reduce(ADD) * DEFINE_VAR.cast(c.dtype)
-fn try_define_var_factor(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
-    // Pattern: WHERE((DEFINE_VAR & y), c, 0)
+/// Pattern: (PARAM & y).where(c, 0).reduce(ADD) → y.where(c, 0).reduce(ADD) * PARAM.cast(c.dtype)
+fn try_param_factor(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
     let Op::Ternary(svod_ir::TernaryOp::Where, cond, true_val, false_val) = src.op() else {
         return None;
     };
@@ -2122,14 +1704,15 @@ fn try_define_var_factor(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Op
         return None;
     }
 
-    // Match AND(DEFINE_VAR, y) or AND(y, DEFINE_VAR)
+    // Match AND(PARAM, y) or AND(y, PARAM).
     let Op::Binary(BinaryOp::And, and_lhs, and_rhs) = cond.op() else {
         return None;
     };
 
-    let (define_var, other) = if matches!(and_lhs.op(), Op::DefineVar { .. }) {
+    let is_alu_param = |u: &Arc<UOp>| matches!(u.op(), Op::Param { arg, .. } if arg.addrspace.is_none());
+    let (define_var, other) = if is_alu_param(and_lhs) {
         (and_lhs.clone(), and_rhs.clone())
-    } else if matches!(and_rhs.op(), Op::DefineVar { .. }) {
+    } else if is_alu_param(and_rhs) {
         (and_rhs.clone(), and_lhs.clone())
     } else {
         return None;
@@ -2171,28 +1754,43 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
         (lhs.as_ref(), rhs.clone())
     };
 
-    // Pattern: (x + y) < c → x < (c - y)
-    if let Op::Binary(BinaryOp::Add, x, y) = inner_lhs.op()
-        && no_range(y)
-    {
-        let new_rhs = effective_rhs.try_sub(y).ok()?;
-        return x.try_cmplt(&new_rhs).ok();
+    // Pattern: (x + y) < c → x < (c - y). ADD is commutative, so try both
+    // operand orders: tinygrad's UPat matches commutative sources in either
+    // position (`(UPat.var("x")+UPat.var("y")) < UPat.var("c")`,
+    // `codegen/simplify.py:101`), and morok's canonical ordering puts the
+    // range-free operand first whenever it sorts below the RANGE.
+    if let Op::Binary(BinaryOp::Add, x, y) = inner_lhs.op() {
+        if no_range(y) {
+            let new_rhs = effective_rhs.try_sub(y).ok()?;
+            return x.try_cmplt(&new_rhs).ok();
+        }
+        if no_range(x) {
+            let new_rhs = effective_rhs.try_sub(x).ok()?;
+            return y.try_cmplt(&new_rhs).ok();
+        }
     }
 
-    // Pattern: (x * y) < c → x < ceil(c/y) when y > 0
-    if let Op::Binary(BinaryOp::Mul, x, y) = inner_lhs.op()
-        && no_range(y)
-    {
-        // Check y > 0 via vmin
-        if let ConstValue::Int(ymin) = y.vmin()
-            && *ymin > 0
-        {
-            // ceil(c/y) = (c + y - 1) / y
+    // Pattern: (x * y) < c → x < ceil(c/y) when y > 0, either operand order.
+    if let Op::Binary(BinaryOp::Mul, x, y) = inner_lhs.op() {
+        let ceil_div = |num: &Arc<UOp>, den: &Arc<UOp>| -> Option<Arc<UOp>> {
+            // Check den > 0 via vmin.
+            let ConstValue::Int(den_min) = den.vmin() else { return None };
+            if *den_min <= 0 {
+                return None;
+            }
+            // ceil(c/den) = (c + den - 1) / den
             let one = UOp::index_const(1);
-            let c_plus_y = effective_rhs.try_add(y).ok()?;
-            let c_plus_y_minus_1 = c_plus_y.try_sub(&one).ok()?;
-            let new_rhs = c_plus_y_minus_1.try_div(y).ok()?;
+            num.try_add(den).ok()?.try_sub(&one).ok()?.try_div(den).ok()
+        };
+        if no_range(y)
+            && let Some(new_rhs) = ceil_div(&effective_rhs, y)
+        {
             return x.try_cmplt(&new_rhs).ok();
+        }
+        if no_range(x)
+            && let Some(new_rhs) = ceil_div(&effective_rhs, x)
+        {
+            return y.try_cmplt(&new_rhs).ok();
         }
     }
 
@@ -2282,9 +1880,9 @@ pub fn pm_load_collapse() -> &'static TypedPatternMatcher<()> {
         // substitution). All arithmetic lifting, NE lifting, and .or_casted()
         // patterns live inside the inner matcher
         // (build_reduce_load_collapse_matcher), not at this level.
-        _reduce @ Reduce { src, ranges, reduce_op }
-            if ranges.len() == 1 && *reduce_op == ReduceOp::Add
-            => |src, ranges| {
+        _reduce @ Reduce { src, ranges, reduce_op, num_axes }
+            if ranges.len() == 1 && *reduce_op == ReduceOp::Add && *num_axes == 0
+            => |src, ranges, _num_axes| {
                 super::transforms::reduce_load_collapse(src, ranges)
             },
 
@@ -2293,7 +1891,7 @@ pub fn pm_load_collapse() -> &'static TypedPatternMatcher<()> {
         // This undoes the arithmetic lifting that pm_reduce_load_collapse may have
         // applied when the lifted form risks integer overflow on loaded values.
         Lt(Add(x, y), c)
-            if x.dtype() == DType::Index && !no_load(x) && no_load(y) && no_load(c)
+            if x.dtype() == DType::WeakInt && !no_load(x) && no_load(y) && no_load(c)
             => |x, y, c| {
                 let new_c = c.try_sub(y).ok()?;
                 x.try_cmplt(&new_c).ok()
@@ -2314,7 +1912,9 @@ pub fn pm_load_collapse() -> &'static TypedPatternMatcher<()> {
 pub fn build_reduce_collapse_matcher() -> &'static TypedPatternMatcher<()> {
     static CACHED: std::sync::LazyLock<TypedPatternMatcher<()>> =
         // Pair the reduce-specific patterns with full `symbolic`.
-        std::sync::LazyLock::new(|| reduce_collapse_inner_patterns() + crate::symbolic::symbolic());
+        std::sync::LazyLock::new(|| {
+            reduce_collapse_inner_patterns() + crate::symbolic::symbolic() + crate::symbolic::pm_fold_cast_const()
+        });
     &CACHED
 }
 
@@ -2376,21 +1976,21 @@ fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
         cond @ Ge(_, rhs) if no_range(rhs) => |cond| try_lift_arithmetic_from_ge(cond),
 
         // Distributive: (x+y).reduce(ADD) → x.reduce(ADD) + y.reduce(ADD)
-        Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add => |src, ranges| {
+        Reduce { src, ranges, reduce_op, num_axes } if *reduce_op == ReduceOp::Add => |src, ranges, num_axes| {
             let Op::Binary(BinaryOp::Add, x, y) = src.op() else { return None };
-            let x_reduced = x.reduce(ranges.clone(), ReduceOp::Add);
-            let y_reduced = y.reduce(ranges.clone(), ReduceOp::Add);
+            let x_reduced = x.reduce_with_num_axes(ranges.clone(), ReduceOp::Add, *num_axes);
+            let y_reduced = y.reduce_with_num_axes(ranges.clone(), ReduceOp::Add, *num_axes);
             x_reduced.try_add(&y_reduced).ok()
         },
 
         // Bound patterns + DEFINE_VAR factoring on REDUCE(ADD) with single range
         // These match the synthetic REDUCE created by reduce_collapse's per-range iteration.
         // Patterns: bound-from-below, bound-from-above, two-sided, gated NE/EQ collapse.
-        reduce @ Reduce { src, ranges, reduce_op }
-            if !ranges.is_empty() && *reduce_op == ReduceOp::Add
-            => |reduce, src, ranges| {
+        reduce @ Reduce { src, ranges, reduce_op, num_axes }
+            if !ranges.is_empty() && *reduce_op == ReduceOp::Add && *num_axes == 0
+            => |reduce, src, ranges, _num_axes| {
                 try_reduce_collapse(reduce, src, ranges, ReduceOp::Add)
-                    .or_else(|| try_define_var_factor(src, ranges))
+                    .or_else(|| try_param_factor(src, ranges))
             },
 
         // MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
@@ -2423,7 +2023,7 @@ pub fn pm_mod_to_and() -> &'static TypedPatternMatcher<()> {
     use svod_ir::types::ConstValue;
     crate::cached_patterns! {
         // x % c where c is power of two → x & (c - 1)
-        Mod(x, _c @const(c_val)) => |x, c_val| {
+        FloorMod(x, _c @const(c_val)) => |x, c_val| {
             // Only apply to integer types
             if !x.dtype().is_int() { return None; }
 
@@ -2497,16 +2097,17 @@ pub fn pm_threefry_decomp() -> &'static TypedPatternMatcher<()> {
 
 /// Threefry2x32 mixing algorithm (Random123 library).
 fn threefry2x32(x: &Arc<UOp>, key: &Arc<UOp>) -> Arc<UOp> {
-    let u32_dt = DType::Scalar(svod_dtype::ScalarDType::UInt32);
-    let u64_dt = DType::Scalar(svod_dtype::ScalarDType::UInt64);
-    let mask32 = UOp::const_(u64_dt.clone(), ConstValue::UInt(0xFFFFFFFF));
-    let pow32 = UOp::const_(u64_dt.clone(), ConstValue::UInt(1u64 << 32));
+    let u32_dt = DType::UInt32;
+    let u64_dt = DType::UInt64;
+    let shift32 = UOp::const_(u64_dt.clone(), ConstValue::Int(32));
 
-    // Split x and key from uint64 to two uint32
-    let x0 = x.and_(&mask32).cast(u32_dt.clone());
-    let x1 = x.idiv(&pow32).and_(&mask32).cast(u32_dt.clone());
-    let key0 = key.and_(&mask32).cast(u32_dt.clone());
-    let key1 = key.idiv(&pow32).and_(&mask32).cast(u32_dt.clone());
+    // Split x and key from uint64 to two uint32. Narrowing casts truncate, so
+    // `.cast(u32)` / `>> 32` need no mask; this is also the form the uint64
+    // pack-cancellation rules in `symbolic_simple` invert.
+    let x0 = x.cast(u32_dt.clone());
+    let x1 = x.shr(&shift32).cast(u32_dt.clone());
+    let key0 = key.cast(u32_dt.clone());
+    let key1 = key.shr(&shift32).cast(u32_dt.clone());
 
     // Key schedule: ks = [key1, key0 ^ key1 ^ 0x1BD11BDA, key0]
     let skein_const = UOp::const_(u32_dt.clone(), ConstValue::UInt(0x1BD11BDA));
@@ -2522,9 +2123,9 @@ fn threefry2x32(x: &Arc<UOp>, key: &Arc<UOp>) -> Arc<UOp> {
     for i in 0..5u32 {
         for &r in &rotations[i as usize % 2] {
             let new_x0 = xr0.add(&xr1);
-            // Rotation: (xr1 * 2^r) + (xr1 // 2^(32-r))  (barrel rotate via mul+div)
-            let rot_left = xr1.mul(&UOp::const_(u32_dt.clone(), ConstValue::UInt(1u64 << r)));
-            let rot_right = xr1.idiv(&UOp::const_(u32_dt.clone(), ConstValue::UInt(1u64 << (32 - r))));
+            // Barrel rotate: (xr1 << r) + (xr1 >> (32-r)).
+            let rot_left = xr1.shl(&UOp::const_(u32_dt.clone(), ConstValue::Int(r as i64)));
+            let rot_right = xr1.shr(&UOp::const_(u32_dt.clone(), ConstValue::Int(32 - r as i64)));
             let rotated = rot_left.add(&rot_right);
             xr1 = new_x0.xor(&rotated);
             xr0 = new_x0;
@@ -2535,8 +2136,8 @@ fn threefry2x32(x: &Arc<UOp>, key: &Arc<UOp>) -> Arc<UOp> {
         xr1 = xr1.add(&ks[(i as usize + 1) % 3]).add(&round_const);
     }
 
-    // Recombine: xr1.cast(u64) * 2^32 | xr0.cast(u64)
-    xr1.cast(u64_dt.clone()).mul(&pow32).or_(&xr0.cast(u64_dt))
+    // Recombine: (xr1.cast(u64) << 32) | xr0.cast(u64)
+    xr1.cast(u64_dt.clone()).shl(&shift32).or_(&xr0.cast(u64_dt))
 }
 
 /// DeMorgan's law: NOT(x) & NOT(y) → NOT(x | y).
@@ -2576,8 +2177,8 @@ pub fn pm_div_to_shr() -> &'static TypedPatternMatcher<()> {
     use svod_ir::uop::properties::VminVmaxProperty;
 
     crate::cached_patterns! {
-        // x // c where c is power of two → x >> log2(c)
-        Idiv(x, _c @const(c_val)) => |x, c_val| {
+        // C-style x / c where c is power of two.
+        CDiv(x, _c @const(c_val)) => |x, c_val| {
             // Only apply to integer types
             if !x.dtype().is_int() { return None; }
 

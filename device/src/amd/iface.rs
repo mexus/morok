@@ -59,12 +59,51 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// return its queue id + mmapped doorbell.
     fn setup_ring(&self, desc: &RingDesc) -> Result<QueueHandle>;
     /// Destroy the in-kernel queue object and `munmap` the queue's doorbell
-    /// page (`doorbell_base` is the mmap base from [`QueueHandle`]). Best-effort.
-    fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>);
+    /// page (`doorbell_base` is the mmap base from [`QueueHandle`]).
+    fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) -> Result<QueueTeardown>;
     /// Block up to `timeout_ms` on the device's completion + fault events.
     /// `Ok(Some(Error::Runtime{..}))` on a fault, `Ok(None)` on a normal
     /// wake-up/timeout, `Err` if the WAIT_EVENTS ioctl itself failed.
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
+
+    /// The KFD queue-completion event mailbox, when this backend has one.
+    /// A completion packet that writes `event_id` there and raises an interrupt
+    /// wakes a blocked `WAIT_EVENTS` immediately instead of leaving it to the
+    /// poll tier (tinygrad `AMDComputeQueue.signal`, `ops_amd.py:391-393`).
+    /// `None` on backends with no KFD event page (AM, host mocks), which then
+    /// rely on the coherent GTT slot alone.
+    fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
+        None
+    }
+
+    /// Fault-injection checkpoint around queue publication. Production
+    /// backends keep the default no-op; the host mock scripts failures here to
+    /// prove reservation rollback and post-doorbell poisoning.
+    fn publication_checkpoint(&self, _stage: PublicationStage) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Address of a KFD event's mailbox slot plus the id written into it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueEventMailbox {
+    pub address: u64,
+    pub event_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicationStage {
+    AfterReservation,
+    BeforeDoorbell,
+    AfterDoorbell,
+}
+
+/// Result after KFD has definitively stopped a queue. A leaked doorbell mapping
+/// is a host-resource leak, but no longer requires GPU backing quarantine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueTeardown {
+    Complete,
+    DoorbellLeaked { errno: i32 },
 }
 
 /// Allocation flavor — selects the KFD flag set built in [`AmdIface::alloc_raw`].
@@ -149,7 +188,6 @@ pub struct KfdIface {
     queue_event_id: u32,
     #[allow(dead_code)]
     queue_event_slot_index: u32,
-    #[allow(dead_code)]
     queue_event_mailbox_ptr: u64,
     mem_fault_event_id: u32,
     hw_fault_event_id: u32,
@@ -215,16 +253,22 @@ impl KfdIface {
         if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut qe as *mut _) } {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(queue signal)", errno: e as i32 });
         }
+        let mut queue_event = EventGuard::new(kfd_fd.as_raw_fd(), qe.event_id);
         let mut mem_event =
             kfd::kfd_ioctl_create_event_args { event_type: kfd::KFD_IOC_EVENT_MEMORY, ..Default::default() };
         if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut mem_event as *mut _) } {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(mem fault)", errno: e as i32 });
         }
+        let mut memory_event = EventGuard::new(kfd_fd.as_raw_fd(), mem_event.event_id);
         let mut hw_event =
             kfd::kfd_ioctl_create_event_args { event_type: kfd::KFD_IOC_EVENT_HW_EXCEPTION, ..Default::default() };
         if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut hw_event as *mut _) } {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(hw fault)", errno: e as i32 });
         }
+        let mut hardware_event = EventGuard::new(kfd_fd.as_raw_fd(), hw_event.event_id);
+        queue_event.disarm();
+        memory_event.disarm();
+        hardware_event.disarm();
 
         // The mailbox sits at event_page + slot_index * 8. SDMA fence packets
         // write the queue event_id here to wake up `WAIT_EVENTS` from `sleep()`.
@@ -258,7 +302,43 @@ impl KfdIface {
     }
 }
 
+impl Drop for KfdIface {
+    fn drop(&mut self) {
+        for event_id in [self.queue_event_id, self.mem_fault_event_id, self.hw_fault_event_id] {
+            let mut args = kfd::kfd_ioctl_destroy_event_args { event_id, pad: 0 };
+            let _ = unsafe { ioctl::kfd_destroy_event(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
+        }
+    }
+}
+
+struct EventGuard {
+    kfd_fd: i32,
+    event_id: Option<u32>,
+}
+
+impl EventGuard {
+    fn new(kfd_fd: i32, event_id: u32) -> Self {
+        Self { kfd_fd, event_id: Some(event_id) }
+    }
+
+    fn disarm(&mut self) {
+        self.event_id = None;
+    }
+}
+
+impl Drop for EventGuard {
+    fn drop(&mut self) {
+        let Some(event_id) = self.event_id else { return };
+        let mut args = kfd::kfd_ioctl_destroy_event_args { event_id, pad: 0 };
+        let _ = unsafe { ioctl::kfd_destroy_event(self.kfd_fd, &mut args as *mut _) };
+    }
+}
+
 impl AmdIface for KfdIface {
+    fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
+        Some(QueueEventMailbox { address: self.queue_event_mailbox_ptr, event_id: self.queue_event_id })
+    }
+
     fn alloc_raw(
         &self,
         size: usize,
@@ -316,12 +396,19 @@ impl AmdIface for KfdIface {
             n_devices: 1,
             n_success: 0,
         };
-        if let Err(e) = unsafe { ioctl::kfd_map_memory_to_gpu(self.kfd_fd.as_raw_fd(), &mut map_args as *mut _) } {
+        let map_result = unsafe { ioctl::kfd_map_memory_to_gpu(self.kfd_fd.as_raw_fd(), &mut map_args as *mut _) };
+        if let Err(e) = map_result {
+            if map_args.n_success != 0 {
+                self.unmap_kfd(mem_handle);
+            }
             self.free_kfd(mem_handle);
             unsafe { munmap(va as *mut _, size) };
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU", errno: e as i32 });
         }
         if map_args.n_success != 1 {
+            if map_args.n_success != 0 {
+                self.unmap_kfd(mem_handle);
+            }
             self.free_kfd(mem_handle);
             unsafe { munmap(va as *mut _, size) };
             return Err(Error::AmdAllocFailed {
@@ -339,6 +426,7 @@ impl AmdIface for KfdIface {
                 // `zero_init && !cpu_access` request reaching this point is a
                 // caller bug (e.g. a future path that bypasses `_alloc`).
                 None => {
+                    self.unmap_kfd(mem_handle);
                     self.free_kfd(mem_handle);
                     unsafe { munmap(va as *mut _, size) };
                     return Err(Error::AmdAllocFailed {
@@ -411,26 +499,40 @@ impl AmdIface for KfdIface {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_QUEUE", errno: e as i32 });
         }
 
-        let (doorbell_base, doorbell) = self.doorbell_mmap(args.doorbell_offset)?;
+        let (doorbell_base, doorbell) = match self.doorbell_mmap(args.doorbell_offset) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                let mut destroy = kfd::kfd_ioctl_destroy_queue_args { queue_id: args.queue_id, ..Default::default() };
+                // SAFETY: queue creation above succeeded and returned this id.
+                if let Err(errno) = unsafe { ioctl::kfd_destroy_queue(self.kfd_fd.as_raw_fd(), &mut destroy as *mut _) }
+                {
+                    return Err(Error::AmdQueueStillActive {
+                        queue_id: args.queue_id,
+                        cause: format!("doorbell mapping failed ({error}); rollback destroy errno {errno}"),
+                    });
+                }
+                return Err(error);
+            }
+        };
         debug!(queue_id = args.queue_id, doorbell_offset = args.doorbell_offset, "AMD queue created");
         Ok(QueueHandle { queue_id: args.queue_id, doorbell_base, doorbell })
     }
 
-    fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) {
+    fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) -> Result<QueueTeardown> {
         let mut args = kfd::kfd_ioctl_destroy_queue_args { queue_id, ..Default::default() };
         // SAFETY: `kfd_fd` is alive (held via Arc<OwnedFd>); the queue_id was
         // returned by KFD on the matching create_queue call.
-        let rc = unsafe { ioctl::kfd_destroy_queue(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
-        if let Err(e) = rc {
-            tracing::warn!(?e, queue_id, "teardown_ring: kfd_destroy_queue failed");
-        }
+        unsafe { ioctl::kfd_destroy_queue(self.kfd_fd.as_raw_fd(), &mut args as *mut _) }
+            .map_err(|errno| Error::AmdIoctl { ioctl: "AMDKFD_IOC_DESTROY_QUEUE", errno: errno as i32 })?;
         // Release the per-queue doorbell MMIO page mapped in `doorbell_mmap`.
         // SAFETY: `doorbell_base` is the mmap base returned for this queue and
         // is no longer referenced once the queue is destroyed.
         if unsafe { munmap(doorbell_base.as_ptr().cast(), DOORBELL_PAGE_BYTES) } != 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            tracing::warn!(queue_id, errno, "teardown_ring: doorbell munmap failed");
+            tracing::warn!(queue_id, errno, "teardown_ring: destroyed queue but leaked doorbell mapping");
+            return Ok(QueueTeardown::DoorbellLeaked { errno });
         }
+        Ok(QueueTeardown::Complete)
     }
 
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>> {
@@ -513,6 +615,17 @@ impl AmdIface for KfdIface {
 }
 
 impl KfdIface {
+    fn unmap_kfd(&self, handle: u64) {
+        let mut gpu_id = self.node.gpu_id;
+        let mut args = kfd::kfd_ioctl_unmap_memory_from_gpu_args {
+            handle,
+            device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
+            n_devices: 1,
+            n_success: 0,
+        };
+        let _ = unsafe { ioctl::kfd_unmap_memory_from_gpu(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
+    }
+
     fn free_kfd(&self, handle: u64) {
         let mut args = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
         // SAFETY: self.kfd_fd is alive; handle is from a successful alloc.

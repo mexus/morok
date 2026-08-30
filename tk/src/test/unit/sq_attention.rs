@@ -80,7 +80,13 @@ fn sq_attention_graph_shape_both_arches() {
                 caps.arch
             );
             assert!(topo.iter().any(|u| matches!(u.op(), Op::Range { .. })), "{:?}: streamed N loop", caps.arch);
-            assert!(!topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "{:?}: no LDS", caps.arch);
+            assert!(
+                !topo.iter().any(
+                    |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))
+                ),
+                "{:?}: no LDS",
+                caps.arch
+            );
             assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "{:?}: no MFMA/WMMA", caps.arch);
             assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "{:?}: no barrier", caps.arch);
         }
@@ -99,7 +105,9 @@ fn sq_attention_graph_shape_both_arches() {
                 let topo = graph.toposort();
                 assert!(topo.iter().any(|u| matches!(u.op(), Op::Range { .. })), "{:?}: split {name} loop", caps.arch);
                 assert!(
-                    !topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))),
+                    !topo.iter().any(
+                        |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))
+                    ),
                     "{:?}: split {name} no LDS",
                     caps.arch
                 );
@@ -128,13 +136,19 @@ fn sq_attention_renders_both_arches() {
             ("sq_attention_partial", partial, true),
             ("sq_attention_merge", merge, false),
         ] {
-            let lowered =
-                svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), graph, &mut ());
-            let program = svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu);
+            let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(arch);
+            let opt_renderer = svod_schedule::OptimizerRenderer::for_amd_arch(arch).with_rewrite_capabilities(
+                svod_ir::RendererOps::all(),
+                svod_codegen::traits::Renderer::decompositor(&renderer),
+                None,
+            );
+            let optimized =
+                svod_schedule::apply_post_optimization_with_renderer(graph, &opt_renderer).expect("post optimization");
+            let program = svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Cpu)
+                .expect("final target graph");
             let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("linearize");
             let linear =
                 linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR");
-            let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(arch);
             let code = svod_codegen::traits::Renderer::render(&renderer, &linear, Some(name)).expect("render").code;
             assert_eq!(code.contains("llvm.amdgcn.ds.bpermute"), shuffle, "{arch:?}: {name} shuffle rendering");
             assert!(!code.contains("@local"), "{arch:?}: {name} no LDS allocation");

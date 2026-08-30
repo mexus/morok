@@ -76,7 +76,7 @@ The enum has ~60 Op variants organized by abstraction level (~80+ including indi
 | **Control** | `RANGE`, `END`, `IF`, `BARRIER` | Loop and branch structure |
 | **Memory** | `LOAD`, `STORE`, `INDEX`, `BUFFER` | Hardware memory access |
 | **ALU** | `ADD`, `MUL`, `SQRT`, `EXP`, `WHERE` | CPU/GPU instructions |
-| **Advanced** | `WMMA`, `CONTRACT`, `UNROLL` | Tensor cores, vectorization |
+| **Advanced** | `WMMA` | Tensor cores and their expansion metadata |
 
 When you print a UOp graph, you see its tree structure:
 

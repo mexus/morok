@@ -30,6 +30,13 @@ use svod_tensor::Tensor;
 /// Result type for the launch path.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+pub(crate) fn plan_compact_buffers(globals: &[usize], supplied: usize) -> Result<Vec<(usize, usize)>> {
+    if supplied != globals.len() {
+        return BufferCountSnafu { expected: globals.len(), supplied, slots: globals.to_vec() }.fail();
+    }
+    Ok(globals.iter().copied().enumerate().map(|(ordinal, slot)| (ordinal, slot)).collect())
+}
+
 /// Errors raised while compiling or dispatching a hand-built kernel.
 ///
 /// Nested backend errors are boxed (`svod_runtime::Error` alone is ~144 B), so
@@ -81,6 +88,10 @@ pub enum Error {
     /// A buffer required by the compiled ABI was not supplied.
     #[snafu(display("buffer slot {slot} not supplied (of {supplied} buffers)"))]
     BufferMissing { slot: usize, supplied: usize },
+
+    /// The compact runtime buffer vector does not match ProgramInfo.globals.
+    #[snafu(display("expected {expected} compact buffers for slots {slots:?}, got {supplied}"))]
+    BufferCount { expected: usize, supplied: usize, slots: Vec<usize> },
 
     /// A required buffer could not be allocated on its device.
     #[snafu(display("allocate buffer slot {slot} (of {supplied}): {source}"))]
@@ -191,10 +202,13 @@ pub(crate) fn concrete_dims(
 /// output buffer(s) in place. `buffers` are ordered output(s)-first then inputs,
 /// matching the `gl()` declaration order in the kernel body (PARAM slots 0,1,…).
 ///
-/// The compiled ABI (`ProgramSpec.globals`) is a *sorted* slot list, so the
-/// concrete pointer for ABI position `i` is `buffers[globals[i]]`. With the
-/// canonical declaration order `globals[i] == i`, but we index through `globals`
-/// so a kernel that declares slots out of order still binds correctly.
+/// Binding is *compact and ordinal*: the compiled ABI (`ProgramSpec.globals`)
+/// is a sorted slot list, and the pointer for ABI position `i` is `buffers[i]`
+/// — the declared slot number is carried only for diagnostics. So a kernel that
+/// declares slots `[0, 5]` takes exactly two buffers, and `buffers[1]` binds to
+/// slot 5; supplying `globals.len()` buffers is required, and a sparse vector
+/// indexed by slot number is not. `plan_compact_buffers` is the mapping, pinned
+/// by `sparse_and_interleaved_program_slots_plan_compact_buffers`.
 pub fn launch(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<()> {
     let compiled = compile(device, sink, buffers)?;
     // SAFETY: `compile` resolved + allocated every ABI buffer pointer, and the
@@ -299,46 +313,49 @@ impl CompiledLaunch {
 /// for repeated dispatch. [`launch`] is exactly `compile(..)?.dispatch(true)`;
 /// factoring the render+compile out lets a benchmark loop only the dispatch.
 ///
-/// `buffers` are ordered output(s)-first then inputs, matching the `gl()`
-/// declaration order in the kernel body (PARAM slots 0,1,…). The compiled ABI
-/// (`ProgramSpec.globals`) is a *sorted* slot list, so position `i` binds
-/// `buffers[globals[i]]` (identity for canonical declaration order).
+/// `buffers` are compact and ordered by storage-descriptor ordinal, matching
+/// `ProgramSpec.globals`. PARAM slots select signature positions and are never
+/// used as indexes into this vector.
 pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<CompiledLaunch> {
-    // Lower `Index`-typed addressing arithmetic to a concrete int width. The
-    // normal tensor pipeline does this in the optimizer (stage 15), which the
-    // direct-launch path bypasses (`opts_to_apply = Some(vec![])` skips opts) —
-    // so a hand-built kernel's offset MULs/DIVs would otherwise reach codegen as
-    // `Scalar(Index)` and panic. Idempotent on already-lowered graphs.
-    let sink = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
+    let optimizer_renderer = match device.device {
+        DeviceSpec::Cpu => {
+            if std::env::var("SVOD_AMX").as_deref() == Ok("1") {
+                svod_schedule::OptimizerRenderer::apple_amx()
+            } else {
+                svod_schedule::OptimizerRenderer::cpu()
+            }
+        }
+        DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
+        DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
+        DeviceSpec::Amd { .. } => device
+            .renderer
+            .gpu_arch()
+            .and_then(svod_dtype::GpuArch::amd)
+            .map(svod_schedule::OptimizerRenderer::for_amd_arch)
+            .unwrap_or_else(svod_schedule::OptimizerRenderer::amd_rdna3),
+        _ => svod_schedule::OptimizerRenderer::cpu(),
+    }
+    .with_codegen_renderer(device.renderer.as_ref());
+    let sink = svod_schedule::optimize_kernel_with_config(
+        sink,
+        &optimizer_renderer,
+        &svod_schedule::OptimizerConfig::default(),
+    )
+    .map_err(|error| Error::Compile {
+        name: "tk_kernel".to_string(),
+        source: Box::new(svod_device::Error::Runtime { message: error.to_string() }),
+    })?;
 
-    // Post-index symbolic simplification (as in tinygrad's late pipeline): fold
-    // the degenerate index arithmetic lowering regenerates (`x*0`, `x*1`, `x/1`,
-    // `x%1`, redundant casts). Left unfolded, those loop-invariant values reach
-    // the renderer stranded in non-dominating blocks (LLVM "does not dominate all
-    // uses"). The dead-loop-free variant preserves hand-built END/AFTER loop
-    // carries (see `symbolic_no_dead_loop`).
-    let sink = svod_schedule::graph_rewrite(svod_schedule::symbolic::symbolic_no_dead_loop(), sink, &mut ());
-
-    // Apply the backend's `Renderer::decompositor()` — the same pass `tensor::realize`
-    // runs from the optimizer, which this direct path skips. Without it a hand-built
-    // kernel misses backend-mandatory lowerings (AMD's integer f32→bf16 cast, the
-    // SLEEF transcendentals). Like Tinygrad, every kernel — custom or not — gets the
-    // renderer's decomposition matchers.
-    let sink = match device.renderer.decompositor() {
-        Some(matcher) => svod_ir::decompositions::decompose_with(&sink, &matcher),
-        None => sink,
-    };
-
-    // PROGRAM(sink, device) → SOURCE → BINARY (render + compile, cached nowhere
+    // PROGRAM(sink, target arg) -> SOURCE -> BINARY (render + compile, cached nowhere
     // here; repeated launches recompile — the JIT cache lives a layer up).
-    let program = program_pipeline::program_from_sink(sink, device.device.clone());
+    let program = program_pipeline::program_from_sink_with_renderer(sink, device.renderer.as_ref())
+        .context(CompileSnafu { name: "tk_kernel".to_string() })?;
     let kernel_name = ProgramSpec::from_uop(&program).ok().map(|s| s.name).unwrap_or_else(|| "tk_kernel".into());
 
     let rendered = program_pipeline::get_program(
         &program,
         device.renderer.as_ref(),
         device.compiler.as_ref(),
-        Some(&kernel_name),
         ProgramTarget::Source,
     )
     .context(CompileSnafu { name: kernel_name.clone() })?;
@@ -349,10 +366,11 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
     let spec = ProgramSpec::from_uop(&compiled_program).context(SpecSnafu { name: kernel_name.clone() })?;
     let prog = (device.runtime)(&compiled).context(RuntimeSnafu { name: kernel_name.clone() })?;
 
-    // Resolve buffer pointers in the compiled ABI order (sorted PARAM slots).
+    // Resolve compact buffer pointers in ProgramInfo.globals order. The slot is
+    // retained only for diagnostics; the ordinal indexes the user vector.
     let mut ptrs: Vec<*mut u8> = Vec::with_capacity(spec.globals.len());
-    for &slot in &spec.globals {
-        let buf = buffers.get(slot).context(BufferMissingSnafu { slot, supplied: buffers.len() })?;
+    for (ordinal, slot) in plan_compact_buffers(&spec.globals, buffers.len())? {
+        let buf = buffers.get(ordinal).context(BufferMissingSnafu { slot, supplied: buffers.len() })?;
         buf.ensure_allocated().context(BufferAllocSnafu { slot, supplied: buffers.len() })?;
         // SAFETY: the buffer is allocated and held alive by `_buffers` below for
         // the lifetime of the `CompiledLaunch` (and thus of these raw pointers).
@@ -430,8 +448,9 @@ where
 /// first), so `build` sees the same PARAM slots as the direct path. Launch
 /// geometry rides on the `Op::Special` ops [`Kernel::new`](crate::Kernel::new)
 /// mints from `grid`/`block` (no launch dims are passed through `CallInfo`); the
-/// `finish()`-stamped `opts_to_apply = Some(vec![])` keeps the optimizer off the
-/// hand-lowered body.
+/// `finish()`-stamped `opts_to_apply = Some(vec![])` makes the optimizer apply
+/// zero schedule opts to the hand-lowered body, which then goes through the same
+/// pre/post-optimization pipeline as any other kernel.
 ///
 /// ```no_run
 /// use svod_tensor::Tensor;
@@ -657,18 +676,19 @@ pub fn realize_buffer(t: &Tensor) -> Result<Buffer> {
     // No backing buffer: allocate one sized to the tensor's logical shape on its
     // BUFFER UOp's device, then register it so `t.buffer()` resolves it.
     let base = t.uop().base();
-    let svod_ir::Op::Buffer { device, size, .. } = base.op() else {
+    let svod_ir::Op::Buffer { arg, .. } = base.op() else {
         return Err(RealizeSnafu.into_error(svod_tensor::error::Error::NoBuffer));
     };
-    let svod_ir::Op::Device(spec) = device.op() else {
+    let Some(spec) = arg.device.as_ref() else {
         return Err(RealizeSnafu.into_error(svod_tensor::error::Error::NoBuffer));
     };
+    let size = base.buffer_size().ok_or_else(|| RealizeSnafu.into_error(svod_tensor::error::Error::NoBuffer))?;
     let dtype = base.dtype();
     let shape: Vec<usize> = t
         .shape()
         .ok()
         .and_then(|s| s.iter().map(|d| d.as_const()).collect::<Option<Vec<_>>>())
-        .unwrap_or_else(|| vec![*size]);
+        .unwrap_or_else(|| vec![size]);
 
     let allocator =
         svod_device::registry::registry().get(spec).context(AllocatorSnafu { spec: format!("{spec:?}") })?;

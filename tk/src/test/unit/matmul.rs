@@ -53,21 +53,23 @@ fn test_mma_ab_wmma_graph_shape() {
     let wmmas: Vec<_> = out.uop().toposort().into_iter().filter(|u| matches!(u.op(), Op::Wmma { .. })).collect();
     assert_eq!(wmmas.len(), 1, "exactly one symbolic WMMA per K-iteration");
 
-    let bf16x4 = DType::BFloat16.vec(4).unwrap();
-    let f32x4 = DType::Float32.vec(4).unwrap();
     let Op::Wmma { a: wa, b: wb, c: wc, metadata } = wmmas[0].op() else { unreachable!() };
-    assert_eq!(wa.dtype(), bf16x4, "A operand is bf16.vec(4)");
-    assert_eq!(wb.dtype(), bf16x4, "B operand is bf16.vec(4)");
-    assert_eq!(wc.dtype(), f32x4, "C (accumulator) operand is f32.vec(4)");
-    assert_eq!(wmmas[0].dtype(), f32x4, "WMMA result is f32.vec(4)");
+    assert_eq!(wa.dtype(), DType::BFloat16, "A operand keeps its scalar dtype");
+    assert_eq!(wb.dtype(), DType::BFloat16, "B operand keeps its scalar dtype");
+    assert_eq!(wc.dtype(), DType::Float32, "C operand keeps its scalar dtype");
+    assert_eq!(wmmas[0].dtype(), DType::Float32, "WMMA dtype follows C");
+    for operand in [wa, wb, wc, &wmmas[0]] {
+        assert_eq!(operand.shape().unwrap().unwrap()[0].as_const(), Some(4));
+    }
 
     assert_eq!(metadata.dims, (16, 16, 16));
     assert_eq!(metadata.dtype_in, DType::BFloat16);
     assert_eq!(metadata.dtype_out, DType::Float32);
-    let prod = |axes: &[(usize, usize)]| axes.iter().map(|(_, s)| s).product::<usize>();
-    assert_eq!(prod(&metadata.upcast_axes.a), 4, "A upcast product");
-    assert_eq!(prod(&metadata.upcast_axes.b), 4, "B upcast product");
-    assert_eq!(prod(&metadata.upcast_axes.c), 4, "C upcast product");
+    let prod = |axes: &[(svod_ir::AxisId, usize)]| axes.iter().map(|(_, s)| s).product::<usize>();
+    let axes = metadata.upcast_axes.as_ref().expect("unexpanded WMMA metadata");
+    assert_eq!(prod(&axes.a), 4, "A upcast product");
+    assert_eq!(prod(&axes.b), 4, "B upcast product");
+    assert_eq!(prod(&axes.c), 4, "C upcast product");
 }
 
 /// The fully-unrolled MMA ([`Kernel::set_unroll`]) emits one symbolic `WMMA` per
@@ -101,8 +103,12 @@ fn test_mma_unroll_flattens_mfma() {
     assert_eq!(wmma_count(&build(true)), 8, "unrolled mma → 8 flat WMMA nodes (2×2 output × 2 K-steps)");
 
     let render = |sink: Arc<UOp>| {
-        let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
-        let program = svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu);
+        let pm = svod_schedule::symbolic::pm_lower_index_dtype()
+            + svod_ir::decompositions::divmod_decomposition_patterns()
+                .with_context::<svod_schedule::symbolic::WeakMemo>();
+        let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut svod_schedule::symbolic::WeakMemo::default());
+        let program =
+            svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu).expect("final target graph");
         let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
         let linear_uop =
             linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR present");
@@ -137,8 +143,11 @@ fn test_matmul_rdna_renders_wmma() {
     );
     build_matmul_cfg(&ker, n, SMALL_CFG);
     let sink = ker.finish(SMALL_CFG.n_accum);
-    let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
-    let program = svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu);
+    let pm = svod_schedule::symbolic::pm_lower_index_dtype()
+        + svod_ir::decompositions::divmod_decomposition_patterns().with_context::<svod_schedule::symbolic::WeakMemo>();
+    let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut svod_schedule::symbolic::WeakMemo::default());
+    let program =
+        svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu).expect("final target graph");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
     let linear_uop =
         linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR present");
@@ -171,8 +180,8 @@ fn test_group_2d_wave_index_shape() {
                 && matches!(d.op(), Op::Const(c) if matches!(c.0, svod_ir::ConstValue::Int(4))))
         })
     };
-    assert!(by_four(&g.warp_row(), BinaryOp::Idiv), "warp_row divides the wave id by cols_waves=4");
-    assert!(by_four(&g.warp_col(), BinaryOp::Mod), "warp_col mods the wave id by cols_waves=4");
+    assert!(by_four(&g.warp_row(), BinaryOp::FloorDiv), "warp_row divides the wave id by cols_waves=4");
+    assert!(by_four(&g.warp_col(), BinaryOp::FloorMod), "warp_col mods the wave id by cols_waves=4");
 
     // Single-warp group keeps the 1×1 grid.
     let w = ker.warp();

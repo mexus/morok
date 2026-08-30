@@ -3,6 +3,7 @@
 use svod_dtype::DType;
 use svod_ir::{AxisType, ConstValue, Op};
 use svod_tensor::Tensor;
+use test_case::test_case;
 
 use crate::jit::InputSpec;
 use crate::state::HasStateDict;
@@ -145,22 +146,49 @@ fn low_precision_cross_projection_keeps_fp32_cache_storage() {
     }
 }
 
-#[test]
-fn low_precision_load_preserves_openai_fp32_parameters() {
+/// OpenAI keeps embeddings and LayerNorm affine parameters at checkpoint
+/// precision; only projections take the compute dtype. Observable at FP8,
+/// where a coerced token embedding would quantize the vocabulary table.
+#[test_case(DType::Float16)]
+#[test_case(DType::FP8E4M3)]
+fn low_precision_load_preserves_openai_fp32_parameters(compute: DType) {
     let source_dims = small_decoder_dims();
     let source = Whisper::empty(source_dims.clone()).state_dict("");
     let mut low_dims = source_dims;
-    low_dims.dtype = DType::Float16;
+    low_dims.dtype = compute.clone();
     let model = Whisper::from_state_dict(&source, low_dims).unwrap();
 
-    assert_eq!(model.encoder.conv1.weight.uop().dtype(), DType::Float16);
-    assert_eq!(model.encoder.blocks[0].attn.query.weight.uop().dtype(), DType::Float16);
+    assert_eq!(model.encoder.conv1.weight.uop().dtype(), compute);
+    assert_eq!(model.encoder.blocks[0].attn.query.weight.uop().dtype(), compute);
     assert_eq!(model.encoder.positional_embedding.uop().dtype(), DType::Float32);
     assert_eq!(model.encoder.blocks[0].attn_ln.weight.uop().dtype(), DType::Float32);
     assert_eq!(model.decoder.token_embedding.uop().dtype(), DType::Float32);
     assert_eq!(model.decoder.positional_embedding.uop().dtype(), DType::Float32);
     assert_eq!(model.decoder.blocks[0].cross_attn_ln.bias.uop().dtype(), DType::Float32);
     assert_eq!(model.decoder.ln.weight.uop().dtype(), DType::Float32);
+}
+
+#[test]
+fn quantized_weight_scale_scales_output_channels() {
+    // The per-output-channel scale must be reshaped to `[out, 1]` before it is
+    // multiplied into a `[out, in]` weight; a bare `[out]` scale either fails to
+    // broadcast or (when out == in) scales the input axis.
+    let dims = small_decoder_dims();
+    let mut sd = Whisper::empty(dims.clone()).state_dict("");
+    let key = "decoder.blocks.0.mlp.0.weight";
+    let (out, inp) = (dims.n_text_state * 4, dims.n_text_state);
+    let weight: Vec<f32> = (0..out * inp).map(|value| value as f32 * 0.25).collect();
+    let scale: Vec<f32> = (0..out).map(|row| 1.0 + row as f32).collect();
+    sd.insert(key.into(), Tensor::from_slice(weight.clone()).try_reshape([out, inp]).unwrap());
+    sd.insert(format!("{key}.weight_scale"), Tensor::from_slice(scale.clone()));
+
+    let model = Whisper::from_state_dict(&sd, dims).unwrap();
+    let mut loaded = model.decoder.blocks[0].mlp0_w.contiguous();
+    Tensor::realize_batch([&mut loaded]).unwrap();
+
+    assert_eq!(loaded.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(), [out, inp]);
+    let expected: Vec<f32> = weight.iter().enumerate().map(|(index, value)| value * scale[index / inp]).collect();
+    assert_eq!(loaded.as_vec::<f32>().unwrap(), expected);
 }
 
 #[test]

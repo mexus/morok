@@ -31,7 +31,13 @@ fn test_shuffle_xor_graph_shape() {
             "{:?}: shuffle_xor emits a ds_bpermute Op::Custom",
             caps.arch
         );
-        assert!(!topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "{:?}: no LDS scratch", caps.arch);
+        assert!(
+            !topo
+                .iter()
+                .any(|u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
+            "{:?}: no LDS scratch",
+            caps.arch
+        );
         assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "{:?}: no barrier", caps.arch);
     }
 }
@@ -47,7 +53,12 @@ fn test_compare_exchange_graph_shape() {
     let topo = warp.compare_exchange(dst, &src, 1, SwapDir::ByLaneBit(2)).uop().toposort();
     assert!(topo.iter().any(|u| matches!(u.op(), Op::Custom { .. })), "ds_bpermute gather present");
     assert!(topo.iter().any(|u| matches!(u.op(), Op::Ternary(..))), "min/max select (where) present");
-    assert!(!topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "no LDS scratch");
+    assert!(
+        !topo
+            .iter()
+            .any(|u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
+        "no LDS scratch"
+    );
     assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "no barrier");
 }
 

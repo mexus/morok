@@ -44,11 +44,11 @@ Moving validity into INDEX enables better load combining and vectorization.
 
 > **Stage at a Glance**
 >
-> **Goal**: Convert UNROLL/UPCAST to explicit operations
-> **Key Concepts**: UNROLL, CONTRACT, pattern order
+> **Goal**: Expand UPCAST and UNROLL ranges into explicit STACK/INDEX structure
+> **Key Concepts**: range axis types, STACK, INDEX, pattern order
 > **Impact**: Makes vectorization explicit and ready for hardware
 
-**What This Does**: Transforms UNROLL/UPCAST optimization primitives into explicit operations.
+**What This Does**: Transforms UPCAST/UNROLL range classifications into explicit operations.
 
 **Why This Matters**: UPCAST and UNROLL mark intent—what we want to do. This stage makes that intent explicit so the hardware can actually do it.
 
@@ -66,27 +66,14 @@ The patterns are combined and run to fixpoint. The order affects which pattern i
 
 Wrong precedence can cause incorrect vectorization or reduction scoping.
 
-**UNROLL and CONTRACT**:
-
-UNROLL and CONTRACT work together:
-
-```text
-UNROLL: "Take this one thing and make N copies for different positions"
-Example:  x → [x_0, x_1, x_2, x_3]
-
-CONTRACT: "Take these N things and combine them back"
-Example:  [a, b, c, d] → one vector containing all four
-```
-
-Together: UPCAST marks intent to vectorize → UNROLL expands → CONTRACT combines.
+Expanded lanes are collected with `STACK` and selected with `INDEX`. UNROLL is
+an `AxisType` on `RANGE`, not a standalone operation.
 
 **UPCAST range → VECTORIZE**:
 ```mermaid
 flowchart TD
   A["Before: UPCAST marks vectorization intent. RANGE(end=4, UPCAST)"]
-  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL with constant indices. UNROLL(VCONST([0, 1, 2, 3]))"]
-  B -->|"expander"| C["Step 2: Expand operations with UNROLL sources. Operations now have unrolled sources"]
-  C -->|"CONTRACT or implicit"| D["After: explicit VECTORIZE. VECTORIZE(op[0], op[1], op[2], op[3])"]
+  A -->|"expander"| B["After: STACK(op[0], op[1], op[2], op[3])"]
 ```
 
 **UNROLL range → repeated operations**:
@@ -96,16 +83,14 @@ When we say "operations duplicated," it sounds like copy-paste. But that's not w
 ```mermaid
 flowchart TD
   A["Before: UPCAST marks vectorization intent. RANGE(end=3, UPCAST)"]
-  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL. UNROLL(VCONST([0, 1, 2]))"]
-  B -->|"expander"| C["Step 2: Operations expand to handle all positions. After: operations processed together (not duplicated). UNROLL([op_at_0, op_at_1, op_at_2])"]
+  A -->|"expander"| B["After: STACK(op_at_0, op_at_1, op_at_2)"]
 ```
 
-**UNROLL/END/CONTRACT interaction**:
+**Expanded END interaction**:
 ```mermaid
 flowchart TD
   A["Before: END(STORE(...), [RANGE(UPCAST)])"]
-  A -->|"pm_pre_expander"| B["Step 1: END(STORE(...), [UNROLL(VCONST([0,1,2,3]))])"]
-  B -->|"expander"| C["Step 2: END(CONTRACT(STORE(...x4)), [])"]
+  A -->|"expander"| B["After: END(STACK(STORE(...x4)), [])"]
 ```
 
 **Broadcast through AFTER/END**:

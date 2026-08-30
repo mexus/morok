@@ -321,7 +321,6 @@ Svod supports multiple code generation backends:
 |---------|--------|--------|
 | **LLVM** | Native machine code | Primary (CPU) |
 | **C** | C source code | Available |
-| **MLIR** | MLIR dialect | Available |
 
 ---
 

@@ -29,7 +29,7 @@ For architecture details, see the [documentation site](https://npatsakula.github
 | [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp graph IR: 80+ ops, symbolic integers, provenance |
 | [device](https://github.com/npatsakula/svod/tree/main/device/) | Buffer management: lazy alloc, zero-copy views, LRU caching |
 | [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | Optimization engine: 20+ passes, RANGEIFY, Z3 verification |
-| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | Code generation: Clang (default), LLVM JIT, MLIR |
+| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | Code generation: Clang (default), LLVM JIT |
 | [runtime](https://github.com/npatsakula/svod/tree/main/runtime/) | JIT compilation and kernel execution |
 | [tensor](https://github.com/npatsakula/svod/tree/main/tensor/) | High-level lazy tensor API |
 | [onnx](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX model importer |

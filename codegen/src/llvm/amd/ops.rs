@@ -25,16 +25,58 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         // ── AMD-specific overrides ───────────────────────────────────────
         Op::Special { name, .. } => render_special(uop, name, ctx, kernel),
         Op::Barrier { .. } => render_barrier(kernel),
-        Op::DefineLocal(_) => render_define_local(uop, ctx, kernel),
-        Op::DefineReg { .. } => render_define_reg(uop, ctx, kernel),
+        Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
+            render_define_local(uop, ctx, kernel)
+        }
+        Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => render_define_reg(uop, ctx, kernel),
         Op::Wmma { a, b, c, metadata } => wmma::render_wmma_amd(uop, a, b, c, metadata, arch, ctx, kernel),
-        Op::Unary(UnaryOp::Sqrt, _) | Op::Unary(UnaryOp::Log2, _) | Op::Unary(UnaryOp::Exp2, _) => {
-            guard_unsupported_f64_transcendental(uop, ctx).or_else(|| cpu::render_uop(uop, ctx, kernel))
+        Op::Unary(op @ (UnaryOp::Sqrt | UnaryOp::Log2 | UnaryOp::Exp2 | UnaryOp::Sin), src) => {
+            render_float_unary(uop, src, *op, ctx, kernel)
         }
         Op::Cast { src, .. } if is_fp8_cast(uop, src) => render_fp8_cast(uop, src, ctx, kernel),
         // ── Everything else: shared CPU path (ALU, INDEX, LOAD, STORE, …) ─
         _ => cpu::render_uop(uop, ctx, kernel),
     }
+}
+
+/// Lower `sqrt`/`log2`/`exp2`/`sin` to the LLVM intrinsic the AMDGPU backend
+/// selects itself, so the object needs no ROCm device library.
+///
+/// Tinygrad renders these as `@llvm.{sqrt,log2,exp2}.<ty>`
+/// (`renderer/llvmir.py:226,236`) and drives amdgcn straight through LLVM with
+/// no device libs (`runtime/support/compiler_llvm.py:19-24`). The AMDGPU
+/// backend has no f64 lowering for `log2`/`exp2`/`sin` — it reports
+/// "no libcall available" / "cannot select f64 fsin", which is why tinygrad
+/// substitutes its `xlog2`/`xexp2` expansions there — so exactly those three
+/// keep the ROCm `__ocml_*` entry points. Their presence is what
+/// `amd_object_flags` keys `-nogpulib` off.
+fn render_float_unary(
+    uop: &Arc<UOp>,
+    src: &Arc<UOp>,
+    op: UnaryOp,
+    ctx: &mut RenderContext,
+    kernel: &mut Vec<String>,
+) -> Option<()> {
+    let bits = match uop.dtype() {
+        DType::Scalar(ScalarDType::Float16) => 16,
+        DType::Scalar(ScalarDType::Float32) => 32,
+        DType::Scalar(ScalarDType::Float64) => 64,
+        _ => return cpu::render_uop(uop, ctx, kernel),
+    };
+    let name = match op {
+        UnaryOp::Sqrt => "sqrt",
+        UnaryOp::Log2 => "log2",
+        UnaryOp::Exp2 => "exp2",
+        UnaryOp::Sin => "sin",
+        _ => unreachable!(),
+    };
+    let callee =
+        if bits == 64 && name != "sqrt" { format!("@__ocml_{name}_f64") } else { format!("@llvm.{name}.f{bits}") };
+    let ty = ldt(&uop.dtype());
+    let dst = ctx.name(uop);
+    let value = ctx.get(src);
+    kernel.push(format!("  {dst} = call {ty} {callee}({ty} {value})"));
+    Some(())
 }
 
 // ── SPECIAL: workgroup / workitem / direct-global axis ────────────────────
@@ -98,14 +140,11 @@ fn render_barrier(kernel: &mut Vec<String>) -> Option<()> {
 
 fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
     let dst = ctx.name(uop); // e.g. "%local42"
-    let id = match uop.op() {
-        Op::DefineLocal(id) => *id,
+    let (id, base_dtype) = match uop.op() {
+        Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) => (arg.slot, arg.dtype.clone()),
         _ => unreachable!(),
     };
-    let (base_dtype, size) = match uop.dtype() {
-        DType::Ptr { base, size, .. } => (base.as_ref().clone(), size.unwrap_or(1)),
-        other => (other, 1),
-    };
+    let size = uop.buffer_size().unwrap_or(1);
     let base_ty = ldt(&base_dtype);
     let global_name = format!("@local{id}");
     // Declare the LDS-backed global at module scope.
@@ -132,9 +171,9 @@ fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec
 
 fn render_define_reg(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
     let dst = ctx.name(uop);
-    let (alloc_size, base) = match uop.dtype() {
-        DType::Ptr { size, base, .. } => (size.unwrap_or(1), ldt(&base)),
-        other => (1, ldt(&other)),
+    let (alloc_size, base) = match uop.op() {
+        Op::Buffer { arg, .. } => (uop.buffer_size().unwrap_or(1), ldt(&arg.dtype)),
+        _ => unreachable!(),
     };
     let raw = format!("{dst}.raw");
     kernel.push(format!("  {raw} = alloca [{alloc_size} x {base}], align 4, addrspace(5)"));
@@ -182,21 +221,6 @@ fn render_fp8_cast(uop: &Arc<UOp>, src: &Arc<UOp>, ctx: &mut RenderContext, kern
         _ => unreachable!("is_fp8_cast guard"),
     }
     Some(())
-}
-
-// ── Transcendentals: error on f64 paths until we wire xlog2/xexp2 ────────
-
-fn guard_unsupported_f64_transcendental(uop: &Arc<UOp>, ctx: &mut RenderContext) -> Option<()> {
-    if matches!(uop.dtype().scalar(), Some(ScalarDType::Float64))
-        && matches!(uop.op(), Op::Unary(UnaryOp::Log2, _) | Op::Unary(UnaryOp::Exp2, _))
-    {
-        ctx.set_invalid_graph(
-            "AMD renderer: @llvm.log2.f64/@llvm.exp2.f64 are not supported on amdgcn; \
-             apply the xlog2/xexp2 decomposition pass before rendering",
-        );
-        return Some(());
-    }
-    None
 }
 
 /// Module-level prefix lines required when the kernel uses fp8 conversions.

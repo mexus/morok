@@ -38,7 +38,7 @@ fn test_parse_binding_pattern() {
 #[test]
 fn test_parse_struct_pattern() {
     let input: PatternList = syn::parse_quote! {
-        Bufferize { compute: c, .. } ~> c
+        Stage { compute: c, .. } ~> c
     };
     assert_eq!(input.items.len(), 1);
 }
@@ -58,7 +58,7 @@ fn test_parse_with_guard_infallible() {
 fn test_parse_with_guard_fallible() {
     // Guard on LHS with fallible arrow
     let input: PatternList = syn::parse_quote! {
-        Idiv(x, x2) if Rc::ptr_eq(x, x2) => Some(one_const())
+        FloorDiv(x, x2) if Rc::ptr_eq(x, x2) => Some(one_const())
     };
     assert_eq!(input.items.len(), 1);
     assert!(get_rule(&input, 0).guard.is_some());
@@ -334,7 +334,7 @@ fn test_parse_fallible_with_block() {
 fn test_parse_mixed_arrow_kinds() {
     let input: PatternList = syn::parse_quote! {
         Add(x, @zero) ~> x,
-        Idiv(x, x2) => Rc::ptr_eq(x, x2).then(|| one()),
+        FloorDiv(x, x2) => Rc::ptr_eq(x, x2).then(|| one()),
         Mul(x, @one) ~> x,
     };
     assert_eq!(input.items.len(), 3);
@@ -457,7 +457,7 @@ fn test_parse_closure_with_type_annotation() {
 fn test_parse_closure_fallible() {
     // Fallible closure RHS
     let input: PatternList = syn::parse_quote! {
-        Mod(x, y) => |x, y| x.try_mod(y).ok()
+        FloorMod(x, y) => |x, y| x.try_mod(y).ok()
     };
     assert_eq!(get_rule(&input, 0).arrow, ArrowKind::Fallible);
     assert!(matches!(get_rule(&input, 0).rhs, RewriteExpr::Closure(_)));

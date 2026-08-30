@@ -46,7 +46,7 @@ pub(crate) fn detect_language_profile(
     }
     if let Some(graph_profile) = graph_profile {
         let graph_started = std::time::Instant::now();
-        let kernels = decoder_jit.execute_profiled().context(JitSnafu)?;
+        let kernels = decoder_jit.execute_profiled_static().context(JitSnafu)?;
         decoder_jit.output().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
         graph_profile.record(graph_started.elapsed(), kernels);
     } else {
@@ -274,16 +274,16 @@ pub(crate) fn check_fallback(result: &DecodeResult, fallback: &FallbackPolicy, o
 /// than rerunning prefill. Cache snapshots remain device-local and are copied
 /// into a row only when that row changes request ownership.
 pub(crate) struct DecodeSeed {
-    metadata: PrefillMetadata,
-    self_k_cache: Buffer,
-    self_v_cache: Buffer,
-    cross_k: Buffer,
-    cross_v: Buffer,
-    per_pos_bytes: usize,
-    self_cache_bytes: usize,
-    cross_cache_bytes: usize,
-    self_positions: usize,
-    cross_positions: usize,
+    pub(crate) metadata: PrefillMetadata,
+    pub(crate) self_k_cache: Buffer,
+    pub(crate) self_v_cache: Buffer,
+    pub(crate) cross_k: Buffer,
+    pub(crate) cross_v: Buffer,
+    pub(crate) per_pos_bytes: usize,
+    pub(crate) self_cache_bytes: usize,
+    pub(crate) cross_cache_bytes: usize,
+    pub(crate) self_positions: usize,
+    pub(crate) cross_positions: usize,
 }
 
 impl DecodeSeed {
@@ -342,7 +342,7 @@ pub(crate) fn prefill_decode_seed(
     Ok(seed)
 }
 
-fn clone_device_cache(src: &Buffer) -> Result<Buffer> {
+pub(crate) fn clone_device_cache(src: &Buffer) -> Result<Buffer> {
     if src.dtype() != DType::Float32 || !src.size().is_multiple_of(std::mem::size_of::<f32>()) {
         return Err(decode_err("prefill cache must contain aligned float32 data"));
     }
@@ -357,7 +357,7 @@ fn clone_device_cache(src: &Buffer) -> Result<Buffer> {
     Ok(clone)
 }
 
-fn build_decode_seed(
+pub(crate) fn build_decode_seed(
     metadata: PrefillMetadata,
     self_k: Buffer,
     self_v: Buffer,
@@ -919,7 +919,7 @@ pub(crate) fn run_fixed_slot_decode(
                 .sum::<usize>();
             if profile {
                 let graph_started = std::time::Instant::now();
-                let kernels = step_jit.execute_profiled().context(JitSnafu)?;
+                let kernels = step_jit.execute_profiled_static().context(JitSnafu)?;
                 step_jit.logits().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
                 graph_profile.record(graph_started.elapsed(), kernels);
             } else {
@@ -1139,7 +1139,12 @@ fn write_self_key_len_row(jit: &mut WhisperDecoderStepJit, row: usize, pos: usiz
 }
 
 /// Seed one physical cache row from an immutable device-local snapshot.
-fn copy_device_cache_row(buf: &mut Buffer, row: usize, row_stride_bytes: usize, data: &Buffer) -> Result<()> {
+pub(crate) fn copy_device_cache_row(
+    buf: &mut Buffer,
+    row: usize,
+    row_stride_bytes: usize,
+    data: &Buffer,
+) -> Result<()> {
     if buf.dtype() != DType::Float32 || data.dtype() != DType::Float32 {
         return Err(decode_err("cache seed buffers must be float32"));
     }
@@ -1321,15 +1326,15 @@ pub(crate) fn finalize_beam_hypotheses(
     finished.into_iter().next()
 }
 
-struct PrefillMetadata {
-    initial_tokens: Vec<u32>,
-    sample_begin: usize,
-    init_len: usize,
-    suppress_tokens: Vec<i32>,
-    prefill_logits: Vec<f32>,
-    no_speech_prob: f32,
-    pos_embedding: Vec<f32>,
-    n_state: usize,
+pub(crate) struct PrefillMetadata {
+    pub(crate) initial_tokens: Vec<u32>,
+    pub(crate) sample_begin: usize,
+    pub(crate) init_len: usize,
+    pub(crate) suppress_tokens: Vec<i32>,
+    pub(crate) prefill_logits: Vec<f32>,
+    pub(crate) no_speech_prob: f32,
+    pub(crate) pos_embedding: Vec<f32>,
+    pub(crate) n_state: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1373,7 +1378,7 @@ fn execute_prefill(
     // Execute prefill JIT (plan manages all buffers, no realize)
     if let Some(graph_profile) = graph_profile {
         let graph_started = std::time::Instant::now();
-        let kernels = prefill_jit.execute_profiled().context(JitSnafu)?;
+        let kernels = prefill_jit.execute_profiled_static().context(JitSnafu)?;
         prefill_jit.logits().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
         graph_profile.record(graph_started.elapsed(), kernels);
     } else {
@@ -1781,87 +1786,4 @@ fn sample_from_logits(logits: &[f32], temperature: f32, rng: &mut impl Rng) -> u
         }
     }
     (probs.len() - 1) as u32
-}
-
-#[cfg(test)]
-mod scheduler_seed_tests {
-    use super::*;
-    use std::sync::Arc;
-    use svod_device::CpuAllocator;
-
-    fn cache(allocator: Arc<CpuAllocator>, values: &[f32]) -> Buffer {
-        let mut buffer =
-            Buffer::allocate(allocator, DType::Float32, vec![values.len()], BufferSpec::default()).unwrap();
-        buffer.copyin(bytemuck::cast_slice(values)).unwrap();
-        buffer
-    }
-
-    #[test]
-    fn scheduler_seed_owns_device_buffers_and_seeds_multiple_rows() {
-        let allocator = Arc::new(CpuAllocator);
-        let self_values = [1.0f32, 2.0, 3.0, 4.0];
-        let cross_values = [5.0f32, 6.0, 7.0, 8.0, 9.0, 10.0];
-        let self_k_source = cache(allocator.clone(), &self_values);
-        let self_v_source = cache(allocator.clone(), &self_values);
-        let cross_k_source = cache(allocator.clone(), &cross_values);
-        let cross_v_source = cache(allocator.clone(), &cross_values);
-        let metadata = PrefillMetadata {
-            initial_tokens: vec![1, 2],
-            sample_begin: 2,
-            init_len: 2,
-            suppress_tokens: Vec::new(),
-            prefill_logits: vec![0.0; 4],
-            no_speech_prob: f32::NAN,
-            pos_embedding: Vec::new(),
-            n_state: 0,
-        };
-
-        let seed = build_decode_seed(
-            metadata,
-            clone_device_cache(&self_k_source).unwrap(),
-            clone_device_cache(&self_v_source).unwrap(),
-            clone_device_cache(&cross_k_source).unwrap(),
-            clone_device_cache(&cross_v_source).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(seed.metadata.initial_tokens, [1, 2]);
-        assert_eq!(seed.per_pos_bytes, 2 * std::mem::size_of::<f32>());
-        assert_eq!(seed.self_cache_bytes, std::mem::size_of_val(&self_values));
-        assert_eq!(seed.cross_cache_bytes, std::mem::size_of_val(&cross_values));
-        assert_eq!((seed.self_positions, seed.cross_positions), (2, 3));
-        assert_ne!(seed.self_k_cache.storage_id(), self_k_source.storage_id());
-        assert_ne!(seed.self_v_cache.storage_id(), self_v_source.storage_id());
-        assert_ne!(seed.cross_k.storage_id(), cross_k_source.storage_id());
-        assert_ne!(seed.cross_v.storage_id(), cross_v_source.storage_id());
-
-        let self_stride = 4 * seed.per_pos_bytes;
-        let mut self_rows = Buffer::allocate(
-            allocator.clone(),
-            DType::Float32,
-            vec![2 * self_stride / std::mem::size_of::<f32>()],
-            BufferSpec::default(),
-        )
-        .unwrap();
-        copy_device_cache_row(&mut self_rows, 0, self_stride, &seed.self_k_cache).unwrap();
-        copy_device_cache_row(&mut self_rows, 1, self_stride, &seed.self_k_cache).unwrap();
-        let self_bytes = self_rows.as_host_bytes().unwrap();
-        let expected_self: &[u8] = bytemuck::cast_slice(&self_values);
-        assert_eq!(&self_bytes[..expected_self.len()], expected_self);
-        assert_eq!(&self_bytes[self_stride..self_stride + expected_self.len()], expected_self);
-
-        let mut cross_rows = Buffer::allocate(
-            allocator,
-            DType::Float32,
-            vec![2 * seed.cross_cache_bytes / std::mem::size_of::<f32>()],
-            BufferSpec::default(),
-        )
-        .unwrap();
-        copy_device_cache_row(&mut cross_rows, 0, seed.cross_cache_bytes, &seed.cross_k).unwrap();
-        copy_device_cache_row(&mut cross_rows, 1, seed.cross_cache_bytes, &seed.cross_k).unwrap();
-        let cross_bytes = cross_rows.as_host_bytes().unwrap();
-        let expected_cross: &[u8] = bytemuck::cast_slice(&cross_values);
-        assert_eq!(&cross_bytes[..expected_cross.len()], expected_cross);
-        assert_eq!(&cross_bytes[seed.cross_cache_bytes..], expected_cross);
-    }
 }

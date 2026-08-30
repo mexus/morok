@@ -13,9 +13,8 @@
 //!
 //! Used by [`AmdComputeQueue`] to emit signal/barrier/wait packets through
 //! the AQL vendor-specific indirect-buffer mechanism. The AQL kernel-dispatch
-//! packet itself doesn't honor the HSA `completion_signal` field on AMD
-//! hardware; we therefore wrap PM4 `RELEASE_MEM` in an AQL vendor IB
-//! packet to set the completion signal.
+//! packet's HSA `completion_signal` is deliberately unused; PM4 `RELEASE_MEM`
+//! inside a barriered AQL vendor IB advances the queue-owned timeline instead.
 
 #![allow(dead_code)]
 
@@ -43,6 +42,8 @@ pub const PACKET3_PRED_EXEC: u32 = 0x23;
 /// `(1 << 23)` bit for the PACKET3_INDIRECT_BUFFER count dword, marking the
 /// IB as valid for the CP to execute.
 pub const INDIRECT_BUFFER_VALID: u32 = 1 << 23;
+/// Number of dwords representable by the PACKET3_INDIRECT_BUFFER size field.
+pub const INDIRECT_BUFFER_SIZE_MASK: u32 = (1 << 20) - 1;
 
 // ── RELEASE_MEM bitfields (DW1) ───────────────────────────────────────────
 
@@ -151,7 +152,7 @@ pub const HDP_FLUSH_DONE_ADDR: u32 = 0xD20 + 263;
 
 // ── PACKET3 opcodes & constants (PM4 dispatch path, single-XCC) ──────────
 //
-// These constants drive the raw-PM4 `AmdComputeQueue::dispatch_pm4` path used
+// These constants drive the raw-PM4 HCQ submission path used
 // when `xccs == 1` (the gfx11/gfx12 default).
 
 pub const PACKET3_DISPATCH_DIRECT: u32 = 0x15;
@@ -222,18 +223,31 @@ pub const EVENT_INDEX_PARTIAL_FLUSH: u32 = 4;
 /// dw7  ctxid                      always 0 in our usage
 /// ```
 pub fn release_mem(addr: u64, value: u32, cache_flush: bool, is_gfx9: bool) -> [u32; 8] {
+    release_mem_write(addr, value as u64, false, cache_flush, true, is_gfx9)
+}
+
+/// General RELEASE_MEM memory write used by HCQ stores. `interrupt` is kept
+/// explicit because queue timeline stores are polled and need no KFD event.
+pub fn release_mem_write(
+    addr: u64,
+    value: u64,
+    write_64: bool,
+    cache_flush: bool,
+    interrupt: bool,
+    is_gfx9: bool,
+) -> [u32; 8] {
     // gfx9 (CDNA) and gfx10+ (RDNA) encode the cache flush differently: gfx9
     // uses the TC action bits in DW1, gfx10+ the GCR bitfield. DST_SEL only
     // exists on gfx10+ (it is implicitly memory on gfx9).
     let (cache, memsel_dw) = if is_gfx9 {
         let cache = if cache_flush { EOP_CACHE_FLUSH_GFX9 } else { 0 };
-        let memsel =
-            release_mem_data_sel(DATA_SEL_SEND_32_BIT_LOW) | release_mem_int_sel(INT_SEL_INTERRUPT_AFTER_WRITE);
+        let memsel = release_mem_data_sel(if write_64 { DATA_SEL_SEND_64_BIT_DATA } else { DATA_SEL_SEND_32_BIT_LOW })
+            | if interrupt { release_mem_int_sel(INT_SEL_INTERRUPT_AFTER_WRITE) } else { 0 };
         (cache, memsel)
     } else {
         let cache = if cache_flush { RELEASE_MEM_CACHE_FLUSH_ALL } else { 0 };
-        let memsel = release_mem_data_sel(DATA_SEL_SEND_32_BIT_LOW)
-            | release_mem_int_sel(INT_SEL_INTERRUPT_AFTER_WRITE)
+        let memsel = release_mem_data_sel(if write_64 { DATA_SEL_SEND_64_BIT_DATA } else { DATA_SEL_SEND_32_BIT_LOW })
+            | if interrupt { release_mem_int_sel(INT_SEL_INTERRUPT_AFTER_WRITE) } else { 0 }
             | release_mem_dst_sel(DST_SEL_MEMORY);
         (cache, memsel)
     };
@@ -245,9 +259,44 @@ pub fn release_mem(addr: u64, value: u32, cache_flush: bool, is_gfx9: bool) -> [
         memsel_dw,
         addr as u32,
         (addr >> 32) as u32,
-        value,
-        0, // value_hi (unused for 32-bit data_sel)
+        value as u32,
+        (value >> 32) as u32,
         0, // ctxid
+    ]
+}
+
+/// KFD queue-event mailbox write: store `event_id` at `addr`, raise the
+/// completion interrupt, and carry the id in `ctxid` so KFD routes the
+/// interrupt to that event. Mirrors the second RELEASE_MEM of Tinygrad's
+/// `AMDComputeQueue.signal` (`ops_amd.py:392-393`). No cache flush — the
+/// timeline value store that precedes it already carries one.
+pub fn release_mem_event(addr: u64, event_id: u32, is_gfx9: bool) -> [u32; 8] {
+    let mut packet = release_mem_write(
+        addr,
+        u64::from(event_id),
+        /*write_64=*/ false,
+        /*cache_flush=*/ false,
+        true,
+        is_gfx9,
+    );
+    packet[7] = event_id;
+    packet
+}
+
+/// End-of-pipe ordering packet with no memory write, matching Tinygrad's first
+/// timestamp RELEASE_MEM. The zero address is ignored when DATA_SEL is none.
+pub fn release_mem_order(is_gfx9: bool) -> [u32; 8] {
+    let memsel = release_mem_int_sel(INT_SEL_INTERRUPT_AFTER_WRITE)
+        | if is_gfx9 { 0 } else { release_mem_dst_sel(DST_SEL_MEMORY) };
+    [
+        packet3(PACKET3_RELEASE_MEM, 6),
+        release_mem_event_type(CACHE_FLUSH_AND_INV_TS_EVENT) | release_mem_event_index(EVENT_INDEX_END_OF_PIPE),
+        memsel,
+        0,
+        0,
+        0,
+        0,
+        0,
     ]
 }
 

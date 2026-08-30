@@ -322,7 +322,7 @@ pub fn gemm_core(
     let tile = lp.index().clone();
 
     // Collaborative GLOBAL→LDS fill over all threads (each ends in a barrier);
-    // Uses 128-bit vectorized loads for the large-N strips. B is indexed as
+    // Uses 128-bit-coalescible shaped loads for the large-N strips. B is indexed as
     // [K-strip, N-block] at (tile, col).
     let (a_smem, b_smem) = if cfg.vec_load {
         (

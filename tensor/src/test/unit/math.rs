@@ -79,6 +79,7 @@ fn test_erf_basic() {
     let t = Tensor::from_slice([0.0f32, 1.0, -1.0]);
     let result = t.erf().unwrap();
     assert_eq!(result.uop().dtype(), DType::Float32);
+    assert!(result.uop().toposort().iter().any(|node| matches!(node.op(), Op::Unary(svod_ir::UnaryOp::Erf, _))));
 }
 
 #[test]
@@ -138,6 +139,19 @@ fn test_isinf() {
 }
 
 crate::codegen_tests! {
+    /// The lowered transcendentals must match libm. `sin(+-1e6)` exercises
+    /// Payne-Hanek reduction rather than the small-angle Cody-Waite path.
+    fn test_transcendental_values(config) {
+        let check = |inputs: &[f32], op: fn(&Tensor) -> crate::Result<Tensor>, reference: fn(f32) -> f32| {
+            let actual = op(&Tensor::from_slice(inputs)).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+            assert_close_f32(&actual, &inputs.iter().map(|&x| reference(x)).collect::<Vec<_>>(), 2e-6);
+        };
+        check(&[-3.25, -0.5, 0.0, 0.75, 4.0], Tensor::try_exp2, f32::exp2);
+        check(&[f32::MIN_POSITIVE, 0.125, 0.75, 1.0, 17.0], Tensor::try_log2, f32::log2);
+        check(&[-1_000_000.0, -31.0, -0.5, 0.0, 31.0, 1_000_000.0], Tensor::sin, f32::sin);
+        check(&[0.0, 0.25, 1.0, 2.0, 100.0], Tensor::try_sqrt, f32::sqrt);
+    }
+
     fn test_isnan_values(config) {
         let t = Tensor::from_slice([1.0f32, f32::NAN, 3.0]);
         let vals = t.isnan().unwrap().realize_with_and(&config).as_vec::<bool>().unwrap();

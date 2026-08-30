@@ -92,8 +92,8 @@ impl Swizzle {
                 let e = row.mul(&cidx(cols_i)).add(&col);
                 let byte = e.mul(&cidx(itemsize));
                 let sw_bytes = byte.mod_(&cidx(repeat)).shr(&cidx(7)).shl(&cidx(3));
-                let e2 = e.xor(&sw_bytes.idiv(&cidx(itemsize)));
-                (e2.idiv(&cidx(cols_i)), e2.mod_(&cidx(cols_i)))
+                let e2 = e.xor(&sw_bytes.floor_div(&cidx(itemsize)));
+                (e2.floor_div(&cidx(cols_i)), e2.mod_(&cidx(cols_i)))
             }
         }
     }

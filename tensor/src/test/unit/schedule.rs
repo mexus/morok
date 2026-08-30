@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 use svod_device::Buffer;
-use svod_ir::{AxisId, AxisType, CallInfo, DType, DeviceSpec, Op, UOp};
+use svod_ir::{AxisId, AxisType, CallInfo, DType, DeviceSpec, Op, ReduceOp, UOp};
 
 use crate::schedule::{
     InputBuffers, KernelInvocation, PreSchedule, PreScheduleItem, ScheduleItem, create_schedule, instantiate_schedule,
@@ -14,12 +14,66 @@ fn cpu_buffer(numel: usize) -> Buffer {
     Buffer::new(alloc, DType::Float32, vec![numel], Default::default())
 }
 
+#[test]
+fn slice_is_resolved_to_alias_handle_before_runtime_planning() {
+    let base_uop = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
+    let intermediate_uop = UOp::new_buffer(DeviceSpec::Cpu, 5, DType::Float32);
+    let output_uop = UOp::new_buffer(DeviceSpec::Cpu, 2, DType::Float32);
+    let first_slice = base_uop.contiguous_slice(5, 2, DType::Float32);
+    let first_call =
+        first_slice.call(smallvec::smallvec![intermediate_uop.clone(), base_uop.clone()], CallInfo::default());
+    let second_slice = intermediate_uop.contiguous_slice(2, 1, DType::Float32);
+    let second_call =
+        second_slice.call(smallvec::smallvec![output_uop.clone(), intermediate_uop.clone()], CallInfo::default());
+    let pre = PreSchedule {
+        items: vec![
+            PreScheduleItem {
+                kernel: first_call.clone(),
+                ast: first_slice,
+                sources: vec![intermediate_uop.clone(), base_uop.clone()],
+                dependencies: vec![],
+                bound_ranges: vec![],
+            },
+            PreScheduleItem {
+                kernel: second_call.clone(),
+                ast: second_slice,
+                sources: vec![output_uop.clone(), intermediate_uop.clone()],
+                dependencies: vec![first_call.id],
+                bound_ranges: vec![],
+            },
+        ],
+        invocations: vec![
+            KernelInvocation { kernel_id: first_call.id, fixedvars: HashMap::new() },
+            KernelInvocation { kernel_id: second_call.id, fixedvars: HashMap::new() },
+        ],
+        output_buffer_uops: vec![output_uop.clone()],
+    };
+    let base = cpu_buffer(8);
+    let storage = base.storage_id();
+    let result = instantiate_schedule(&pre, &HashMap::from([(base_uop.id, base)]), &HashMap::new(), false).unwrap();
+
+    assert!(result.items.is_empty(), "SLICE must not survive as an executable schedule item");
+    assert_eq!(result.output_uop_ids, vec![output_uop.id]);
+    assert!(!result.alias_output_buffers.contains_key(&intermediate_uop.id));
+    let output = &result.alias_output_buffers[&output_uop.id];
+    assert_eq!(output.storage_id(), storage);
+    assert_eq!(output.offset(), 3 * DType::Float32.bytes());
+    assert_eq!(output.size(), 2 * DType::Float32.bytes());
+}
+
 fn assert_ir_construction_error_contains(err: crate::Error, needle: &str) {
     match err {
         crate::Error::IrConstruction { details } => {
             assert!(details.contains(needle), "expected IrConstruction details to contain '{needle}', got '{details}'");
         }
         other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+fn expect_schedule_error(result: crate::Result<crate::schedule::ScheduleResult>) -> crate::Error {
+    match result {
+        Ok(_) => panic!("schedule unexpectedly succeeded"),
+        Err(err) => err,
     }
 }
 
@@ -84,6 +138,155 @@ fn test_create_schedule_mselect_uses_canonical_buffer_id() {
     assert_eq!(item.buffers.len(), 1);
     assert_eq!(item.buffers[0].id(), input.id());
     assert!(item.alias_registered_ids.contains(&mselect.id));
+}
+
+fn lane_buffers(count: usize) -> Vec<Arc<UOp>> {
+    (0..count).map(|_| UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32)).collect()
+}
+
+fn mstack_of(lanes: &[Arc<UOp>]) -> Arc<UOp> {
+    UOp::mstack(SmallVec::from_vec(lanes.to_vec()))
+}
+
+/// A CALL whose body computes `body` over `sources`.
+fn call_over(body: Arc<UOp>, sources: Vec<Arc<UOp>>) -> Arc<UOp> {
+    UOp::sink(vec![body]).call(SmallVec::from_vec(sources), CallInfo::default())
+}
+
+fn lane_inputs(lanes: &[&Arc<UOp>]) -> InputBuffers {
+    lanes.iter().map(|lane| (lane.id, cpu_buffer(1))).collect()
+}
+
+/// A DEVICE range over `extent` lanes — the axis that turns an expanded CALL
+/// into a per-device dispatch.
+fn device_axis(extent: Arc<UOp>) -> Arc<UOp> {
+    UOp::range_axis(extent, AxisId::Renumbered(0), AxisType::Device)
+}
+
+#[test]
+fn test_create_schedule_expands_mstack_sources_lane_wise() {
+    // Two MSTACK sources must stay aligned lane by lane, while a scalar BIND is
+    // shared by every lane instead of being split across them. Without a DEVICE
+    // axis in the body no lane gets a `_device_num` binding.
+    let (a, b) = (lane_buffers(2), lane_buffers(2));
+    let scalar = UOp::define_var("N".into(), 0, 8).bind(UOp::index_const(3));
+    let call = call_over(UOp::native_const(0.0f32), vec![mstack_of(&a), mstack_of(&b), scalar]);
+    let inputs = lane_inputs(&[&a[0], &a[1], &b[0], &b[1]]);
+
+    let result = create_schedule(UOp::sink(vec![call]), &inputs, &HashMap::new()).unwrap();
+
+    assert_eq!(result.items.len(), 2);
+    assert_eq!(result.items[0].buffer_uop_ids, vec![a[0].id, b[0].id]);
+    assert_eq!(result.items[1].buffer_uop_ids, vec![a[1].id, b[1].id]);
+    assert!(result.items.iter().all(|item| !item.fixedvars.contains_key("_device_num")));
+}
+
+#[test]
+fn test_create_schedule_binds_device_num_per_lane() {
+    let lanes = lane_buffers(2);
+    let call = call_over(device_axis(UOp::index_const(2)), vec![mstack_of(&lanes)]);
+
+    let result =
+        create_schedule(UOp::sink(vec![call]), &lane_inputs(&[&lanes[0], &lanes[1]]), &HashMap::new()).unwrap();
+
+    assert_eq!(result.items.len(), 2);
+    assert_eq!(result.items[0].fixedvars.get("_device_num"), Some(&0));
+    assert_eq!(result.items[1].fixedvars.get("_device_num"), Some(&1));
+    assert!(result.items.iter().all(|item| !item.loop_var_names.contains("_device_num")));
+}
+
+#[test]
+fn test_create_schedule_rejects_malformed_multi_device_calls() {
+    let (a, b) = (lane_buffers(2), lane_buffers(1));
+    let ordinary = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let zero = UOp::native_const(0.0f32);
+    let reject = |sources: Vec<Arc<UOp>>, body: Arc<UOp>| {
+        expect_schedule_error(create_schedule(
+            UOp::sink(vec![call_over(body, sources)]),
+            &InputBuffers::new(),
+            &HashMap::new(),
+        ))
+    };
+
+    let err = reject(vec![mstack_of(&a).mselect(2)], zero.clone());
+    assert!(matches!(err, crate::Error::MultiSelectOutOfBounds { device_index: 2, lane_count: 2, .. }), "{err:?}");
+
+    let err = reject(vec![UOp::mstack(SmallVec::new())], zero.clone());
+    assert!(matches!(err, crate::Error::MultiEmptyLanes { source_index: 0, .. }), "{err:?}");
+
+    let err = reject(vec![mstack_of(&a), mstack_of(&b)], zero.clone());
+    assert!(
+        matches!(err, crate::Error::MultiLaneCountMismatch { source_index: 1, expected: 2, actual: 1, .. }),
+        "{err:?}"
+    );
+
+    // A DEVICE extent must match the lane count and be statically known.
+    let err = reject(vec![mstack_of(&a)], device_axis(UOp::index_const(3)));
+    assert!(matches!(err, crate::Error::MultiDeviceExtentMismatch { expected: 2, actual: 3, .. }), "{err:?}");
+    let dynamic = device_axis(UOp::variable("device_count".into(), 1, 4, DType::Index));
+    assert!(matches!(reject(vec![mstack_of(&a)], dynamic), crate::Error::MultiDeviceExtentNotStatic { .. }));
+
+    // A DEVICE axis without MSTACK lanes, and MSTACK lanes mixed with a plain
+    // buffer, are both unexpanded forms.
+    let err = reject(vec![ordinary.clone()], device_axis(UOp::index_const(1)));
+    assert!(matches!(err, crate::Error::MultiUnsupportedForm { .. }), "{err:?}");
+    let err = reject(vec![mstack_of(&a), ordinary.clone()], zero.clone());
+    assert!(matches!(err, crate::Error::MultiUnsupportedForm { .. }), "{err:?}");
+
+    let sliced = mstack_of(&[a[0].contiguous_slice(1, 0, DType::Float32), a[1].clone()]);
+    let err = reject(vec![sliced], zero);
+    assert!(matches!(err, crate::Error::MultiLaneSliceAlias { source_index: 0, lane: 0, .. }), "{err:?}");
+}
+
+#[test]
+fn test_create_schedule_rejects_device_binding_conflict() {
+    let lanes = lane_buffers(2);
+    let call = call_over(UOp::variable("_device_num".into(), 0, 1, DType::Index), vec![mstack_of(&lanes)]);
+
+    let err = expect_schedule_error(create_schedule(
+        UOp::sink(vec![call]),
+        &lane_inputs(&[&lanes[0], &lanes[1]]),
+        &HashMap::from([("_device_num".into(), 0)]),
+    ));
+    assert!(matches!(
+        err,
+        crate::Error::MultiBindingConflict { ref name, existing: 0, incoming: 0, .. } if name == "_device_num"
+    ));
+}
+
+#[test]
+fn host_collective_schedule_item_depends_on_every_shard_producer() {
+    let output = UOp::new_buffer(DeviceSpec::Cpu, 2, DType::Float32);
+    let shard0 = UOp::new_buffer(DeviceSpec::Cpu, 2, DType::Float32);
+    let shard1 = UOp::new_buffer(DeviceSpec::Cpu, 2, DType::Float32);
+    let producer0 =
+        UOp::sink(vec![UOp::native_const(0.0f32)]).call(SmallVec::from_vec(vec![shard0.clone()]), CallInfo::default());
+    let producer1 =
+        UOp::sink(vec![UOp::native_const(0.0f32)]).call(SmallVec::from_vec(vec![shard1.clone()]), CallInfo::default());
+    let formals = SmallVec::from_vec(vec![
+        UOp::placeholder_like(&output, 0, svod_ir::AddrSpace::Global).unwrap(),
+        UOp::placeholder_like(&shard0, 1, svod_ir::AddrSpace::Global).unwrap(),
+        UOp::placeholder_like(&shard1, 2, svod_ir::AddrSpace::Global).unwrap(),
+    ]);
+    let collective = UOp::custom_function(svod_ir::CustomFunctionKind::AllReduce { reduce_op: ReduceOp::Add }, formals)
+        .call(
+            SmallVec::from_vec(vec![
+                output.clone(),
+                shard0.after(SmallVec::from_vec(vec![producer0.clone()])),
+                shard1.after(SmallVec::from_vec(vec![producer1.clone()])),
+            ]),
+            CallInfo::default(),
+        );
+    let transformed =
+        UOp::sink(vec![producer0.clone(), producer1.clone(), output.after(smallvec::smallvec![collective.clone()])]);
+    let inputs = HashMap::from([(output.id, cpu_buffer(2)), (shard0.id, cpu_buffer(2)), (shard1.id, cpu_buffer(2))]);
+
+    let schedule = create_schedule(transformed, &inputs, &HashMap::new()).unwrap();
+    let item = schedule.items.iter().find(|item| item.kernel.id == collective.id).unwrap();
+    let mut expected = vec![producer0.id, producer1.id];
+    expected.sort_unstable();
+    assert_eq!(item.dependencies, expected);
+    assert!(matches!(item.ast.op(), Op::CustomFunction { kind: svod_ir::CustomFunctionKind::AllReduce { .. }, .. }));
 }
 
 #[test]
@@ -302,10 +505,10 @@ fn test_create_schedule_opaque_body_intra_kernel_after_end_store() {
     let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
 
     // Intra-kernel REG accumulator with the canonical `reduce_to_acc` edges.
-    let acc = UOp::define_reg_typed(1, DType::Float32);
+    let acc = UOp::buffer(0, 1, DType::Float32, svod_ir::AddrSpace::Reg, None);
     let zero = UOp::index_const(0);
-    let idx = |buf: Arc<UOp>| UOp::index().buffer(buf).indices(vec![zero.clone()]).ptr(true).call().expect("index");
-    let load = |buf: Arc<UOp>| UOp::load().buffer(buf.clone()).index(idx(buf)).call();
+    let idx = |buf: Arc<UOp>| UOp::index().buffer(buf).indices(vec![zero.clone()]).call().expect("index");
+    let load = |buf: Arc<UOp>| UOp::load().index(idx(buf)).call();
 
     let init = idx(acc.clone()).store(UOp::native_const(0.0f32)); // bare STORE
     let range = UOp::range_const(4, 0);
@@ -318,7 +521,8 @@ fn test_create_schedule_opaque_body_intra_kernel_after_end_store() {
     let out_store = idx(buffer_uop.clone()).store(result);
 
     // Marked SINK → opaque CALL body.
-    let body = UOp::sink_with_info(vec![out_store], svod_ir::KernelInfo { opts_to_apply: Some(vec![]), name: None });
+    let body =
+        UOp::sink_with_info(vec![out_store], svod_ir::KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() });
     let call = body.call(SmallVec::from_vec(vec![buffer_uop.clone()]), CallInfo::default());
     let transformed = UOp::sink(vec![call.clone()]);
 
@@ -407,12 +611,8 @@ fn test_create_schedule_accepts_store_in_after_dependencies() {
     let producer =
         UOp::sink(vec![UOp::native_const(1.0f32)]).call(SmallVec::from_vec(vec![input.clone()]), CallInfo::default());
 
-    let store_idx = UOp::index()
-        .buffer(passthrough.clone())
-        .indices(vec![UOp::index_const(0)])
-        .ptr(true)
-        .call()
-        .expect("store index");
+    let store_idx =
+        UOp::index().buffer(passthrough.clone()).indices(vec![UOp::index_const(0)]).call().expect("store index");
     let side_store = store_idx.store(UOp::native_const(0.0f32));
 
     let after = passthrough.after(SmallVec::from_vec(vec![producer.clone(), side_store]));
@@ -525,6 +725,25 @@ fn test_create_schedule_nested_after_mstack_mselect_dependencies_consistent() {
 }
 
 #[test]
+fn test_create_schedule_adds_conservative_instance_dependencies_for_expanded_producer() {
+    let lanes = lane_buffers(2);
+    let producer = call_over(UOp::native_const(1.0f32), vec![mstack_of(&lanes)]);
+    let after_producer =
+        lanes.iter().map(|lane| lane.after(SmallVec::from_vec(vec![producer.clone()]))).collect::<Vec<_>>();
+    let consumer = call_over(UOp::native_const(2.0f32), vec![mstack_of(&after_producer)]);
+    let transformed = UOp::sink(vec![producer.clone(), consumer.clone()]);
+
+    let result = create_schedule(transformed, &lane_inputs(&[&lanes[0], &lanes[1]]), &HashMap::new()).unwrap();
+    assert_eq!(result.items.len(), 4);
+    assert!(result.items[..2].iter().all(|item| item.kernel.id == producer.id));
+    for item in &result.items[2..] {
+        assert_eq!(item.kernel.id, consumer.id);
+        assert_eq!(item.dependencies, vec![producer.id]);
+        assert_eq!(item.instance_dependencies, vec![0, 1]);
+    }
+}
+
+#[test]
 fn test_create_schedule_treats_unended_bound_range_as_runtime_bind() {
     // After the schedule-level Range/End refactor, schedule-level wrappers are
     // identified structurally: a Range is a loop only if it appears in an
@@ -573,7 +792,7 @@ fn test_create_schedule_rejects_non_concrete_outer_range_bounds() {
         Ok(_) => panic!("non-concrete OUTER RANGE bounds should fail"),
         Err(err) => err,
     };
-    assert_ir_construction_error_contains(err, "schedule range vmax must be concrete integer");
+    assert_ir_construction_error_contains(err, "schedule range vmin must be concrete integer");
 }
 
 #[test]

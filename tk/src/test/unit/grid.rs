@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use svod_dtype::DType;
 use svod_ir::uop::eval::{eval_binary_op, eval_ternary_op};
 use svod_ir::{ConstValue, Op, UOp};
 
@@ -87,7 +86,7 @@ fn test_l2_swizzle_is_bijection() {
     assert_bijection(10, 7);
 }
 
-/// The UOp `l2_swizzle` is built from pure `Index` arithmetic + `Where` selects
+/// The UOp `l2_swizzle` is built from pure integer arithmetic + `Where` selects
 /// (no control flow, no loads) — so it composes into the matmul's index math.
 #[test]
 fn test_l2_swizzle_is_pure_index_math() {
@@ -95,15 +94,17 @@ fn test_l2_swizzle_is_pure_index_math() {
     for u in m.toposort().into_iter().chain(n.toposort()) {
         assert!(
             matches!(u.op(), Op::Const(_) | Op::Binary(..) | Op::Ternary(..)),
-            "l2_swizzle node {:?} is not pure Index/Bool arithmetic",
+            "l2_swizzle node {:?} is not pure integer/Bool arithmetic",
             u.op()
         );
         let base = u.dtype().base();
         assert!(
-            matches!(base, svod_dtype::ScalarDType::Index | svod_dtype::ScalarDType::Bool),
-            "l2_swizzle node dtype {:?} is not Index/Bool",
+            matches!(
+                base,
+                svod_dtype::ScalarDType::WeakInt | svod_dtype::ScalarDType::Int32 | svod_dtype::ScalarDType::Bool
+            ),
+            "l2_swizzle node dtype {:?} is not WeakInt/Int32/Bool",
             u.dtype()
         );
     }
-    let _ = DType::Index;
 }

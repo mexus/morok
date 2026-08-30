@@ -19,8 +19,20 @@ fn sint_vmax(s: &SInt) -> usize {
         SInt::Const(v) => *v,
         SInt::Symbolic(uop) => match uop.op() {
             Op::DefineVar { max_val, .. } => *max_val as usize,
+            Op::Param { arg, .. } if arg.addrspace.is_none() => arg
+                .vmin_vmax
+                .as_ref()
+                .and_then(|(_, max)| max.0.try_int())
+                .and_then(|max| usize::try_from(max).ok())
+                .unwrap_or(1),
             Op::Bind { var, .. } => match var.op() {
                 Op::DefineVar { max_val, .. } => *max_val as usize,
+                Op::Param { arg, .. } if arg.addrspace.is_none() => arg
+                    .vmin_vmax
+                    .as_ref()
+                    .and_then(|(_, max)| max.0.try_int())
+                    .and_then(|max| usize::try_from(max).ok())
+                    .unwrap_or(1),
                 _ => 1,
             },
             _ => 1,
@@ -48,6 +60,7 @@ use error::*;
 
 pub mod activation;
 pub mod arithmetic;
+pub mod beam_worker;
 pub mod bitwise;
 pub mod broadcast;
 pub mod conditional;
@@ -77,6 +90,7 @@ pub mod variable;
 // Re-export for public API
 pub use config::PrepareConfig;
 pub use index::{Idx, IndexSpec};
+pub use memory_planner::PlannerMode;
 pub use svod_dtype::default_device::{clear_default_device, default_device, set_default_device, with_default_device};
 pub use svod_runtime::CpuBackend;
 pub use tensor_registry::apply_map_to_tensors;
@@ -133,7 +147,7 @@ pub struct KernelInfo {
 /// # Global Graph Substitution
 ///
 /// Tensors are registered in a global registry to support atomic graph substitution.
-/// When rangeify transforms a UOp (e.g., NEG → BUFFERIZE(NEG)), all tensors
+/// When rangeify transforms a UOp (e.g., NEG → STAGE(NEG)), all tensors
 /// referencing it are updated atomically via `apply_map_to_tensors()`.
 ///
 /// This is critical for diamond patterns (like argmin's NEG feeding both MAX and EQ)
@@ -165,6 +179,25 @@ pub struct Tensor {
 impl Clone for Tensor {
     fn clone(&self) -> Self {
         Self { entry: Arc::clone(&self.entry), buffer: self.buffer.clone() }
+    }
+}
+
+/// Symbolic ceiling division, mirroring tinygrad `helpers.py:63-66`.
+///
+/// The `(num + amt - 1) / amt` form is exact only for a non-negative numerator
+/// and a positive divisor; everywhere else `-(num / -amt)` is exact for either
+/// sign, because integer division floors.
+pub(crate) fn ceildiv_uop(num: &Arc<UOp>, amt: &Arc<UOp>) -> Arc<UOp> {
+    let nonneg =
+        |value: &ConstValue| matches!(value, ConstValue::Int(v) if *v >= 0) || matches!(value, ConstValue::UInt(_));
+    let positive = |value: &ConstValue| {
+        matches!(value, ConstValue::Int(v) if *v > 0) || matches!(value, ConstValue::UInt(v) if *v > 0)
+    };
+    if nonneg(num.vmin()) && positive(amt.vmin()) {
+        let one = UOp::const_(amt.dtype(), ConstValue::one(amt.dtype().base()));
+        num.add(&amt.sub(&one)).floor_div(amt)
+    } else {
+        num.floor_div(&amt.neg()).neg()
     }
 }
 
@@ -402,9 +435,7 @@ impl Tensor {
 
             Self::full(&[ceildiv as usize], *s, dtype.clone())?
         } else {
-            let diff = stop.sub(&start);
-            let one = UOp::const_(dtype.clone(), ConstValue::one(dtype.base()));
-            let ceildiv = diff.add(&step.sub(&one)).idiv(&step);
+            let ceildiv = ceildiv_uop(&stop.sub(&start), &step);
             let output_len_sint = SInt::from(ceildiv.clone());
             let ones: Shape = vec![SInt::Const(1)].into();
             let target: Shape = vec![output_len_sint].into();

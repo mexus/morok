@@ -1,4 +1,3 @@
-use crate::test::helpers::RealizeTestExt;
 use crate::*;
 use ndarray::array;
 use svod_dtype::DType;
@@ -123,6 +122,12 @@ crate::codegen_tests! {
         assert_eq!(result.as_vec::<f32>().unwrap(), [1.0, 3.0, 5.0]);
     }
 
+    fn test_masked_select_requires_bool(_config) {
+        let tensor = Tensor::from_slice([1i32, 2]);
+        let mask = Tensor::from_slice([1i32, 0]);
+        assert!(matches!(tensor.masked_select(&mask), Err(Error::TypeMismatch { expected, .. }) if expected == DType::Bool));
+    }
+
     // =========================================================================
     // NonZero Tests
     // =========================================================================
@@ -138,67 +143,17 @@ crate::codegen_tests! {
         assert_eq!(view[[2, 0]], 4); // index of 3
     }
 
-    fn test_nonzero_2d_debug_coords(config) {
-        // Test the coordinate building for nonzero on [2, 2]
-        // coord0: arange(2) → [0, 1], reshape [2, 1], expand [2, 2], flatten → [0, 0, 1, 1]
-        let mut coord0 = Tensor::arange(0, Some(2), None)
-            .unwrap()
-            .try_reshape([2, 1])
-            .unwrap()
-            .try_expand([2, 2])
-            .unwrap()
-            .flatten()
-            .unwrap();
-        let c0 = coord0.realize_with_and(&config).as_vec::<i32>().unwrap();
-        eprintln!("coord0 len: {}, vals: {:?}", c0.len(), c0);
-
-        // coord1: arange(2) → [0, 1], reshape [1, 2], expand [2, 2], flatten → [0, 1, 0, 1]
-        let mut coord1 = Tensor::arange(0, Some(2), None)
-            .unwrap()
-            .try_reshape([1, 2])
-            .unwrap()
-            .try_expand([2, 2])
-            .unwrap()
-            .flatten()
-            .unwrap();
-        let c1 = coord1.realize_with_and(&config).as_vec::<i32>().unwrap();
-        eprintln!("coord1 len: {}, vals: {:?}", c1.len(), c1);
-
-        assert_eq!(c0, [0, 0, 1, 1]);
-        assert_eq!(c1, [0, 1, 0, 1]);
-    }
-
-    fn test_nonzero_2d_debug_stack(config) {
-        // Test stack with lazy coordinate tensors
-        let coord0 = Tensor::arange(0, Some(2), None)
-            .unwrap()
-            .try_reshape([2, 1])
-            .unwrap()
-            .try_expand([2, 2])
-            .unwrap()
-            .flatten()
-            .unwrap(); // [0, 0, 1, 1]
-
-        let coord1 = Tensor::arange(0, Some(2), None)
-            .unwrap()
-            .try_reshape([1, 2])
-            .unwrap()
-            .try_expand([2, 2])
-            .unwrap()
-            .flatten()
-            .unwrap(); // [0, 1, 0, 1]
-
-        let stacked = Tensor::stack(&[&coord0, &coord1], -1).unwrap();
-        eprintln!("stacked uop tree:\n{}", stacked.uop().tree());
-        let mut stacked = stacked;
-        stacked.realize_with(&config).unwrap();
-        let stacked_vec = stacked.as_vec::<i32>().unwrap();
-        let stacked_shape = get_shape(&stacked);
-        eprintln!("stacked shape: {:?}", stacked_shape);
-        eprintln!("stacked values: {:?}", stacked_vec);
-        assert_eq!(stacked_shape, [4, 2]);
-        // Expected: [[0, 0], [0, 1], [1, 0], [1, 1]]
-        assert_eq!(stacked_vec, [0, 0, 0, 1, 1, 0, 1, 1]);
+    fn test_nonzero_scalar_and_empty(config) {
+        for (tensor, expected_shape) in [
+            (Tensor::const_(1i32, DType::Int32), vec![1, 0]),
+            (Tensor::const_(0i32, DType::Int32), vec![0, 0]),
+            (Tensor::empty_zero(DType::Int32), vec![0, 1]),
+        ] {
+            let mut result = tensor.nonzero().unwrap().contiguous();
+            result.realize_with(&config).unwrap();
+            assert_eq!(get_shape(&result), expected_shape);
+            assert!(result.as_vec::<i32>().unwrap().is_empty());
+        }
     }
 
     fn test_nonzero_2d(config) {
@@ -208,14 +163,33 @@ crate::codegen_tests! {
         result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![3, 2]);
         let view = result.array_view::<i32>().unwrap();
-        eprintln!("nonzero shape: {:?}", view.shape());
-        eprintln!("nonzero values: {:?}", view.as_slice().unwrap());
         assert_eq!(view[[0, 0]], 0);
         assert_eq!(view[[0, 1]], 0);
         assert_eq!(view[[1, 0]], 1);
         assert_eq!(view[[1, 1]], 0);
         assert_eq!(view[[2, 0]], 1);
         assert_eq!(view[[2, 1]], 1);
+    }
+
+    fn test_nonzero_interior_singleton(config) {
+        // Every interior axis needs the modulo, singleton dims included: without it
+        // a `[2, 1, 3]` tensor reports `[1, 1, 0]` for the element at `(1, 0, 0)`.
+        for dims in [vec![2usize, 1, 3], vec![1, 3], vec![3, 1, 1]] {
+            let numel: usize = dims.iter().product();
+            let shape = dims.iter().map(|&d| d as isize).collect::<Vec<_>>();
+            let t = Tensor::from_slice(vec![1i32; numel]).try_reshape(shape).unwrap();
+            let mut result = t.nonzero().unwrap().contiguous();
+            result.realize_with(&config).unwrap();
+            assert_eq!(get_shape(&result), vec![numel, dims.len()]);
+            let mut expected = Vec::new();
+            for flat in 0..numel {
+                for axis in 0..dims.len() {
+                    let stride: usize = dims[axis + 1..].iter().product();
+                    expected.push((flat / stride % dims[axis]) as i32);
+                }
+            }
+            assert_eq!(result.as_vec::<i32>().unwrap(), expected, "dims {dims:?}");
+        }
     }
 
     // =========================================================================

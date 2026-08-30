@@ -1,6 +1,6 @@
 use svod_dtype::DType;
 
-use crate::{Op, SInt, UOp, sint_max, sint_min, sint_prod};
+use crate::{SInt, UOp, sint_max, sint_min, sint_prod};
 
 #[test]
 fn test_sint_const() {
@@ -64,8 +64,8 @@ fn test_sint_min_concrete() {
 #[test]
 fn test_sint_to_uop() {
     let s = SInt::from(42);
-    let uop = s.to_uop(DType::Index);
-    assert_eq!(uop.dtype(), DType::Index);
+    let uop = s.arithmetic_uop();
+    assert_eq!(uop.dtype(), DType::WeakInt);
 }
 
 #[test]
@@ -121,7 +121,7 @@ fn test_sint_smax_concrete() {
 
 #[test]
 fn test_sint_smax_absorbs_nested_max() {
-    let n_uop = UOp::new(Op::DefineVar { name: "N".to_string(), min_val: 1, max_val: 100 }, DType::Index);
+    let n_uop = UOp::define_var("N".to_string(), 1, 100);
     let n = SInt::from(n_uop);
     let n_plus_1 = &n + 1usize;
 
@@ -141,7 +141,7 @@ fn test_sint_smin_concrete() {
 
 #[test]
 fn test_sint_arithmetic_symbolic() {
-    let var = UOp::new(Op::DefineVar { name: "N".to_string(), min_val: 1, max_val: 100 }, DType::Index);
+    let var = UOp::define_var("N".to_string(), 1, 100);
     let sym = SInt::from(var);
 
     // Symbolic + Const → Symbolic
@@ -200,7 +200,7 @@ fn test_sint_smin_infer_panics() {
 fn test_sint_display() {
     assert_eq!(format!("{}", SInt::from(42)), "42");
     assert_eq!(format!("{}", SInt::Infer), "-1");
-    let var = UOp::new(Op::DefineVar { name: "N".to_string(), min_val: 1, max_val: 100 }, DType::Index);
+    let var = UOp::define_var("N".to_string(), 1, 100);
     assert_eq!(format!("{}", SInt::from(var)), "<symbolic>");
 }
 

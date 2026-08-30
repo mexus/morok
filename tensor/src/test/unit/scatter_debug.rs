@@ -4,7 +4,7 @@ use crate::*;
 /// must preserve original data. Reproduces the ONNX test_scatternd inputs.
 ///
 /// Root cause was a rewrite engine bug where `handle_link` resolved stale
-/// results before pattern chains completed (PtrCat not eliminated).
+/// results before index and stack rewrites completed.
 #[test]
 fn test_scatternd_debug() {
     let cfg = PrepareConfig::from(svod_schedule::OptimizerConfig::default());

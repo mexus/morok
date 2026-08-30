@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use svod_ir::{BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp};
+use test_case::test_case;
 
 use crate::rangeify::indexing::{get_const_value, is_const, is_identity_value, is_zero_value};
 
@@ -70,12 +71,12 @@ pub fn extract_kernel(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 /// Count codegen PARAM operations (device: None) in a UOp graph.
 pub fn count_codegen_params(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Param { device: None, .. }))
+    count_ops(uop, |op| matches!(op, Op::Param { arg, .. } if arg.device.is_none()))
 }
 
 /// Count DEFINE_LOCAL operations in a UOp graph.
 pub fn count_define_locals(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::DefineLocal(_)))
+    count_ops(uop, |op| matches!(op, Op::Buffer { arg, .. } if arg.addrspace == Some(svod_dtype::AddrSpace::Local)))
 }
 
 /// Count STORE operations in a UOp graph.
@@ -88,9 +89,9 @@ pub fn count_ends(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |op| matches!(op, Op::End { .. }))
 }
 
-/// Count BUFFERIZE operations in a UOp graph.
+/// Count STAGE operations in a UOp graph.
 pub fn count_bufferizes(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Bufferize { .. }))
+    count_ops(uop, |op| matches!(op, Op::Stage { .. }))
 }
 
 // ============================================================================
@@ -112,71 +113,54 @@ pub fn create_range_symbolic(end: Arc<UOp>, axis_id: usize) -> Arc<UOp> {
     UOp::range(end, axis_id)
 }
 
-/// Create a BUFFERIZE operation with global address space.
+/// Create a STAGE operation with global address space.
 pub fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
-    UOp::bufferize_global(compute, ranges)
+    UOp::stage_global(compute, ranges)
 }
 
-/// Create a BUFFERIZE operation with custom options.
+/// Create a STAGE operation with custom options.
 pub fn create_bufferize_opts(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>, opts: BufferizeOpts) -> Arc<UOp> {
-    UOp::bufferize(compute, ranges, opts)
+    UOp::stage(compute, ranges, opts)
 }
 
 // ============================================================================
-// Helper Function Tests
+// Tests for the indexing helpers these builders feed
 // ============================================================================
 
-#[test]
-fn test_is_identity_value() {
-    // Add identity
-    assert!(is_identity_value(&ConstValue::Int(0), &BinaryOp::Add, false));
-    assert!(is_identity_value(&ConstValue::Int(0), &BinaryOp::Add, true));
-    assert!(is_identity_value(&ConstValue::Float(0.0), &BinaryOp::Add, false));
+/// `is_identity_value` is per-operator and side-aware: `-` and `//` have a right
+/// identity only.
+#[test_case(ConstValue::Int(0), BinaryOp::Add, false, true ; "zero is a left add identity")]
+#[test_case(ConstValue::Int(0), BinaryOp::Add, true, true ; "zero is a right add identity")]
+#[test_case(ConstValue::Float(0.0), BinaryOp::Add, false, true ; "float zero is an add identity")]
+#[test_case(ConstValue::Int(1), BinaryOp::Mul, false, true ; "one is a left mul identity")]
+#[test_case(ConstValue::Int(1), BinaryOp::Mul, true, true ; "one is a right mul identity")]
+#[test_case(ConstValue::Float(1.0), BinaryOp::Mul, false, true ; "float one is a mul identity")]
+#[test_case(ConstValue::Int(0), BinaryOp::Sub, false, false ; "sub has no left identity")]
+#[test_case(ConstValue::Int(0), BinaryOp::Sub, true, true ; "sub has a right identity")]
+#[test_case(ConstValue::Int(1), BinaryOp::FloorDiv, false, false ; "div has no left identity")]
+#[test_case(ConstValue::Int(1), BinaryOp::FloorDiv, true, true ; "div has a right identity")]
+#[test_case(ConstValue::Int(2), BinaryOp::Add, false, false ; "two is not an add identity")]
+#[test_case(ConstValue::Int(0), BinaryOp::Mul, false, false ; "zero is not a mul identity")]
+fn identity_values(value: ConstValue, op: BinaryOp, right: bool, expected: bool) {
+    assert_eq!(is_identity_value(&value, &op, right), expected);
+}
 
-    // Mul identity
-    assert!(is_identity_value(&ConstValue::Int(1), &BinaryOp::Mul, false));
-    assert!(is_identity_value(&ConstValue::Int(1), &BinaryOp::Mul, true));
-    assert!(is_identity_value(&ConstValue::Float(1.0), &BinaryOp::Mul, false));
-
-    // Sub only has right identity
-    assert!(!is_identity_value(&ConstValue::Int(0), &BinaryOp::Sub, false));
-    assert!(is_identity_value(&ConstValue::Int(0), &BinaryOp::Sub, true));
-
-    // Idiv only has right identity
-    assert!(!is_identity_value(&ConstValue::Int(1), &BinaryOp::Idiv, false));
-    assert!(is_identity_value(&ConstValue::Int(1), &BinaryOp::Idiv, true));
-
-    // Non-identity values
-    assert!(!is_identity_value(&ConstValue::Int(2), &BinaryOp::Add, false));
-    assert!(!is_identity_value(&ConstValue::Int(0), &BinaryOp::Mul, false));
+/// `is_zero_value` is the absorbing element, not the literal zero.
+#[test_case(ConstValue::Int(0), BinaryOp::Mul, true ; "zero absorbs mul")]
+#[test_case(ConstValue::Float(0.0), BinaryOp::Mul, true ; "float zero absorbs mul")]
+#[test_case(ConstValue::Int(0), BinaryOp::And, true ; "zero absorbs and")]
+#[test_case(ConstValue::Int(1), BinaryOp::Mul, false ; "one does not absorb mul")]
+#[test_case(ConstValue::Int(0), BinaryOp::Add, false ; "zero does not absorb add")]
+fn zero_values(value: ConstValue, op: BinaryOp, expected: bool) {
+    assert_eq!(is_zero_value(&value, &op), expected);
 }
 
 #[test]
-fn test_is_zero_value() {
-    // Mul zero
-    assert!(is_zero_value(&ConstValue::Int(0), &BinaryOp::Mul));
-    assert!(is_zero_value(&ConstValue::Float(0.0), &BinaryOp::Mul));
-
-    // And zero
-    assert!(is_zero_value(&ConstValue::Int(0), &BinaryOp::And));
-
-    // Non-zero values
-    assert!(!is_zero_value(&ConstValue::Int(1), &BinaryOp::Mul));
-    assert!(!is_zero_value(&ConstValue::Int(0), &BinaryOp::Add));
-}
-
-#[test]
-fn test_get_const_value() {
+fn only_constants_have_a_const_value() {
     let c = UOp::native_const(42i32);
     assert_eq!(get_const_value(&c), Some(ConstValue::Int(42)));
-
-    let x = UOp::param(0, 1, DType::Float32, None);
-    assert_eq!(get_const_value(&x), None);
-}
-
-#[test]
-fn test_is_const() {
-    let c = UOp::native_const(42i32);
     assert!(is_const(&c, &ConstValue::Int(42)));
     assert!(!is_const(&c, &ConstValue::Int(0)));
+
+    assert_eq!(get_const_value(&UOp::param(0, 1, DType::Float32, None)), None);
 }

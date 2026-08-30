@@ -307,18 +307,12 @@ impl<'k> Group<'k> {
         imod(&self.warpid_in_group(), self.cols_waves as i64)
     }
 
-    /// Anchor a constant-address unrolled **read** to the enclosing rolled
-    /// (tracked) loops, so loop-invariant code motion cannot hoist a read of a
-    /// loop-*carried* register out of the loop. The looped primitives dodge this
-    /// incidentally (their loop-variable index makes the read non-hoistable); the
-    /// unrolled bodies use constant indices, so a read of a carried accumulator
-    /// (`max_vec`, `o_reg`, …) would otherwise be lifted to the entry block and
-    /// see the *initial* value every iteration. A no-op when looped or when there
-    /// is no enclosing tracked loop. (Over-anchors genuinely loop-invariant
-    /// read-only tiles — harmless: a redundant ordering edge.)
+    /// Anchor a tile read to every enclosing tracked loop. This mirrors
+    /// tinygrad TK's `tile.after(*ker.range_stack)`: an inner helper range does
+    /// not by itself keep a loop-carried REG load inside the outer loop.
     pub(crate) fn anchor(&self, buf: &Arc<UOp>) -> Arc<UOp> {
         let tracked = self.ker.tracked_ranges();
-        if self.ker.unrolled() && !tracked.is_empty() { buf.after(tracked) } else { buf.clone() }
+        if tracked.is_empty() { buf.clone() } else { buf.after(tracked) }
     }
 
     /// Build a per-element register op body — one bare `STORE` per logical

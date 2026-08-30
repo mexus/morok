@@ -59,22 +59,17 @@ enum TraversalMode {
     PreserveCalls,
 }
 
-fn traversal_sources(node: &Arc<UOp>, mode: TraversalMode) -> SmallVec<[Arc<UOp>; 4]> {
+/// Borrowed children — `Op::sources()` would clone every `Arc` just to read it.
+fn traversal_sources<'a>(node: &'a Arc<UOp>, mode: TraversalMode) -> SmallVec<[&'a Arc<UOp>; 4]> {
     if mode == TraversalMode::Full {
-        return node.op().sources();
+        return node.op().children();
     }
 
     match node.op() {
-        Op::Call { args, .. } | Op::Function { args, .. } => args.clone(),
-        // Program holds compiled artifacts (linear/source/binary) wrapped as
-        // UOps; traversing through them during rewrite passes is expensive
-        // and unnecessary — only the device producer is traversed.
-        Op::Program { device, .. } => {
-            let mut children = SmallVec::new();
-            children.push(device.clone());
-            children
-        }
-        _ => node.op().sources(),
+        Op::Call { args, .. } | Op::Function { args, .. } => args.iter().collect(),
+        // PROGRAM is opaque when preserving call bodies.
+        Op::Program { .. } => SmallVec::new(),
+        _ => node.op().children(),
     }
 }
 
@@ -157,11 +152,30 @@ pub struct UOp {
     /// O(1) membership test via `backward_slice_ids().contains(&target.id)`.
     #[debug(skip)]
     pub(crate) backward_slice_cache: std::sync::OnceLock<HashSet<u64>>,
+    /// Whether this node or any node in its backward slice has a weak-float dtype.
+    /// Cached O(1) lookup used by the value-sensitive symbolic guard.
+    #[debug(skip)]
+    pub(crate) has_weak_float_cache: std::sync::OnceLock<bool>,
+    /// Cached device specification carried by this node's backward slice.
+    /// Without the memo the recursive walk is exponential on shared (diamond) DAGs.
+    #[debug(skip)]
+    pub(crate) device_spec_cache: std::sync::OnceLock<Option<svod_dtype::DeviceSpec>>,
+    /// Cached storage address space carried by this value. Same exponential-blowup
+    /// reason as `device_spec_cache`.
+    #[debug(skip)]
+    pub(crate) addrspace_cache: std::sync::OnceLock<Option<svod_dtype::AddrSpace>>,
     /// Structural content hash — deterministic regardless of allocation order.
     /// Computed at creation time: hash(op_discriminant, dtype, op_data, children_content_hashes).
     /// O(1) per node since children are already created with their content_hash set.
     /// Used for schedule-level caching where UOp IDs are not stable across runs.
     pub content_hash: u64,
+    /// Set of op kinds among this node's direct children, computed at creation time.
+    ///
+    /// Drives the pattern matcher's early reject: a compiled pattern whose fixed-position
+    /// sources demand an op kind absent here cannot match, so its closure is skipped.
+    /// Tinygrad equivalent: `UOp._src_ops` (uop/ops.py:1480), memoised there instead.
+    #[debug(skip)]
+    pub(crate) src_ops: crate::op::OpMask,
     /// Tag for tracking tensor identity through the rangeify pipeline.
     ///
     /// Tags are sequences of integer indices that track which original tensor
@@ -205,6 +219,11 @@ impl UOp {
         &self.op
     }
 
+    /// Set of op kinds among the direct children (Tinygrad: `UOp._src_ops`).
+    pub fn src_ops(&self) -> crate::op::OpMask {
+        self.src_ops
+    }
+
     /// Get the data type.
     pub fn dtype(&self) -> DType {
         self.dtype.clone()
@@ -235,7 +254,7 @@ impl UOp {
     pub fn has_buffer_identity(&self) -> bool {
         match &self.op {
             Op::Reshape { src, .. } | Op::Multi { src, .. } => src.has_buffer_identity(),
-            Op::Buffer { .. } | Op::BufferView { .. } | Op::Param { .. } => true,
+            Op::Buffer { .. } | Op::Slice { .. } | Op::Param { .. } => true,
             Op::GetTuple { src, index } => match src.op() {
                 Op::Tuple { src: elements } => elements.get(*index).is_some_and(|t| t.has_buffer_identity()),
                 _ => false,
@@ -244,9 +263,9 @@ impl UOp {
         }
     }
 
-    /// Get pointer dtype components if this UOp has a Ptr dtype.
+    /// Get address dtype components from a Ptr dtype or PARAM metadata.
     ///
-    /// Returns `(base, addrspace, size)` for Ptr types, None otherwise.
+    /// Returns `(base, addrspace, size)` for address-bearing values, None otherwise.
     /// This simplifies pattern matching on pointer types.
     ///
     /// # Examples
@@ -261,8 +280,55 @@ impl UOp {
     /// }
     /// ```
     pub fn ptrdtype(&self) -> Option<(&DType, svod_dtype::AddrSpace, Option<usize>)> {
-        match &self.dtype {
-            DType::Ptr { base, addrspace, size, .. } => Some((base.as_ref(), *addrspace, *size)),
+        match (&self.dtype, self.op()) {
+            (DType::Ptr { base, addrspace, size, .. }, _) => Some((base.as_ref(), *addrspace, *size)),
+            (_, Op::Param { arg, .. } | Op::Buffer { arg, .. }) => {
+                Some((&arg.dtype, arg.addrspace.unwrap_or(svod_dtype::AddrSpace::Global), None))
+            }
+            _ => None,
+        }
+    }
+
+    /// Storage address space carried by this value.
+    ///
+    /// This is the structured-storage equivalent of Tinygrad's `UOp.addrspace`:
+    /// PARAM/BUFFER read it from `ParamArg`, exact address-preserving wrappers
+    /// project source zero, and elementwise/shaped containers preserve only a
+    /// common non-ALU address space. `None` covers ALU values and operations
+    /// without address semantics.
+    pub fn addrspace(self: &Arc<Self>) -> Option<svod_dtype::AddrSpace> {
+        use crate::uop::cached_property::CachedProperty;
+        *crate::uop::properties::AddrSpaceProperty::get(self)
+    }
+
+    pub(crate) fn compute_addrspace(self: &Arc<Self>) -> Option<svod_dtype::AddrSpace> {
+        use Op::*;
+
+        let common = |sources: SmallVec<[Arc<UOp>; 4]>| {
+            let mut address_spaces = sources.iter().filter_map(|source| source.addrspace());
+            let first = address_spaces.next()?;
+            address_spaces.all(|address_space| address_space == first).then_some(first)
+        };
+
+        match self.op() {
+            Param { arg, .. } | Buffer { arg, .. } => arg.addrspace,
+            Index { buffer, .. } | MSelect { buffer, .. } => buffer.addrspace(),
+            Cast { src, .. }
+            | After { passthrough: src, .. }
+            | Reduce { src, .. }
+            | End { computation: src, .. }
+            | Reshape { src, .. }
+            | Permute { src, .. }
+            | Expand { src, .. }
+            | Pad { src, .. }
+            | Shrink { src, .. }
+            | Flip { src, .. }
+            | Multi { src, .. } => src.addrspace(),
+            Store { index, .. } => index.addrspace(),
+            MStack { buffers } => buffers.first().and_then(|buffer| buffer.addrspace()),
+            Unary(..) | Binary(..) | Ternary(..) | BitCast { .. } | Stack { .. } | Wmma { .. } | Group { .. } => {
+                common(self.op().sources())
+            }
             _ => None,
         }
     }
@@ -338,16 +404,6 @@ impl UOp {
                 Op::Index { buffer, .. } => Some(buffer),
                 _ => None,
             },
-            _ => None,
-        }
-    }
-
-    /// Get the buffer from a LOAD operation.
-    ///
-    /// Returns `None` if this is not a LOAD operation.
-    pub fn load_buffer(&self) -> Option<Arc<UOp>> {
-        match self.op() {
-            Op::Load { buffer, .. } => Some(buffer.clone()),
             _ => None,
         }
     }
@@ -435,10 +491,7 @@ impl UOp {
 
     /// Extract device specification from this UOp graph.
     ///
-    /// Traverses the graph to find Op::Device nodes:
-    /// - DEVICE: returns the DeviceSpec directly
-    /// - BUFFER: returns device from the device child
-    /// - COPY: returns device from the device child (target device)
+    /// Traverses the graph to find storage or transfer device metadata.
     /// - Otherwise: searches children recursively
     ///
     /// # Examples
@@ -449,41 +502,26 @@ impl UOp {
     /// let buffer = UOp::new_buffer(DeviceSpec::Cpu, 10, DType::Float32);
     /// assert_eq!(buffer.device_spec(), Some(DeviceSpec::Cpu));
     /// ```
-    pub fn device_spec(&self) -> Option<svod_dtype::DeviceSpec> {
+    pub fn device_spec(self: &Arc<Self>) -> Option<svod_dtype::DeviceSpec> {
+        use crate::uop::cached_property::CachedProperty;
+        crate::uop::properties::DeviceSpecProperty::get(self).clone()
+    }
+
+    pub(crate) fn compute_device_spec(self: &Arc<Self>) -> Option<svod_dtype::DeviceSpec> {
         match self.op() {
-            Op::Device(spec) => Some(spec.clone()),
-            Op::Buffer { device, .. } => {
-                if let Op::Device(spec) = device.op() {
-                    Some(spec.clone())
-                } else {
-                    None
-                }
-            }
-            Op::Param { device: Some(device), .. } => {
-                if let Op::Device(spec) = device.op() {
-                    Some(spec.clone())
-                } else {
-                    None
-                }
-            }
-            Op::Param { device: None, .. } => None,
-            Op::Copy { device, .. } => {
-                if let Op::Device(spec) = device.op() {
-                    Some(spec.clone())
-                } else {
-                    None
-                }
-            }
-            _ => {
-                // Search children for device
-                for child in self.op().children() {
-                    if let Some(spec) = child.device_spec() {
-                        return Some(spec);
-                    }
-                }
-                None
-            }
+            Op::Buffer { arg, .. } | Op::Param { arg, .. } => arg.device.clone(),
+            Op::Copy { device, .. } | Op::AllReduce { device, .. } => Some(device.clone()),
+            // Children are memoised, so this is a single level, not a re-walk.
+            _ => self.op().children().iter().find_map(|child| child.device_spec()),
         }
+    }
+
+    /// Concrete element count encoded by a PARAM/BUFFER's single shape source.
+    pub fn buffer_size(self: &Arc<Self>) -> Option<usize> {
+        self.shape().ok().flatten()?.iter().try_fold(1usize, |size, dim| match dim {
+            crate::SInt::Const(value) => size.checked_mul(*value),
+            crate::SInt::Symbolic(_) | crate::SInt::Infer => None,
+        })
     }
 
     /// Get the base UOp by walking through movement operations.
@@ -555,7 +593,7 @@ impl UOp {
     ///
     /// Returns nodes in an order where all dependencies come before their dependents.
     pub fn toposort(self: &Arc<Self>) -> Vec<Arc<Self>> {
-        let mut visited = HashSet::new();
+        let mut visited = visited_set(FULL_GRAPH_HINT);
         let mut result = Vec::new();
         let mut stack = vec![(self.clone(), false)];
 
@@ -618,7 +656,7 @@ impl UOp {
     where
         F: Fn(&Arc<UOp>) -> bool,
     {
-        let mut visited = HashSet::new();
+        let mut visited = visited_set(LOCAL_HINT);
         let mut result = Vec::new();
         let mut stack = vec![(self.clone(), false)];
 
@@ -664,7 +702,7 @@ impl UOp {
     pub fn toposort_call_aware(self: &Arc<Self>, include_call_bodies: bool) -> Vec<Arc<Self>> {
         let mode = if include_call_bodies { TraversalMode::Full } else { TraversalMode::PreserveCalls };
 
-        let mut visited = HashSet::new();
+        let mut visited = visited_set(FULL_GRAPH_HINT);
         let mut result = Vec::new();
         let mut stack = vec![(self.clone(), false)];
 
@@ -680,14 +718,10 @@ impl UOp {
                 result.push(node);
             } else {
                 stack.push((node.clone(), true));
-                let mut children = Vec::new();
-                for child in traversal_sources(&node, mode) {
-                    if !visited.contains(&Arc::as_ptr(&child)) {
-                        children.push(child);
+                for child in traversal_sources(&node, mode).into_iter().rev() {
+                    if !visited.contains(&Arc::as_ptr(child)) {
+                        stack.push((child.clone(), false));
                     }
-                }
-                for child in children.into_iter().rev() {
-                    stack.push((child, false));
                 }
             }
         }
@@ -702,7 +736,7 @@ impl UOp {
     {
         let mode = if include_call_bodies { TraversalMode::Full } else { TraversalMode::PreserveCalls };
 
-        let mut visited = HashSet::new();
+        let mut visited = visited_set(LOCAL_HINT);
         let mut result = Vec::new();
         let mut stack = vec![(self.clone(), false)];
 
@@ -718,14 +752,10 @@ impl UOp {
                 result.push(node);
             } else if gate(&node) {
                 stack.push((node.clone(), true));
-                let mut children = Vec::new();
-                for child in traversal_sources(&node, mode) {
-                    if !visited.contains(&Arc::as_ptr(&child)) {
-                        children.push(child);
+                for child in traversal_sources(&node, mode).into_iter().rev() {
+                    if !visited.contains(&Arc::as_ptr(child)) {
+                        stack.push((child.clone(), false));
                     }
-                }
-                for child in children.into_iter().rev() {
-                    stack.push((child, false));
                 }
             }
         }
@@ -742,7 +772,7 @@ impl UOp {
     where
         F: Fn(&Arc<UOp>) -> bool,
     {
-        let mut visited = HashSet::new();
+        let mut visited = visited_set(FULL_GRAPH_HINT);
         let mut stack = vec![self.clone()];
         while let Some(node) = stack.pop() {
             if !visited.insert(Arc::as_ptr(&node)) {
@@ -768,7 +798,7 @@ impl UOp {
     where
         F: Fn(&Arc<UOp>) -> bool,
     {
-        let mut visited = HashSet::new();
+        let mut visited = visited_set(FULL_GRAPH_HINT);
         let mut stack = vec![self.clone()];
         let mut result = Vec::new();
         while let Some(node) = stack.pop() {
@@ -792,7 +822,7 @@ impl UOp {
     /// Much cheaper than `toposort().len()` — no result Vec, no ordering.
     /// Uses pointer-based visited set for O(1) identity checks.
     pub fn node_count(self: &Arc<Self>) -> usize {
-        let mut visited = HashSet::new();
+        let mut visited = visited_set(FULL_GRAPH_HINT);
         let mut stack = vec![self.clone()];
         while let Some(node) = stack.pop() {
             if !visited.insert(Arc::as_ptr(&node)) {
@@ -994,11 +1024,21 @@ impl UOp {
         crate::rewrite::graph_rewrite_walk(&matcher, self.clone(), &mut ())
     }
 
+    /// Single-pass substitution that also preserves opaque callable bodies.
+    #[allow(clippy::mutable_key_type)]
+    pub fn substitute_walk_preserve_calls(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
+        if map.is_empty() {
+            return self.clone();
+        }
+        let matcher = SubstituteMatcher(map);
+        crate::rewrite::graph_rewrite_walk_preserve_calls(&matcher, self.clone(), &mut ())
+    }
+
     /// Replace UOps while preserving CALL/FUNCTION/PROGRAM body boundaries.
     ///
     /// Direct substitutions still apply to CALL/FUNCTION/PROGRAM nodes themselves.
     /// Traversal skips CALL/FUNCTION bodies and PROGRAM internals by default,
-    /// while still rewriting CALL/FUNCTION arguments and PROGRAM device.
+    /// while still rewriting CALL/FUNCTION arguments.
     #[allow(clippy::mutable_key_type)]
     pub fn substitute_preserve_calls(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
@@ -1066,13 +1106,9 @@ impl UOp {
             Op::Const(_)
             | Op::Unique(_)
             | Op::LUnique(_)
-            | Op::Device(_)
             | Op::Noop
-            | Op::Invalid
-            | Op::DefineLocal(_)
             | Op::VConst { .. }
             | Op::DefineVar { .. }
-            | Op::DefineReg { .. }
             | Op::Source { .. }
             | Op::ProgramBinary { .. } => {
                 assert_eq!(new_srcs.len(), 0, "Nullary op should have no sources");
@@ -1106,6 +1142,10 @@ impl UOp {
                 assert_eq!(new_srcs.len(), 1);
                 Op::BitCast { src: src(0), dtype: dtype.clone() }
             }
+            Op::GetAddr { device, .. } => {
+                assert_eq!(new_srcs.len(), 1);
+                Op::GetAddr { src: src(0), device: device.clone() }
+            }
 
             // Special operations
             Op::MSelect { device_index, .. } => {
@@ -1118,48 +1158,31 @@ impl UOp {
             }
 
             // Buffer operations
-            Op::Buffer { size, .. } => {
-                assert_eq!(new_srcs.len(), 2);
-                Op::Buffer { unique: src(0), device: src(1), size: *size }
-            }
-            Op::Param { slot, size, device } => {
-                if device.is_some() {
-                    assert_eq!(new_srcs.len(), 1);
-                    Op::Param { slot: *slot, size: *size, device: Some(src(0)) }
-                } else {
-                    assert_eq!(new_srcs.len(), 0);
-                    return self.clone();
-                }
-            }
-            Op::BufferView { size, offset, .. } => {
+            Op::Buffer { arg, .. } => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::BufferView { buffer: src(0), size: *size, offset: *offset }
+                Op::Buffer { shape: src(0), arg: arg.clone() }
             }
-            Op::Bufferize { opts, .. } => {
-                assert!(!new_srcs.is_empty());
-                Op::Bufferize { compute: src(0), ranges: new_srcs[1..].iter().cloned().collect(), opts: opts.clone() }
+            Op::Param { arg, .. } => {
+                assert_eq!(new_srcs.len(), 1);
+                Op::Param { shape: src(0), arg: arg.clone() }
             }
-            Op::Index { gate, .. } => {
+            Op::Slice { size, .. } => {
+                assert_eq!(new_srcs.len(), 2);
+                Op::Slice { buffer: src(0), offset: src(1), size: *size }
+            }
+            Op::Stage { opts, .. } => {
                 assert!(!new_srcs.is_empty());
-                // First source is buffer, rest are indices, last might be gate
+                Op::Stage { compute: src(0), ranges: new_srcs[1..].iter().cloned().collect(), opts: opts.clone() }
+            }
+            Op::Index { .. } => {
+                assert!(!new_srcs.is_empty());
                 let buffer = src(0);
-                let (indices, gate_new) = if gate.is_some() && new_srcs.len() >= 2 {
-                    let gate_src = new_srcs.last().unwrap().clone();
-                    let indices: SmallVec<[Arc<Self>; 4]> = new_srcs[1..new_srcs.len() - 1].iter().cloned().collect();
-                    (indices, Some(gate_src))
-                } else {
-                    let indices: SmallVec<[Arc<Self>; 4]> = new_srcs[1..].iter().cloned().collect();
-                    (indices, None)
-                };
-                Op::Index { buffer, indices, gate: gate_new }
+                let indices: SmallVec<[Arc<Self>; 4]> = new_srcs[1..].iter().cloned().collect();
+                Op::Index { buffer, indices }
             }
-            Op::PointerIndex { .. } => {
-                assert_eq!(new_srcs.len(), 2);
-                Op::PointerIndex { ptr: src(0), offset: src(1) }
-            }
-            Op::Copy { .. } => {
-                assert_eq!(new_srcs.len(), 2);
-                Op::Copy { src: src(0), device: src(1) }
+            Op::Copy { device, .. } => {
+                assert_eq!(new_srcs.len(), 1);
+                Op::Copy { src: src(0), device: device.clone() }
             }
             Op::MStack { .. } => Op::MStack { buffers: new_srcs.iter().cloned().collect() },
 
@@ -1182,7 +1205,7 @@ impl UOp {
             }
             Op::Shrink { .. } => {
                 assert_eq!(new_srcs.len(), 3);
-                Op::Shrink { src: src(0), begins: src(1), ends: src(2) }
+                Op::Shrink { src: src(0), offsets: src(1), sizes: src(2) }
             }
             Op::Flip { axes, .. } => {
                 assert_eq!(new_srcs.len(), 1);
@@ -1198,13 +1221,18 @@ impl UOp {
                 assert_eq!(new_srcs.len(), 1);
                 Op::ReduceAxis { src: src(0), reduce_op: *reduce_op, axes: axes.clone() }
             }
-            Op::Reduce { reduce_op, .. } => {
+            Op::Reduce { reduce_op, num_axes, .. } => {
                 assert!(!new_srcs.is_empty());
-                Op::Reduce { src: src(0), ranges: new_srcs[1..].iter().cloned().collect(), reduce_op: *reduce_op }
+                Op::Reduce {
+                    src: src(0),
+                    ranges: new_srcs[1..].iter().cloned().collect(),
+                    reduce_op: *reduce_op,
+                    num_axes: *num_axes,
+                }
             }
-            Op::AllReduce { reduce_op, .. } => {
-                assert_eq!(new_srcs.len(), 2);
-                Op::AllReduce { src: src(0), device: src(1), reduce_op: *reduce_op }
+            Op::AllReduce { device, reduce_op, .. } => {
+                assert_eq!(new_srcs.len(), 1);
+                Op::AllReduce { src: src(0), device: device.clone(), reduce_op: *reduce_op }
             }
 
             // Control flow operations
@@ -1220,7 +1248,7 @@ impl UOp {
                 assert!(!new_srcs.is_empty());
                 Op::Range {
                     end: src(0),
-                    axis_id: *axis_id,
+                    axis_id: axis_id.clone(),
                     axis_type: *axis_type,
                     deps: new_srcs[1..].iter().cloned().collect(),
                 }
@@ -1234,27 +1262,9 @@ impl UOp {
                 Op::Barrier { src: src(0), deps: new_srcs[1..].iter().cloned().collect() }
             }
 
-            // Vector operations — recompute dtype from new elements when element
-            // dtype category changed (e.g. Scalar → Ptr during rewrite reconstruction).
-            // Preserving old dtype is wrong when DEFINE_LOCAL → AFTER(Ptr) changes
-            // element types from Scalar to Ptr, causing pm_add_loads infinite loops.
-            Op::Vectorize { .. } => {
-                let elements: SmallVec<[Arc<Self>; 4]> = new_srcs.iter().cloned().collect();
-                let elem_dtype = elements[0].dtype();
-                let new_dtype = match &elem_dtype {
-                    DType::Scalar(_) | DType::Ptr { .. } => {
-                        elem_dtype.vec(elements.len()).expect("vectorize element is a scalar or scalar pointer")
-                    }
-                    _ => self.dtype.clone(),
-                };
-                return Self::new(Op::Vectorize { elements }, new_dtype);
+            Op::Stack { .. } => {
+                return Self::stack(new_srcs.iter().cloned().collect());
             }
-            Op::Gep { indices, .. } => {
-                assert_eq!(new_srcs.len(), 1);
-                Op::Gep { vector: src(0), indices: indices.clone() }
-            }
-            Op::Cat { .. } => Op::Cat { sources: new_srcs.iter().cloned().collect() },
-            Op::PtrCat { .. } => Op::PtrCat { sources: new_srcs.iter().cloned().collect() },
 
             // Symbolic/Define operations
             Op::Bind { .. } => {
@@ -1267,14 +1277,6 @@ impl UOp {
                 assert_eq!(new_srcs.len(), 3);
                 Op::Wmma { a: src(0), b: src(1), c: src(2), metadata: metadata.clone() }
             }
-            Op::Contract { upcast_ranges, .. } => {
-                assert_eq!(new_srcs.len(), 1);
-                Op::Contract { src: src(0), upcast_ranges: upcast_ranges.clone() }
-            }
-            Op::Unroll { unroll_axes, .. } => {
-                assert_eq!(new_srcs.len(), 1);
-                Op::Unroll { src: src(0), unroll_axes: unroll_axes.clone() }
-            }
             Op::Call { info, .. } => {
                 assert!(!new_srcs.is_empty(), "Call requires at least body source");
                 Op::Call { body: src(0), args: new_srcs[1..].iter().cloned().collect(), info: info.clone() }
@@ -1283,12 +1285,10 @@ impl UOp {
                 assert!(!new_srcs.is_empty(), "Function requires at least body source");
                 Op::Function { body: src(0), args: new_srcs[1..].iter().cloned().collect(), info: info.clone() }
             }
-            Op::Program { linear, source, binary, .. } => {
-                assert!(new_srcs.len() >= 2, "Program requires sink and device sources");
+            Op::Program { info, linear, source, binary, .. } => {
+                assert!(!new_srcs.is_empty(), "Program requires a sink source");
                 let mut idx = 0usize;
                 let sink = src(idx);
-                idx += 1;
-                let device = src(idx);
                 idx += 1;
 
                 let linear_new = if linear.is_some() {
@@ -1314,9 +1314,10 @@ impl UOp {
                 };
 
                 assert_eq!(idx, new_srcs.len(), "Program source count mismatch");
-                Op::Program { sink, device, linear: linear_new, source: source_new, binary: binary_new }
+                Op::Program { sink, info: info.clone(), linear: linear_new, source: source_new, binary: binary_new }
             }
             Op::Linear { .. } => Op::Linear { ops: new_srcs.iter().cloned().collect() },
+            Op::Ins { arg, .. } => Op::Ins { sources: new_srcs.iter().cloned().collect(), arg: arg.clone() },
             Op::Tuple { .. } => Op::Tuple { src: new_srcs.iter().cloned().collect() },
             Op::GetTuple { index, .. } => {
                 assert_eq!(new_srcs.len(), 1);
@@ -1357,15 +1358,22 @@ impl UOp {
             Op::CustomI { code, .. } => Op::CustomI { deps: new_srcs.iter().cloned().collect(), code: code.clone() },
 
             // Memory operations
-            Op::Load { alt, .. } => {
-                // Load has 2-3 sources: buffer, index, and optionally alt
-                assert!(new_srcs.len() >= 2 && new_srcs.len() <= 3, "Load requires 2-3 sources");
-                let new_alt = if new_srcs.len() == 3 { Some(src(2)) } else { alt.clone() };
-                Op::Load { buffer: src(0), index: src(1), alt: new_alt }
+            Op::Load { alt, gate, .. } => {
+                assert_eq!(alt.is_some(), gate.is_some(), "LOAD requires either index only or index, alt, and gate");
+                let expected = 1 + usize::from(alt.is_some()) + usize::from(gate.is_some());
+                assert_eq!(new_srcs.len(), expected);
+                let mut next = 1;
+                let new_alt = alt.as_ref().map(|_| {
+                    let value = src(next);
+                    next += 1;
+                    value
+                });
+                let new_gate = gate.as_ref().map(|_| src(next));
+                Op::Load { index: src(0), alt: new_alt, gate: new_gate }
             }
-            Op::Store { .. } => {
-                assert!(new_srcs.len() == 2, "Store requires exactly 2 sources (index, value)");
-                Op::Store { index: src(0), value: src(1) }
+            Op::Store { gate, .. } => {
+                assert_eq!(new_srcs.len(), 2 + usize::from(gate.is_some()));
+                Op::Store { index: src(0), value: src(1), gate: gate.as_ref().map(|_| src(2)) }
             }
 
             // Graph organization
@@ -1373,8 +1381,19 @@ impl UOp {
             Op::Group { .. } => Op::Group { sources: new_srcs.iter().cloned().collect() },
         };
 
-        // Preserve original dtype and tag through source reconstruction.
-        Self::new_tagged(new_op, self.dtype.clone(), self.tag.clone())
+        // ALU dtype and shape are independent: shaped STACK sources still have
+        // scalar element dtypes. Always derive rebuilt ALU dtype so a legacy
+        // vector result cannot survive after its lanes move into source shape.
+        let source_dtypes_unchanged =
+            self.op.children().iter().zip(new_op.children()).all(|(old, new)| old.dtype() == new.dtype());
+        let dtype = if matches!(new_op, Op::Unary(..) | Op::Binary(..) | Op::Ternary(..)) {
+            crate::dtype_from_op(&new_op).unwrap_or_else(|| self.dtype.clone())
+        } else if source_dtypes_unchanged {
+            self.dtype.clone()
+        } else {
+            crate::dtype_from_op(&new_op).unwrap_or_else(|| self.dtype.clone())
+        };
+        Self::new_tagged(new_op, dtype, self.tag.clone())
     }
 }
 
@@ -1409,6 +1428,22 @@ impl UOp {
     }
 }
 
+/// Pre-sizing hint for traversals that walk a whole kernel graph.
+const FULL_GRAPH_HINT: usize = 256;
+
+/// Pre-sizing hint for traversals that typically stop after a handful of nodes
+/// (cached-property cold paths walk ~2 nodes on average).
+const LOCAL_HINT: usize = 8;
+
+/// Visited set for the pointer-identity graph traversals below.
+///
+/// `Arc::as_ptr` values are already well distributed, so FxHash is both faster
+/// and sufficient; `capacity` is the caller's expected node count, which avoids
+/// both rehashing on full-graph walks and 2 KiB of dead table on local ones.
+fn visited_set(capacity: usize) -> rustc_hash::FxHashSet<*const UOp> {
+    rustc_hash::FxHashSet::with_capacity_and_hasher(capacity, Default::default())
+}
+
 impl Clone for UOp {
     fn clone(&self) -> Self {
         Self {
@@ -1416,6 +1451,7 @@ impl Clone for UOp {
             op: self.op.clone(),
             dtype: self.dtype.clone(),
             content_hash: self.content_hash,
+            src_ops: self.src_ops,
             tag: self.tag.clone(),
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
@@ -1424,6 +1460,9 @@ impl Clone for UOp {
             sound_vmin_vmax_cache: std::sync::OnceLock::new(),
             has_index_in_sources_cache: std::sync::OnceLock::new(),
             backward_slice_cache: std::sync::OnceLock::new(),
+            has_weak_float_cache: std::sync::OnceLock::new(),
+            device_spec_cache: std::sync::OnceLock::new(),
+            addrspace_cache: std::sync::OnceLock::new(),
             metadata: self.metadata.clone(),
         }
     }

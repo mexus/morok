@@ -31,7 +31,7 @@ fn eval_const(u: &Arc<UOp>) -> i64 {
 /// A swizzle must be a bijection over `[0,rows)×[0,cols)` (else LDS round-trips
 /// corrupt), and must not move an element out of its base fragment.
 fn assert_bijection(sw: Swizzle, rows: usize, cols: usize, scalar: ScalarDType) {
-    let cidx = |v: usize| UOp::const_(DType::Index, ConstValue::Int(v as i64));
+    let cidx = |v: usize| UOp::index_const(v as i64);
     let mut seen = vec![false; rows * cols];
     for r in 0..rows {
         for c in 0..cols {
@@ -51,7 +51,7 @@ fn assert_bijection(sw: Swizzle, rows: usize, cols: usize, scalar: ScalarDType) 
 /// to 16 distinct LDS slots — the bank-conflict-free property the XOR buys.
 #[test]
 fn test_sw16x16_row_distinct_banks() {
-    let cidx = |v: usize| UOp::const_(DType::Index, ConstValue::Int(v as i64));
+    let cidx = |v: usize| UOp::index_const(v as i64);
     for r in 0..16usize {
         let mut cols_seen = std::collections::HashSet::new();
         for c in 0..16usize {
@@ -73,8 +73,8 @@ fn test_swizzle_is_bijection() {
 
 #[test]
 fn test_identity_swizzle_passthrough() {
-    let row = UOp::const_(DType::Index, ConstValue::Int(3));
-    let col = UOp::const_(DType::Index, ConstValue::Int(5));
+    let row = UOp::const_(DType::Int32, ConstValue::Int(3));
+    let col = UOp::const_(DType::Int32, ConstValue::Int(5));
     let (srow, scol) = ST_16X16.swizzle.swizzle_rc(row.clone(), col.clone(), 16, ScalarDType::Float32);
     assert!(Arc::ptr_eq(&srow, &row), "identity swizzle must return row unchanged");
     assert!(Arc::ptr_eq(&scol, &col), "identity swizzle must return col unchanged");

@@ -4,7 +4,7 @@ use snafu::{OptionExt, ResultExt};
 use strum::{Display, EnumString};
 
 use super::*;
-use crate::error::{NdimMinimumSnafu, ShapeMismatchSnafu, SymbolicShapeUnsupportedSnafu};
+use crate::error::{NdimMinimumSnafu, ShapeMismatchSnafu, SymbolicShapeUnsupportedSnafu, TypeMismatchSnafu};
 
 /// Reduction mode for scatter operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, Display)]
@@ -72,7 +72,13 @@ impl Tensor {
         let dim_size = self_shape[dim].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
             operation: "gather along a symbolic dim".to_string(),
         })?;
-        let arange = Tensor::arange(0, Some(dim_size as i64), None)?.cast(index.uop().dtype())?;
+        let arange_dtype = DType::Int64;
+        let arange = Tensor::arange_with_dtype()
+            .start(UOp::const_(arange_dtype.clone(), ConstValue::Int(0)))
+            .stop(UOp::const_(arange_dtype.clone(), ConstValue::Int(dim_size as i64)))
+            .dtype(arange_dtype)
+            .call()?
+            .cast(index.uop().dtype())?;
         let mask = index.try_unsqueeze(-1)?.try_eq(&arange)?;
 
         x.where_(&mask, &Self::new(x.uop().const_like(0)))?.sum_with().axes(-1).dtype(self.uop().dtype()).call()
@@ -259,22 +265,28 @@ impl Tensor {
     /// Requires `realize()` internally (data-dependent output size).
     #[track_caller]
     pub fn masked_select(&self, mask: &Tensor) -> Result<Tensor> {
+        if mask.uop().dtype() != DType::Bool {
+            return TypeMismatchSnafu { expected: DType::Bool, actual: mask.uop().dtype() }.fail();
+        }
         let x = self.flatten()?;
         let mask_flat = mask.broadcast_to(&self.shape()?)?.flatten()?;
-        let mask_cumsum = mask_flat.cast(svod_dtype::DType::Int32)?.cumsum(0)?;
+        let mask_cumsum = mask_flat.cast(DType::Int64)?.cumsum(0)?;
         // Realize to get output size (data-dependent shape)
         let n = mask_flat.numel()?;
+        if n == 0 {
+            return Ok(Tensor::empty_zero(self.uop().dtype()).to(self.device()));
+        }
         let mut count_t = mask_cumsum.try_shrink([((n - 1) as isize, n as isize)])?;
         count_t.realize()?;
-        let count_t = count_t.as_ndarray::<i32>()?;
+        let count_t = count_t.as_ndarray::<i64>()?;
         let count = count_t[[0]] as usize;
         if count == 0 {
-            return Ok(Tensor::empty_zero(self.uop().dtype()));
+            return Ok(Tensor::empty_zero(self.uop().dtype()).to(self.device()));
         }
 
         // Build gather indices: zeros.scatter(0, cumsum, 1).cumsum
-        let zeros = Tensor::full(&[count], ConstValue::Int(0), svod_dtype::DType::Int32)?;
-        let ones = Tensor::full(&[n], ConstValue::Int(1), svod_dtype::DType::Int32)?;
+        let zeros = Tensor::full(&[count], ConstValue::Int(0), DType::Int64)?;
+        let ones = Tensor::full(&[n], ConstValue::Int(1), DType::Int64)?;
         let idxs = zeros.scatter_reduce(0, &mask_cumsum, &ones, ScatterReduction::Sum, false)?.cumsum(0)?;
         x.gather(0, &idxs)
     }
@@ -462,24 +474,36 @@ impl Tensor {
 
         let mask = self.try_ne(&Tensor::const_(ConstValue::Int(0), self.uop().dtype()))?.flatten()?;
 
-        // Build coordinate tensor: for each dim, arange → reshape to broadcast → flatten
-        let coords: Vec<Tensor> = (0..ndim)
-            .map(|i| {
-                let ar = Tensor::arange(0, Some(dims[i] as i64), None)?;
-                let mut rshape = vec![1isize; ndim];
-                rshape[i] = dims[i] as isize;
-                let expand_shape: Vec<isize> = dims.iter().map(|&d| d as isize).collect();
-                ar.try_reshape(&rshape)?.try_expand(&expand_shape)?.flatten()
+        if numel == 0 {
+            return Tensor::empty_zero(DType::Int32).to(self.device()).try_reshape([0, ndim as isize]);
+        }
+        let index_dtype = DType::Int64;
+        let flat_indices = Tensor::arange_with_dtype()
+            .start(UOp::const_(index_dtype.clone(), ConstValue::Int(0)))
+            .stop(UOp::const_(index_dtype.clone(), ConstValue::Int(numel as i64)))
+            .dtype(index_dtype.clone())
+            .call()?;
+        let selected = flat_indices.masked_select(&mask)?;
+        if ndim == 0 {
+            return Tensor::empty_zero(DType::Int32).to(self.device()).try_reshape([selected.numel()? as isize, 0]);
+        }
+        let coords = (0..ndim)
+            .map(|axis| {
+                let stride = dims[axis + 1..].iter().product::<usize>();
+                let mut coord = if stride == 1 {
+                    selected.clone()
+                } else {
+                    selected.try_div(&Tensor::const_(ConstValue::Int(stride as i64), index_dtype.clone()))?
+                };
+                // Axis 0 needs no modulo (the division already bounds it); every interior
+                // axis does, singleton dims included.
+                if axis != 0 {
+                    coord = coord.try_mod(&Tensor::const_(ConstValue::Int(dims[axis] as i64), index_dtype.clone()))?;
+                }
+                coord.cast(DType::Int32)
             })
             .collect::<Result<Vec<_>>>()?;
-
-        let coords_refs: Vec<&Tensor> = coords.iter().collect();
-        let indices = Tensor::stack(&coords_refs, -1)?; // [numel, ndim]
-
-        // Select nonzero coordinates
-        let expanded_mask = mask.try_unsqueeze(-1)?.try_expand([numel as isize, ndim as isize])?;
-        let selected = indices.masked_select(&expanded_mask)?;
-        selected.try_reshape([-1, ndim as isize])
+        Tensor::stack(&coords.iter().collect::<Vec<_>>(), -1)
     }
 
     /// Reverse the first `sequence_lens[i]` elements along `time_axis` for each

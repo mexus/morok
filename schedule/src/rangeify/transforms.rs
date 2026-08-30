@@ -2,8 +2,8 @@
 //!
 //! This module contains:
 //! - Main `rangeify()` entry point
-//! - Movement op → BUFFERIZE+INDEX transformation helpers
-//! - BUFFERIZE → STORE conversion
+//! - Movement op → STAGE+INDEX transformation helpers
+//! - STAGE → STORE conversion
 //! - Reduction simplifications (reduce_unparented, reduce_collapse)
 //! - Range flattening (flatten_range_impl)
 //! - Cycle detection (find_bufs)
@@ -12,14 +12,14 @@
 //! flatten_range.rs, cycle_detection.rs
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use super::context::RangeifyContext;
 use super::indexing::IndexingContext;
 use super::kernel::RangeifyBufferContext;
 use smallvec::{SmallVec, smallvec};
 use svod_ir::shape::Shape;
-use svod_ir::{AddrSpace, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
+use svod_ir::{AddrSpace, AxisType, BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
 
 // ============================================================================
 // ADD_TAGS
@@ -51,10 +51,8 @@ fn should_skip_tag(op: &Op) -> bool {
         op,
         Op::Param { .. }
             | Op::Const(_)
-            | Op::Device(_)
             | Op::Unique(_)
             | Op::LUnique(_)
-            | Op::DefineVar { .. }
             | Op::Bind { .. }
             | Op::Call { .. }
             | Op::End { .. }
@@ -78,8 +76,6 @@ pub fn add_tags_patterns() -> crate::TypedPatternMatcher<AddTagsCtx> {
                 }
             }
             if should_skip_tag(x.op()) { return None; }
-            // Index-typed scalars are not tagged.
-            if x.dtype().base() == svod_dtype::ScalarDType::Index { return None; }
             // MStack/MSelect: only tag if NOT all sources are PARAM.
             if matches!(x.op(), Op::MStack { .. } | Op::MSelect { .. })
                 && x.op().sources().iter().all(|s| matches!(s.op(), Op::Param { .. }))
@@ -101,54 +97,11 @@ fn resolve_single_function(function: &Arc<UOp>) -> svod_ir::Result<Option<Arc<UO
         return Ok(None);
     }
 
-    // FUNCTION bodies are TUPLE-wrapped value producers; opaque bodies (SINK /
-    // PROGRAM / COPY / BUFFER_VIEW / CUSTOM_FUNCTION) get a CALL wrapper
-    // instead, which is preserved by resolve_calls. PARAMs are gathered across
-    // the entire TUPLE body via toposort.
-    let mut params: Vec<(usize, Arc<UOp>)> = body
-        .toposort()
-        .into_iter()
-        .filter_map(|u| if let Op::Param { slot, .. } = u.op() { Some((*slot, u)) } else { None })
-        .collect();
-    params.sort_unstable_by_key(|(slot, _)| *slot);
-
-    #[allow(clippy::mutable_key_type)]
-    let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
-    for (slot, param) in params {
-        let Some(arg) = args.get(slot) else {
-            return Err(svod_ir::Error::CallArgCountMismatch { expected: slot + 1, got: args.len() });
-        };
-        let expected_shape = param.shape()?.cloned();
-        let got_shape = arg.shape()?.cloned();
-        // Compare via upper-bound shape so distinct symbolic dims with the
-        // same vmax match. Both-None is a graph bug — FUNCTION param/arg
-        // pairs always carry shapes; reject rather than silently pass.
-        let mismatch = match (&expected_shape, &got_shape) {
-            (Some(p), Some(a)) => !svod_ir::shape::max_shapes_equal(p, a),
-            _ => true,
-        };
-        if mismatch {
-            return Err(svod_ir::Error::CallArgShapeMismatch {
-                arg_index: slot,
-                expected: expected_shape.map(Box::new),
-                got: got_shape.map(Box::new),
-            });
-        }
-
-        let expected_dtype = param.dtype();
-        let got_dtype = arg.dtype();
-        if expected_dtype != got_dtype {
-            return Err(svod_ir::Error::CallArgDTypeMismatch {
-                arg_index: slot,
-                expected: expected_dtype,
-                got: got_dtype,
-            });
-        }
-
-        subs.insert(UOpKey(param), arg.clone());
-    }
-
-    let resolved = body.substitute(&subs).rtag(function.tag().clone());
+    // Shared with shape inference: sparse positional slots are valid and
+    // substitutions are single-pass so actual argument graphs are not treated
+    // as part of the callable implementation.
+    let subs = svod_ir::shape::function_param_substitutions(body, args)?;
+    let resolved = body.substitute_walk_preserve_calls(&subs).rtag(function.tag().clone());
     Ok(Some(resolved))
 }
 
@@ -156,8 +109,11 @@ fn resolve_traversal_sources(node: &Arc<UOp>) -> Vec<Arc<UOp>> {
     match node.op() {
         // CALL is an opaque boundary: only rewrite/resolve call arguments.
         Op::Call { args, .. } => args.iter().cloned().collect(),
+        // A precompiled FUNCTION is equally opaque. In particular, do not
+        // resolve nested FUNCTIONs from its implementation body.
+        Op::Function { args, info, .. } if info.precompile => args.iter().cloned().collect(),
         // PROGRAM internals are also boundaries in this pass.
-        Op::Program { device, .. } => vec![device.clone()],
+        Op::Program { .. } => Vec::new(),
         _ => node.op().sources().into_iter().collect(),
     }
 }
@@ -216,8 +172,7 @@ pub(crate) fn resolve_calls(root: Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
         if let Some(resolved) = resolve_single_function(&current)? {
             current = resolved;
         }
-        // GETTUPLE(TUPLE(srcs), i) -> srcs[i]. Also handles GETTUPLE(FUNCTION(TUPLE), i)
-        // created when callers preserve a precompile FUNCTION wrapper.
+        // Pinned rangeify extracts only a direct GETTUPLE(TUPLE(...), i).
         current = resolve_gettuple(&current);
 
         rewritten.insert(UOpKey(node), current);
@@ -226,22 +181,12 @@ pub(crate) fn resolve_calls(root: Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
     Ok(rewritten.remove(&UOpKey(root.clone())).unwrap_or(root))
 }
 
-/// Resolve `GETTUPLE(TUPLE(srcs), i)` (and `GETTUPLE(FUNCTION(TUPLE(srcs)), i)`) to `srcs[i]`.
+/// Resolve `GETTUPLE(TUPLE(srcs), i)` to `srcs[i]`.
 fn resolve_gettuple(node: &Arc<UOp>) -> Arc<UOp> {
     let Op::GetTuple { src, index } = node.op() else {
         return node.clone();
     };
-    let inner = match src.op() {
-        Op::Tuple { src: tuple_src } => tuple_src,
-        Op::Function { body, .. } => {
-            if let Op::Tuple { src: tuple_src } = body.op() {
-                tuple_src
-            } else {
-                return node.clone();
-            }
-        }
-        _ => return node.clone(),
-    };
+    let Op::Tuple { src: inner } = src.op() else { return node.clone() };
     inner.get(*index).cloned().unwrap_or_else(|| node.clone())
 }
 
@@ -252,7 +197,7 @@ fn resolve_gettuple(node: &Arc<UOp>) -> Arc<UOp> {
 /// Main rangeify transformation entry point.
 ///
 /// Converts movement operations (RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP)
-/// into BUFFERIZE + INDEX operations with explicit loop ranges.
+/// into STAGE + INDEX operations with explicit loop ranges.
 pub fn rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, RangeifyContext)> {
     let result = rangeify_with_map(sink)?;
     Ok((result.sink, result.context))
@@ -277,8 +222,9 @@ pub struct RangeifyResult {
 ///
 /// # Pipeline
 ///
+/// **Pre-stage**: multi_pm + supported-subset validation, then add_tags
 /// **Stage 0**: Range assignment (run_rangeify)
-/// **Stage 1**: movement_op_patterns + pm_syntactic_sugar (BOTTOM_UP) - Early movement ops
+/// **Stage 1**: movement_op_patterns (BOTTOM_UP) - Early movement ops
 /// **Stage 2**: pm_load_collapse - Collapse load tensor indexing
 /// **Stage 3**: pm_split_ranges + pm_flatten_range - Range splitting
 /// **Stage 4**: sym + pm_flatten_range - Initial symbolic (TOP_DOWN)
@@ -287,11 +233,37 @@ pub struct RangeifyResult {
 #[allow(clippy::mutable_key_type)]
 #[tracing::instrument(skip_all)]
 pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
+    // Resolve the exact hardware-independent multi subset before tags capture
+    // tensor identity and before range assignment can materialize its sources.
+    let t_stage = std::time::Instant::now();
+    svod_ir::dump_canonical_stage("pre_multi", &sink);
+    let mut sink = crate::rewrite::graph_rewrite_preserve_calls(&crate::multi::multi_pm(), sink, &mut ());
+    svod_ir::dump_canonical_stage("post_multi", &sink);
+    crate::multi::validate_supported_subset(&sink)?;
+    sink = crate::rewrite::graph_rewrite_preserve_calls(&crate::multi::lower_allreduce_pm(), sink, &mut ());
+    crate::multi::validate_no_unresolved_allreduce(&sink)?;
+    tracing::debug!(
+        uop.tree = sink.tree(),
+        node_count = sink.node_count(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "pre-rangeify multi-device resolution complete"
+    );
     // add_tags: assign sequential integer tags to UOps.
-    // MUST run FIRST — tags track tensor identity through the entire pipeline.
+    // Tags track tensor identity after shard-local structure is normalized.
     let t_stage = std::time::Instant::now();
     let mut tag_ctx = AddTagsCtx::new();
-    let mut sink = crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&add_tags_patterns(), sink, &mut tag_ctx);
+    sink = crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&add_tags_patterns(), sink, &mut tag_ctx);
+    let output_tag_order: HashMap<usize, usize> = match sink.op() {
+        Op::Sink { sources, .. } => sources
+            .iter()
+            .enumerate()
+            .flat_map(|(position, source)| {
+                let tags = source.tag().clone().or_else(|| source.base().tag().clone()).unwrap_or_default();
+                tags.into_iter().map(move |tag| (tag, position))
+            })
+            .collect(),
+        _ => sink.tag().as_ref().into_iter().flatten().copied().map(|tag| (tag, 0)).collect(),
+    };
     let uop_list = tag_ctx.uop_list;
     tracing::debug!(
         tagged_count = uop_list.len(),
@@ -303,47 +275,37 @@ pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
     // resolve_function before heavy range/movement stages.
     let t_stage = std::time::Instant::now();
     sink = resolve_calls(sink)?;
+    crate::multi::validate_supported_subset(&sink)?;
     tracing::debug!(
         node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "resolve_function complete"
     );
 
-    // Combined early pass: pm_syntactic_sugar + movement_op_patterns +
-    // earliest_rewrites + replace_contiguous, bottom_up.
+    // Combined earliest bottom-up rewrite, including reduction splitting.
     let t_stage = std::time::Instant::now();
-    let early_combined = super::patterns::pm_syntactic_sugar().with_context::<super::patterns::ReplaceContiguousCtx>()
-        + super::patterns::movement_op_patterns().with_context::<super::patterns::ReplaceContiguousCtx>()
-        + super::patterns::early_rewrites().with_context::<super::patterns::ReplaceContiguousCtx>()
-        + super::patterns::replace_contiguous();
-    let mut contig_ctx = super::patterns::ReplaceContiguousCtx::new();
-    sink = crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&early_combined, sink, &mut contig_ctx);
-    tracing::debug!(
-        uop.tree = sink.tree(),
-        node_count = sink.node_count(),
-        elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "early rewrites + replace contiguous complete"
-    );
-
-    // Split large reductions BEFORE range assignment.
-    let t_stage = std::time::Instant::now();
+    static EARLY_COMBINED: LazyLock<crate::TypedPatternMatcher<super::kernel::SplitReduceOpConfig>> =
+        LazyLock::new(|| {
+            super::patterns::movement_op_patterns().with_context::<super::kernel::SplitReduceOpConfig>()
+                + super::patterns::early_rewrites().with_context::<super::kernel::SplitReduceOpConfig>()
+                + super::patterns::split_reduceop_patterns()
+        });
     let mut split_config = super::kernel::SplitReduceOpConfig::default();
-    let split_matcher = super::patterns::split_reduceop_patterns();
-    sink = crate::rewrite::graph_rewrite_preserve_calls(&split_matcher, sink, &mut split_config);
+    sink = crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&*EARLY_COMBINED, sink, &mut split_config);
     tracing::debug!(
         uop.tree = sink.tree(),
         node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "split reduceops complete"
+        "earliest rewrites complete"
     );
 
     // =========================================================================
     // Stage 0: Range assignment + apply rangeify patterns.
     // Includes pm_generate_realize_map, assign loop, and pm_apply_rangeify
-    // (REDUCE_AXIS→REDUCE, PAD→WHERE, BUFFERIZE+INDEX).
+    // (REDUCE_AXIS→REDUCE, PAD→WHERE, STAGE+INDEX).
     // =========================================================================
     let t_stage = std::time::Instant::now();
-    let (rangeified, indexing_ctx) = super::indexing::run_rangeify(sink)?;
+    let (rangeified, mut indexing_ctx) = super::indexing::run_rangeify(sink)?;
     sink = rangeified;
     tracing::debug!(
         uop.tree = sink.tree(),
@@ -354,7 +316,7 @@ pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
 
     // =========================================================================
     // Fused fixpoint: symbolic + reduce-simplify + movement-op rewriting +
-    // const folding + dead-axis pruning + bufferize removal. Pattern groups
+    // const folding + dead-axis pruning + stage removal. Pattern groups
     // re-fire each other's outputs until the graph stabilizes — splitting
     // them into separate passes loses simplifications that only appear after
     // a substitution.
@@ -388,22 +350,29 @@ pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
     // Stages 2a-6 (load_collapse, split_ranges, symbolic+flatten, simplify_ranges,
     // split_store) now run per-kernel in optimizer::apply_pre_optimization().
 
-    // Rebuild SINK from tagged backward slice nodes — keep tagged nodes whose
-    // base op is one of the materializable output forms.
+    // Rebuild SINK from transformed versions of the original outputs only.
+    // Intermediate tags also survive rangeify, but they are not public outputs.
     {
-        let filtered: Vec<Arc<UOp>> = sink
+        let mut filtered: Vec<Arc<UOp>> = sink
             .backward_slice()
             .into_iter()
             .filter(|s| {
                 let valid_op = matches!(
                     s.base().op(),
-                    Op::Bufferize { .. } | Op::MStack { .. } | Op::Const(_) | Op::Param { .. } | Op::After { .. }
+                    Op::Stage { .. } | Op::MStack { .. } | Op::Const(_) | Op::Param { .. } | Op::After { .. }
                 );
-                let tagged = s.tag().as_ref().is_some_and(|t| !t.is_empty());
-                valid_op && tagged
+                let output =
+                    s.tag().as_ref().is_some_and(|tags| tags.iter().any(|tag| output_tag_order.contains_key(tag)));
+                valid_op && output
             })
             .collect();
         if !filtered.is_empty() {
+            filtered.sort_by_key(|node| {
+                node.tag()
+                    .as_ref()
+                    .and_then(|tags| tags.iter().filter_map(|tag| output_tag_order.get(tag)).min().copied())
+                    .unwrap_or(usize::MAX)
+            });
             tracing::debug!(filtered = filtered.len(), "SINK rebuilt from tagged backward slice");
             sink = UOp::sink(filtered);
         }
@@ -415,7 +384,7 @@ pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
     {
         let t_stage = std::time::Instant::now();
         let limit_matcher = super::patterns::buffer_limit_patterns(limit);
-        sink = crate::rewrite::graph_rewrite_preserve_calls(&limit_matcher, sink, &mut ());
+        sink = crate::rewrite::graph_rewrite_preserve_calls(&limit_matcher, sink, &mut indexing_ctx);
         tracing::debug!(
             uop.tree = sink.tree(),
             elapsed_ms = t_stage.elapsed().as_millis() as u64,
@@ -430,6 +399,7 @@ pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
     // Build RangeifyContext for return
     let rangeify_ctx = RangeifyContext { range_counter: indexing_ctx.range_counter(), range_map: HashMap::new() };
 
+    svod_ir::dump_canonical_stage("rangeified", &sink);
     Ok(RangeifyResult { sink, context: rangeify_ctx, uop_list })
 }
 
@@ -450,68 +420,54 @@ pub fn pm_flatten_range() -> &'static crate::TypedPatternMatcher {
 /// Context for tracking ranges that should be split via modulo decomposition.
 ///
 /// When we see `RANGE % const`, we mark the range for splitting at the SINK.
-#[derive(Default)]
 pub struct SplitRangesContext {
-    /// Maps RANGE ids to their modulo constant for decomposition
-    pub marked_ranges: HashMap<u64, i64>,
-    /// RANGE ids that should NOT be substituted (e.g., used in ImageDType stores)
-    protected_ranges: HashSet<u64>,
+    /// Maps RANGE ids to their modulo constant, or `None` for ranges that must
+    /// not be split at all (image stores address two coordinates directly).
+    pub marked_ranges: HashMap<u64, Option<i64>>,
+}
+
+impl SplitRangesContext {
+    pub fn new() -> Self {
+        Self { marked_ranges: HashMap::new() }
+    }
+}
+
+impl Default for SplitRangesContext {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Pattern matcher for range splitting via modulo arithmetic.
 ///
 /// Context-collecting pass that:
 /// 1. Marks RANGE ops used in `RANGE % const` expressions
-/// 2. Protects ranges used in ImageDType stores from substitution
-/// 3. At SINK, substitutes marked (non-protected) ranges with divmod decomposition
+/// 2. At SINK, substitutes marked ranges with divmod decomposition
 ///
 /// Example transformation for `RANGE(12) % 4`:
 /// - Original: `r = RANGE(12)`
 /// - After: `r_div = RANGE(3) * 4`, `r_mod = RANGE(4)`, substitute `r → r_div + r_mod`
 ///
-/// # ImageDType Protection
-///
-/// Range splitting must NOT apply to ImageDType stores because image addressing
-/// uses special 2D coordinates that don't follow standard linear indexing.
-/// Applying range splitting to image stores corrupts the addressing scheme.
 pub fn pm_split_ranges() -> crate::TypedPatternMatcher<SplitRangesContext> {
     crate::patterns! {
         @context SplitRangesContext;
 
         // Mark RANGE % const: record the modulo constant for this range
-        _modop @ Mod(r @ Range { end, axis_id: _, axis_type: _ }, c @ Const(_))
-            if is_divisible_range_end(end, c) => |r, c| {
-                mark_range_mod(ctx, r, c);
-                None // Don't transform yet, just mark
-            },
+        _modop @ FloorMod(r @ Range { end: _, axis_id: _, axis_type: _ }, c @ Const(_)) => |r, c| {
+            mark_range_mod(ctx, r, c);
+            None // Don't transform yet, just mark
+        },
 
-        // Protect ranges used in ImageDType stores from substitution
-        _store @ Store { index: idx @ Index { buffer: buf, indices: _, gate: _ }, value: _ }
-            if is_image_dtype(buf) => |idx| {
-                protect_ranges_for_image(ctx, idx);
-                None // Don't transform, just protect
-            },
+        // An image STORE pins its index ranges against splitting.
+        Store { index, value: _, gate: _ } => |index| {
+            dont_split_ranges_for_image(ctx, index);
+            None
+        },
 
         // At SINK: perform the substitution
         sink @ Sink { sources: _ } if !ctx.marked_ranges.is_empty() => |sink| {
             do_split_ranges_substitute(ctx, sink)
         },
-    }
-}
-
-/// Check if a buffer has ImageDType.
-fn is_image_dtype(buf: &Arc<UOp>) -> bool {
-    matches!(buf.dtype(), DType::Image { .. })
-}
-
-/// Protect all ranges reachable from an INDEX used in an ImageDType store.
-fn protect_ranges_for_image(ctx: &mut SplitRangesContext, idx: &Arc<UOp>) {
-    for node in idx.toposort() {
-        if matches!(node.op(), Op::Range { .. }) {
-            ctx.protected_ranges.insert(node.id);
-            // Also remove from marked_ranges if already marked
-            ctx.marked_ranges.remove(&node.id);
-        }
     }
 }
 
@@ -529,23 +485,43 @@ fn const_uop_to_i64(c: &Arc<UOp>) -> Option<i64> {
 
 /// Check if a RANGE end is divisible by the modulo constant.
 fn is_divisible_range_end(end: &Arc<UOp>, c: &Arc<UOp>) -> bool {
-    let Some(end_val) = const_uop_to_i64(end) else {
-        return false;
-    };
     let Some(mod_val) = const_uop_to_i64(c) else {
         return false;
     };
-    mod_val > 0 && end_val % mod_val == 0
+    matches!(end.op(), Op::Const(_)) && end.divides(mod_val).is_some()
 }
 
 /// Mark a range for modulo decomposition.
 fn mark_range_mod(ctx: &mut SplitRangesContext, r: &Arc<UOp>, c: &Arc<UOp>) {
-    // Don't mark if already marked or protected (e.g., used in ImageDType store)
-    if ctx.marked_ranges.contains_key(&r.id) || ctx.protected_ranges.contains(&r.id) {
+    if ctx.marked_ranges.contains_key(&r.id) {
+        return;
+    }
+
+    // Warp and device ranges are not looped over, so they cannot be split.
+    let Op::Range { end, axis_type, .. } = r.op() else {
+        return;
+    };
+    if matches!(axis_type, AxisType::Warp | AxisType::Device) {
+        return;
+    }
+    if !is_divisible_range_end(end, c) {
         return;
     }
     if let Some(mod_val) = const_uop_to_i64(c) {
-        ctx.marked_ranges.insert(r.id, mod_val);
+        ctx.marked_ranges.insert(r.id, Some(mod_val));
+    }
+}
+
+/// Pin every range an image STORE indexes with, so the SINK substitution leaves it
+/// alone: an image address is a pair of coordinates, not a flat offset that a
+/// divmod split can reconstruct.
+fn dont_split_ranges_for_image(ctx: &mut SplitRangesContext, index: &Arc<UOp>) {
+    let Op::Index { buffer, indices } = index.op() else { return };
+    if !buffer.dtype().is_image() {
+        return;
+    }
+    for range in indices.iter().flat_map(|index| index.ranges()) {
+        ctx.marked_ranges.insert(range.id, None);
     }
 }
 
@@ -556,7 +532,6 @@ fn mark_range_mod(ctx: &mut SplitRangesContext, r: &Arc<UOp>, c: &Arc<UOp>) {
 /// - Create `r_inner = RANGE(mod_val)` with same axis type, shifted axis_id
 /// - Substitute `r → r_outer * mod_val + r_inner`
 fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use svod_ir::AxisId;
     use svod_ir::rewrite::graph_rewrite_bottom_up;
 
     if ctx.marked_ranges.is_empty() {
@@ -566,38 +541,20 @@ fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> 
     // Build substitution map
     let mut subs: HashMap<u64, Arc<UOp>> = HashMap::new();
 
-    // Collect all UOps to find the marked ranges and max axis_id
+    // Traverse in graph order so multiple splits serialize deterministically.
     let topo = sink.toposort();
 
-    // Find max axis_id across ALL ranges to avoid collisions when creating split ranges
-    let mut max_axis_id: usize = 0;
     for uop in &topo {
-        if let Op::Range { axis_id, .. } = uop.op() {
-            max_axis_id = max_axis_id.max(axis_id.value());
-        }
-    }
-    let mut next_id = max_axis_id + 1;
-
-    for uop in &topo {
-        // Skip protected ranges (e.g., used in ImageDType stores)
-        if ctx.protected_ranges.contains(&uop.id) {
-            continue;
-        }
-        if let Some(&mod_val) = ctx.marked_ranges.get(&uop.id)
-            && let Op::Range { end, axis_type, .. } = uop.op()
+        if let Some(&Some(mod_val)) = ctx.marked_ranges.get(&uop.id)
+            && let Op::Range { end, axis_id, axis_type, .. } = uop.op()
         {
-            let Some(end_val) = const_uop_to_i64(end) else {
+            let Some(outer_end) = end.divides(mod_val) else {
                 continue;
             };
 
-            // Create outer range with unique axis_id
-            let outer_end = end_val / mod_val;
-            let outer_range = UOp::range_axis(UOp::index_const(outer_end), AxisId::Renumbered(next_id), *axis_type);
-            next_id += 1;
+            let outer_range = UOp::range_axis(outer_end, axis_id.child(0), *axis_type);
 
-            // Create inner range with unique axis_id
-            let inner_range = UOp::range_axis(UOp::index_const(mod_val), AxisId::Renumbered(next_id), *axis_type);
-            next_id += 1;
+            let inner_range = UOp::range_axis(UOp::index_const(mod_val), axis_id.child(1), *axis_type);
 
             // Substitution: r → outer * mod_val + inner
             let mod_const = UOp::index_const(mod_val);
@@ -620,6 +577,11 @@ fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> 
     };
 
     let result = graph_rewrite_bottom_up(&substitute_pm, sink.clone(), &mut ());
+    // Tinygrad's do_substitute returns ret.simplify() here. At the pinned
+    // revision UOp.simplify is exactly symbolic + pm_fold_cast_const.
+    static SPLIT_SIMPLIFY: std::sync::LazyLock<crate::TypedPatternMatcher> =
+        std::sync::LazyLock::new(|| crate::symbolic::symbolic() + crate::symbolic::pm_fold_cast_const());
+    let result = crate::rewrite::graph_rewrite(&*SPLIT_SIMPLIFY, result, &mut ());
 
     // Clear the context after substitution
     ctx.marked_ranges.clear();
@@ -628,12 +590,12 @@ fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> 
 }
 
 // ============================================================================
-// TRANSFORM HELPERS (movement ops → BUFFERIZE + INDEX)
+// TRANSFORM HELPERS (movement ops → STAGE + INDEX)
 // ============================================================================
 
-/// Transform a UOp's sources by adding BUFFERIZE + INDEX where needed.
+/// Transform a UOp's sources by adding STAGE + INDEX where needed.
 pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Vec<Arc<UOp>>> {
-    if matches!(x.op(), Op::Bufferize { .. } | Op::Index { .. }) {
+    if matches!(x.op(), Op::Stage { .. } | Op::Index { .. }) {
         return None;
     }
 
@@ -642,15 +604,25 @@ pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &mut IndexingContext)
         return None;
     }
 
+    let data_sources = super::indexing::data_sources(x);
+
     // INDEX is only added when `x in ctx.range_map`. For SINK (not in
-    // range_map), realized sources still get BUFFERIZE but no INDEX.
-    let input_ranges = if let Some((ranges, _)) = ctx.get_ranges(x) { ranges.clone() } else { Vec::new() };
+    // range_map), realized sources still get STAGE but no INDEX.
+    let input_ranges = if let Some((input, _)) = ctx.get_ranges(x) { input.clone() } else { Vec::new() };
 
     let mut new_sources = Vec::with_capacity(sources.len());
     let mut any_changed = false;
 
-    for src in sources.iter() {
-        let new_src = transform_single_source(x, src, &input_ranges, ctx);
+    for (source_index, src) in sources.iter().enumerate() {
+        // Op sources are ordered as data sources followed by metadata/ranges.
+        let is_data_source = source_index < data_sources.len();
+        let source_ranges =
+            if is_data_source { super::indexing::broadcast_ranges(x, src, &input_ranges) } else { Vec::new() };
+        let new_src = if is_data_source || ctx.get_realize_axes(src).is_some() {
+            transform_single_source(x, src, &source_ranges, ctx)
+        } else {
+            src.clone()
+        };
         if !Arc::ptr_eq(&new_src, src) {
             any_changed = true;
         }
@@ -660,16 +632,16 @@ pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &mut IndexingContext)
     if any_changed { Some(new_sources) } else { None }
 }
 
-/// Flatten multi-range BUFFERIZE to single-range via RESHAPE to 1D.
+/// Flatten multi-range STAGE to single-range via RESHAPE to 1D.
 ///
 /// 1. Reshapes multi-dim ranges to a single flat index via apply_reshape_ranges
-/// 2. Creates new BUFFERIZE with single computed range
+/// 2. Creates new STAGE with single computed range
 /// 3. Wraps with RESHAPE back to original shape for downstream movement ops
 /// 4. For symbolic range ends, adds SHRINK to symbolic shape
 ///
-/// After this, `bufferize_to_store` only sees single-range BUFFERIZE.
-fn flatten_bufferize(bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Bufferize { compute, ranges, opts } = bufferize.op() else { return None };
+/// After this, `bufferize_to_store` only sees single-range STAGE.
+fn flatten_bufferize(stage: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Stage { compute, ranges, opts } = stage.op() else { return None };
     if ranges.len() <= 1 {
         return None;
     }
@@ -687,8 +659,8 @@ fn flatten_bufferize(bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
     let ranges_vec: Vec<Arc<UOp>> = ranges.iter().cloned().collect();
     let flat_indices = super::indexing::apply_reshape_ranges(&flat_shape, &shape, &ranges_vec);
     assert_eq!(flat_indices.len(), 1, "flatten_bufferize: expected 1 flat index, got {}", flat_indices.len());
-    // New BUFFERIZE with single range
-    let flat_buf = UOp::bufferize(compute.clone(), vec![flat_indices[0].clone()], opts.clone());
+    // New STAGE with single range
+    let flat_buf = UOp::stage(compute.clone(), vec![flat_indices[0].clone()], opts.clone());
 
     // RESHAPE back to original shape.
     let shape_smallvec: Shape = shape.iter().cloned().collect();
@@ -712,53 +684,26 @@ fn flatten_bufferize(bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 }
 
-/// Push movement op through AFTER: `AFTER(MOVEMENT(x), deps) → MOVEMENT(AFTER(x, deps))`.
+/// Push movement op or INDEX through AFTER: `AFTER(r(x, ...), deps) → r(AFTER(x, deps), ...)`.
 ///
-/// Reuses the original movement op's parameters directly (no roundtrip/validation).
-pub(crate) fn push_movement_through_after(
+/// Reuses the original op's remaining sources directly (no roundtrip/validation).
+///
+/// Tag placement follows tinygrad `schedule/rangeify.py:54-55`: the rebuilt AFTER
+/// keeps the original AFTER's tag (`a.replace`), and the outer movement node is
+/// constructed fresh, so it carries no tag.
+pub(crate) fn push_op_through_after(
     after: &Arc<UOp>,
-    mop: &Arc<UOp>,
+    r: &Arc<UOp>,
     deps: &SmallVec<[Arc<UOp>; 4]>,
 ) -> Option<Arc<UOp>> {
-    let inner_src = &mop.op().sources()[0];
-    let new_after = inner_src.after(deps.clone()).rtag(None);
-    // Re-create the movement op with new_after as source, reusing original parameters.
-    let new_op = match mop.op() {
-        Op::Reshape { new_shape, .. } => Op::Reshape { src: new_after, new_shape: new_shape.clone() },
-        Op::Permute { axes, .. } => Op::Permute { src: new_after, axes: axes.clone() },
-        Op::Expand { new_shape, .. } => Op::Expand { src: new_after, new_shape: new_shape.clone() },
-        Op::Pad { begin_pads, end_pads, .. } => {
-            Op::Pad { src: new_after, begin_pads: begin_pads.clone(), end_pads: end_pads.clone() }
-        }
-        Op::Shrink { begins, ends, .. } => Op::Shrink { src: new_after, begins: begins.clone(), ends: ends.clone() },
-        Op::Flip { axes, .. } => Op::Flip { src: new_after, axes: axes.clone() },
-        _ => return None,
-    };
-    let moved = UOp::new(new_op, mop.dtype());
-    if let Some(tag) = after.tag().clone() { Some(moved.with_tag(tag)) } else { Some(moved) }
+    let inner_src = &r.op().sources()[0];
+    let new_after_sources = std::iter::once(inner_src.clone()).chain(deps.iter().cloned()).collect();
+    let new_after = after.with_sources(new_after_sources);
+    let new_sources = std::iter::once(new_after).chain(r.op().sources().into_iter().skip(1)).collect();
+    Some(r.with_sources(new_sources).rtag(None))
 }
 
-/// Push INDEX through AFTER: `AFTER(INDEX(x, idxs), deps) → INDEX(AFTER(x, deps), idxs)`.
-pub(crate) fn push_index_through_after(
-    after: &Arc<UOp>,
-    index: &Arc<UOp>,
-    buffer: &Arc<UOp>,
-    indices: &SmallVec<[Arc<UOp>; 4]>,
-    gate: &Option<Arc<UOp>>,
-    deps: &SmallVec<[Arc<UOp>; 4]>,
-) -> Option<Arc<UOp>> {
-    let new_after = buffer.after(deps.clone()).rtag(None);
-    let indexed = UOp::index()
-        .buffer(new_after)
-        .indices(indices.clone())
-        .maybe_gate(gate.clone())
-        .dtype(index.dtype())
-        .call()
-        .ok()?;
-    if let Some(tag) = after.tag().clone() { Some(indexed.with_tag(tag)) } else { Some(indexed) }
-}
-
-/// Transform a single source by adding BUFFERIZE + INDEX if needed.
+/// Transform a single source by adding STAGE + INDEX if needed.
 ///
 /// Non-recursive: only handles immediate buffer-like and realized sources.
 /// Movement ops and compute ops are left for the BPM rewrite engine to process
@@ -774,7 +719,7 @@ pub(crate) fn transform_single_source(
     ctx: &mut IndexingContext,
 ) -> Arc<UOp> {
     // Case 1: Buffer-like op → add multi-index INDEX
-    // Unlike Case 2 (BUFFERIZE), we can't linearize here because the buffer's
+    // Unlike Case 2 (STAGE), we can't linearize here because the buffer's
     // dimensional structure isn't directly available from ctx — the output_ranges
     // may contain PAD validity expressions, not clean RANGE ops.
     // Multi-index INDEX is preserved through the pipeline; codegen linearizes at render time.
@@ -782,22 +727,23 @@ pub(crate) fn transform_single_source(
         src.op(),
         Op::Buffer { .. }
             | Op::Param { .. }
-            | Op::BufferView { .. }
+            | Op::Slice { .. }
             | Op::MStack { .. }
             | Op::MSelect { .. }
             | Op::After { .. }
     ) {
         if !input_ranges.is_empty() {
+            let indices = linearize_static_indices(src, input_ranges).unwrap_or_else(|| input_ranges.to_vec());
             return UOp::index()
                 .buffer(Arc::clone(src))
-                .indices(input_ranges.to_vec())
+                .indices(indices)
                 .call()
                 .expect("Failed to create INDEX for buffer source");
         }
         return Arc::clone(src);
     }
 
-    // Case 2: source needs realization → wrap in BUFFERIZE + INDEX
+    // Case 2: source needs realization → wrap in STAGE + INDEX
     let realize_axes_opt = ctx.get_realize_axes(src).cloned();
     if let Some(ref realize_axes) = realize_axes_opt {
         let (_, output_ranges) = ctx.get_ranges(src).expect("Realized op must have ranges");
@@ -830,15 +776,15 @@ pub(crate) fn transform_single_source(
             output_ranges_len = output_ranges.len(),
             addrspace = ?addrspace,
             removable = removable,
-            "BUFFERIZE decision"
+            "STAGE decision"
         );
-        // Propagate source device to BUFFERIZE opts.
+        // Propagate source device to STAGE opts.
         let device = src.device_spec();
-        let opts = BufferizeOpts { device, addrspace, removable };
+        let opts = BufferizeOpts { device, local_axis: None, addrspace, removable };
 
         // tag=s.tag if GLOBAL, else None.
         let buf_tag = if addrspace == AddrSpace::Global { src.tag().clone() } else { None };
-        let bufferized = UOp::bufferize(Arc::clone(src), closed_ranges.clone(), opts);
+        let bufferized = UOp::stage(Arc::clone(src), closed_ranges.clone(), opts);
         let bufferized = if let Some(t) = buf_tag { bufferized.with_tag(t) } else { bufferized };
 
         let index_ranges: Vec<_> = input_ranges
@@ -855,7 +801,7 @@ pub(crate) fn transform_single_source(
                 .buffer(bufferized)
                 .indices(index_ranges)
                 .call()
-                .expect("Failed to create INDEX after BUFFERIZE");
+                .expect("Failed to create INDEX after STAGE");
         } else {
             return bufferized;
         }
@@ -865,14 +811,37 @@ pub(crate) fn transform_single_source(
     Arc::clone(src)
 }
 
+/// Generic buffers are one-dimensional at the renderer boundary. Preserve
+/// image/dynamic coordinates, but flatten statically-shaped tensor accesses at
+/// their rangeify producer.
+fn linearize_static_indices(buffer: &Arc<UOp>, indices: &[Arc<UOp>]) -> Option<Vec<Arc<UOp>>> {
+    if indices.len() <= 1 || buffer.dtype().is_image() {
+        return None;
+    }
+    // Image coordinates are a (y, x) pair the renderer addresses directly; flattening
+    // them into one linear offset makes the access unrenderable.
+    let shape = buffer.shape().ok().flatten()?;
+    if shape.len() != indices.len() {
+        return None;
+    }
+    let extents = shape.iter().map(|dim| dim.as_const()).collect::<Option<Vec<_>>>()?;
+    let mut stride = 1i64;
+    let mut terms = Vec::with_capacity(indices.len());
+    for (index, extent) in indices.iter().zip(extents.iter()).rev() {
+        terms.push(if stride == 1 { index.clone() } else { index.mul(&UOp::index_const(stride)) });
+        stride = stride.checked_mul(*extent as i64)?;
+    }
+    Some(vec![terms.into_iter().reduce(|lhs, rhs| lhs.add(&rhs))?])
+}
+
 // ============================================================================
-// BUFFERIZE TO STORE CONVERSION
+// STAGE TO STORE CONVERSION
 // ============================================================================
 
-/// Calculate buffer size from BUFFERIZE ranges.
+/// Calculate buffer size from STAGE ranges.
 ///
 /// `size = prod(int(r.vmax+1) for r in ranges)`. RANGE UOps have `vmax = end-1`,
-/// so `vmax+1 = end`. For flattened BUFFERIZE (single computed expression),
+/// so `vmax+1 = end`. For flattened STAGE (single computed expression),
 /// `vmax+1` gives the total flat size.
 fn calculate_size_from_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> usize {
     if ranges.is_empty() {
@@ -903,18 +872,18 @@ fn calculate_size_from_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> usize {
 /// regardless of their insertion order in the graph.
 fn sort_ranges_by_axis_id(ranges: &SmallVec<[Arc<UOp>; 4]>) -> SmallVec<[Arc<UOp>; 4]> {
     let mut sorted: Vec<_> = ranges.iter().cloned().collect();
-    sorted.sort_by_key(|r| {
-        if let Op::Range { axis_id, axis_type, .. } = r.op() {
-            // Tiebreak by `AxisType::priority()` so Loop sorts before Global.
-            (axis_id.value(), axis_type.priority())
-        } else {
-            (usize::MAX, i32::MAX)
+    sorted.sort_by(|a, b| match (a.op(), b.op()) {
+        (Op::Range { axis_id: a_id, axis_type: a_type, .. }, Op::Range { axis_id: b_id, axis_type: b_type, .. }) => {
+            (a_id, a_type.priority()).cmp(&(b_id, b_type.priority()))
         }
+        (Op::Range { .. }, _) => std::cmp::Ordering::Less,
+        (_, Op::Range { .. }) => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
     });
     sorted.into()
 }
 
-/// Collect RANGE UOps from BUFFERIZE ranges, traversing flattened expressions.
+/// Collect RANGE UOps from STAGE ranges, traversing flattened expressions.
 ///
 /// After `flatten_bufferize`, `ranges[0]` may be a computed expression (Add/Mul of RANGEs)
 /// rather than a direct RANGE UOp. This helper traverses all range entries:
@@ -944,55 +913,47 @@ fn new_lunique_buffer(
     size: usize,
     dtype: DType,
 ) -> Arc<UOp> {
-    let unique = UOp::lunique(Some(ctx.next_lunique()));
-    let dev = UOp::device(device);
-    UOp::new(Op::Buffer { unique, device: dev, size }, dtype)
+    let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![svod_ir::SInt::Const(size)]);
+    // Keep deterministic schedule-local slots disjoint from runtime BUFFER slots.
+    // Cache restoration replaces these with fresh runtime slots before execution.
+    let slot = (1usize << (usize::BITS - 1)) | ctx.next_lunique();
+    let arg = svod_ir::ParamArg::buffer(slot, dtype.clone(), AddrSpace::Global, Some(device));
+    UOp::new(Op::Buffer { shape, arg }, dtype)
+        .with_tag(smallvec::smallvec![svod_ir::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER])
 }
 
-/// Convert BUFFERIZE operation to STORE with buffer allocation and END wrapping.
+/// Convert STAGE operation to STORE with buffer allocation and END wrapping.
 ///
 /// # Arguments
 ///
-/// * `bufferize_op` - The BUFFERIZE UOp to convert
+/// * `bufferize_op` - The STAGE UOp to convert
 /// * `ctx` - Kernel context for tracking buffers and generating IDs
-/// * `allow_locals` - If false, treat local address space as global. If true,
-///   create DEFINE_LOCAL for local address space.
-pub fn bufferize_to_store(
-    bufferize_op: &Arc<UOp>,
-    ctx: &mut RangeifyBufferContext,
-    allow_locals: bool,
-) -> Option<Arc<UOp>> {
+pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut RangeifyBufferContext) -> Option<Arc<UOp>> {
     let (compute, ranges, opts) = match bufferize_op.op() {
-        Op::Bufferize { compute, ranges, opts } => {
+        Op::Stage { compute, ranges, opts } => {
             tracing::debug!(
                 bufferize_id = bufferize_op.id,
                 compute_id = compute.id,
                 ranges_len = ranges.len(),
-                allow_locals = allow_locals,
-                "bufferize_to_store: CONVERTING BUFFERIZE to STORE→AFTER"
+                "bufferize_to_store: CONVERTING STAGE to STORE→AFTER"
             );
             (compute, ranges, opts)
         }
         _ => return None,
     };
 
-    // Calculate size and base dtype upfront (needed for both buffer creation and INDEX dtype)
+    // Calculate size and base dtype upfront.
     let size = calculate_size_from_ranges(ranges);
     let base_dtype = match bufferize_op.dtype() {
         DType::Ptr { base, .. } => (*base).clone(),
         other => other,
     };
 
-    // Calculate sdtype explicitly: `x.dtype.ptr(size=size, addrspace=opts.addrspace)`.
-    // This is the pointer type used for STORE targets, ensuring consistent
-    // size and addrspace across all INDEX operations in this function.
-    let sdtype = base_dtype.clone().ptr(Some(size), opts.addrspace)?;
-
     // Get end_ranges for wrapping stores via `.end(*rngs)`.
     let end_ranges: SmallVec<[Arc<UOp>; 4]> = sort_ranges_by_axis_id(&collect_range_uops(ranges));
 
     // =========================================================================
-    // Case 0: BUFFERIZE(AFTER(...)) reuses the underlying buffer.
+    // Case 0: STAGE(AFTER(...)) reuses the underlying buffer.
     // =========================================================================
     if let Op::After { passthrough, deps } = compute.op() {
         let buf = passthrough.buf_uop().base();
@@ -1008,7 +969,7 @@ pub fn bufferize_to_store(
 
             let mut store_target = store_index.clone();
             if let Op::Index { buffer: target_buffer, .. } = store_target.op()
-                && let Op::Bufferize { compute: target_compute, .. } = target_buffer.op()
+                && let Op::Stage { compute: target_compute, .. } = target_buffer.op()
                 && matches!(target_compute.op(), Op::Index { .. })
             {
                 store_target = target_compute.clone();
@@ -1026,7 +987,7 @@ pub fn bufferize_to_store(
                 }
             }
             let combined = sort_ranges_by_axis_id(&combined);
-            ended_stores.push(store_target.with_dtype(sdtype.clone()).store_value(value.clone()).end(combined));
+            ended_stores.push(store_target.store_value(value.clone()).end(combined));
         }
 
         let result = if ended_stores.is_empty() { buf } else { buf.after(ended_stores) };
@@ -1034,26 +995,17 @@ pub fn bufferize_to_store(
         return Some(result);
     }
 
-    // Determine effective address space based on allow_locals parameter:
-    // - false: skip local buffers entirely (return None) — local buffers are
-    //   converted during codegen, not during kernel splitting.
-    // - true: create DEFINE_LOCAL for local address space.
-    if !allow_locals && opts.addrspace == AddrSpace::Local {
+    // LOCAL stages survive kernel splitting and are lowered by pm_add_local_buffers.
+    if opts.addrspace == AddrSpace::Local {
         return None;
     }
-    let effective_addrspace = opts.addrspace;
 
     let buffer = if let Some(existing_buffer) = ctx.get_buffer(bufferize_op) {
         existing_buffer.clone()
-    } else if effective_addrspace == AddrSpace::Global {
+    } else {
         // Create BUFFER node — BUFFER → PARAM conversion happens later in split_store.
         let device = opts.device.clone().unwrap_or_else(svod_dtype::default_device::default_device);
         new_lunique_buffer(ctx, device, size, base_dtype.clone())
-    } else {
-        // For local address space (only when allow_locals=true), create DEFINE_LOCAL directly.
-        let local_ptr_dtype = base_dtype.clone().ptr(Some(size), opts.addrspace)?;
-        let local_id = ctx.next_local();
-        UOp::define_local(local_id, local_ptr_dtype)
     };
 
     // Collect active RANGE UOps from the ranges. Sort by axis_id for correct
@@ -1069,30 +1021,22 @@ pub fn bufferize_to_store(
     let store_target = if !sorted_ranges.is_empty() {
         // After flatten_bufferize, ranges[0] may be the already-linearized flat index.
         // Use it directly. For non-flattened single-range, the RANGE is used directly.
-        // INDEX = buf.index(idx, dtype=sdtype).
         assert!(
             ranges.len() <= 1 || ranges.iter().all(|r| matches!(r.op(), Op::Const(_))),
             "bufferize_to_store: unexpected multi-range in general path after flatten_bufferize"
         );
-        let idx = if ranges.len() == 1 && !matches!(ranges[0].op(), Op::Const(_)) {
-            // Single range element (possibly flattened expression or RANGE)
-            ranges[0].clone()
-        } else {
-            // Multiple RANGE UOps (shouldn't happen after flatten, but fallback)
-            sorted_ranges[0].clone()
-        };
+        let [idx] = ranges.as_slice() else { unreachable!("STAGE must be flattened before store conversion") };
+        let idx = idx.clone();
         UOp::index()
             .buffer(store_buffer)
             .indices(vec![idx])
-            .dtype(sdtype.clone())
             .call()
-            .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
+            .expect("Failed to create INDEX for STAGE-to-STORE conversion")
     } else {
-        // Scalar store: create INDEX with buffer + index 0 and explicit sdtype
+        // Scalar store: create INDEX with buffer + index 0.
         UOp::index()
             .buffer(store_buffer)
             .indices(vec![UOp::index_const(0)])
-            .dtype(sdtype.clone())
             .call()
             .expect("Failed to create INDEX for scalar STORE")
     };
@@ -1107,16 +1051,12 @@ pub fn bufferize_to_store(
     // NOTE: STORE takes (index, value) - buffer is accessed via index.buffer
     let store = store_target.store_value(compute.clone());
 
-    // Determine END ranges: use only actual RANGE ops from BUFFERIZE.
+    // Determine END ranges: use only actual RANGE ops from STAGE.
     // CONST(0) entries are excluded because `.ranges` only collects RANGE UOps.
     // END should only wrap with actual iteration ranges, not collapsed singletons.
     let end_ranges: SmallVec<[Arc<UOp>; 4]> = sorted_ranges.clone();
 
-    let mut do_store = if !end_ranges.is_empty() { store.end(end_ranges) } else { store };
-
-    if opts.addrspace == AddrSpace::Local {
-        do_store = do_store.barrier(SmallVec::new());
-    }
+    let do_store = if !end_ranges.is_empty() { store.end(end_ranges) } else { store };
 
     let result = buffer.after(SmallVec::from_elem(do_store, 1));
     ctx.map_buffer(bufferize_op.clone(), result.clone());
@@ -1182,8 +1122,7 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
             return None;
         }
 
-        // 2. Identify external inputs and substitute with DEFINE_VAR
-        // (excluding CONST, VCONST, PARAM, DEFINE_LOCAL, DEFINE_VAR).
+        // 2. Identify external inputs and substitute with scalar PARAMs.
         let mut replaces: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
         for node in &in_scope {
             node.0.op().map_child(|child| {
@@ -1191,29 +1130,24 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
                 if in_scope.contains(&key) || replaces.contains_key(&key) {
                     return;
                 }
-                if matches!(
-                    child.op(),
-                    Op::Const(_)
-                        | Op::VConst { .. }
-                        | Op::DefineVar { .. }
-                        | Op::Param { device: None, .. }
-                        | Op::DefineLocal { .. }
-                ) {
+                if matches!(child.op(), Op::Const(_) | Op::VConst { .. }) || matches!(child.op(), Op::Param { .. }) {
                     return;
                 }
                 let vmin = match child.vmin() {
+                    ConstValue::Invalid => return,
                     ConstValue::Int(i) => *i,
                     ConstValue::UInt(u) => *u as i64,
                     ConstValue::Float(f) => *f as i64,
                     ConstValue::Bool(b) => *b as i64,
                 };
                 let vmax = match child.vmax() {
+                    ConstValue::Invalid => return,
                     ConstValue::Int(i) => *i,
                     ConstValue::UInt(u) => *u as i64,
                     ConstValue::Float(f) => *f as i64,
                     ConstValue::Bool(b) => *b as i64,
                 };
-                let var = UOp::define_var(format!("in{}", replaces.len()), vmin, vmax).with_dtype(child.dtype());
+                let var = UOp::variable(format!("in{}", replaces.len()), vmin, vmax, child.dtype());
                 replaces.insert(key, var);
             });
         }
@@ -1232,7 +1166,7 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
             return None;
         }
 
-        // 6. Reverse substitute: DEFINE_VAR → original external inputs
+        // 6. Reverse substitute the temporary PARAMs.
         let reverse: HashMap<UOpKey, Arc<UOp>> = replaces.into_iter().map(|(k, v)| (UOpKey(v), k.0)).collect();
         u = result.substitute(&reverse);
     }
@@ -1267,7 +1201,7 @@ pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &svod_dtype::DType) 
     if target_dtype.is_vector() {
         let count = target_dtype.count();
         let elements: SmallVec<[Arc<UOp>; 4]> = (0..count).map(|_| casted.clone()).collect();
-        Some(UOp::vectorize(elements))
+        Some(UOp::stack(elements))
     } else {
         Some(casted)
     }
@@ -1276,6 +1210,12 @@ pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &svod_dtype::DType) 
 // ============================================================================
 // RANGE SIMPLIFICATION
 // ============================================================================
+
+/// Bounds collected from INDEX validity gates for `pm_simplify_ranges`.
+#[derive(Default)]
+pub struct SimplifyRangesContext {
+    bounds: HashMap<UOpKey, Arc<UOp>>,
+}
 
 /// Simplify ranges by merging adjacent ranges to reduce divmod operations.
 ///
@@ -1380,7 +1320,7 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
         let merged_size_uop = r0_end.mul(r1_end);
         let merged_range = r0.with_sources(vec![merged_size_uop]);
 
-        let new_r0 = merged_range.idiv(r1_end);
+        let new_r0 = merged_range.floor_div(r1_end);
         let new_r1 = merged_range.mod_(r1_end);
 
         #[allow(clippy::mutable_key_type)]
@@ -1390,8 +1330,9 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
 
         // Apply substitution and simplify.
         let rewritten = current.substitute(&subs);
-        static MERGE_SYM: std::sync::LazyLock<crate::TypedPatternMatcher> =
-            std::sync::LazyLock::new(|| crate::symbolic::symbolic().clone() + pm_flatten_range().clone());
+        static MERGE_SYM: std::sync::LazyLock<crate::TypedPatternMatcher> = std::sync::LazyLock::new(|| {
+            crate::symbolic::symbolic() + crate::symbolic::pm_fold_cast_const() + pm_flatten_range()
+        });
         let simplified = crate::rewrite::graph_rewrite(&*MERGE_SYM, rewritten, &mut ());
 
         // Accept if divmod count is reduced or equal.
@@ -1407,15 +1348,138 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
     if changed { Some(current) } else { None }
 }
 
-/// Pattern matcher for range simplification.
+/// Collect the per-range upper bounds an INDEX proves.
 ///
-/// Tries to merge adjacent ranges to reduce divmod operations.
-pub fn pm_simplify_ranges() -> &'static crate::TypedPatternMatcher {
-    crate::cached_patterns! {
-        // Match END ops with ranges
-        u @ End { computation: _, ranges } if !ranges.is_empty() => |u| simplify_merge_adjacent(u),
-        // Match REDUCE ops with ranges
-        u @ Reduce { src: _, ranges, reduce_op: _ } if !ranges.is_empty() => |u| simplify_merge_adjacent(u),
+/// Port of tinygrad `codegen/simplify.py:43-53`, widened to every index. Upstream
+/// reads `idx.src[1]` alone because its INDEX carries one flattened index by this
+/// stage; morok still has multi-index INDEX here whenever `linearize_static_indices`
+/// bails (symbolic or dynamic dims), so a range used only in `indices[1..]` would
+/// otherwise be neither bounded nor protected — and could be shrunk by a bound
+/// harvested from a different access.
+///
+/// Guards are merged across indices keeping the largest bound; every range an
+/// index uses without a guard of its own pins that range to its original end.
+fn mark_gated(ctx: &mut SimplifyRangesContext, idx: &Arc<UOp>) {
+    let Op::Index { indices, .. } = idx.op() else { return };
+
+    fn pin(ctx: &mut SimplifyRangesContext, range: &Arc<UOp>) {
+        if let Op::Range { end, .. } = range.op() {
+            ctx.bounds.insert(UOpKey(range.clone()), end.clone());
+        }
+    }
+
+    let is_gate = |index: &Arc<UOp>| matches!(index.op(), Op::Ternary(svod_ir::TernaryOp::Where, _, _, _));
+    if !indices.iter().any(is_gate) {
+        // No gate anywhere: every range the access reaches is an ungated use.
+        for range in idx.ranges() {
+            pin(ctx, range);
+        }
+        return;
+    }
+
+    let mut guards: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+    let mut ungated: Vec<Arc<UOp>> = Vec::new();
+    for index in indices {
+        let index_guards: HashMap<UOpKey, Arc<UOp>> = if is_gate(index) {
+            index
+                .get_valid()
+                .split_uop(BinaryOp::And)
+                .into_iter()
+                .filter_map(|valid| match valid.op() {
+                    Op::Binary(BinaryOp::Lt, range, bound)
+                        if matches!(range.op(), Op::Range { .. }) && matches!(bound.op(), Op::Const(_)) =>
+                    {
+                        Some((UOpKey(range.clone()), bound.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        let expression = index.get_idx();
+        for range in expression.ranges() {
+            if !index_guards.contains_key(&UOpKey(range.clone())) {
+                ungated.push(range.clone());
+            }
+        }
+        for (range, bound) in index_guards {
+            let larger = guards.get(&range).is_none_or(|old| {
+                const_uop_to_i64(old).zip(const_uop_to_i64(&bound)).is_some_and(|(old, new)| old < new)
+            });
+            if larger {
+                guards.insert(range, bound);
+            }
+        }
+    }
+
+    // A range may feed several gated accesses. The largest bound is required
+    // to preserve every access covered by the original iteration space.
+    for (range, bound) in guards {
+        let larger = ctx
+            .bounds
+            .get(&range)
+            .is_none_or(|old| const_uop_to_i64(old).zip(const_uop_to_i64(&bound)).is_some_and(|(old, new)| old < new));
+        if larger {
+            ctx.bounds.insert(range, bound);
+        }
+    }
+
+    // Any ungated use protects the range from narrowing.
+    for range in &ungated {
+        pin(ctx, range);
+    }
+}
+
+fn protect_reduce_ranges(ctx: &mut SimplifyRangesContext, ranges: &[Arc<UOp>]) {
+    for range in ranges {
+        if let Op::Range { end, .. } = range.op() {
+            ctx.bounds.insert(UOpKey(range.clone()), end.clone());
+        }
+    }
+}
+
+#[allow(clippy::mutable_key_type)]
+fn substitute_simplified_ranges(ctx: &mut SimplifyRangesContext, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let substitutions = ctx
+        .bounds
+        .iter()
+        .filter_map(|(range, bound)| match range.0.op() {
+            Op::Range { .. } => Some((range.clone(), range.0.with_sources(vec![bound.clone()]))),
+            _ => None,
+        })
+        .collect();
+    ctx.bounds.clear();
+
+    let substituted = sink.substitute(&substitutions);
+    if Arc::ptr_eq(&substituted, sink) {
+        return None;
+    }
+
+    // At 8c8b43de UOp.simplify is exactly this tier.
+    static SIMPLIFY: std::sync::LazyLock<crate::TypedPatternMatcher> =
+        std::sync::LazyLock::new(|| crate::symbolic::symbolic() + crate::symbolic::pm_fold_cast_const());
+    Some(crate::rewrite::graph_rewrite(&*SIMPLIFY, substituted, &mut ()))
+}
+
+/// Merge ranges and narrow ranges proven bounded by every INDEX access.
+pub fn pm_simplify_ranges() -> crate::TypedPatternMatcher<SimplifyRangesContext> {
+    crate::patterns! {
+        @context SimplifyRangesContext;
+
+        // Rule order matches Tinygrad: merge, collect gates, protect REDUCE, substitute at SINK.
+        u @ End { computation: _, ranges: _ } => |u| simplify_merge_adjacent(u),
+        u @ Reduce { src: _, ranges: _, reduce_op: _ } => |u| simplify_merge_adjacent(u),
+        idx @ Index { buffer: _, indices: _ } => |idx| {
+            mark_gated(ctx, idx);
+            None
+        },
+        _red @ Reduce { src: _, ranges, reduce_op: _ } => |ranges| {
+            protect_reduce_ranges(ctx, ranges);
+            None
+        },
+        sink @ Sink { sources: _ } => |sink| substitute_simplified_ranges(ctx, sink),
     }
 }
 
@@ -1432,45 +1496,27 @@ pub fn flatten_range_impl(r: &Arc<UOp>) -> Option<Arc<UOp>> {
     };
 
     let original_sources = r.op().sources();
-    let original_ranges: Vec<&Arc<UOp>> = original_sources.iter().skip(off).collect();
-    let mut all_range_sources: Vec<Arc<UOp>> = original_ranges.iter().map(|r| (*r).clone()).collect();
-
-    let innermost_computation = if matches!(r.op(), Op::End { .. }) {
-        let mut computation = Arc::clone(&original_sources[0]);
-
-        while matches!(computation.op(), Op::End { .. }) {
-            all_range_sources.extend(computation.op().sources().iter().skip(1).cloned());
-            computation = Arc::clone(&computation.op().sources()[0]);
-        }
-
-        Some(computation)
-    } else {
-        None
-    };
-
-    if all_range_sources.is_empty() {
+    let original_ranges = &original_sources[off..];
+    if original_ranges.is_empty() {
         return None;
     }
 
-    let sink = UOp::sink(all_range_sources);
+    // BOOL/VOID sources are reduction backedges, not ranges to flatten.
+    let is_backedge = |source: &&Arc<UOp>| source.dtype() == DType::Bool || source.dtype() == DType::Void;
+    let backedges: Vec<Arc<UOp>> = original_ranges.iter().filter(is_backedge).cloned().collect();
+    let sink = UOp::sink(original_ranges.iter().filter(|source| !is_backedge(source)).cloned().collect());
     let new_ranges: Vec<Arc<UOp>> =
         sink.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::Range { .. })).collect();
 
-    if new_ranges.is_empty() {
+    let mut new_sources = original_sources[..off].to_vec();
+    new_sources.extend(new_ranges);
+    new_sources.extend(backedges);
+
+    if new_sources.len() == original_sources.len()
+        && new_sources.iter().zip(original_sources.iter()).all(|(a, b)| Arc::ptr_eq(a, b))
+    {
         return None;
     }
-
-    // Check if anything actually changed
-    if new_ranges.len() == original_ranges.len()
-        && innermost_computation.as_ref().is_none_or(|c| Arc::ptr_eq(c, &original_sources[0]))
-        && new_ranges.iter().zip(original_ranges.iter()).all(|(a, b)| Arc::ptr_eq(a, *b))
-    {
-        return None; // No change, avoid infinite loop
-    }
-
-    let mut new_sources: Vec<Arc<UOp>> =
-        if let Some(inner_comp) = innermost_computation { vec![inner_comp] } else { original_sources[..off].to_vec() };
-    new_sources.extend(new_ranges);
 
     Some(r.with_sources(new_sources))
 }
@@ -1493,83 +1539,40 @@ pub fn flatten_ranges(root: &Arc<UOp>) -> Arc<UOp> {
 // CYCLE DETECTION
 // ============================================================================
 
-/// Buffer access types for cycle detection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum OpAccessType {
-    Load,
-    Store,
-}
-
-/// Unwrap buffer-like ops to get the underlying buffer.
-pub fn as_buf(uop: &Arc<UOp>) -> Arc<UOp> {
-    match uop.op() {
-        Op::MSelect { buffer, .. } => buffer.clone(),
-        Op::MStack { buffers } if !buffers.is_empty() => buffers[0].clone(),
-        Op::After { passthrough, .. } => passthrough.clone(),
-        _ => uop.clone(),
-    }
-}
-
-/// Detect conflicting buffer accesses. Panics if same buffer has both LOAD and STORE.
+/// Detect conflicting buffer identities reached through different INDEX source ops.
 #[allow(clippy::mutable_key_type)]
-pub fn find_bufs(store: &Arc<UOp>) -> HashMap<UOpKey, OpAccessType> {
-    let mut ret: HashMap<UOpKey, OpAccessType> = HashMap::new();
+pub fn find_bufs(store: &Arc<UOp>) {
+    let indices = store
+        .toposort_filtered(|uop| !matches!(uop.op(), Op::After { .. }))
+        .into_iter()
+        .filter(|uop| matches!(uop.op(), Op::Index { .. }));
+    let mut read_from = HashMap::new();
 
-    let nodes = store.toposort_filtered(|uop| !matches!(uop.op(), Op::After { .. }));
-
-    for node in nodes {
-        if let Op::Load { buffer, .. } = node.op() {
-            let buf = as_buf(buffer);
-            let buf_key = UOpKey(buf.clone());
-
-            if let Some(&existing_access) = ret.get(&buf_key)
-                && existing_access != OpAccessType::Load
-            {
-                panic!(
-                    "buffer accessed with conflicting ops: {:?} (existing: {:?}, new: {:?})",
-                    buf,
-                    existing_access,
-                    OpAccessType::Load
-                );
-            }
-
-            ret.insert(buf_key, OpAccessType::Load);
+    for index in indices {
+        let Op::Index { buffer, .. } = index.op() else { unreachable!() };
+        let buf = buffer.buf_uop();
+        if !matches!(buf.op(), Op::Buffer { .. } | Op::Param { .. }) {
+            continue;
         }
-
-        if let Some(buffer) = node.store_buffer() {
-            let buf = as_buf(buffer);
-            let buf_key = UOpKey(buf.clone());
-
-            if let Some(&existing_access) = ret.get(&buf_key)
-                && existing_access != OpAccessType::Store
-            {
-                panic!(
-                    "buffer accessed with conflicting ops: {:?} (existing: {:?}, new: {:?})",
-                    buf,
-                    existing_access,
-                    OpAccessType::Store
-                );
-            }
-
-            ret.insert(buf_key, OpAccessType::Store);
+        let source_op = std::mem::discriminant(buffer.op());
+        if let Some(previous) = read_from.insert(UOpKey(buf.clone()), source_op)
+            && previous != source_op
+        {
+            panic!("cycle detected while indexing {buf:?}");
         }
     }
-
-    ret
 }
 
 // ============================================================================
 // PM_ADD_BUFFERS PATTERNS
 // ============================================================================
 
-/// Convert DISK BUFFERIZE(BITCAST|CONTIGUOUS) → BUFFER_VIEW.
-/// For DISK devices, creates a zero-copy typed view with byte offset into the
-/// memory-mapped file instead of a compute kernel.
-fn late_buffer_view(compute: &Arc<UOp>, bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
+/// Convert a contiguous DISK movement into Tinygrad's SLICE metadata.
+fn late_buffer_slice(compute: &Arc<UOp>, stage: &Arc<UOp>) -> Option<Arc<UOp>> {
     use svod_ir::uop::cached_property::CachedProperty;
     use svod_ir::uop::properties::VminVmaxProperty;
 
-    let Op::Bufferize { opts, ranges, .. } = bufferize.op() else { return None };
+    let Op::Stage { opts, ranges, .. } = stage.op() else { return None };
 
     // Only for DISK device
     if !matches!(&opts.device, Some(d) if d.is_disk()) {
@@ -1637,39 +1640,10 @@ fn late_buffer_view(compute: &Arc<UOp>, bufferize: &Arc<UOp>) -> Option<Arc<UOp>
     // Get base buffer (the DISK BUFFER UOp)
     let base = index.base();
 
-    // Create BUFFER_VIEW with compute's dtype
-    let buffer_view = UOp::new(Op::BufferView { buffer: base, size, offset }, compute.dtype());
+    let slice = base.contiguous_slice(size, offset, compute.dtype());
 
-    // Replace BUFFERIZE's first source with the BUFFER_VIEW, keep the range source
-    let new_sources: Vec<Arc<UOp>> = std::iter::once(buffer_view).chain(ranges.iter().cloned()).collect();
-    Some(UOp::bufferize(new_sources[0].clone(), new_sources[1..].to_vec(), opts.clone()))
-}
-
-fn move_reshape_through_mselect_mstack(m: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let rebuilt = match m.op() {
-        Op::MSelect { buffer, device_index } => {
-            let Op::Reshape { src, .. } = buffer.op() else {
-                return None;
-            };
-            src.base().mselect(*device_index)
-        }
-        Op::MStack { buffers } => {
-            let mut bases = SmallVec::<[Arc<UOp>; 4]>::with_capacity(buffers.len());
-            for buf in buffers {
-                let Op::Reshape { src, .. } = buf.op() else {
-                    return None;
-                };
-                bases.push(src.base());
-            }
-            UOp::mstack(bases)
-        }
-        _ => return None,
-    }
-    .rtag(None);
-
-    let shape = m.shape().ok()??;
-    let reshaped = rebuilt.try_reshape(shape).ok()?;
-    Some(reshaped.rtag(m.tag().clone()))
+    let new_sources: Vec<Arc<UOp>> = std::iter::once(slice).chain(ranges.iter().cloned()).collect();
+    Some(UOp::stage(new_sources[0].clone(), new_sources[1..].to_vec(), opts.clone()))
 }
 
 fn strip_reshape_on_callable_sources(callable: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -1699,88 +1673,32 @@ fn strip_reshape_on_callable_sources(callable: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(body.call(rewritten, info.clone()).rtag(callable.tag().clone()))
 }
 
-/// Create pattern matcher for adding buffers (BUFFERIZE → STORE conversion).
+/// Create pattern matcher for adding buffers (STAGE → STORE conversion).
 ///
 /// Uses `allow_locals=false`. Shared RangeifyBufferContext ensures unique buffer
 /// IDs across all pattern matches.
-pub fn pm_add_buffers_patterns() -> crate::TypedPatternMatcher<super::kernel::RangeifyBufferContext> {
-    crate::patterns! {
-        @context super::kernel::RangeifyBufferContext;
-        // Flatten multi-range BUFFERIZE to 1D.
-        buf @ Bufferize { compute: _ } if matches!(buf.op(), Op::Bufferize { ranges, .. } if ranges.len() > 1)
-            => |buf, _ctx| { flatten_bufferize(buf) },
-        // Movement-op rewrites: push through INDEX / AFTER, strip from END.
-        idx @ Index { buffer: mop, indices, gate } if mop.op().is_movement()
-            => |idx, mop, indices, gate, _ctx| {
-                super::patterns::transform_movement_through_index(mop, indices, gate, idx.dtype())
-            },
-        after @ After { passthrough: mop, deps } if mop.op().is_movement()
-            => |after, mop, deps, _ctx| {
-                push_movement_through_after(after, mop, deps)
-            },
-        after @ After { passthrough: idx @ Index { buffer, indices, gate }, deps }
-            => |after, idx, buffer, indices, gate, deps, _ctx| {
-                push_index_through_after(after, idx, buffer, indices, gate, deps)
-            },
-        End { computation: mop, ranges } if mop.op().is_movement()
-            => |mop, ranges, _ctx| {
-                let src = &mop.op().sources()[0];
-                Some(src.end(ranges.clone()))
-            },
-        // DISK BUFFERIZE(BITCAST|CONTIGUOUS) → BUFFER_VIEW.
-        buf @ Bufferize { compute }
-            if matches!(compute.op(), Op::BitCast { .. } | Op::Contiguous { .. })
-            => |buf, compute, _ctx| late_buffer_view(compute, buf),
-        // BUFFERIZE → STORE conversion (allow_locals=false: treat local as global).
-        buf @ Bufferize { compute: _ } => |buf, ctx| {
-            bufferize_to_store(buf, ctx, false)
-        },
-        // Move RESHAPE through MSELECT/MSTACK.
-        m @ MSelect { buffer: _ }
-            if matches!(m.op(), Op::MSelect { buffer, .. } if matches!(buffer.op(), Op::Reshape { .. }))
-            => |m, _ctx| { move_reshape_through_mselect_mstack(m) },
-        m @ MStack { buffers: _ }
-            if matches!(m.op(), Op::MStack { buffers } if buffers.iter().all(|x| matches!(x.op(), Op::Reshape { .. })))
-            => |m, _ctx| { move_reshape_through_mselect_mstack(m) },
-        // Strip RESHAPE wrappers on CALL sources.
-        c @ Call { body: _, args: _, info: _ } => |c, _ctx| { strip_reshape_on_callable_sources(c) },
-    }
+pub fn pm_add_buffers_patterns() -> &'static crate::TypedPatternMatcher<super::kernel::RangeifyBufferContext> {
+    static PM: LazyLock<crate::TypedPatternMatcher<super::kernel::RangeifyBufferContext>> =
+        LazyLock::new(build_add_buffers_patterns);
+    &PM
 }
 
-/// Create pattern matcher for adding buffers with local buffer support.
-///
-/// Same as `pm_add_buffers_patterns`, but with `allow_locals=true`.
-pub fn pm_add_buffers_local_patterns() -> crate::TypedPatternMatcher<super::kernel::RangeifyBufferContext> {
-    crate::patterns! {
-        @context super::kernel::RangeifyBufferContext;
-        // Flatten multi-range BUFFERIZE to 1D.
-        buf @ Bufferize { compute: _ } if matches!(buf.op(), Op::Bufferize { ranges, .. } if ranges.len() > 1)
-            => |buf, _ctx| { flatten_bufferize(buf) },
-        // Movement-op rewrites: push through INDEX / AFTER, strip from END.
-        idx @ Index { buffer: mop, indices, gate } if mop.op().is_movement()
-            => |idx, mop, indices, gate, _ctx| {
-                super::patterns::transform_movement_through_index(mop, indices, gate, idx.dtype())
+fn build_add_buffers_patterns() -> crate::TypedPatternMatcher<super::kernel::RangeifyBufferContext> {
+    super::patterns::movement_op_patterns().with_context::<super::kernel::RangeifyBufferContext>()
+        + crate::patterns! {
+            @context super::kernel::RangeifyBufferContext;
+            // Flatten multi-range STAGE to 1D.
+            buf @ Stage { compute: _ } if matches!(buf.op(), Op::Stage { ranges, .. } if ranges.len() > 1)
+                => |buf, _ctx| { flatten_bufferize(buf) },
+            // DISK STAGE(BITCAST|CONTIGUOUS) → SLICE.
+            buf @ Stage { compute }
+                if matches!(compute.op(), Op::BitCast { .. } | Op::Contiguous { .. })
+                => |buf, compute, _ctx| late_buffer_slice(compute, buf),
+            // STAGE → STORE conversion (allow_locals=false: treat local as global).
+            buf @ Stage { compute: _ } => |buf, ctx| {
+                bufferize_to_store(buf, ctx)
             },
-        after @ After { passthrough: mop, deps } if mop.op().is_movement()
-            => |after, mop, deps, _ctx| {
-                push_movement_through_after(after, mop, deps)
-            },
-        after @ After { passthrough: idx @ Index { buffer, indices, gate }, deps }
-            => |after, idx, buffer, indices, gate, deps, _ctx| {
-                push_index_through_after(after, idx, buffer, indices, gate, deps)
-            },
-        End { computation: mop, ranges } if mop.op().is_movement()
-            => |mop, ranges, _ctx| {
-                let src = &mop.op().sources()[0];
-                Some(src.end(ranges.clone()))
-            },
-        // DISK BUFFERIZE(BITCAST|CONTIGUOUS) → BUFFER_VIEW.
-        buf @ Bufferize { compute }
-            if matches!(compute.op(), Op::BitCast { .. } | Op::Contiguous { .. })
-            => |buf, compute, _ctx| late_buffer_view(compute, buf),
-        // BUFFERIZE → STORE (allow_locals=true: create DEFINE_LOCAL for local addrspace).
-        buf @ Bufferize { compute: _ } => |buf, ctx| {
-            bufferize_to_store(buf, ctx, true)
-        },
-    }
+            // Strip RESHAPE wrappers on CALL sources.
+            c @ Call { body: _, args: _, info: _ } => |c, _ctx| { strip_reshape_on_callable_sources(c) },
+        }
 }

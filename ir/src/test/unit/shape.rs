@@ -1,6 +1,6 @@
 use smallvec::smallvec;
 
-use svod_dtype::DType;
+use svod_dtype::{DType, DeviceSpec};
 
 use crate::{ConstValue, SInt, UOp, shape::*};
 
@@ -14,6 +14,12 @@ fn test_is_static() {
     // For now, just test with concrete values
     let also_static = smallvec![SInt::from(3), SInt::from(10)];
     assert!(is_static(&also_static));
+}
+
+#[test]
+fn group_is_shape_opaque() {
+    let source = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    assert!(UOp::group(vec![source]).shape().unwrap().is_none());
 }
 
 #[test]
@@ -39,6 +45,17 @@ fn test_shape_product() {
     let shape: Shape = smallvec![SInt::from(2), SInt::from(3), SInt::from(4)];
     let product = crate::sint_prod(&shape);
     assert_eq!(product.as_const(), Some(24));
+}
+
+#[test]
+fn binary_alu_broadcasts_shaped_operands() {
+    let lhs = UOp::stack(smallvec![UOp::native_const(1.0f32); 8]);
+    let rhs = UOp::stack(smallvec![UOp::native_const(2.0f32); 128])
+        .try_reshape(&smallvec![SInt::Const(4), SInt::Const(4), SInt::Const(8)])
+        .unwrap();
+
+    let sum = lhs.try_add(&rhs).unwrap();
+    assert_eq!(sum.shape().unwrap().unwrap().as_slice(), &[SInt::Const(4), SInt::Const(4), SInt::Const(8)]);
 }
 
 #[test]
@@ -189,17 +206,26 @@ fn test_shape_caching() {
 // =====================================================================
 
 #[test]
-fn test_shape_to_uop_non_empty() {
+fn test_shape_to_uop() {
     use crate::op::Op;
 
-    // Non-empty shape should create Vectorize with elements
-    let shape = smallvec![SInt::from(3), SInt::from(4)];
-    let shape_uop = shape_to_uop(&shape);
+    // A rank-1 shape needs no STACK; higher ranks stack one lane per dim.
+    let single = shape_to_uop(&smallvec![SInt::from(7)]);
+    assert!(matches!(single.op(), Op::Const(_)));
+    assert_eq!(single.dtype(), DType::WeakInt);
 
-    // Should be Vectorize with correct number of elements
-    if let Op::Vectorize { elements } = shape_uop.op() {
-        assert_eq!(elements.len(), 2, "Shape [3, 4] should have 2 elements");
-    } else {
-        panic!("Expected Vectorize, got {:?}", shape_uop.op());
-    }
+    let empty = shape_to_uop(&smallvec![]);
+    assert!(matches!(empty.op(), Op::Stack { sources } if sources.is_empty()));
+    assert_eq!(empty.dtype(), DType::Void);
+
+    let pair = shape_to_uop(&smallvec![SInt::from(3), SInt::from(4)]);
+    assert!(matches!(pair.op(), Op::Stack { sources } if sources.len() == 2));
+    assert_eq!(pair.dtype(), DType::WeakInt);
+
+    // Mixed const/symbolic lanes are materialised at the promoted dtype, so the
+    // constant dim survives the round trip instead of hiding behind a CAST.
+    let mixed = smallvec![SInt::from(3), SInt::Symbolic(UOp::var("n", DType::Int32, 1, 8))];
+    let Op::Stack { sources } = shape_to_uop(&mixed).op().clone() else { panic!("expected STACK") };
+    assert_eq!(SInt::from(&sources[0]), SInt::Const(3));
+    assert_eq!(SInt::from(&sources[1]).as_symbolic().map(|dim| dim.dtype()), Some(DType::Int32));
 }

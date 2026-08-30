@@ -60,7 +60,7 @@ PROVENANCE_TRACKER.with(|t| {
 | Category | Methods | File |
 |----------|---------|------|
 | **Constants** | `const_`, `var`, `unique`, `noop` | `uop/constructors.rs` |
-| **Memory** | `new_buffer`, `buffer_view`, `define_global`, `define_local` | `uop/constructors.rs` |
+| **Memory** | `new_buffer`, `contiguous_slice`, `define_global`, `define_local` | `uop/constructors.rs` |
 | **Load/Store** | `load`, `load_gated`, `store`, `store_gated`, `index` | `uop/constructors.rs` |
 | **Arithmetic** | `try_add_op`, `try_sub_op`, `try_mul_op`, `try_div_op`, `try_mod_op` | `ops/arithmetic.rs` |
 | **Unary** | `neg`, `abs`, `not`, `try_sqrt`, `try_exp`, `try_log` | `uop/constructors.rs` |

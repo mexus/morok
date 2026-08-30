@@ -52,6 +52,36 @@ fn test_combine_matchers() {
 }
 
 #[test]
+fn composition_preserves_wildcard_before_later_indexed_rule() {
+    let mut first = SimplifiedPatternMatcher::<()>::new();
+    first.add_wildcard(|_, _| RewriteResult::Rewritten(const_int(1)));
+    let mut second = SimplifiedPatternMatcher::<()>::new();
+    second.add(&[OpKey::Binary(BinaryOp::Add)], |_, _| RewriteResult::Rewritten(const_int(2)));
+
+    let input = binary(BinaryOp::Add, const_int(3), const_int(4));
+    let RewriteResult::Rewritten(result) = (first + second).rewrite(&input, &mut ()) else {
+        panic!("expected rewrite");
+    };
+    assert!(matches!(result.op(), Op::Const(value) if value.0 == ConstValue::Int(1)));
+}
+
+#[test]
+fn guarded_matcher_defers_to_later_composed_rules() {
+    let mut first = SimplifiedPatternMatcher::<()>::new();
+    first.add(&[OpKey::Binary(BinaryOp::Add)], |_, _| RewriteResult::Rewritten(const_int(1)));
+    let first = first.guarded(|_| false);
+
+    let mut second = SimplifiedPatternMatcher::<()>::new();
+    second.add(&[OpKey::Binary(BinaryOp::Add)], |_, _| RewriteResult::Rewritten(const_int(2)));
+
+    let input = binary(BinaryOp::Add, const_int(3), const_int(4));
+    let RewriteResult::Rewritten(result) = (first + second).rewrite(&input, &mut ()) else {
+        panic!("expected later matcher to rewrite");
+    };
+    assert!(matches!(result.op(), Op::Const(value) if value.0 == ConstValue::Int(2)));
+}
+
+#[test]
 fn test_rewrite_basic() {
     let mut matcher = SimplifiedPatternMatcher::<()>::new();
 

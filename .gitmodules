@@ -1,9 +1,6 @@
 [submodule "submodules/tinygrad"]
 	path = submodules/tinygrad
 	url = https://github.com/tinygrad/tinygrad.git
-[submodule "submodules/melior"]
-	path = submodules/melior
-	url = https://github.com/mlir-rs/melior.git
 [submodule "submodules/onnx"]
 	path = submodules/onnx
 	url = https://github.com/onnx/onnx.git

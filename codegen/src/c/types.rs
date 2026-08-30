@@ -3,12 +3,15 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use svod_dtype::{DType, ScalarDType};
+use svod_dtype::{DType, ScalarDType, cast::committed_float_bits};
+
+use crate::common::value_width;
 use svod_ir::{ConstValue, UOp};
 
 /// Convert a DType to its C scalar type string.
 pub fn c_scalar(s: ScalarDType) -> &'static str {
     match s {
+        ScalarDType::WeakInt | ScalarDType::WeakFloat => panic!("weak dtype reached C rendering"),
         ScalarDType::Bool => "_Bool",
         ScalarDType::Int8 => "signed char",
         ScalarDType::UInt8 => "unsigned char",
@@ -24,15 +27,18 @@ pub fn c_scalar(s: ScalarDType) -> &'static str {
         ScalarDType::Float64 => "double",
         ScalarDType::Void => "void",
         ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => "unsigned char",
+        ScalarDType::FP8E4M3FNUZ | ScalarDType::FP8E5M2FNUZ => panic!("FNUZ reached C rendering"),
     }
 }
 
 /// Space-free identifier base for vector typedef names (e.g. `uchar4`, `llong2`).
 fn c_vector_base(s: ScalarDType) -> &'static str {
     match s {
+        ScalarDType::WeakInt | ScalarDType::WeakFloat => panic!("weak dtype reached C vector rendering"),
         ScalarDType::Bool => "bool",
         ScalarDType::Int8 => "schar",
         ScalarDType::UInt8 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => "uchar",
+        ScalarDType::FP8E4M3FNUZ | ScalarDType::FP8E5M2FNUZ => panic!("FNUZ reached C vector rendering"),
         ScalarDType::Int16 => "short",
         ScalarDType::UInt16 => "ushort",
         ScalarDType::Int32 => "int",
@@ -65,6 +71,7 @@ pub fn c_dtype(dtype: &DType) -> String {
 /// Render a constant value as a C literal.
 pub fn c_const(val: &ConstValue, dtype: &DType) -> String {
     match val {
+        ConstValue::Invalid => panic!("Invalid reached C constant rendering"),
         ConstValue::Bool(b) => if *b { "1" } else { "0" }.to_string(),
         ConstValue::Int(i) => {
             let base = dtype.base();
@@ -89,6 +96,10 @@ pub fn c_const(val: &ConstValue, dtype: &DType) -> String {
 /// Render a float constant as a C literal.
 fn c_float(f: f64, dtype: &DType) -> String {
     let base = dtype.base();
+
+    if base.is_fp8() {
+        return committed_float_bits(f, base).expect("FP8 constant was committed by IR construction").to_string();
+    }
 
     if f.is_nan() {
         return match base {
@@ -160,6 +171,14 @@ pub fn collect_vector_typedefs(nodes: &[Arc<UOp>]) -> Vec<String> {
 
     for node in nodes {
         collect_vec_dtype(&node.dtype(), &mut seen);
+        // Grouped memory keeps a scalar dtype and carries its lane count in
+        // shape. Only LOAD and STACK synthesize a shape-derived C vector type
+        // after devectorization; probing control-flow shapes can recurse
+        // through RANGE/END dependencies.
+        let count = value_width(node);
+        if count > 1 && node.dtype().base() != ScalarDType::Void && !matches!(node.dtype(), DType::Ptr { .. }) {
+            seen.insert((node.dtype().base(), count));
+        }
         // Also check child dtypes for cases where vectors appear as operands
         for child in node.op().children() {
             collect_vec_dtype(&child.dtype(), &mut seen);
@@ -171,8 +190,8 @@ pub fn collect_vector_typedefs(nodes: &[Arc<UOp>]) -> Vec<String> {
             // Bool can't be used as ext_vector_type base; store as unsigned char
             let storage_scalar = if scalar == ScalarDType::Bool { "unsigned char" } else { c_scalar(scalar) };
             let vec_name = format!("{}{}", c_vector_base(scalar), count);
-            let alignment = scalar.bytes() * count;
-            let alignment = alignment.next_power_of_two();
+            let bytes = scalar.bytes() * count;
+            let alignment = if scalar == ScalarDType::Bool { 1 } else { 1usize << bytes.ilog2() };
             format!(
                 "typedef {storage_scalar} {vec_name} __attribute__((aligned({alignment}),ext_vector_type({count})));",
             )
@@ -223,7 +242,7 @@ pub fn c_reduce_identity(op: svod_ir::ReduceOp, dtype: &DType) -> String {
         }
         ReduceOp::Max => {
             if dtype.is_float() {
-                format!("-{}", c_math_fn("__builtin_inf", dtype))
+                format!("-{}()", c_math_fn("__builtin_inf", dtype))
             } else if dtype.is_signed() {
                 match dtype.base() {
                     ScalarDType::Int64 | ScalarDType::Index => format!("{}LL", i64::MIN),
@@ -238,7 +257,7 @@ pub fn c_reduce_identity(op: svod_ir::ReduceOp, dtype: &DType) -> String {
         }
         ReduceOp::Min => {
             if dtype.is_float() {
-                c_math_fn("__builtin_inf", dtype)
+                format!("{}()", c_math_fn("__builtin_inf", dtype))
             } else if dtype.is_signed() {
                 match dtype.base() {
                     ScalarDType::Int64 | ScalarDType::Index => format!("{}LL", i64::MAX),

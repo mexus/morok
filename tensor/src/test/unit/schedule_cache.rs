@@ -97,7 +97,7 @@ fn test_prepare_with_reuses_same_schedule_cache_entry() {
     );
 }
 
-fn batch_cache_key(tensors: &[&Tensor], cfg: &PrepareConfig) -> (u64, &'static str) {
+fn batch_cache_key(tensors: &[&Tensor], cfg: &PrepareConfig) -> (u64, String) {
     let sink = UOp::sink(tensors.iter().map(|t| t.uop().contiguous()).collect());
     let normalized = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize cache key");
     let codegen = crate::realize::resolve_codegen(&normalized.param_buffers, cfg).expect("batch codegen");
@@ -114,12 +114,14 @@ fn test_resolve_codegen_skips_disk_buffers() {
         .resolve_device(&svod_dtype::DeviceSpec::Cpu, registry)
         .expect("CPU device should resolve")
         .compiler
-        .cache_key();
+        .cache_key()
+        .to_string();
     let expected_default = config
         .resolve_device(&svod_dtype::default_device::default_device(), registry)
         .expect("default device should resolve")
         .compiler
-        .cache_key();
+        .cache_key()
+        .to_string();
 
     let disk = UOp::new_buffer(
         svod_dtype::DeviceSpec::Disk { path: std::path::PathBuf::from("weights.bin") },
@@ -286,7 +288,11 @@ fn test_normalize_for_schedule_cache_collects_var_vals_and_strips_bind_values() 
         "normalized graph should replace BIND placeholders with PARAM for reversible restore"
     );
     assert!(
-        normalized.normalized.toposort().iter().any(|node| matches!(node.op(), Op::Param { device: Some(_), .. })),
+        normalized
+            .normalized
+            .toposort()
+            .iter()
+            .any(|node| matches!(node.op(), Op::Param { arg, .. } if arg.device.is_some())),
         "normalized graph should include PARAM placeholders for stripped runtime BIND values"
     );
 }
@@ -316,6 +322,23 @@ fn test_normalize_for_schedule_cache_normalizes_standalone_unique_identity() {
 }
 
 #[test]
+fn test_normalize_for_schedule_cache_preserves_internal_buffers() {
+    let global = UOp::buffer(101, 8, DType::Float32, svod_ir::AddrSpace::Global, Some(svod_dtype::DeviceSpec::Cpu));
+    let local = UOp::buffer(909, 8, DType::Float32, svod_ir::AddrSpace::Local, None);
+    let reg = UOp::buffer(707, 1, DType::Float32, svod_ir::AddrSpace::Reg, None);
+    let normalized = crate::realize::normalize_for_schedule_cache(&UOp::sink(vec![global, local, reg]))
+        .expect("normalize mixed storage");
+
+    assert_eq!(normalized.param_values.len(), 1, "only global storage is a positional input");
+    assert!(normalized.normalized.toposort().iter().any(
+        |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) && arg.slot == 909)
+    ));
+    assert!(normalized.normalized.toposort().iter().any(
+        |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) && arg.slot == 707)
+    ));
+}
+
+#[test]
 fn test_post_sched_cache_restore_replaces_params() {
     let c = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
     let sink = UOp::sink(vec![c.uop().contiguous()]);
@@ -332,10 +355,16 @@ fn test_post_sched_cache_restore_replaces_params() {
 }
 
 #[test]
-fn test_post_sched_cache_restore_materializes_lunique_buffers() {
-    let lunique = UOp::lunique(Some(0));
-    let device = UOp::device(svod_dtype::DeviceSpec::Cpu);
-    let placeholder = UOp::new(Op::Buffer { unique: lunique, device, size: 8 }, DType::Float32);
+fn test_post_sched_cache_restore_materializes_runtime_buffers() {
+    let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![svod_ir::SInt::Const(8)]);
+    let arg = svod_ir::ParamArg::buffer(
+        usize::MAX,
+        DType::Float32,
+        svod_ir::AddrSpace::Global,
+        Some(svod_dtype::DeviceSpec::Cpu),
+    );
+    let placeholder = UOp::new(Op::Buffer { shape, arg }, DType::Float32)
+        .with_tag(smallvec::smallvec![svod_ir::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER]);
     let root = UOp::sink(vec![placeholder]);
 
     let normalization = crate::realize::ScheduleCacheNormalization {
@@ -347,22 +376,12 @@ fn test_post_sched_cache_restore_materializes_lunique_buffers() {
     };
 
     let restored = crate::realize::restore_post_schedule_cache(&root, &normalization);
-    assert!(
-        restored
-            .toposort()
-            .iter()
-            .any(|n| matches!(n.op(), Op::Buffer { unique, .. } if matches!(unique.op(), Op::Unique(_))))
-    );
-    assert!(
-        restored
-            .toposort()
-            .iter()
-            .all(|n| !matches!(n.op(), Op::Buffer { unique, .. } if matches!(unique.op(), Op::LUnique(_))))
-    );
+    assert!(restored.toposort().iter().any(|n| matches!(n.op(), Op::Buffer { arg, .. } if arg.slot != usize::MAX)));
+    assert!(restored.toposort().iter().all(|n| !matches!(n.op(), Op::Buffer { arg, .. } if arg.slot == usize::MAX)));
 }
 
 #[test]
-fn test_post_sched_cache_restore_rewrites_call_boundary_params() {
+fn test_post_sched_cache_restore_keeps_codegen_params_inside_call_body() {
     crate::test::helpers::test_setup();
 
     let c = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
@@ -372,54 +391,27 @@ fn test_post_sched_cache_restore_rewrites_call_boundary_params() {
     let rangeify = svod_schedule::rangeify_with_map(normalization.normalized.clone()).unwrap();
     let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify.sink).unwrap();
 
-    let restored = crate::realize::restore_post_schedule_cache(&kernel_graph, &normalization);
+    let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph).unwrap();
+    let restored = crate::realize::restore_post_schedule_pre_schedule(&pre_schedule, &normalization);
 
     assert!(
-        restored.toposort().iter().all(|n| !matches!(n.op(), Op::Param { device: Some(_), .. })),
-        "restored callable graph should not retain normalized PARAM placeholders"
+        restored.items.iter().flat_map(|item| &item.sources).all(|source| matches!(source.op(), Op::Buffer { .. })),
+        "CALL arguments must restore to runtime buffers"
     );
     assert!(
-        restored.toposort().iter().all(|n| !matches!(n.op(), Op::LUnique(_))),
-        "restored callable graph should not retain LUNIQUE placeholders"
-    );
-}
-
-#[test]
-fn test_buffer_view_normalization_and_restore_parity() {
-    let base_a = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 16, DType::Float32);
-    let base_b = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 16, DType::Float32);
-    let view_a = base_a.view(8, 2);
-    let view_b = base_b.view(8, 2);
-
-    let sink_a = UOp::sink(vec![view_a.clone()]);
-    let sink_b = UOp::sink(vec![view_b.clone()]);
-
-    let norm_a = crate::realize::normalize_for_schedule_cache(&sink_a).expect("normalize buffer view A");
-    let norm_b = crate::realize::normalize_for_schedule_cache(&sink_b).expect("normalize buffer view B");
-
-    assert!(
-        norm_a.normalized.toposort().iter().all(|n| !matches!(n.op(), Op::BufferView { .. })),
-        "normalized cache graph should strip BUFFER_VIEW placeholders to PARAM"
+        restored.items.iter().all(|item| item.ast.toposort().iter().any(|node| {
+            matches!(node.op(), Op::Param { .. })
+                && node.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_CODEGEN_PARAM))
+        })),
+        "callable bodies must retain codegen PARAM formals"
     );
     assert!(
-        norm_a.normalized.toposort().iter().any(|n| matches!(n.op(), Op::Param { device: Some(_), .. })),
-        "normalized buffer-view graph should include PARAM placeholders"
-    );
-
-    assert_eq!(
-        crate::schedule_cache::content_hash(&norm_a.normalized),
-        crate::schedule_cache::content_hash(&norm_b.normalized),
-        "same BUFFER_VIEW structure with different base buffer identity should normalize to same key"
-    );
-
-    let restored = crate::realize::restore_post_schedule_cache(&norm_a.normalized, &norm_a);
-    assert!(
-        restored.toposort().iter().all(|n| !matches!(n.op(), Op::Param { .. })),
-        "restored BUFFER_VIEW graph should not retain PARAM placeholders"
-    );
-    assert!(
-        restored.toposort().iter().any(|n| matches!(n.op(), Op::BufferView { .. })),
-        "restored graph should recover BUFFER_VIEW nodes"
+        restored.items.iter().all(|item| item
+            .ast
+            .toposort()
+            .iter()
+            .all(|node| !matches!(node.op(), Op::Buffer { .. }))),
+        "codegen AST must not contain runtime BUFFERs"
     );
 }
 
@@ -435,6 +427,43 @@ fn test_normalize_for_schedule_cache_rejects_conflicting_bind_values() {
         Err(err) => err,
     };
     assert!(format!("{err}").contains("bind mismatch on variable N"), "error should mention bind mismatch");
+}
+
+#[test]
+fn test_function_symbolic_actuals_participate_in_schedule_cache_identity() {
+    let formal_dim = UOp::scalar_param(1, Some("formal".into()), DType::WeakInt, 1, 8);
+    let formal = UOp::param_with_shape(0, &smallvec::smallvec![SInt::Symbolic(formal_dim)], DType::Float32, None);
+
+    let make = |name: &str| {
+        let dim = UOp::define_var(name.into(), 1, 8);
+        let actual = UOp::param_with_shape(7, &smallvec::smallvec![SInt::Symbolic(dim.clone())], DType::Float32, None);
+        UOp::sink(vec![formal.function(smallvec::smallvec![actual, dim], CallInfo::default()).try_gettuple(0).unwrap()])
+    };
+
+    let a = crate::realize::normalize_for_schedule_cache(&make("a")).unwrap();
+    let b = crate::realize::normalize_for_schedule_cache(&make("b")).unwrap();
+    assert_ne!(
+        crate::schedule_cache::content_hash(&a.normalized),
+        crate::schedule_cache::content_hash(&b.normalized),
+        "different symbolic actuals must not alias in the schedule cache"
+    );
+}
+
+#[test]
+fn test_schedule_cache_normalization_preserves_opaque_call_body() {
+    let hidden = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 8, DType::Float32);
+    let body = UOp::sink(vec![hidden]);
+    let actual = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 8, DType::Float32);
+    let call = body.call(smallvec::smallvec![actual], CallInfo::default());
+    let normalized = crate::realize::normalize_for_schedule_cache(&UOp::sink(vec![call])).unwrap();
+    let normalized_call = normalized
+        .normalized
+        .toposort_call_aware(false)
+        .into_iter()
+        .find(|node| matches!(node.op(), Op::Call { .. }))
+        .unwrap();
+    let Op::Call { body: normalized_body, .. } = normalized_call.op() else { unreachable!() };
+    assert!(Arc::ptr_eq(normalized_body, &body));
 }
 
 // ============================================================================

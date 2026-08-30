@@ -3,6 +3,7 @@ use crate::test::helpers::*;
 use crate::*;
 use ndarray::array;
 use svod_dtype::DType;
+use svod_ir::Op;
 
 #[test]
 fn test_axis_spec_all() {
@@ -57,6 +58,19 @@ fn test_sum_acc_dtype() {
     assert_eq!(Tensor::sum_acc_dtype(&DType::BFloat16), DType::Float32);
     assert_eq!(Tensor::sum_acc_dtype(&DType::Float32), DType::Float32);
     assert_eq!(Tensor::sum_acc_dtype(&DType::Float64), DType::Float64);
+}
+
+#[test]
+fn test_keepdim_wraps_squeezed_tensor_reduce_in_reshape() {
+    let tensor = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([2, 3]).unwrap();
+    let squeezed = tensor.sum(1).unwrap();
+    let kept = tensor.sum_with().axes(1).keepdim(true).call().unwrap();
+
+    assert!(matches!(squeezed.uop().op(), Op::Reduce { ranges, num_axes: 1, .. } if ranges.is_empty()));
+    assert_eq!(squeezed.shape().unwrap().as_slice(), &[SInt::Const(2)]);
+    assert!(matches!(kept.uop().op(), Op::Reshape { src, .. }
+        if matches!(src.op(), Op::Reduce { ranges, num_axes: 1, .. } if ranges.is_empty())));
+    assert_eq!(kept.shape().unwrap().as_slice(), &[SInt::Const(2), SInt::Const(1)]);
 }
 
 // ========== Argmax Tests ==========
@@ -332,6 +346,18 @@ crate::codegen_tests! {
         assert_close_f32(&result.realize_with_and(&config).as_vec::<f32>().unwrap(), &[3.0, 7.0], 1e-6);
     }
 
+    fn test_sum_empty_axis_preserves_nonreduced_shape(config) {
+        test_setup();
+        let t = Tensor::empty(&[0, 3], DType::Float32);
+        let mut squeezed = t.sum(0).unwrap();
+        assert_eq!(squeezed.shape().unwrap().as_slice(), &[SInt::Const(3)]);
+        assert_eq!(squeezed.realize_with_and(&config).as_vec::<f32>().unwrap(), [0.0; 3]);
+
+        let mut kept = t.sum_with().axes(0).keepdim(true).call().unwrap();
+        assert_eq!(kept.shape().unwrap().as_slice(), &[SInt::Const(1), SInt::Const(3)]);
+        assert_eq!(kept.realize_with_and(&config).as_vec::<f32>().unwrap(), [0.0; 3]);
+    }
+
     fn test_sum_single_element_value(config) {
         test_setup();
         let t = Tensor::from_slice([42.0f32]);
@@ -391,6 +417,13 @@ crate::codegen_tests! {
         test_setup();
         let t = Tensor::from_slice([-1.0f32, -5.0, -3.0]);
         assert_close_f32(&t.min(()).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap(), &[-5.0], 1e-6);
+    }
+
+    fn test_empty_float_minmax_use_the_reduction_identity(config) {
+        test_setup();
+        let t = Tensor::empty(&[0], DType::Float32);
+        assert_eq!(t.max(()).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap(), [f32::NEG_INFINITY]);
+        assert_eq!(t.min(()).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap(), [f32::INFINITY]);
     }
 
     // ========== Argmax Tests (from Tinygrad test_ops.py:1087-1105) ==========

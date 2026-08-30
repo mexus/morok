@@ -25,7 +25,7 @@ For architecture details, see the [documentation site](https://npatsakula.github
 | [ir](ir/) | UOp graph IR: 80+ ops, symbolic integers, provenance |
 | [device](device/) | Buffer management: lazy alloc, zero-copy views, LRU caching |
 | [schedule](schedule/) | Optimization engine: 20+ passes, RANGEIFY, Z3 verification |
-| [codegen](codegen/) | Code generation: Clang (default), LLVM JIT, MLIR |
+| [codegen](codegen/) | Code generation: Clang (default), LLVM JIT |
 | [runtime](runtime/) | JIT compilation and kernel execution |
 | [tensor](tensor/) | High-level lazy tensor API |
 | [onnx](onnx/) | ONNX model importer |

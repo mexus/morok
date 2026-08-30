@@ -39,7 +39,7 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
         None => return Ok(None),
     };
 
-    let Op::Reduce { reduce_op: reduce_type, ranges: _, src } = reduce_op.op() else {
+    let Op::Reduce { reduce_op: reduce_type, ranges: _, src, .. } = reduce_op.op() else {
         return Ok(None);
     };
 
@@ -97,8 +97,9 @@ fn get_ranges(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     uop.backward_slice().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect()
 }
 
-fn get_axis_id(range: &Arc<UOp>) -> usize {
-    if let Op::Range { axis_id, .. } = range.op() { axis_id.value() } else { 0 }
+fn get_axis_id(range: &Arc<UOp>) -> AxisId {
+    let Op::Range { axis_id, .. } = range.op() else { unreachable!("range list contains non-RANGE") };
+    axis_id.clone()
 }
 
 fn get_range_size(range: &Arc<UOp>) -> Option<i64> {
@@ -148,9 +149,25 @@ pub fn select_tensor_core(
     if in0_dt.is_image() || in1_dt.is_image() || out_dt.is_image() {
         return Ok(None);
     }
-    let Some(in0_scalar) = in0_dt.scalar() else { return Ok(None) };
-    let Some(in1_scalar) = in1_dt.scalar() else { return Ok(None) };
+    let Some(mut in0_scalar) = in0_dt.scalar() else { return Ok(None) };
+    let Some(mut in1_scalar) = in1_dt.scalar() else { return Ok(None) };
     let Some(out_scalar) = out_dt.scalar() else { return Ok(None) };
+
+    // Dtype emulation runs after TC application. Match an unsupported FP8
+    // input against the f16 WMMA it will become, rather than either missing the
+    // TC opportunity or claiming a native FP8 matrix instruction.
+    if in0_scalar.is_fp8()
+        && !renderer.supports_dtype(in0_scalar)
+        && renderer.supports_dtype(svod_dtype::ScalarDType::Float16)
+    {
+        in0_scalar = svod_dtype::ScalarDType::Float16;
+    }
+    if in1_scalar.is_fp8()
+        && !renderer.supports_dtype(in1_scalar)
+        && renderer.supports_dtype(svod_dtype::ScalarDType::Float16)
+    {
+        in1_scalar = svod_dtype::ScalarDType::Float16;
+    }
 
     for (tc_idx, tc) in tensor_cores.iter().enumerate() {
         if tc.dtype_in.is_image() || tc.dtype_out.is_image() {
@@ -341,13 +358,13 @@ fn apply_axis_choice_impl(
 
     // Create WARP dimension
     let mut warp = UOp::range_axis(
-        UOp::const_(svod_dtype::DType::Index, ConstValue::Int(tc.threads as i64)),
+        UOp::index_const(tc.threads as i64),
         AxisId::Renumbered(scheduler.maxarg() + 1),
         AxisType::Warp,
     );
 
     // Step 1: Apply TC opts via shift_to — splits each axis into (reduced, new_rng)
-    let two = UOp::const_(svod_dtype::DType::Index, ConstValue::Int(2));
+    let two = UOp::index_const(2);
     let mut ne: Vec<Arc<UOp>> = Vec::with_capacity(tc.opts.len());
 
     for opt in &tc.opts {
@@ -387,8 +404,8 @@ fn apply_axis_choice_impl(
             .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "REDUCE missing after shift_to" }.build())?;
 
         // Validate that the REDUCE still contains MUL pattern after shift_to
-        let reduce_src = match updated_reduce.op() {
-            Op::Reduce { src, .. } => src.clone(),
+        let (reduce_src, updated_reduce_ranges) = match updated_reduce.op() {
+            Op::Reduce { src, ranges, .. } => (src.clone(), ranges.clone()),
             _ => unreachable!(),
         };
         let mul = match reduce_src.op() {
@@ -405,16 +422,10 @@ fn apply_axis_choice_impl(
         let inv_a = argsort(&perm_a);
         let inv_b = argsort(&perm_b);
 
-        // Create placeholder UOps with unique axis_ids
-        let ph_base = scheduler.maxarg() + 100;
+        // PLACEHOLDER is a temporary axis namespace, so ordinal identities are
+        // deterministic and cannot collide with live kernel ranges.
         let placeholders: Vec<Arc<UOp>> = (0..ne.len())
-            .map(|i| {
-                UOp::range_axis(
-                    UOp::const_(svod_dtype::DType::Index, ConstValue::Int(2)),
-                    AxisId::Renumbered(ph_base + i),
-                    AxisType::Upcast,
-                )
-            })
+            .map(|i| UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(i), AxisType::Placeholder))
             .collect();
 
         // Substitute ne → placeholders in REDUCE subtree
@@ -463,10 +474,10 @@ fn apply_axis_choice_impl(
         base_upcast_ne.extend(&upcast_ne);
         base_upcast_ne.reverse();
 
-        let base_upcast_axes: Vec<(usize, usize)> = base_upcast_ne
+        let base_upcast_axes: Vec<(AxisId, usize)> = base_upcast_ne
             .iter()
             .map(|rng| match rng.op() {
-                Op::Range { axis_id, .. } => (axis_id.value(), 2),
+                Op::Range { axis_id, .. } => (axis_id.clone(), 2),
                 _ => unreachable!(),
             })
             .collect();
@@ -475,16 +486,24 @@ fn apply_axis_choice_impl(
         let n_a = (tc.elements_per_thread.0 as f64).log2() as usize;
         let n_b = (tc.elements_per_thread.1 as f64).log2() as usize;
         let n_c = (tc.elements_per_thread.2 as f64).log2() as usize;
-        let a_axes = base_upcast_axes[..n_a].to_vec();
-        let b_axes = base_upcast_axes[..n_b].to_vec();
-        let c_axes = base_upcast_axes[..n_c].to_vec();
+        let mut a_axes = base_upcast_axes[..n_a].to_vec();
+        let mut b_axes = base_upcast_axes[..n_b].to_vec();
+        let mut c_axes = base_upcast_axes[..n_c].to_vec();
+        let all_input_axes: Vec<_> = a_axes.iter().chain(&b_axes).cloned().collect();
+        for axes in [&mut a_axes, &mut b_axes, &mut c_axes] {
+            for (axis, _) in &all_input_axes {
+                if !axes.iter().any(|(existing, _)| existing == axis) {
+                    axes.push((axis.clone(), 1));
+                }
+            }
+        }
 
         // Step 5: Construct WMMA
         // Compute TC reduce axis IDs early (needed for metadata)
-        let tc_reduce_aids: Vec<usize> = ne[tc.opts.len()..]
+        let tc_reduce_aids: Vec<AxisId> = ne[tc.opts.len()..]
             .iter()
             .filter_map(|r| match r.op() {
-                Op::Range { axis_id, .. } => Some(axis_id.value()),
+                Op::Range { axis_id, .. } => Some(axis_id.clone()),
                 _ => None,
             })
             .collect();
@@ -503,25 +522,17 @@ fn apply_axis_choice_impl(
             dtype_out: tc.dtype_out.clone(),
             device: scheduler.ren.device,
             threads: tc.threads,
-            upcast_axes: WmmaUpcastAxes { a: a_axes.clone(), b: b_axes.clone(), c: c_axes.clone() },
+            upcast_axes: Some(WmmaUpcastAxes { a: a_axes, b: b_axes, c: c_axes.clone() }),
             reduce_axes: tc_reduce_aids.clone(),
             tile_grid: tc.tile_grid,
         };
 
-        // Tag the WMMA structure finalized (see `TAG_TC_FINAL`) so the expander
-        // keeps the operand CONTRACTs / WMMA / output UNROLL distinct from the
-        // raw operand subtrees and expands the WMMA per output tile.
-        let tc_tag = smallvec::smallvec![crate::devectorize::TAG_TC_FINAL];
-        let a_contract = src_a.contract(a_axes).with_tag(tc_tag.clone());
-        let b_contract = src_b.contract(b_axes).with_tag(tc_tag.clone());
         // The WMMA C/accumulator operand carries the full per-thread D-register
         // width (`elements_per_thread.2`, == prod(c_axes)), NOT a scalar — see
         // tinygrad postrange.py:300-303 which builds the zero accumulator as
-        // `dtype_out.vec(elements_per_thread[2])`. A scalar-0 here desyncs the
-        // C operand from A/B/D when the expander replicates the WMMA over the
-        // M/N output tiles: do_expand broadcasts a scalar C by `expand_sz`
-        // (e.g. 16) giving a count-16 operand, while A/B/D become count-64,
-        // and `devectorize_wmma` then can't group C into per-tile slices.
+        // `dtype_out.vec(elements_per_thread[2])`. The direct WMMA expander
+        // preserves C unchanged before reconstructing the output coordinates,
+        // so this width must already match the hardware accumulator fragment.
         let c_count = tc.elements_per_thread.2;
         let zero_scalar = if tc.dtype_out.is_float() {
             UOp::const_(tc.dtype_out.clone(), ConstValue::Float(0.0))
@@ -529,24 +540,15 @@ fn apply_axis_choice_impl(
             UOp::const_(tc.dtype_out.clone(), ConstValue::Int(0))
         };
         let zero_acc = zero_scalar.broadcast(c_count);
-        let wmma = UOp::wmma(a_contract, b_contract, zero_acc, metadata).with_tag(tc_tag.clone());
-        let mut tc_uop = wmma.unroll_with_dtype(c_axes, tc.dtype_out.clone()).with_tag(tc_tag.clone());
+        let mut tc_uop = UOp::wmma(src_a, src_b, zero_acc, metadata);
 
-        // Re-wrap the WMMA in a REDUCE over the residual reduction ranges — the
-        // K-tile loop left once the matrix core folds the contraction axes
-        // (`tc_reduce_aids`). `shift_to` splits K and substitutes the composite
-        // index back into the operand expressions, so the residual range no
-        // longer lives in `updated_reduce.ranges` (which collapses to empty) but
-        // in the WMMA's backward slice. Collect it from the slice, keeping only
-        // `Reduce`-typed ranges the core did not consume — the slice also carries
-        // Global/Warp/Upcast ranges, which must NOT be wrapped. Without this
-        // REDUCE, pm_reduce
-        // never builds the carried accumulator + loop-close `End`, so codegen
-        // emits a bare WMMA with a const-0 C operand and an unterminated loop.
-        let mut extra: SmallVec<[Arc<UOp>; 4]> = tc_uop
-            .backward_slice()
+        // Preserve only ranges reachable from the original REDUCE range
+        // sources. Operand ranges in the WMMA backward slice are not residual
+        // reductions (postrange.py `_apply_tc_opt`, lines 310-313).
+        let mut extra: SmallVec<[Arc<UOp>; 4]> = UOp::sink(updated_reduce_ranges.into_vec())
+            .toposort()
             .into_iter()
-            .filter(|r| matches!(r.op(), Op::Range { axis_id, axis_type: AxisType::Reduce, .. } if !tc_reduce_aids.contains(&axis_id.value())))
+            .filter(|r| matches!(r.op(), Op::Range { axis_id, .. } if !tc_reduce_aids.contains(axis_id)))
             .collect();
         // Deterministic nesting (outer = lowest axis_id); slice may list a range once.
         extra.sort_by_key(get_axis_id);
@@ -568,6 +570,7 @@ fn apply_axis_choice_impl(
 
 fn tc_reject_reason(err: &OptError) -> &'static str {
     match err {
+        OptError::Spec { .. } => "tensor spec verification failed",
         OptError::ValidationFailed { reason, .. } => reason,
         OptError::InvalidArgType { .. } => "invalid argument type",
         OptError::AxisOutOfBounds { .. } => "axis out of bounds",
@@ -576,7 +579,9 @@ fn tc_reject_reason(err: &OptError) -> &'static str {
         OptError::ExpectedRangeOperation => "expected range operation",
         OptError::MissingAxisParameter => "missing axis parameter",
         OptError::UnsupportedFeature { .. } => "unsupported backend feature",
+        OptError::MissingRendererCapabilities => "missing renderer capabilities",
         OptError::DeviceLimitExceeded { .. } => "device limit exceeded",
+        OptError::BeamWorker { .. } => "BEAM worker failure",
     }
 }
 

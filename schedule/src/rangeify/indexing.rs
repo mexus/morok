@@ -6,9 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use svod_dtype::DType;
+use indexmap::IndexSet;
 use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, SInt, UOp, UOpKey};
-use tracing::{debug, info_span, instrument, trace, warn};
+use tracing::{debug, info_span, instrument, trace};
 
 use crate::argsort;
 
@@ -18,17 +18,6 @@ use crate::argsort;
 
 /// (input_ranges, output_ranges) for a UOp.
 type UOpRanges = (Vec<Arc<UOp>>, Vec<Arc<UOp>>);
-
-/// Rangeify observability counters.
-#[derive(Debug, Clone, Default)]
-pub struct RangeifyStats {
-    pub recovery_retries: usize,
-    pub leaked_pad_ops: usize,
-    pub leaked_reduceaxis_ops: usize,
-    pub pad_fallback_attempts: usize,
-    pub reduceaxis_fallback_attempts: usize,
-    pub fallback_suppressed: usize,
-}
 
 /// Context for range assignment during rangeify.
 #[derive(Default)]
@@ -41,8 +30,6 @@ pub struct IndexingContext {
     pub range_map: HashMap<UOpKey, UOpRanges>,
     /// Counter for generating unique range IDs.
     range_idx: usize,
-    /// Observability counters for fallback/recovery behavior.
-    pub stats: RangeifyStats,
 }
 
 impl IndexingContext {
@@ -68,17 +55,15 @@ impl IndexingContext {
             return UOp::index_const(0);
         }
 
-        self.new_range_uncollapsed(size, axistype)
-    }
-
-    /// Create new RANGE with unique ID, without collapsing size=1 to Const(0).
-    /// Use this when you need a proper Range UOp for realization/kernel boundaries.
-    pub fn new_range_uncollapsed(&mut self, size: &SInt, axistype: AxisType) -> Arc<UOp> {
         // Create range with Unrenumbered axis_id
         let axis_id = AxisId::Unrenumbered(self.range_idx);
         self.range_idx += 1;
 
-        let size_uop = size.to_uop(svod_dtype::DType::Index);
+        let size_uop = match size {
+            SInt::Const(value) => UOp::index_const(*value as i64),
+            SInt::Symbolic(value) => value.clone(),
+            SInt::Infer => panic!("cannot create a range from an inferred dimension"),
+        };
 
         UOp::range_axis(size_uop, axis_id, axistype)
     }
@@ -140,12 +125,6 @@ impl IndexingContext {
         self.non_removable_realizes.contains(&UOpKey(Arc::clone(uop)))
     }
 
-    /// Get all keys in the realize_map (for debugging).
-    #[allow(dead_code)]
-    pub fn realize_map_keys(&self) -> Vec<&UOpKey> {
-        self.realize_map.keys().collect()
-    }
-
     /// Set the range map for a UOp.
     pub fn set_ranges(&mut self, uop: &Arc<UOp>, input_ranges: Vec<Arc<UOp>>, output_ranges: Vec<Arc<UOp>>) {
         self.range_map.insert(UOpKey(Arc::clone(uop)), (input_ranges, output_ranges));
@@ -160,57 +139,65 @@ impl IndexingContext {
     pub fn range_counter(&self) -> usize {
         self.range_idx
     }
-
-    /// Record one recovery retry and leaked high-level op counts.
-    pub fn record_recovery_retry(&mut self, leaked_pad: usize, leaked_reduceaxis: usize) {
-        self.stats.recovery_retries += 1;
-        self.stats.leaked_pad_ops += leaked_pad;
-        self.stats.leaked_reduceaxis_ops += leaked_reduceaxis;
-    }
-
-    /// Record PAD fallback usage.
-    pub fn record_pad_fallback(&mut self) -> bool {
-        self.stats.pad_fallback_attempts += 1;
-        true
-    }
-
-    /// Record ReduceAxis fallback usage.
-    pub fn record_reduceaxis_fallback(&mut self) -> bool {
-        self.stats.reduceaxis_fallback_attempts += 1;
-        true
-    }
 }
 
 // ============================================================================
 // Core Algorithm
 // ============================================================================
 
-/// Cache for memoizing expensive `graph_rewrite` calls during rangeify.
-///
-/// Matches upstream `@functools.cache` on `_apply_reshape` and `apply_movement_op`.
-/// Keyed by input UOp's `content_hash` (structural, O(1) — pre-computed at creation).
-/// Hash-consing ensures same expression = same Arc = same `id` = cache hit.
-///
-/// Scoped to a single `run_rangeify` call — automatically freed when the function returns.
-/// Uses `UOp.id` (identity) as key — collision-free because all UOps are held alive
-/// within a single run, and hash consing guarantees same structure = same Arc = same id.
-#[derive(Default)]
-pub struct SimplifyCache {
-    cache: HashMap<u64, Arc<UOp>>,
+/// Key for the movement-op cache: everything upstream's `@functools.cache` sees on
+/// `apply_movement_op(op, in_shape, arg, rngs)` and `_apply_reshape(in_shape, out_shape,
+/// urngs)` (tinygrad/schedule/indexing.py:158,171) — the op, its own arg, the input
+/// shape and the range tuple, never the source being moved. Shapes and range tuples
+/// collapse to one hash-consed `id` each.
+#[derive(PartialEq, Eq, Hash)]
+struct MovementKey {
+    op: std::mem::Discriminant<Op>,
+    arg: UOpKey,
+    in_shape: UOpKey,
+    rngs: UOpKey,
 }
 
-impl SimplifyCache {
-    /// Look up or compute a graph_rewrite simplification.
-    /// `input` is the UOp to simplify; `f` computes the result if not cached.
-    #[inline]
-    fn get_or_simplify(&mut self, input: &Arc<UOp>, f: impl FnOnce() -> Arc<UOp>) -> Arc<UOp> {
-        if let Some(cached) = self.cache.get(&input.id) {
-            return cached.clone();
-        }
-        let result = f();
-        self.cache.insert(input.id, result.clone());
-        result
+/// `_apply_reshape(in_shape, out_shape, urngs)`.
+#[derive(PartialEq, Eq, Hash)]
+struct ReshapeKey {
+    in_shape: UOpKey,
+    out_shape: UOpKey,
+    rngs: UOpKey,
+}
+
+/// Both caches are process-global, exactly as upstream's `@functools.cache`: a hit
+/// skips building the index chain and its `graph_rewrite` entirely, across every
+/// `run_rangeify`.
+#[allow(clippy::mutable_key_type)]
+type Memo<K> = std::sync::LazyLock<std::sync::Mutex<rustc_hash::FxHashMap<K, Vec<Arc<UOp>>>>>;
+static MOVEMENT_CACHE: Memo<MovementKey> = std::sync::LazyLock::new(Default::default);
+static RESHAPE_CACHE: Memo<ReshapeKey> = std::sync::LazyLock::new(Default::default);
+
+/// One hash-consed identity per input tuple. The key owns the node, which is what
+/// keeps its `id` stable: interning holds only weak references, so a tuple that no
+/// live key mentions is re-interned with a fresh id.
+fn tuple_key(sources: Vec<Arc<UOp>>) -> UOpKey {
+    UOpKey(UOp::sink(sources))
+}
+
+fn shape_key(shape: &[SInt]) -> UOpKey {
+    tuple_key(shape.iter().map(SInt::arithmetic_uop).collect())
+}
+
+/// Whether these inputs are already memoised, for the reuse test.
+#[cfg(test)]
+pub(crate) fn movement_cache_holds(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> bool {
+    MOVEMENT_CACHE.lock().expect("movement cache poisoned").contains_key(&movement_key(op, in_shape, rngs))
+}
+
+fn cached<K: Eq + std::hash::Hash>(memo: &Memo<K>, key: K, f: impl FnOnce() -> Vec<Arc<UOp>>) -> Vec<Arc<UOp>> {
+    if let Some(hit) = memo.lock().expect("movement cache poisoned").get(&key) {
+        return hit.clone();
     }
+    let result = f();
+    memo.lock().expect("movement cache poisoned").insert(key, result.clone());
+    result
 }
 
 /// Run range assignment on a UOp graph. Returns (transformed_sink, context).
@@ -218,107 +205,132 @@ impl SimplifyCache {
 #[instrument(skip(sink), fields(sink_id = sink.id))]
 pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContext)> {
     let mut ctx = IndexingContext::new();
-    let mut simplify_cache = SimplifyCache::default();
 
     // Step 1: Generate realize map via pattern matcher (pm_generate_realize_map)
     // bottom_up=True — patterns see ORIGINAL children
     crate::rewrite::graph_rewrite_bottom_up_preserve_calls(pm_generate_realize_map(), sink.clone(), &mut ctx);
 
-    // Step 2: Get toposort (root-to-leaves) and consumer map
-    let consumer_map = sink.get_consumer_map_call_aware(false);
+    // Step 2: Get toposort (root-to-leaves) and consumer map. Shape/index args
+    // are not dataflow consumers and must not influence range assignment.
+    let consumer_map = consumer_map_for_data_sources(&sink);
 
     // Use forward toposort (root first) for range propagation
     let forward_topo: Vec<_> = sink.toposort_call_aware(false).into_iter().rev().collect();
 
     // Step 3: Assign ranges via forward traversal
-    assign_ranges(&forward_topo, &consumer_map, &mut ctx, &mut simplify_cache)?;
+    assign_ranges(&forward_topo, &consumer_map, &mut ctx)?;
 
     // Step 4: Apply rangeify patterns (pm_apply_rangeify)
-    // Converts ReduceAxis→REDUCE, PAD→WHERE, creates BUFFERIZE+INDEX, removes movement ops.
+    // Converts tensor REDUCE to ranged REDUCE, PAD→WHERE, creates STAGE+INDEX, removes movement ops.
     // Must run bottom_up so patterns see ORIGINAL children (bottom_up=True).
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
-    let mut transformed_sink =
-        crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&rangeify_matcher, sink, &mut ctx);
+    let transformed_sink = crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&rangeify_matcher, sink, &mut ctx);
 
-    // Recovery pass for rangeify leaks caused by node reconstruction during rewrite.
-    //
-    // In some large graphs, a movement op can be reconstructed after initial
-    // range assignment (same semantics, different node identity), so it misses
-    // `range_map` and escapes conversion/removal in the first pm_apply_rangeify pass.
-    // Re-running realize/range assignment on the rewritten graph and applying
-    // pm_apply_rangeify once more resolves these misses while preserving parity
-    // behavior for normal kernels.
-    for pass_idx in 0..2 {
-        let mut leaked_pad = 0usize;
-        let mut leaked_reduceaxis = 0usize;
-        for n in transformed_sink.toposort_call_aware(false) {
-            match n.op() {
-                Op::Pad { .. } => leaked_pad += 1,
-                Op::ReduceAxis { .. } => leaked_reduceaxis += 1,
-                _ => {}
-            }
-        }
-
-        if leaked_pad == 0 && leaked_reduceaxis == 0 {
-            break;
-        }
-
-        ctx.record_recovery_retry(leaked_pad, leaked_reduceaxis);
-
-        tracing::debug!(
-            recovery_pass = pass_idx + 1,
-            leaked_pad,
-            leaked_reduceaxis,
-            "run_rangeify: leaked high-level ops detected, re-running assign+apply"
-        );
-
-        // Rebuild a fresh context on each retry to avoid stale range_map/realize_map
-        // entries from previous passes affecting subsequent recovery behavior.
-        let mut retry_ctx = IndexingContext::new();
-        retry_ctx.stats = ctx.stats.clone();
-
-        crate::rewrite::graph_rewrite_bottom_up_preserve_calls(
-            pm_generate_realize_map(),
-            transformed_sink.clone(),
-            &mut retry_ctx,
-        );
-
-        let consumer_map = transformed_sink.get_consumer_map_call_aware(false);
-        let forward_topo: Vec<_> = transformed_sink.toposort_call_aware(false).into_iter().rev().collect();
-        let mut pass_cache = SimplifyCache::default();
-        assign_ranges(&forward_topo, &consumer_map, &mut retry_ctx, &mut pass_cache)?;
-
-        transformed_sink =
-            crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&rangeify_matcher, transformed_sink, &mut retry_ctx);
-        ctx = retry_ctx;
-    }
-
-    if ctx.stats.recovery_retries > 0
-        || ctx.stats.pad_fallback_attempts > 0
-        || ctx.stats.reduceaxis_fallback_attempts > 0
-    {
-        tracing::debug!(
-            recovery_retries = ctx.stats.recovery_retries,
-            leaked_pad_ops = ctx.stats.leaked_pad_ops,
-            leaked_reduceaxis_ops = ctx.stats.leaked_reduceaxis_ops,
-            pad_fallback_attempts = ctx.stats.pad_fallback_attempts,
-            reduceaxis_fallback_attempts = ctx.stats.reduceaxis_fallback_attempts,
-            fallback_suppressed = ctx.stats.fallback_suppressed,
-            "rangeify diagnostics"
-        );
-    }
-
-    let leaked = transformed_sink
+    // Tinygrad has no recovery loop: neither PAD nor the tensor-form REDUCE survives
+    // pm_apply_rangeify. Fail loudly rather than leaking one into the kernel AST.
+    if transformed_sink
         .toposort_call_aware(false)
-        .into_iter()
-        .find(|n| matches!(n.op(), Op::Pad { .. } | Op::ReduceAxis { .. }));
-    if leaked.is_some() {
+        .iter()
+        .any(|node| matches!(node.op(), Op::Pad { .. } | Op::ReduceAxis { .. }))
+    {
         return Err(svod_ir::Error::SymbolicShapeUnsupported {
-            operation: "rangeify leaked high-level PAD/ReduceAxis after recovery",
+            operation: "rangeify left a high-level PAD/ReduceAxis in the kernel graph",
         });
     }
 
     Ok((transformed_sink, ctx))
+}
+
+/// Consumers of each node, in discovery order and without repeats — a consumer
+/// that reads the same source twice (`y * y`) counts once, matching upstream's
+/// `consumer_map[x][c] = None` dict insert (indexing.py:202-205).
+type ConsumerMap = HashMap<UOpKey, IndexSet<UOpKey>>;
+
+#[allow(clippy::mutable_key_type)]
+fn consumer_map_for_data_sources(sink: &Arc<UOp>) -> ConsumerMap {
+    let topo = sink.toposort_call_aware(false);
+    let mut consumer_map: ConsumerMap = topo.iter().map(|u| (UOpKey(u.clone()), IndexSet::new())).collect();
+    for consumer in topo {
+        for source in data_sources(&consumer) {
+            if let Some(consumers) = consumer_map.get_mut(&UOpKey(source)) {
+                consumers.insert(UOpKey(consumer.clone()));
+            }
+        }
+    }
+    consumer_map
+}
+
+/// Data-bearing sources used by range assignment and source indexing.
+/// Mirrors Tinygrad's `data_srcs`: movement/control metadata and AFTER deps do
+/// not consume tensor iteration ranges.
+pub(crate) fn data_sources(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
+    match uop.op() {
+        Op::Param { .. } | Op::Buffer { .. } | Op::Range { .. } | Op::Special { .. } | Op::Bind { .. } => Vec::new(),
+        op if op.is_movement() => op.sources().first().cloned().into_iter().collect(),
+        Op::Index { buffer, .. } => vec![buffer.clone()],
+        Op::Slice { buffer, .. } => vec![buffer.clone()],
+        Op::Stage { compute, .. } => vec![compute.clone()],
+        Op::Reduce { src, .. } | Op::ReduceAxis { src, .. } => vec![src.clone()],
+        Op::After { passthrough, .. } => vec![passthrough.clone()],
+        Op::End { computation, .. } => vec![computation.clone()],
+        _ => uop.op().sources().into_iter().collect(),
+    }
+}
+
+/// Consumer axes the source is broadcast over: the ones added on its left plus
+/// the ones expanding a singleton source dim (`broadcast_axes`, ops.py:80-83).
+/// `None` when the two shapes do not broadcast.
+fn broadcast_axes(source: &Arc<UOp>, consumer: &Arc<UOp>) -> Option<(usize, Vec<usize>)> {
+    let (Ok(Some(consumer_shape)), Ok(Some(source_shape))) = (consumer.shape(), source.shape()) else {
+        return None;
+    };
+    let left_pad = consumer_shape.len().checked_sub(source_shape.len())?;
+    let mut axes: Vec<usize> = (0..left_pad).collect();
+    axes.extend(source_shape.iter().enumerate().filter_map(|(axis, source_dim)| {
+        let consumer_axis = left_pad + axis;
+        (source_dim.as_const() == Some(1) && consumer_shape[consumer_axis].as_const() != Some(1))
+            .then_some(consumer_axis)
+    }));
+    Some((left_pad, axes))
+}
+
+/// Map a consumer's ranges onto one broadcastable source.
+pub(crate) fn broadcast_ranges(consumer: &Arc<UOp>, source: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+    if !is_broadcastable_op(consumer) {
+        return ranges.to_vec();
+    }
+    let Some((left_pad, target_axes)) = broadcast_axes(source, consumer) else {
+        return ranges.to_vec();
+    };
+
+    ranges
+        .iter()
+        .enumerate()
+        .filter(|(axis, _)| *axis >= left_pad)
+        .map(|(axis, range)| if target_axes.contains(&axis) { UOp::index_const(0) } else { range.clone() })
+        .collect()
+}
+
+/// The ranges `x`'s consumers iterate that `x` itself broadcasts over —
+/// upstream's `broadcast_ending_ranges` (indexing.py:221-223):
+///
+///   ended = [rctx.range_map[c][0][i] for c in consumer_map[x]
+///            if c in rctx.range_map and c.op in GroupOp.Broadcastable
+///            for i in broadcast_axes(x.shape, c.shape)]
+///   broadcast_ending_ranges = list(UOp.sink(*ended).ranges)
+fn broadcast_ending_ranges(x: &Arc<UOp>, consumers: &[Arc<UOp>], ctx: &IndexingContext) -> Vec<Arc<UOp>> {
+    let mut ended = Vec::new();
+    for consumer in consumers.iter().filter(|c| is_broadcastable_op(c)) {
+        let (Some((_, axes)), Some((consumer_in, _))) = (broadcast_axes(x, consumer), ctx.get_ranges(consumer)) else {
+            continue;
+        };
+        ended.extend(axes.into_iter().filter_map(|axis| consumer_in.get(axis).cloned()));
+    }
+    ended.iter().flat_map(collect_ranges_from_uop).collect()
+}
+
+fn is_broadcastable_op(uop: &Arc<UOp>) -> bool {
+    matches!(uop.op(), Op::Binary(..) | Op::Ternary(..))
 }
 
 /// Pattern matcher for generating the realize map (`pm_generate_realize_map`).
@@ -327,18 +339,25 @@ pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContex
 /// - SINK sources (if not always-contiguous)
 /// - COPY, CONTIGUOUS, STORE (always realized)
 /// - Sources of COPY, MSTACK, MSELECT (realized if not always-contiguous)
+/// - Inputs of custom-kernel CALLs (realized and pinned non-removable)
 ///
 /// Patterns return `None` (no rewrite) — context side-effects mark nodes in the realize map.
-fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingContext> {
+pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingContext> {
     crate::cached_patterns! {
         @context IndexingContext;
 
-        // SINK sources → realize non-contiguous bases.
-        x @ Sink { sources: _ } => |x, ctx| {
-            for src in x.op().sources() {
-                let base = src.base();
-                if !is_always_contiguous(&base) {
-                    ctx.mark_realize_all(&base).ok();
+        // `realize_custom_kernel_srcs` (indexing.py:44-49): a hand-written kernel
+        // reads its inputs through PARAM slots, so each one must already be a
+        // buffer — and must stay one, hence non-removable.
+        _c @ Call { body, args, info: _ }
+            if matches!(body.op(), Op::Sink { .. } | Op::Program { .. }) => |_c, args, ctx| {
+            for arg in args {
+                let mut src = Arc::clone(arg);
+                while let Op::Reshape { src: inner, .. } = src.op() {
+                    src = Arc::clone(inner);
+                }
+                if !is_always_contiguous(&src) {
+                    ctx.mark_realize_non_removable(&src);
                 }
             }
             None
@@ -350,25 +369,31 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
         // already overwrote).
         x @ Store { index, value } => |x, index, value, ctx| {
             ctx.mark_realize_pending(x);
+            // `realize_store_after_src` (indexing.py:37-40): a SLICE that is the
+            // direct source of the STORE needs no buffer of its own — the store
+            // target already is the output. A movement op on the destination
+            // means the two do not line up, so the SLICE keeps its buffer.
+            if matches!(value.op(), Op::Slice { .. })
+                && ctx.should_realize(value)
+                && !index.any_in_subtree(|n| {
+                    matches!(n.op(), Op::Shrink { .. } | Op::Permute { .. } | Op::Flip { .. } | Op::Pad { .. })
+                })
+            {
+                ctx.clear_realize(value);
+            }
             if value.backward_slice_ids().contains(&index.base().id) {
                 ctx.mark_realize_non_removable(value);
             }
             None
         },
-        x @ BufferView { buffer: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
-
-        x @ Copy { src: _ } => |x, ctx| {
+        x @ Contiguous { src: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
+        x @ Copy { src, .. } => |x, src, ctx| {
             ctx.mark_realize_all(x).ok();
-            // Also realize sources
-            for src in x.op().sources() {
-                // realize_srcs: guard on src.base.op, realize src.
-                if !is_always_contiguous(&src.base()) {
-                    ctx.mark_realize_all(&src).ok();
-                }
+            if !is_always_contiguous(&src.base()) {
+                ctx.mark_realize_all(src).ok();
             }
             None
         },
-        x @ Contiguous { src: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
         // MStack/MSelect → realize sources
         x @ MStack { buffers: _ } => |x, ctx| {
             for src in x.op().sources() {
@@ -394,25 +419,23 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
 /// Check if a UOp is always contiguous (doesn't need realization).
 ///
 /// Aligned with ALWAYS_CONTIGUOUS.
-/// When the source of a BUFFERIZE is in this set, the BUFFERIZE gets `removable: false`,
+/// When the source of a STAGE is in this set, the STAGE gets `removable: false`,
 /// preventing it from being inlined by buffer removal.
 pub(crate) fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
     matches!(
         uop.op(),
         Op::Contiguous { .. }
-            | Op::Copy { .. }
+            | Op::After { .. }
             | Op::Buffer { .. }
-            | Op::BufferView { .. }
+            | Op::Slice { .. }
             | Op::Const(_)
             | Op::Bind { .. }
-            | Op::Device(_)
             | Op::MSelect { .. }
             | Op::MStack { .. }
             | Op::Param { .. }
-            | Op::DefineLocal(_)
-            | Op::DefineReg { .. }
             | Op::Load { .. }
             | Op::Call { .. }
+            | Op::Function { .. }
     )
 }
 
@@ -456,8 +479,10 @@ pub(crate) fn merge_consumer_ranges(
     // With PCONTIG=0 (default): condition per-dim = `all_all_same || (PCONTIG && all_same(dim))`.
     // When all_all_same=False and PCONTIG=0, this is always False → all dims realized.
     let all_all_same = all_rngs.iter().all(|dim_ranges| {
+        // `all_same([])` is True (helpers.py:31); upstream's `zip(*consumer_rngs)`
+        // (indexing.py:249) truncates such a dim away rather than realizing it.
         if dim_ranges.is_empty() {
-            return false;
+            return true;
         }
         if dim_ranges.iter().skip(1).all(|r| Arc::ptr_eq(&dim_ranges[0], r)) {
             return true;
@@ -468,7 +493,7 @@ pub(crate) fn merge_consumer_ranges(
 
     for (dim_idx, dim_ranges) in all_rngs.iter().enumerate() {
         if dim_ranges.is_empty() {
-            out_rngs.push(ctx.new_range(&shape[dim_idx], AxisType::Loop));
+            out_rngs.push(ctx.new_range(&shape[dim_idx], AxisType::Weak));
             realize_axes.push(dim_idx);
             continue;
         }
@@ -507,18 +532,14 @@ pub(crate) fn merge_consumer_ranges(
             };
             out_rngs.push(merged_range);
         } else {
-            debug!(dim_idx, "merge_consumer_ranges: creating NEW Loop range (ranges not compatible)");
-            out_rngs.push(ctx.new_range(&shape[dim_idx], AxisType::Loop));
+            debug!(dim_idx, "merge_consumer_ranges: creating NEW Weak range (ranges not compatible)");
+            out_rngs.push(ctx.new_range(&shape[dim_idx], AxisType::Weak));
             realize_axes.push(dim_idx);
         }
     }
 
     if !realize_axes.is_empty() {
-        if uop.dtype().scalar() == Some(svod_dtype::ScalarDType::Index) {
-            debug!(realize_axes = ?realize_axes, "range conflict on Index op - marking axes for realization");
-        } else {
-            warn!(realize_axes = ?realize_axes, "range conflict detected - marking axes for realization");
-        }
+        debug!(realize_axes = ?realize_axes, "range conflict detected - marking axes for realization");
         ctx.mark_realize(uop, realize_axes.clone());
     }
 
@@ -530,23 +551,14 @@ pub(crate) fn merge_consumer_ranges(
 #[instrument(skip_all)]
 fn assign_ranges(
     reverse_topo: &[Arc<UOp>],
-    consumer_map: &HashMap<UOpKey, Vec<Arc<UOp>>>,
+    consumer_map: &ConsumerMap,
     ctx: &mut IndexingContext,
-    simplify_cache: &mut SimplifyCache,
 ) -> svod_ir::Result<()> {
     // Local variable for ending_ranges - only used within this function
     let mut ending_ranges: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
 
     for x in reverse_topo {
-        if matches!(x.op(), Op::Device(_) | Op::Unique(_)) {
-            continue;
-        }
-
-        // Keep Index-typed dataflow in range assignment so movement-heavy integer
-        // branches can be lowered; skip only literal/index-definition helpers.
-        if x.dtype().scalar() == Some(svod_dtype::ScalarDType::Index)
-            && matches!(x.op(), Op::Const(_) | Op::DefineVar { .. } | Op::Bind { .. } | Op::Index { .. })
-        {
+        if matches!(x.op(), Op::Unique(_)) {
             continue;
         }
 
@@ -565,9 +577,10 @@ fn assign_ranges(
 
         let _span = info_span!("assign_range", uop_id = x.id, op = x.op().as_ref()).entered();
 
-        let consumers: Vec<_> = consumer_map.get(&UOpKey(x.clone())).cloned().unwrap_or_default();
+        let consumers: Vec<Arc<UOp>> =
+            consumer_map.get(&UOpKey(x.clone())).into_iter().flatten().map(|c| Arc::clone(&c.0)).collect();
         let consumer_rngs: Vec<Vec<Arc<UOp>>> =
-            consumers.iter().filter_map(|c| ctx.get_ranges(c).map(|(inp, _)| inp.clone())).collect();
+            consumers.iter().filter_map(|c| ctx.get_ranges(c).map(|(inp, _)| broadcast_ranges(c, x, inp))).collect();
 
         debug!(
             num_consumers = consumers.len(),
@@ -589,6 +602,12 @@ fn assign_ranges(
                 consumer_ids = ?consumers.iter().map(|c| c.id).collect::<Vec<_>>(),
                 "ending_ranges: node inherits from consumers"
             );
+        }
+        // `ended` / `broadcast_ending_ranges` (indexing.py:221-223), plus the
+        // "fusion decision: REDUCE before the broadcast" row at :225.
+        let broadcast_ending = broadcast_ending_ranges(x, &consumers, ctx);
+        if matches!(x.op(), Op::Reduce { .. }) {
+            inherited_ending.extend(broadcast_ending.iter().cloned());
         }
         ending_ranges.insert(UOpKey(x.clone()), inherited_ending);
 
@@ -615,7 +634,7 @@ fn assign_ranges(
                     dims = shape.len(),
                     "REALIZE via realize_map (fresh ranges)"
                 );
-                let rngs: Vec<_> = shape.iter().map(|s| ctx.new_range(s, AxisType::Loop)).collect();
+                let rngs: Vec<_> = shape.iter().map(|s| ctx.new_range(s, AxisType::Weak)).collect();
                 let axes: Vec<usize> = (0..shape.len()).collect();
                 ctx.realize_map.insert(UOpKey(x.clone()), Some(axes));
                 // Clear ending_ranges when realized
@@ -624,7 +643,6 @@ fn assign_ranges(
             } else {
                 continue;
             }
-        // ReduceAxis uses the same consumer_rngs branching as all other ops
         } else if consumer_rngs.is_empty() {
             continue;
         } else if consumer_rngs.len() == 1 {
@@ -642,14 +660,14 @@ fn assign_ranges(
         if !ending.is_empty() {
             debug!(
                 ending_count = ending.len(),
-                triggers_realization = matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x),
+                triggers_realization = matches!(x.op(), Op::Reduce { .. }) || is_elementwise_op(x),
                 "Ending ranges detected (pre-in_rngs check)"
             );
         }
         // Use ending ranges directly without filtering (matches upstream behavior).
         let filtered_ending = ending.clone();
 
-        if !filtered_ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
+        if !filtered_ending.is_empty() && (matches!(x.op(), Op::Reduce { .. }) || is_elementwise_op(x)) {
             if let Some(shape) = x.shape().ok().flatten() {
                 // Start with existing realize_axes (from merge_consumer_ranges)
                 let mut realize_axes: Vec<usize> = ctx.get_realize_axes(x).cloned().unwrap_or_default();
@@ -689,7 +707,7 @@ fn assign_ranges(
                         .map(|(i, r)| {
                             if realize_axes.contains(&i) {
                                 if let Some(dim) = shape.get(i) {
-                                    ctx.new_range(dim, AxisType::Loop)
+                                    ctx.new_range(dim, AxisType::Weak)
                                 } else {
                                     Arc::clone(r)
                                 }
@@ -704,6 +722,11 @@ fn assign_ranges(
             }
         }
 
+        // `ending_ranges[x] += broadcast_ending_ranges` (indexing.py:284): the
+        // ranges a consumer broadcasts this node over keep propagating to its
+        // producers even when the clears above emptied the inherited set.
+        ending_ranges.entry(UOpKey(x.clone())).or_default().extend(broadcast_ending);
+
         // NOW compute in_rngs from the FINAL out_rngs (after any realization updates)
         let in_rngs = match x.op() {
             Op::Reshape { src, .. }
@@ -713,70 +736,30 @@ fn assign_ranges(
             | Op::Shrink { src, .. }
             | Op::Flip { src, .. } => {
                 if let Some(in_shape) = src.shape()? {
-                    apply_movement_op(x.op(), in_shape, &out_rngs, simplify_cache)
+                    apply_movement_op(x.op(), in_shape, &out_rngs)
                 } else {
                     out_rngs.clone()
                 }
             }
-            Op::ReduceAxis { src, axes, .. } => {
+            // STACK prepends a selection axis; its sources live one axis below.
+            Op::Stack { .. } => out_rngs.iter().skip(1).cloned().collect(),
+            Op::Reduce { src, num_axes, .. } if *num_axes > 0 => {
                 if let Some(in_shape) = src.shape()? {
-                    // Trace ReduceAxis range assignment details
                     if tracing::enabled!(tracing::Level::TRACE) {
                         let out_shape = x.shape()?;
                         trace!(
                             uop.id = x.id,
-                            reduce.axes = ?axes,
+                            reduce.num_axes = *num_axes,
                             in_shape.len = in_shape.len(),
                             out_shape.len = ?out_shape.as_ref().map(|s| s.len()),
                             out_rngs.len = out_rngs.len(),
-                            "ReduceAxis range assignment"
+                            "tensor REDUCE range assignment"
                         );
-                        for (idx, rng) in out_rngs.iter().enumerate() {
-                            match rng.op() {
-                                Op::Binary(binop, a, b) => {
-                                    trace!(
-                                        range.index = idx,
-                                        range.id = rng.id,
-                                        op = "Binary",
-                                        binary_op = ?binop,
-                                        left.id = a.id,
-                                        right.id = b.id,
-                                        "ReduceAxis out_rngs entry"
-                                    );
-                                }
-                                Op::Range { axis_id, axis_type, .. } => {
-                                    trace!(
-                                        range.index = idx,
-                                        range.id = rng.id,
-                                        op = "Range",
-                                        axis.id = ?axis_id,
-                                        axis.type_ = ?axis_type,
-                                        "ReduceAxis out_rngs entry"
-                                    );
-                                }
-                                _ => {
-                                    trace!(
-                                        range.index = idx,
-                                        range.id = rng.id,
-                                        op = ?std::mem::discriminant(rng.op()),
-                                        "ReduceAxis out_rngs entry"
-                                    );
-                                }
-                            }
-                        }
                     }
 
                     let mut rngs = Vec::with_capacity(in_shape.len());
-                    for (i, s) in in_shape.iter().enumerate() {
-                        if axes.contains(&i) {
-                            rngs.push(ctx.new_range(s, AxisType::Reduce));
-                        } else if i < out_rngs.len() {
-                            rngs.push(Arc::clone(&out_rngs[i]));
-                            trace!(dim.index = i, range.id = out_rngs[i].id, "ReduceAxis using existing out_rngs");
-                        } else {
-                            rngs.push(ctx.new_range(s, AxisType::Loop));
-                        }
-                    }
+                    rngs.extend(in_shape.iter().take(*num_axes).map(|s| ctx.new_range(s, AxisType::Reduce)));
+                    rngs.extend(out_rngs.iter().cloned());
                     rngs
                 } else {
                     out_rngs.clone()
@@ -841,17 +824,26 @@ fn assign_ranges(
 // ============================================================================
 
 /// Transform ranges through a movement op (SHRINK, PERMUTE, FLIP, EXPAND, PAD, RESHAPE).
-pub fn apply_movement_op(
-    op: &Op,
-    in_shape: &[SInt],
-    rngs: &[Arc<UOp>],
-    simplify_cache: &mut SimplifyCache,
-) -> Vec<Arc<UOp>> {
+fn movement_key(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> MovementKey {
+    let arg = match op {
+        Op::Permute { axes, .. } => tuple_key(axes.iter().map(|&a| UOp::index_const(a as i64)).collect()),
+        Op::Flip { axes, .. } => tuple_key(axes.iter().map(|&f| UOp::index_const(i64::from(f))).collect()),
+        // Every other movement arg is itself a UOp source behind the moved one.
+        _ => tuple_key(op.sources().iter().skip(1).cloned().collect()),
+    };
+    MovementKey { op: std::mem::discriminant(op), arg, in_shape: shape_key(in_shape), rngs: tuple_key(rngs.to_vec()) }
+}
+
+pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+    cached(&MOVEMENT_CACHE, movement_key(op, in_shape, rngs), || apply_movement_op_uncached(op, in_shape, rngs))
+}
+
+fn apply_movement_op_uncached(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     match op {
-        Op::Shrink { begins, .. } => {
+        Op::Shrink { offsets, .. } => {
             // Matches upstream:
             // case Ops.SHRINK: rngs = tuple(a if ss == 0 else a+ss for a,(ss,_) in zip(rngs, arg))
-            let begin_uops = extract_shape_uops(begins);
+            let begin_uops = extract_shape_uops(offsets);
             rngs.iter()
                 .zip(begin_uops.iter())
                 .map(|(rng, begin)| {
@@ -878,7 +870,7 @@ pub fn apply_movement_op(
                 if !flip {
                     Arc::clone(rng)
                 } else {
-                    let shape_uop = shape.to_uop(svod_dtype::DType::Index);
+                    let shape_uop = shape.arithmetic_uop();
                     let shape_minus_1 = shape_uop.try_sub(&UOp::index_const(1)).unwrap();
                     shape_minus_1.try_sub(rng).unwrap()
                 }
@@ -940,7 +932,7 @@ pub fn apply_movement_op(
                     if is_const_zero(begin) && is_const_zero(end) {
                         return Arc::clone(rng);
                     }
-                    let shape_plus_begin = shape.to_uop(svod_dtype::DType::Index).try_add(begin).unwrap();
+                    let shape_plus_begin = shape.arithmetic_uop().try_add(begin).unwrap();
                     let valid_low = rng.try_cmplt(begin).unwrap().not();
                     let valid_high = rng.try_cmplt(&shape_plus_begin).unwrap();
                     let valid = valid_low.try_and_op(&valid_high).unwrap();
@@ -950,9 +942,7 @@ pub fn apply_movement_op(
                             crate::symbolic::patterns::symbolic()
                                 + crate::symbolic::valid_simplification::pm_simplify_valid()
                         });
-                    let valid = simplify_cache.get_or_simplify(&valid, || {
-                        crate::rewrite::graph_rewrite(&*PAD_SIMPLIFY, valid.clone(), &mut ())
-                    });
+                    let valid = crate::rewrite::graph_rewrite(&*PAD_SIMPLIFY, valid, &mut ());
                     let adjusted_rng = rng.try_sub(begin).unwrap();
                     UOp::try_where(valid, adjusted_rng, UOp::invalid_marker()).unwrap()
                 })
@@ -982,7 +972,7 @@ pub fn apply_movement_op(
 
             // PLACEHOLDER canonicalization + reshape
             with_placeholder_canonicalization(rngs, |canonical| {
-                apply_reshape_core(in_shape, &new_shape_vals, canonical, simplify_cache)
+                apply_reshape_core(in_shape, &new_shape_vals, canonical)
             })
         }
 
@@ -990,18 +980,19 @@ pub fn apply_movement_op(
     }
 }
 
-/// Core RESHAPE: flatten `rngs` by `out_shape` strides, decompose into `in_shape` via Mod/Idiv,
+/// Core RESHAPE: flatten `rngs` by `out_shape` strides, decompose into `in_shape` via FloorMod/FloorDiv,
 /// then run full symbolic simplification.
 ///
 /// Matches upstream `_apply_reshape`.
 /// Callers should PLACEHOLDER-canonicalize `rngs` before calling this.
-fn apply_reshape_core(
-    in_shape: &[SInt],
-    out_shape: &[SInt],
-    rngs: &[Arc<UOp>],
-    simplify_cache: &mut SimplifyCache,
-) -> Vec<Arc<UOp>> {
+fn apply_reshape_core(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     use svod_ir::rewrite::graph_rewrite;
+
+    let key =
+        ReshapeKey { in_shape: shape_key(in_shape), out_shape: shape_key(out_shape), rngs: tuple_key(rngs.to_vec()) };
+    if let Some(hit) = RESHAPE_CACHE.lock().expect("movement cache poisoned").get(&key) {
+        return hit.clone();
+    }
 
     // Pad with CONST(0) on the left when rngs.len() < out_shape.len()
     // (trailing-dimension alignment for partial INDEX)
@@ -1022,17 +1013,17 @@ fn apply_reshape_core(
     let mut axes_in = Vec::new();
     for (shape_dim, rng) in out_shape.iter().zip(padded_rngs.iter()).rev() {
         axes_in.push(acc.try_mul(rng).unwrap());
-        let dim_uop = shape_dim.to_uop(svod_dtype::DType::Index);
+        let dim_uop = shape_dim.arithmetic_uop();
         acc = acc.try_mul(&dim_uop).unwrap();
     }
     let combined = axes_in.into_iter().reduce(|a, b| a.try_add(&b).unwrap()).unwrap_or_else(|| UOp::index_const(0));
 
-    // Unflatten `combined` into in_shape via Mod/Idiv. Redundant mods are
+    // Unflatten `combined` into in_shape via FloorMod/FloorDiv. Redundant mods are
     // dropped by the downstream RESHAPE_SIMPLIFY chain.
     let mut axes_out = Vec::new();
     let mut remaining = combined;
     for shape_dim in in_shape.iter().rev() {
-        let dim_uop = shape_dim.to_uop(svod_dtype::DType::Index);
+        let dim_uop = shape_dim.arithmetic_uop();
         axes_out.push(remaining.try_mod(&dim_uop).unwrap());
         remaining = remaining.try_div(&dim_uop).unwrap();
     }
@@ -1044,12 +1035,13 @@ fn apply_reshape_core(
             + crate::symbolic::valid_simplification::pm_simplify_valid()
             + crate::symbolic::valid_simplification::pm_drop_and_clauses()
     });
-    let sink = UOp::sink(axes_out);
-    let simplified = simplify_cache.get_or_simplify(&sink, || graph_rewrite(&*RESHAPE_SIMPLIFY, sink.clone(), &mut ()));
-    match simplified.op() {
+    let simplified = graph_rewrite(&*RESHAPE_SIMPLIFY, UOp::sink(axes_out), &mut ());
+    let result = match simplified.op() {
         Op::Sink { sources, .. } => sources.iter().cloned().collect(),
         _ => vec![simplified],
-    }
+    };
+    RESHAPE_CACHE.lock().expect("movement cache poisoned").insert(key, result.clone());
+    result
 }
 
 /// Reshape ranges from `out_shape` to `in_shape` via flatten + unflatten.
@@ -1057,8 +1049,7 @@ fn apply_reshape_core(
 /// Public wrapper around `apply_reshape_core` with PLACEHOLDER canonicalization.
 /// Used by `flatten_bufferize` to convert multi-dim ranges to 1D.
 pub fn apply_reshape_ranges(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
-    let mut cache = SimplifyCache::default();
-    with_placeholder_canonicalization(rngs, |canonical| apply_reshape_core(in_shape, out_shape, canonical, &mut cache))
+    with_placeholder_canonicalization(rngs, |canonical| apply_reshape_core(in_shape, out_shape, canonical))
 }
 
 /// Canonicalize RANGE UOps to PLACEHOLDER before calling `f`, then restore.
@@ -1137,13 +1128,13 @@ fn is_const_zero(uop: &Arc<UOp>) -> bool {
     matches!(uop.op(), Op::Const(cv) if cv.0 == ConstValue::Int(0))
 }
 
-/// Extract shape UOps from a vectorize/const (symbolic-aware).
+/// Extract individual dimensions from a scalar/STACK shape argument.
 /// Returns individual element UOps — may be CONST or symbolic expressions.
 /// Matches upstream `marg` which extracts via `sgep`.
 fn extract_shape_uops(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     match uop.op() {
         Op::Cast { src, .. } | Op::BitCast { src, .. } => extract_shape_uops(src),
-        Op::Vectorize { elements } => elements.to_vec(),
+        Op::Stack { sources } => sources.to_vec(),
         Op::Const(_) => vec![uop.clone()],
         Op::VConst { values } => values
             .iter()
@@ -1153,7 +1144,8 @@ fn extract_shape_uops(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
                 _ => panic!("Expected int/uint constant in VConst shape uops"),
             })
             .collect(),
-        _ => panic!("Expected vectorize or constant for shape uops, got {:?}", uop.op()),
+        _ if uop.dtype().is_int() => vec![uop.clone()],
+        _ => panic!("expected STACK or scalar integer for shape uops, got {:?}", uop.op()),
     }
 }
 
@@ -1161,14 +1153,15 @@ fn extract_shape_uops(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
 fn extract_shape_from_uop(uop: &Arc<UOp>) -> Vec<SInt> {
     match uop.op() {
         Op::Cast { src, .. } | Op::BitCast { src, .. } => extract_shape_from_uop(src),
-        Op::Vectorize { elements } => elements
+        Op::Stack { sources } => sources
             .iter()
-            .map(|elem| match elem.op() {
+            .map(|source| match source.op() {
                 Op::Const(cv) => match cv.0 {
                     ConstValue::Int(n) => SInt::Const(n as usize),
-                    _ => SInt::Symbolic(Arc::clone(elem)),
+                    ConstValue::UInt(n) => SInt::Const(n as usize),
+                    _ => SInt::Symbolic(source.clone()),
                 },
-                _ => SInt::Symbolic(Arc::clone(elem)),
+                _ => SInt::Symbolic(source.clone()),
             })
             .collect(),
         Op::Const(cv) => match cv.0 {
@@ -1185,7 +1178,8 @@ fn extract_shape_from_uop(uop: &Arc<UOp>) -> Vec<SInt> {
                 _ => panic!("Expected int/uint constant in VConst shape"),
             })
             .collect(),
-        _ => panic!("Expected vectorize or constant for shape, got {:?}", uop.op()),
+        _ if uop.dtype().is_int() => vec![SInt::Symbolic(uop.clone())],
+        _ => panic!("expected STACK or scalar integer for shape, got {:?}", uop.op()),
     }
 }
 
@@ -1198,57 +1192,13 @@ pub fn ranges_equal(ranges1: &[Arc<UOp>], ranges2: &[Arc<UOp>]) -> bool {
     ranges1.len() == ranges2.len() && ranges1.iter().zip(ranges2).all(|(r1, r2)| Arc::ptr_eq(r1, r2))
 }
 
-/// Check if two ranges are compatible for merging.
-/// Two ranges are compatible if:
-/// Check if two range index expressions are compatible (can share the same range).
-///
-/// Aligned with upstream `all_same()`.
-/// Two ranges are compatible only if they are identical (pointer-equal or
-/// structurally equal including axis_id). Different REDUCE ranges from
-/// different reduction scopes must NOT be considered compatible.
-fn ranges_compatible(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
-    Arc::ptr_eq(a, b) || uop_equal(a, b)
-}
-
 /// Check if all ranges have identical index expressions (ignoring validity masks).
 pub fn all_ranges_same(ranges: &[Arc<UOp>]) -> bool {
     if ranges.is_empty() {
         return true;
     }
     let first_idx = ranges[0].get_idx();
-    ranges.iter().skip(1).all(|r| {
-        let idx = r.get_idx();
-        ranges_compatible(&first_idx, &idx)
-    })
-}
-
-/// Deep structural equality check for UOps.
-pub fn uop_equal(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
-    if Arc::ptr_eq(a, b) {
-        return true;
-    }
-    if std::mem::discriminant(a.op()) != std::mem::discriminant(b.op()) {
-        return false;
-    }
-    if a.dtype() != b.dtype() {
-        return false;
-    }
-    if let (Op::Const(cv_a), Op::Const(cv_b)) = (a.op(), b.op()) {
-        return cv_a.0 == cv_b.0;
-    }
-    if let (
-        Op::Range { end: end_a, axis_id: id_a, axis_type: type_a, .. },
-        Op::Range { end: end_b, axis_id: id_b, axis_type: type_b, .. },
-    ) = (a.op(), b.op())
-    {
-        return id_a == id_b && type_a == type_b && uop_equal(end_a, end_b);
-    }
-    let a_srcs = a.op().sources();
-    let b_srcs = b.op().sources();
-    if a_srcs.len() != b_srcs.len() {
-        return false;
-    }
-    a_srcs.iter().zip(b_srcs.iter()).all(|(sa, sb)| uop_equal(sa, sb))
+    ranges.iter().skip(1).all(|r| Arc::ptr_eq(&first_idx, &r.get_idx()))
 }
 
 /// Check if range is dead (size ≤ 1). Uses vmax analysis.
@@ -1263,11 +1213,12 @@ pub fn is_dead_axis(range: &Arc<UOp>) -> bool {
     }
 }
 
-/// Check if UOp has no RANGE dependencies.
-#[allow(clippy::mutable_key_type)]
+/// Check if UOp has no RANGE anywhere in its backward slice (loop-invariant).
+///
+/// Backed by the cached `RangesProperty`, so this is O(1) after the graph's
+/// first traversal instead of a fresh DFS per call.
 pub fn no_range(uop: &Arc<UOp>) -> bool {
-    let in_scope_ranges = uop.in_scope_ranges();
-    !in_scope_ranges.iter().any(|key| matches!(key.0.op(), Op::Range { .. }))
+    uop.ranges().is_empty()
 }
 
 /// Extract RANGE size as i64. Returns None for symbolic ranges.
@@ -1299,7 +1250,7 @@ pub fn is_identity_value(value: &ConstValue, op: &BinaryOp, is_right: bool) -> b
         (BinaryOp::Sub, ConstValue::Float(f)) if is_right && *f == 0.0 => true,
         (BinaryOp::Mul, ConstValue::Int(1)) => true,
         (BinaryOp::Mul, ConstValue::Float(f)) if *f == 1.0 => true,
-        (BinaryOp::Idiv, ConstValue::Int(1)) if is_right => true,
+        (BinaryOp::FloorDiv, ConstValue::Int(1)) if is_right => true,
         (BinaryOp::Fdiv, ConstValue::Float(f)) if is_right && *f == 1.0 => true,
         (BinaryOp::Or, ConstValue::Int(0)) => true,
         (BinaryOp::Xor, ConstValue::Int(0)) => true,
@@ -1329,29 +1280,6 @@ pub fn get_const_value(uop: &Arc<UOp>) -> Option<ConstValue> {
 /// Check if a UOp is a constant with a specific value.
 pub fn is_const(uop: &Arc<UOp>, value: &ConstValue) -> bool {
     get_const_value(uop).as_ref() == Some(value)
-}
-
-/// Check if a UOp represents a zero-size tensor.
-pub fn is_zero_size(uop: &Arc<UOp>) -> bool {
-    uop.shape().ok().flatten().map(|shape| shape.iter().any(|dim| matches!(dim, SInt::Const(0)))).unwrap_or(false)
-}
-
-/// Check if a dtype is void (used for side-effecting operations).
-pub fn is_void(dtype: &DType) -> bool {
-    *dtype == DType::Void
-}
-
-/// Get the binary operation from a UOp if it's a BINARY operation.
-pub fn get_binary_op(uop: &Arc<UOp>) -> Option<BinaryOp> {
-    match uop.op() {
-        Op::Binary(op, _, _) => Some(*op),
-        _ => None,
-    }
-}
-
-/// Check if a BUFFERIZE operation is for local memory.
-pub fn is_local_bufferize(uop: &Arc<UOp>) -> bool {
-    if let Op::Bufferize { opts, .. } = uop.op() { opts.addrspace == svod_ir::AddrSpace::Local } else { false }
 }
 
 // ============================================================================

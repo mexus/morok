@@ -44,3 +44,18 @@ fn test_safetensors_round_trip() {
     let loaded_bvals = loaded_b.as_vec::<f32>().unwrap();
     assert_eq!(loaded_bvals, vec![0.5, -0.5]);
 }
+
+#[test]
+fn test_load_safetensors_fp8() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fp8.safetensors");
+    let data = [0x00u8, 0x38, 0x40, 0xb8];
+    let tensors = std::collections::HashMap::from([(
+        "weight".to_string(),
+        safetensors::tensor::TensorView::new(safetensors::Dtype::F8_E4M3, vec![2, 2], &data).unwrap(),
+    )]);
+    safetensors::serialize_to_file(&tensors, None::<std::collections::HashMap<String, String>>, &path).unwrap();
+
+    let loaded = crate::state::load_safetensors(&path).unwrap();
+    assert_eq!(loaded["weight"].uop().dtype(), svod_dtype::DType::FP8E4M3);
+}
