@@ -380,6 +380,14 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
         // Upstream avoids this because their pattern ordering resolves it during reconstruction;
         // Svod needs explicit canonicalization.
         Where(cond, inv, x) if UOp::is_invalid_marker(inv) => {
+            // Both branches INVALID: the gate is irrelevant, so collapse instead of
+            // flipping. Without this the canonicalization ping-pongs forever —
+            // WHERE(c, INV, INV) → WHERE(NOT c, INV, INV) → WHERE(c, INV, INV) —
+            // because the inline NOT simplification below undoes the previous flip.
+            // Tinygrad relies on `where(_, val, val) → val` (symbolic.py) firing first.
+            if UOp::is_invalid_marker(x) {
+                return Some(Arc::clone(x));
+            }
             let invalid = inv.clone();
             // Inline NOT simplification: if cond is already NOT(c), flipping gives c (not NOT(NOT(c))).
             // Without this, repeated canonicalization creates NOT(NOT(NOT(...))) chains because
