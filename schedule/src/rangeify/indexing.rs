@@ -277,26 +277,31 @@ pub(crate) fn data_sources(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     }
 }
 
+/// Consumer axes the source is broadcast over: the ones added on its left plus
+/// the ones expanding a singleton source dim (`broadcast_axes`, ops.py:80-83).
+/// `None` when the two shapes do not broadcast.
+fn broadcast_axes(source: &Arc<UOp>, consumer: &Arc<UOp>) -> Option<(usize, Vec<usize>)> {
+    let (Ok(Some(consumer_shape)), Ok(Some(source_shape))) = (consumer.shape(), source.shape()) else {
+        return None;
+    };
+    let left_pad = consumer_shape.len().checked_sub(source_shape.len())?;
+    let mut axes: Vec<usize> = (0..left_pad).collect();
+    axes.extend(source_shape.iter().enumerate().filter_map(|(axis, source_dim)| {
+        let consumer_axis = left_pad + axis;
+        (source_dim.as_const() == Some(1) && consumer_shape[consumer_axis].as_const() != Some(1))
+            .then_some(consumer_axis)
+    }));
+    Some((left_pad, axes))
+}
+
 /// Map a consumer's ranges onto one broadcastable source.
 pub(crate) fn broadcast_ranges(consumer: &Arc<UOp>, source: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     if !is_broadcastable_op(consumer) {
         return ranges.to_vec();
     }
-    let (Ok(Some(consumer_shape)), Ok(Some(source_shape))) = (consumer.shape(), source.shape()) else {
+    let Some((left_pad, target_axes)) = broadcast_axes(source, consumer) else {
         return ranges.to_vec();
     };
-    let Some(left_pad) = consumer_shape.len().checked_sub(source_shape.len()) else {
-        return ranges.to_vec();
-    };
-
-    // Tinygrad's broadcast_axes returns consumer axes that are either newly
-    // added on the left or expand a singleton source dimension.
-    let mut target_axes: Vec<usize> = (0..left_pad).collect();
-    target_axes.extend(source_shape.iter().enumerate().filter_map(|(axis, source_dim)| {
-        let consumer_axis = left_pad + axis;
-        (source_dim.as_const() == Some(1) && consumer_shape[consumer_axis].as_const() != Some(1))
-            .then_some(consumer_axis)
-    }));
 
     ranges
         .iter()
@@ -304,6 +309,24 @@ pub(crate) fn broadcast_ranges(consumer: &Arc<UOp>, source: &Arc<UOp>, ranges: &
         .filter(|(axis, _)| *axis >= left_pad)
         .map(|(axis, range)| if target_axes.contains(&axis) { UOp::index_const(0) } else { range.clone() })
         .collect()
+}
+
+/// The ranges `x`'s consumers iterate that `x` itself broadcasts over —
+/// upstream's `broadcast_ending_ranges` (indexing.py:221-223):
+///
+///   ended = [rctx.range_map[c][0][i] for c in consumer_map[x]
+///            if c in rctx.range_map and c.op in GroupOp.Broadcastable
+///            for i in broadcast_axes(x.shape, c.shape)]
+///   broadcast_ending_ranges = list(UOp.sink(*ended).ranges)
+fn broadcast_ending_ranges(x: &Arc<UOp>, consumers: &[Arc<UOp>], ctx: &IndexingContext) -> Vec<Arc<UOp>> {
+    let mut ended = Vec::new();
+    for consumer in consumers.iter().filter(|c| is_broadcastable_op(c)) {
+        let (Some((_, axes)), Some((consumer_in, _))) = (broadcast_axes(x, consumer), ctx.get_ranges(consumer)) else {
+            continue;
+        };
+        ended.extend(axes.into_iter().filter_map(|axis| consumer_in.get(axis).cloned()));
+    }
+    ended.iter().flat_map(collect_ranges_from_uop).collect()
 }
 
 fn is_broadcastable_op(uop: &Arc<UOp>) -> bool {
@@ -580,6 +603,12 @@ fn assign_ranges(
                 "ending_ranges: node inherits from consumers"
             );
         }
+        // `ended` / `broadcast_ending_ranges` (indexing.py:221-223), plus the
+        // "fusion decision: REDUCE before the broadcast" row at :225.
+        let broadcast_ending = broadcast_ending_ranges(x, &consumers, ctx);
+        if matches!(x.op(), Op::Reduce { .. }) {
+            inherited_ending.extend(broadcast_ending.iter().cloned());
+        }
         ending_ranges.insert(UOpKey(x.clone()), inherited_ending);
 
         let mut out_rngs = if ctx.should_realize(x) {
@@ -692,6 +721,11 @@ fn assign_ranges(
                 ending_ranges.insert(UOpKey(x.clone()), Vec::new());
             }
         }
+
+        // `ending_ranges[x] += broadcast_ending_ranges` (indexing.py:284): the
+        // ranges a consumer broadcasts this node over keep propagating to its
+        // producers even when the clears above emptied the inherited set.
+        ending_ranges.entry(UOpKey(x.clone())).or_default().extend(broadcast_ending);
 
         // NOW compute in_rngs from the FINAL out_rngs (after any realization updates)
         let in_rngs = match x.op() {

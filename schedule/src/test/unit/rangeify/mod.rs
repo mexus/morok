@@ -9,6 +9,7 @@ pub mod cycle_detection;
 pub mod deduplication;
 pub mod device_semantics;
 pub mod edge_cases;
+pub mod ending_ranges;
 pub mod flatten_range;
 pub mod fusion;
 pub mod helpers;
