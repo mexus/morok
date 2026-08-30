@@ -541,54 +541,25 @@ fn test_arena_storage_sharers_have_disjoint_levels() {
 }
 
 #[test]
-fn test_arena_reports_memory_savings() {
-    // Two same-size buffers at distinct levels share one arena slot → savings.
-    let b0 = make_buffer(256);
-    let b1 = make_buffer(256);
-
-    let mut schedule = vec![make_sink_item(90, b0), make_sink_item(91, b1)];
-    chain_deps(&mut schedule);
-    let result = plan(&schedule, &HashSet::new(), PlannerMode::Arena);
-
-    assert!(
-        result.memory_saved > 0,
-        "arena packing of two cross-level same-size buffers must report savings, got {} bytes",
-        result.memory_saved
-    );
-}
-
-#[test]
-fn test_arena_reports_demand_commitment_padding_and_reuse_metrics() {
-    // Each logical buffer is 400 bytes and rounds to 512. Cross-level reuse
-    // commits one 512-byte arena for 800 logical / 1024 rounded bytes.
+fn test_planner_metrics_report_padding_commitment_and_reuse() {
+    // Each logical buffer is 400 bytes and rounds to 512; the two live at
+    // distinct levels, so both planners reuse one allocation for both.
     let mut schedule = vec![make_sink_item(100, make_buffer(100)), make_sink_item(101, make_buffer(100))];
     chain_deps(&mut schedule);
 
-    let result = plan(&schedule, &HashSet::new(), PlannerMode::Arena);
-    let metrics = &result.metrics;
-    assert_eq!(metrics.logical_allocations, 2);
-    assert_eq!(metrics.logical_bytes, 800);
-    assert_eq!(metrics.rounded_bytes, 1024);
-    assert_eq!(metrics.padding_bytes, 224);
-    assert_eq!(metrics.logical_peak_bytes, 400);
-    assert_eq!(metrics.arena_committed_bytes, 512);
-    assert_eq!(metrics.physical_bytes, 512);
-    assert_eq!(metrics.fragmentation_bytes, 112);
-    assert_eq!(metrics.reused_allocations, 1);
-    assert_eq!(metrics.reused_bytes, 288);
-}
+    // Arena commits one rounded 512-byte block for 800 logical / 1024 rounded bytes.
+    let arena = plan(&schedule, &HashSet::new(), PlannerMode::Arena);
+    assert!(arena.memory_saved > 0, "packing two cross-level buffers must report savings");
+    let arena = arena.metrics;
+    assert_eq!((arena.logical_allocations, arena.logical_bytes, arena.rounded_bytes), (2, 800, 1024));
+    assert_eq!((arena.padding_bytes, arena.logical_peak_bytes), (224, 400));
+    assert_eq!((arena.arena_committed_bytes, arena.physical_bytes, arena.fragmentation_bytes), (512, 512, 112));
+    assert_eq!((arena.reused_allocations, arena.reused_bytes), (1, 288));
 
-#[test]
-fn test_remap_reports_exact_physical_and_reused_bytes() {
-    let mut schedule = vec![make_sink_item(105, make_buffer(100)), make_sink_item(106, make_buffer(100))];
-    chain_deps(&mut schedule);
-
-    let result = plan(&schedule, &HashSet::new(), PlannerMode::Remap);
-    assert_eq!(result.metrics.logical_bytes, 800);
-    assert_eq!(result.metrics.rounded_bytes, 1024);
-    assert_eq!(result.metrics.physical_bytes, 400);
-    assert_eq!(result.metrics.reused_allocations, 1);
-    assert_eq!(result.metrics.reused_bytes, 400);
+    // Remap hands back the un-rounded buffer, so physical == one logical allocation.
+    let remap = plan(&schedule, &HashSet::new(), PlannerMode::Remap).metrics;
+    assert_eq!((remap.logical_bytes, remap.rounded_bytes, remap.physical_bytes), (800, 1024, 400));
+    assert_eq!((remap.reused_allocations, remap.reused_bytes), (1, 400));
 }
 
 #[test]

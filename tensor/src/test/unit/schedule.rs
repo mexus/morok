@@ -140,112 +140,55 @@ fn test_create_schedule_mselect_uses_canonical_buffer_id() {
     assert!(item.alias_registered_ids.contains(&mselect.id));
 }
 
-#[test]
-fn test_create_schedule_expands_mstack_without_device_binding() {
-    let buffer0 = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let buffer1 = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let mstack = UOp::mstack(SmallVec::from_vec(vec![buffer0.clone(), buffer1.clone()]));
-    let body = UOp::sink(vec![UOp::native_const(0.0f32)]);
-    let call = body.call(SmallVec::from_vec(vec![mstack]), CallInfo::default());
+fn lane_buffers(count: usize) -> Vec<Arc<UOp>> {
+    (0..count).map(|_| UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32)).collect()
+}
 
-    let inputs = HashMap::from([(buffer0.id, cpu_buffer(4)), (buffer1.id, cpu_buffer(4))]);
+fn mstack_of(lanes: &[Arc<UOp>]) -> Arc<UOp> {
+    UOp::mstack(SmallVec::from_vec(lanes.to_vec()))
+}
+
+/// A CALL whose body computes `body` over `sources`.
+fn call_over(body: Arc<UOp>, sources: Vec<Arc<UOp>>) -> Arc<UOp> {
+    UOp::sink(vec![body]).call(SmallVec::from_vec(sources), CallInfo::default())
+}
+
+fn lane_inputs(lanes: &[&Arc<UOp>]) -> InputBuffers {
+    lanes.iter().map(|lane| (lane.id, cpu_buffer(1))).collect()
+}
+
+/// A DEVICE range over `extent` lanes — the axis that turns an expanded CALL
+/// into a per-device dispatch.
+fn device_axis(extent: Arc<UOp>) -> Arc<UOp> {
+    UOp::range_axis(extent, AxisId::Renumbered(0), AxisType::Device)
+}
+
+#[test]
+fn test_create_schedule_expands_mstack_sources_lane_wise() {
+    // Two MSTACK sources must stay aligned lane by lane, while a scalar BIND is
+    // shared by every lane instead of being split across them. Without a DEVICE
+    // axis in the body no lane gets a `_device_num` binding.
+    let (a, b) = (lane_buffers(2), lane_buffers(2));
+    let scalar = UOp::define_var("N".into(), 0, 8).bind(UOp::index_const(3));
+    let call = call_over(UOp::native_const(0.0f32), vec![mstack_of(&a), mstack_of(&b), scalar]);
+    let inputs = lane_inputs(&[&a[0], &a[1], &b[0], &b[1]]);
+
     let result = create_schedule(UOp::sink(vec![call]), &inputs, &HashMap::new()).unwrap();
 
     assert_eq!(result.items.len(), 2);
-    assert_eq!(result.items[0].buffer_uop_ids, vec![buffer0.id]);
-    assert_eq!(result.items[1].buffer_uop_ids, vec![buffer1.id]);
+    assert_eq!(result.items[0].buffer_uop_ids, vec![a[0].id, b[0].id]);
+    assert_eq!(result.items[1].buffer_uop_ids, vec![a[1].id, b[1].id]);
     assert!(result.items.iter().all(|item| !item.fixedvars.contains_key("_device_num")));
 }
 
 #[test]
-fn test_create_schedule_aligns_multiple_mstack_sources_by_lane() {
-    let a0 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let a1 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let b0 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let b1 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let body = UOp::sink(vec![UOp::native_const(0.0f32)]);
-    let call = body.call(
-        SmallVec::from_vec(vec![
-            UOp::mstack(SmallVec::from_vec(vec![a0.clone(), a1.clone()])),
-            UOp::mstack(SmallVec::from_vec(vec![b0.clone(), b1.clone()])),
-        ]),
-        CallInfo::default(),
-    );
-    let inputs =
-        HashMap::from([(a0.id, cpu_buffer(1)), (a1.id, cpu_buffer(1)), (b0.id, cpu_buffer(1)), (b1.id, cpu_buffer(1))]);
+fn test_create_schedule_binds_device_num_per_lane() {
+    let lanes = lane_buffers(2);
+    let call = call_over(device_axis(UOp::index_const(2)), vec![mstack_of(&lanes)]);
 
-    let result = create_schedule(UOp::sink(vec![call]), &inputs, &HashMap::new()).unwrap();
-    assert_eq!(result.items.len(), 2);
-    assert_eq!(result.items[0].buffer_uop_ids, vec![a0.id, b0.id]);
-    assert_eq!(result.items[1].buffer_uop_ids, vec![a1.id, b1.id]);
-}
+    let result =
+        create_schedule(UOp::sink(vec![call]), &lane_inputs(&[&lanes[0], &lanes[1]]), &HashMap::new()).unwrap();
 
-#[test]
-fn test_create_schedule_rejects_out_of_range_mselect() {
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let mselect = UOp::mstack(SmallVec::from_vec(vec![buffer])).mselect(1);
-    let body = UOp::sink(vec![UOp::native_const(0.0f32)]);
-    let call = body.call(SmallVec::from_vec(vec![mselect]), CallInfo::default());
-
-    let err = match create_schedule(UOp::sink(vec![call]), &InputBuffers::new(), &HashMap::new()) {
-        Ok(_) => panic!("out-of-range MSELECT must be rejected"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, crate::Error::MultiSelectOutOfBounds { device_index: 1, lane_count: 1, .. }));
-}
-
-#[test]
-fn test_create_schedule_requires_common_nonempty_mstack_cardinality() {
-    let a0 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let a1 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let b0 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let empty = UOp::mstack(SmallVec::new());
-    let body = UOp::sink(vec![UOp::native_const(0.0f32)]);
-    let empty_call = body.call(SmallVec::from_vec(vec![empty]), CallInfo::default());
-    let err =
-        expect_schedule_error(create_schedule(UOp::sink(vec![empty_call]), &InputBuffers::new(), &HashMap::new()));
-    assert!(matches!(err, crate::Error::MultiEmptyLanes { source_index: 0, .. }));
-
-    let mismatched = body.call(
-        SmallVec::from_vec(vec![
-            UOp::mstack(SmallVec::from_vec(vec![a0, a1])),
-            UOp::mstack(SmallVec::from_vec(vec![b0])),
-        ]),
-        CallInfo::default(),
-    );
-    let err =
-        expect_schedule_error(create_schedule(UOp::sink(vec![mismatched]), &InputBuffers::new(), &HashMap::new()));
-    assert!(matches!(err, crate::Error::MultiLaneCountMismatch { source_index: 1, expected: 2, actual: 1, .. }));
-}
-
-#[test]
-fn test_create_schedule_exempts_scalar_bind_from_mstack_alignment() {
-    let lane0 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let lane1 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let scalar = UOp::define_var("N".into(), 0, 8).bind(UOp::index_const(3));
-    let body = UOp::sink(vec![UOp::native_const(0.0f32)]);
-    let call = body.call(
-        SmallVec::from_vec(vec![UOp::mstack(SmallVec::from_vec(vec![lane0.clone(), lane1.clone()])), scalar]),
-        CallInfo::default(),
-    );
-    let inputs = HashMap::from([(lane0.id, cpu_buffer(1)), (lane1.id, cpu_buffer(1))]);
-
-    let result = create_schedule(UOp::sink(vec![call]), &inputs, &HashMap::new()).unwrap();
-    assert_eq!(result.items.len(), 2);
-    assert!(result.items.iter().all(|item| item.buffers.len() == 1));
-}
-
-#[test]
-fn test_create_schedule_validates_device_extent_and_binds_each_lane() {
-    let lane0 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let lane1 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let stack = UOp::mstack(SmallVec::from_vec(vec![lane0.clone(), lane1.clone()]));
-    let device = UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(0), AxisType::Device);
-    let body = UOp::sink(vec![device]);
-    let call = body.call(SmallVec::from_vec(vec![stack]), CallInfo::default());
-    let inputs = HashMap::from([(lane0.id, cpu_buffer(1)), (lane1.id, cpu_buffer(1))]);
-
-    let result = create_schedule(UOp::sink(vec![call]), &inputs, &HashMap::new()).unwrap();
     assert_eq!(result.items.len(), 2);
     assert_eq!(result.items[0].fixedvars.get("_device_num"), Some(&0));
     assert_eq!(result.items[1].fixedvars.get("_device_num"), Some(&1));
@@ -253,67 +196,62 @@ fn test_create_schedule_validates_device_extent_and_binds_each_lane() {
 }
 
 #[test]
-fn test_create_schedule_rejects_invalid_device_forms() {
-    let lane0 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let lane1 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let stack = UOp::mstack(SmallVec::from_vec(vec![lane0, lane1]));
-    let wrong_extent = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(0), AxisType::Device);
-    let call = UOp::sink(vec![wrong_extent]).call(SmallVec::from_vec(vec![stack.clone()]), CallInfo::default());
-    let err = expect_schedule_error(create_schedule(UOp::sink(vec![call]), &InputBuffers::new(), &HashMap::new()));
-    assert!(matches!(err, crate::Error::MultiDeviceExtentMismatch { expected: 2, actual: 3, .. }));
+fn test_create_schedule_rejects_malformed_multi_device_calls() {
+    let (a, b) = (lane_buffers(2), lane_buffers(1));
+    let ordinary = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let zero = UOp::native_const(0.0f32);
+    let reject = |sources: Vec<Arc<UOp>>, body: Arc<UOp>| {
+        expect_schedule_error(create_schedule(
+            UOp::sink(vec![call_over(body, sources)]),
+            &InputBuffers::new(),
+            &HashMap::new(),
+        ))
+    };
 
-    let dynamic_end = UOp::variable("device_count".into(), 1, 4, DType::Index);
-    let dynamic = UOp::range_axis(dynamic_end, AxisId::Renumbered(0), AxisType::Device);
-    let call = UOp::sink(vec![dynamic]).call(SmallVec::from_vec(vec![stack]), CallInfo::default());
-    let err = expect_schedule_error(create_schedule(UOp::sink(vec![call]), &InputBuffers::new(), &HashMap::new()));
-    assert!(matches!(err, crate::Error::MultiDeviceExtentNotStatic { .. }));
+    let err = reject(vec![mstack_of(&a).mselect(2)], zero.clone());
+    assert!(matches!(err, crate::Error::MultiSelectOutOfBounds { device_index: 2, lane_count: 2, .. }), "{err:?}");
 
-    let ordinary = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let device = UOp::range_axis(UOp::index_const(1), AxisId::Renumbered(0), AxisType::Device);
-    let call = UOp::sink(vec![device]).call(SmallVec::from_vec(vec![ordinary]), CallInfo::default());
-    let err = expect_schedule_error(create_schedule(UOp::sink(vec![call]), &InputBuffers::new(), &HashMap::new()));
-    assert!(matches!(err, crate::Error::MultiUnsupportedForm { .. }));
+    let err = reject(vec![UOp::mstack(SmallVec::new())], zero.clone());
+    assert!(matches!(err, crate::Error::MultiEmptyLanes { source_index: 0, .. }), "{err:?}");
+
+    let err = reject(vec![mstack_of(&a), mstack_of(&b)], zero.clone());
+    assert!(
+        matches!(err, crate::Error::MultiLaneCountMismatch { source_index: 1, expected: 2, actual: 1, .. }),
+        "{err:?}"
+    );
+
+    // A DEVICE extent must match the lane count and be statically known.
+    let err = reject(vec![mstack_of(&a)], device_axis(UOp::index_const(3)));
+    assert!(matches!(err, crate::Error::MultiDeviceExtentMismatch { expected: 2, actual: 3, .. }), "{err:?}");
+    let dynamic = device_axis(UOp::variable("device_count".into(), 1, 4, DType::Index));
+    assert!(matches!(reject(vec![mstack_of(&a)], dynamic), crate::Error::MultiDeviceExtentNotStatic { .. }));
+
+    // A DEVICE axis without MSTACK lanes, and MSTACK lanes mixed with a plain
+    // buffer, are both unexpanded forms.
+    let err = reject(vec![ordinary.clone()], device_axis(UOp::index_const(1)));
+    assert!(matches!(err, crate::Error::MultiUnsupportedForm { .. }), "{err:?}");
+    let err = reject(vec![mstack_of(&a), ordinary.clone()], zero.clone());
+    assert!(matches!(err, crate::Error::MultiUnsupportedForm { .. }), "{err:?}");
+
+    let sliced = mstack_of(&[a[0].contiguous_slice(1, 0, DType::Float32), a[1].clone()]);
+    let err = reject(vec![sliced], zero);
+    assert!(matches!(err, crate::Error::MultiLaneSliceAlias { source_index: 0, lane: 0, .. }), "{err:?}");
 }
 
 #[test]
 fn test_create_schedule_rejects_device_binding_conflict() {
-    let lane0 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let lane1 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let stack = UOp::mstack(SmallVec::from_vec(vec![lane0.clone(), lane1.clone()]));
-    let device_num = UOp::variable("_device_num".into(), 0, 1, DType::Index);
-    let body = UOp::sink(vec![device_num]);
-    let call = body.call(SmallVec::from_vec(vec![stack]), CallInfo::default());
-    let inputs = HashMap::from([(lane0.id, cpu_buffer(1)), (lane1.id, cpu_buffer(1))]);
+    let lanes = lane_buffers(2);
+    let call = call_over(UOp::variable("_device_num".into(), 0, 1, DType::Index), vec![mstack_of(&lanes)]);
 
     let err = expect_schedule_error(create_schedule(
         UOp::sink(vec![call]),
-        &inputs,
+        &lane_inputs(&[&lanes[0], &lanes[1]]),
         &HashMap::from([("_device_num".into(), 0)]),
     ));
     assert!(matches!(
         err,
         crate::Error::MultiBindingConflict { ref name, existing: 0, incoming: 0, .. } if name == "_device_num"
     ));
-}
-
-#[test]
-fn test_create_schedule_rejects_mixed_and_slice_lane_forms() {
-    let lane0 = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let lane1 = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let ordinary = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let body = UOp::sink(vec![UOp::native_const(0.0f32)]);
-    let mixed = body.call(
-        SmallVec::from_vec(vec![UOp::mstack(SmallVec::from_vec(vec![lane0.clone(), lane1.clone()])), ordinary]),
-        CallInfo::default(),
-    );
-    let err = expect_schedule_error(create_schedule(UOp::sink(vec![mixed]), &InputBuffers::new(), &HashMap::new()));
-    assert!(matches!(err, crate::Error::MultiUnsupportedForm { .. }));
-
-    let sliced = lane0.contiguous_slice(1, 0, DType::Float32);
-    let stack = UOp::mstack(SmallVec::from_vec(vec![sliced, lane1]));
-    let call = body.call(SmallVec::from_vec(vec![stack]), CallInfo::default());
-    let err = expect_schedule_error(create_schedule(UOp::sink(vec![call]), &InputBuffers::new(), &HashMap::new()));
-    assert!(matches!(err, crate::Error::MultiLaneSliceAlias { source_index: 0, lane: 0, .. }));
 }
 
 #[test]
@@ -788,23 +726,14 @@ fn test_create_schedule_nested_after_mstack_mselect_dependencies_consistent() {
 
 #[test]
 fn test_create_schedule_adds_conservative_instance_dependencies_for_expanded_producer() {
-    let lane0 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let lane1 = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
-    let producer = UOp::sink(vec![UOp::native_const(1.0f32)]).call(
-        SmallVec::from_vec(vec![UOp::mstack(SmallVec::from_vec(vec![lane0.clone(), lane1.clone()]))]),
-        CallInfo::default(),
-    );
-    let consumer = UOp::sink(vec![UOp::native_const(2.0f32)]).call(
-        SmallVec::from_vec(vec![UOp::mstack(SmallVec::from_vec(vec![
-            lane0.after(SmallVec::from_vec(vec![producer.clone()])),
-            lane1.after(SmallVec::from_vec(vec![producer.clone()])),
-        ]))]),
-        CallInfo::default(),
-    );
+    let lanes = lane_buffers(2);
+    let producer = call_over(UOp::native_const(1.0f32), vec![mstack_of(&lanes)]);
+    let after_producer =
+        lanes.iter().map(|lane| lane.after(SmallVec::from_vec(vec![producer.clone()]))).collect::<Vec<_>>();
+    let consumer = call_over(UOp::native_const(2.0f32), vec![mstack_of(&after_producer)]);
     let transformed = UOp::sink(vec![producer.clone(), consumer.clone()]);
-    let inputs = HashMap::from([(lane0.id, cpu_buffer(1)), (lane1.id, cpu_buffer(1))]);
 
-    let result = create_schedule(transformed, &inputs, &HashMap::new()).unwrap();
+    let result = create_schedule(transformed, &lane_inputs(&[&lanes[0], &lanes[1]]), &HashMap::new()).unwrap();
     assert_eq!(result.items.len(), 4);
     assert!(result.items[..2].iter().all(|item| item.kernel.id == producer.id));
     for item in &result.items[2..] {
