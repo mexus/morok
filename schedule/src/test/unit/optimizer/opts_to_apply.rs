@@ -27,30 +27,19 @@ fn count_axis_type(ast: &std::sync::Arc<UOp>, axis_type: AxisType) -> usize {
     ast.toposort().iter().filter(|u| matches!(u.op(), Op::Range { axis_type: at, .. } if *at == axis_type)).count()
 }
 
-/// `opts_to_apply = Some(vec![])` (the tinygrad `()` analog): the optimizer
-/// must apply ZERO opts — no heuristic default-upcast — so the manual Weak
-/// range survives and no Upcast axis is introduced.
-#[test]
-fn test_opts_to_apply_empty_skips_heuristic_upcast() {
+/// `opts_to_apply = Some(vec![])` (the tinygrad `()` analog): the optimizer must
+/// apply ZERO opts — no heuristic default-upcast, and no beam search either — so the
+/// manual Weak range survives and no Upcast axis is introduced.
+#[test_case::test_case(OptStrategy::Heuristic; "over the heuristic path")]
+#[test_case::test_case(OptStrategy::Beam { width: 1 }; "over the beam path")]
+fn test_opts_to_apply_empty_applies_no_opts(strategy: OptStrategy) {
     let sink = hand_ranged_sink(8, Some(vec![]));
-    let config = OptimizerConfig { strategy: OptStrategy::Heuristic, ..Default::default() };
+    let config = OptimizerConfig { strategy, ..Default::default() };
     let renderer = Renderer::cpu().with_rewrite_capabilities(svod_ir::RendererOps::all(), None, None);
     let optimized = optimize_kernel_with_config(sink, &renderer, &config).expect("optimize");
 
     assert_eq!(count_axis_type(&optimized, AxisType::Upcast), 0, "opts_to_apply=() must not introduce an Upcast axis");
     assert!(count_axis_type(&optimized, AxisType::Weak) >= 1, "the manual Weak range must survive untouched");
-}
-
-/// The same `Beam` strategy is overridden by an explicit (empty) opt list at
-/// the `optimize_kernel_with_config` level — no heuristic/beam upcast.
-#[test]
-fn test_opts_to_apply_empty_overrides_beam_strategy() {
-    let sink = hand_ranged_sink(8, Some(vec![]));
-    let config = OptimizerConfig { strategy: OptStrategy::Beam { width: 1 }, ..Default::default() };
-    let renderer = Renderer::cpu().with_rewrite_capabilities(svod_ir::RendererOps::all(), None, None);
-    let optimized = optimize_kernel_with_config(sink, &renderer, &config).expect("optimize");
-
-    assert_eq!(count_axis_type(&optimized, AxisType::Upcast), 0, "explicit opts must win over the beam strategy");
 }
 
 /// The `Op::Special` (gidx/lidx) hand-lowered bypass is gone: a SINK carrying

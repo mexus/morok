@@ -164,65 +164,44 @@ mod lower_index_stage_tests {
         assert!(lowered.toposort().iter().all(|node| !node.dtype().is_weak()), "{}", lowered.tree());
     }
 
+    /// The f32 midpoint: two weak floats a `f64` tells apart but an `f32` does not.
+    /// Folding must happen after the commitment to f32, or the two disagree.
+    fn midpoint() -> f64 {
+        1.0 + 2f64.powi(-24)
+    }
+
     #[test]
-    fn lower_index_commits_weak_vconsts_before_comparison_folding() {
-        let midpoint = 1.0 + 2f64.powi(-24);
+    fn lower_index_commits_weak_floats_before_folding_their_consumer() {
         let neighbor = 1.0 + 2f64.powi(-23);
-        let lhs = UOp::vconst(
-            vec![ConstValue::Float(midpoint), ConstValue::Float(neighbor), ConstValue::Invalid],
-            DType::WeakFloat,
-        );
-        let rhs =
-            UOp::vconst(vec![ConstValue::Float(1.0), ConstValue::Float(1.0), ConstValue::Invalid], DType::WeakFloat);
-        let comparison = lhs.try_cmpeq(&rhs).unwrap();
+        let vconst = |values: [f64; 2]| {
+            UOp::vconst(
+                vec![ConstValue::Float(values[0]), ConstValue::Float(values[1]), ConstValue::Invalid],
+                DType::WeakFloat,
+            )
+        };
 
-        let lowered = production_value(comparison);
-
-        assert_eq!(lowered.dtype(), DType::Bool.vec(3).unwrap(), "{}", lowered.tree());
-        assert!(matches!(lowered.op(), Op::VConst { values }
+        let comparison = production_value(vconst([midpoint(), neighbor]).try_cmpeq(&vconst([1.0, 1.0])).unwrap());
+        assert_eq!(comparison.dtype(), DType::Bool.vec(3).unwrap(), "{}", comparison.tree());
+        assert!(matches!(comparison.op(), Op::VConst { values }
             if values == &vec![ConstValue::Bool(true), ConstValue::Bool(false), ConstValue::Invalid]));
-    }
 
-    #[test]
-    fn lower_index_commits_weak_vconsts_before_arithmetic_folding() {
-        let midpoint = 1.0 + 2f64.powi(-24);
-        let neighbor = 1.0 + 2f64.powi(-23);
-        let lhs = UOp::vconst(
-            vec![ConstValue::Float(midpoint), ConstValue::Float(neighbor), ConstValue::Invalid],
-            DType::WeakFloat,
-        );
-        let rhs = UOp::vconst(
-            vec![ConstValue::Float(midpoint), ConstValue::Float(midpoint), ConstValue::Invalid],
-            DType::WeakFloat,
-        );
-        let add = lhs.try_add(&rhs).unwrap();
-
-        let lowered = production_value(add);
-
-        assert_eq!(lowered.dtype(), DType::Float32.vec(3).unwrap());
-        assert!(matches!(lowered.op(), Op::VConst { values }
+        let sum = production_value(vconst([midpoint(), neighbor]).try_add(&vconst([midpoint(); 2])).unwrap());
+        assert_eq!(sum.dtype(), DType::Float32.vec(3).unwrap());
+        assert!(matches!(sum.op(), Op::VConst { values }
             if values == &vec![ConstValue::Float(2.0), ConstValue::Float(2.0), ConstValue::Invalid]));
-    }
 
-    #[test]
-    fn lower_index_commits_scalar_weak_float_before_folding() {
-        let midpoint = 1.0 + 2f64.powi(-24);
-        let comparison = weak_float(midpoint).try_cmpeq(&weak_float(1.0)).unwrap();
-        let add = weak_float(midpoint).try_add(&weak_float(midpoint)).unwrap();
+        let scalar_comparison = production_value(weak_float(midpoint()).try_cmpeq(&weak_float(1.0)).unwrap());
+        assert_eq!(scalar_comparison.dtype(), DType::Bool);
+        assert!(matches!(scalar_comparison.op(), Op::Const(value) if value.0 == ConstValue::Bool(true)));
 
-        let lowered_comparison = production_value(comparison);
-        let lowered_add = production_value(add);
-
-        assert_eq!(lowered_comparison.dtype(), DType::Bool);
-        assert!(matches!(lowered_comparison.op(), Op::Const(value) if value.0 == ConstValue::Bool(true)));
-        assert_eq!(lowered_add.dtype(), DType::Float32);
-        assert!(matches!(lowered_add.op(), Op::Const(value) if value.0 == ConstValue::Float(2.0)));
+        let scalar_sum = production_value(weak_float(midpoint()).try_add(&weak_float(midpoint())).unwrap());
+        assert_eq!(scalar_sum.dtype(), DType::Float32);
+        assert!(matches!(scalar_sum.op(), Op::Const(value) if value.0 == ConstValue::Float(2.0)));
     }
 
     #[test]
     fn lower_index_commits_constant_stack_lanes_before_their_consumer() {
-        let midpoint = 1.0 + 2f64.powi(-24);
-        let lhs = UOp::stack(vec![weak_float(midpoint), UOp::invalid_marker()].into());
+        let lhs = UOp::stack(vec![weak_float(midpoint()), UOp::invalid_marker()].into());
         let rhs = UOp::stack(vec![weak_float(1.0), UOp::invalid_marker()].into());
         let comparison = lhs.try_cmpeq(&rhs).unwrap();
 
@@ -242,10 +221,9 @@ mod lower_index_stage_tests {
 
     #[test]
     fn production_commits_weak_coefficients_before_term_combining() {
-        let midpoint = 1.0 + 2f64.powi(-24);
         let x = UOp::variable("x".into(), -10, 10, DType::Float32);
         let expression =
-            x.try_mul(&weak_float(midpoint)).unwrap().try_add(&x.try_mul(&weak_float(-1.0)).unwrap()).unwrap();
+            x.try_mul(&weak_float(midpoint())).unwrap().try_add(&x.try_mul(&weak_float(-1.0)).unwrap()).unwrap();
 
         let lowered = production_value(expression);
 
@@ -260,8 +238,7 @@ mod lower_index_stage_tests {
 
     #[test]
     fn production_commits_weak_comparison_before_where_bounds() {
-        let midpoint = 1.0 + 2f64.powi(-24);
-        let condition = weak_float(1.0).try_cmplt(&weak_float(midpoint)).unwrap();
+        let condition = weak_float(1.0).try_cmplt(&weak_float(midpoint())).unwrap();
         let expression = UOp::try_where(condition, UOp::native_const(7i32), UOp::native_const(9i32)).unwrap();
 
         let lowered = production_value(expression);
@@ -271,9 +248,8 @@ mod lower_index_stage_tests {
 
     #[test]
     fn production_commits_weak_base_before_power_decomposition() {
-        let midpoint = 1.0 + 2f64.powi(-24);
         let exponent = weak_float(1.0).try_add(&weak_float(1.0)).unwrap();
-        let expression = weak_float(midpoint).try_pow(&exponent).unwrap();
+        let expression = weak_float(midpoint()).try_pow(&exponent).unwrap();
 
         let lowered = production_value(expression);
 
@@ -282,11 +258,10 @@ mod lower_index_stage_tests {
 
     #[test]
     fn production_scalar_midpoint_neighbors_match_f32_commitment() {
-        let midpoint = 1.0 + 2f64.powi(-24);
         for (value, expected) in [
-            (f64::from_bits(midpoint.to_bits() - 1), true),
-            (midpoint, true),
-            (f64::from_bits(midpoint.to_bits() + 1), false),
+            (f64::from_bits(midpoint().to_bits() - 1), true),
+            (midpoint(), true),
+            (f64::from_bits(midpoint().to_bits() + 1), false),
         ] {
             let comparison = weak_float(value).try_cmpeq(&weak_float(1.0)).unwrap();
             let lowered = production_value(comparison);

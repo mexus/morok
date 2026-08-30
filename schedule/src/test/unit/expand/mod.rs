@@ -1,10 +1,31 @@
 use smallvec::smallvec;
 use svod_dtype::DType;
-use svod_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, RendererDevice, SInt, UOp, WmmaMetadata, WmmaUpcastAxes};
+use svod_ir::{AxisId, AxisType, Op, ReduceOp, RendererDevice, SInt, UOp, WmmaMetadata, WmmaUpcastAxes};
 
 use crate::devectorize::pm_expand_broadcast;
 use crate::expand::{build_range_map, pm_group_for_reduce, pre_expand};
 use crate::rewrite::graph_rewrite;
+
+fn wmma_metadata(name: &str, upcast_axes: Option<WmmaUpcastAxes>) -> WmmaMetadata {
+    WmmaMetadata {
+        name: name.into(),
+        dims: (16, 16, 16),
+        dtype_in: DType::Float32,
+        dtype_out: DType::Float32,
+        device: RendererDevice::Cpu,
+        threads: 32,
+        upcast_axes,
+        reduce_axes: vec![],
+        tile_grid: (1, 1),
+    }
+}
+
+/// A STACK of `count` distinct constants reshaped to `shape`.
+fn shaped(count: usize, shape: &[usize]) -> std::sync::Arc<UOp> {
+    UOp::stack((0..count).map(|value| UOp::native_const(value as f32)).collect())
+        .try_reshape(&shape.iter().copied().map(SInt::Const).collect())
+        .unwrap()
+}
 
 #[test]
 fn range_map_uses_kernel_coordinate_order() {
@@ -46,30 +67,17 @@ fn expansion_runs_movement_cleanup_in_the_same_fixpoint() {
 fn wmma_shapes_operands_independently_and_reconstructs_output() {
     let first = UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(7), AxisType::Upcast);
     let second = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(9), AxisType::Upcast);
-    let a_lanes =
-        UOp::stack((0..2).map(|value| UOp::const_(DType::Float32, ConstValue::Float(value as f64))).collect())
-            .try_reshape(&smallvec![SInt::Const(2), SInt::Const(1)])
-            .unwrap();
-    let b_lanes =
-        UOp::stack((0..3).map(|value| UOp::const_(DType::Float32, ConstValue::Float(value as f64))).collect())
-            .try_reshape(&smallvec![SInt::Const(1), SInt::Const(3)])
-            .unwrap();
-    let metadata = WmmaMetadata {
-        name: "test".into(),
-        dims: (16, 16, 16),
-        dtype_in: DType::Float32,
-        dtype_out: DType::Float32,
-        device: RendererDevice::Cpu,
-        threads: 32,
-        upcast_axes: Some(WmmaUpcastAxes {
+    let a_lanes = shaped(2, &[2, 1]);
+    let b_lanes = shaped(3, &[1, 3]);
+    let metadata = wmma_metadata(
+        "test",
+        Some(WmmaUpcastAxes {
             a: vec![(AxisId::Renumbered(7), 2)],
             b: vec![(AxisId::Renumbered(9), 3)],
             c: vec![(AxisId::Renumbered(7), 2)],
         }),
-        reduce_axes: vec![],
-        tile_grid: (1, 1),
-    };
-    let accumulator = UOp::stack(smallvec![UOp::const_(DType::Float32, ConstValue::Float(0.0)); 2]);
+    );
+    let accumulator = UOp::stack(smallvec![UOp::native_const(0.0f32); 2]);
     let result = pre_expand(&UOp::sink(vec![first, second, UOp::wmma(a_lanes, b_lanes, accumulator, metadata)]));
     let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
     assert_eq!(sources[2].shape().unwrap().unwrap().as_slice(), &[SInt::Const(2), SInt::Const(1)]);
@@ -86,24 +94,11 @@ fn nested_split_axis_survives_wmma_contract_and_output_unroll() {
     let scalar = AxisId::Renumbered(7);
     let nested_range = UOp::range_axis(UOp::index_const(2), nested.clone(), AxisType::Upcast);
     let scalar_range = UOp::range_axis(UOp::index_const(3), scalar, AxisType::Upcast);
-    let lanes = UOp::stack((0..6).map(|value| UOp::native_const(value as f32)).collect())
-        .try_reshape(&smallvec![SInt::Const(2), SInt::Const(3)])
-        .unwrap();
-    let metadata = WmmaMetadata {
-        name: "nested-test".into(),
-        dims: (16, 16, 16),
-        dtype_in: DType::Float32,
-        dtype_out: DType::Float32,
-        device: RendererDevice::Cpu,
-        threads: 32,
-        upcast_axes: Some(WmmaUpcastAxes {
-            a: vec![(nested.clone(), 2)],
-            b: vec![(nested.clone(), 2)],
-            c: vec![(nested, 2)],
-        }),
-        reduce_axes: vec![],
-        tile_grid: (1, 1),
-    };
+    let lanes = shaped(6, &[2, 3]);
+    let metadata = wmma_metadata(
+        "nested-test",
+        Some(WmmaUpcastAxes { a: vec![(nested.clone(), 2)], b: vec![(nested.clone(), 2)], c: vec![(nested, 2)] }),
+    );
     let accumulator = UOp::stack(smallvec![UOp::native_const(0.0f32); 2]);
     let result = pre_expand(&UOp::sink(vec![
         nested_range,
@@ -121,22 +116,7 @@ fn nested_split_axis_survives_wmma_contract_and_output_unroll() {
 
 #[test]
 fn wmma_broadcast_stacks_fragments_before_reshape() {
-    let shaped = |count, shape: &[usize]| {
-        UOp::stack((0..count).map(|value| UOp::native_const(value as f32)).collect())
-            .try_reshape(&shape.iter().copied().map(SInt::Const).collect())
-            .unwrap()
-    };
-    let metadata = WmmaMetadata {
-        name: "broadcast-test".into(),
-        dims: (16, 16, 16),
-        dtype_in: DType::Float32,
-        dtype_out: DType::Float32,
-        device: RendererDevice::Cpu,
-        threads: 32,
-        upcast_axes: None,
-        reduce_axes: vec![],
-        tile_grid: (1, 1),
-    };
+    let metadata = wmma_metadata("broadcast-test", None);
     let wmma = UOp::wmma(shaped(64, &[4, 1, 16]), shaped(64, &[1, 4, 16]), shaped(8, &[8]), metadata);
     let result = graph_rewrite(pm_expand_broadcast(), wmma, &mut ());
 
@@ -147,17 +127,7 @@ fn wmma_broadcast_stacks_fragments_before_reshape() {
 
 #[test]
 fn pre_expansion_wmma_accepts_scalar_inputs() {
-    let metadata = WmmaMetadata {
-        name: "scalar-input-test".into(),
-        dims: (16, 16, 16),
-        dtype_in: DType::Float32,
-        dtype_out: DType::Float32,
-        device: RendererDevice::Cpu,
-        threads: 32,
-        upcast_axes: None,
-        reduce_axes: vec![],
-        tile_grid: (1, 1),
-    };
+    let metadata = wmma_metadata("scalar-input-test", None);
     let accumulator = UOp::stack(smallvec![UOp::native_const(0.0f32); 8]);
     let wmma = UOp::wmma(UOp::native_const(1.0f32), UOp::native_const(2.0f32), accumulator, metadata);
     assert_eq!(wmma.shape().unwrap().unwrap().as_slice(), &[SInt::Const(8)]);

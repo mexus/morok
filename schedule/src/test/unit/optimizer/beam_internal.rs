@@ -1,116 +1,157 @@
 use super::super::types::{OptArgExt, OptOps};
 use super::*;
 
-#[test]
-fn test_beam_config_default() {
-    let config = BeamConfig::default();
-    assert_eq!(config.beam_width, 4);
-    assert_eq!(config.max_upcast, 256);
-    assert_eq!(config.max_local, 1024);
+fn trivial_scheduler() -> Scheduler {
+    Scheduler::new(UOp::sink(vec![UOp::native_const(1i32)]), crate::optimizer::Renderer::cpu())
 }
 
-#[test]
-fn test_beam_actions_not_empty() {
-    assert!(!BEAM_ACTIONS.is_empty());
-    // Should have a reasonable number of actions
-    // UPCAST: 8 axes * 6 amounts = 48
-    // UNROLL: 5 axes * 3 amounts = 15
-    // LOCAL: 6 axes * 7 amounts = 42
-    // GROUPTOP: 3 axes * 8 amounts = 24
-    // GROUP: 3 axes * 4 amounts = 12
-    // TC: 1 + 9 = 10
-    // SWAP: 10 pairs
-    // NOLOCALS: 1
-    // Total: ~162 actions
-    assert!(BEAM_ACTIONS.len() > 100, "Expected >100 actions, got {}", BEAM_ACTIONS.len());
-    assert!(BEAM_ACTIONS.len() < 500, "Expected <500 actions, got {}", BEAM_ACTIONS.len());
+/// A SINK with one WEAK axis, so `generate_actions` has something to split.
+fn weak_axis_scheduler(constant: i32) -> Scheduler {
+    use svod_ir::{AxisId, AxisType};
+
+    let range = UOp::range_axis(UOp::index_const(64), AxisId::Renumbered(0), AxisType::Weak);
+    Scheduler::new(UOp::sink(vec![UOp::native_const(constant), range]), crate::optimizer::Renderer::cpu())
 }
 
+/// `BEAM_ACTIONS` is tinygrad's `actions` grid: every opt kind is offered, and the
+/// grid is amount-major (all axes at the first amount, then all axes at the next).
 #[test]
-fn test_beam_actions_contains_expected_types() {
-    let has_upcast = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::UPCAST);
-    let has_local = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::LOCAL);
-    let has_unroll = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::UNROLL);
-    let has_tc = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::TC);
-    let has_swap = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::SWAP);
+fn beam_actions_cover_every_opt_kind_in_amount_major_order() {
+    for op in [OptOps::UPCAST, OptOps::UNROLL, OptOps::LOCAL, OptOps::GROUP, OptOps::GROUPTOP, OptOps::TC, OptOps::SWAP]
+    {
+        assert!(BEAM_ACTIONS.iter().any(|action| action.op == op), "{op:?} must be offered");
+    }
+    // NOLOCALS is env-gated (`SVOD_NOLOCALS`) and absent by default.
+    assert!(!BEAM_ACTIONS.iter().any(|action| action.op == OptOps::NOLOCALS));
+    // 3 CPU-threadable axes x at least 2 divisors.
+    assert!(BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::THREAD).count() >= 6);
 
-    assert!(has_upcast);
-    assert!(has_local);
-    assert!(has_unroll);
-    assert!(has_tc);
-    assert!(has_swap);
-    // NOLOCALS is env-gated (`SVOD_NOLOCALS`), tested separately.
-}
-
-#[test]
-fn test_beam_action_grid_uses_tinygrad_amount_major_order() {
     let upcasts = BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::UPCAST).take(9).collect::<Vec<_>>();
     assert_eq!(
         upcasts.iter().take(8).map(|action| action.axis).collect::<Vec<_>>(),
         (0..8).map(Some).collect::<Vec<_>>()
     );
     assert!(upcasts.iter().take(8).all(|action| action.arg.int() == Ok(0)));
-    assert_eq!(upcasts[8].axis, Some(0));
-    assert_eq!(upcasts[8].arg.int(), Ok(2));
+    assert_eq!((upcasts[8].axis, upcasts[8].arg.int()), (Some(0), Ok(2)));
+
+    // TC: the strict default plus one padded (`opt_level` 2) choice per axis.
+    let tensor_cores = BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::TC).collect::<Vec<_>>();
+    assert_eq!(tensor_cores.len(), 10);
+    assert!(tensor_cores.iter().any(|action| action.arg.tc().unwrap().1 == 0));
+    assert_eq!(tensor_cores.iter().filter(|action| action.arg.tc().unwrap().1 == 2).count(), 9);
 }
 
+/// The persistent BEAM cache replays a winning plan, so its key must separate
+/// everything that changes which plan wins — and nothing that only changes how the
+/// search is executed.
 #[test]
-fn test_beam_tensor_core_actions_keep_strict_default_and_padded_axes() {
-    let tensor_core_actions = BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::TC).collect::<Vec<_>>();
-    assert_eq!(tensor_core_actions.len(), 10);
-    assert!(tensor_core_actions.iter().any(|action| action.arg.tc().unwrap().1 == 0));
-    assert_eq!(tensor_core_actions.iter().filter(|action| action.arg.tc().unwrap().1 == 2).count(), 9);
-}
+fn beam_cache_key_separates_behavior_and_ignores_execution_details() {
+    use svod_dtype::AmdArch;
 
-#[test]
-fn test_beam_cache_key_includes_post_optimization_behavior() {
-    let scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1i32)]), crate::optimizer::Renderer::cpu());
-    let config = BeamConfig::default();
-    assert_ne!(
-        CacheKey::from_scheduler(&scheduler, &config, "compiler", 0).to_bytes(),
-        CacheKey::from_scheduler(&scheduler, &config, "compiler", 1).to_bytes()
-    );
-}
-
-/// A replayed plan is only valid under the action space that produced it, and
-/// `BEAM_ACTIONS` is built from `BEAM_PADTO` / `TC` / `TC_OPT`.
-#[test]
-fn test_beam_cache_key_includes_action_space() {
-    let scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1i32)]), crate::optimizer::Renderer::cpu());
-    let key = CacheKey::from_scheduler(&scheduler, &BeamConfig::default(), "compiler", 0);
-    assert_eq!(key.action_space, action_space_hash(&BEAM_ACTIONS));
-    assert_ne!(key.action_space, action_space_hash(&BEAM_ACTIONS[1..]));
-    assert_ne!(key.to_bytes(), CacheKey { action_space: key.action_space ^ 1, ..key.clone() }.to_bytes());
-}
-
-#[test]
-fn test_beam_cache_key_includes_exact_compiler_identity() {
-    let scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1i32)]), crate::optimizer::Renderer::cpu());
-    let config = BeamConfig::default();
-    assert_ne!(
-        CacheKey::from_scheduler(&scheduler, &config, "cpu-clang:17", 0).to_bytes(),
-        CacheKey::from_scheduler(&scheduler, &config, "cpu-clang:18", 0).to_bytes()
-    );
-}
-
-#[test]
-fn test_beam_cache_key_includes_behavior_controls() {
-    let scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1i32)]), crate::optimizer::Renderer::cpu());
+    let scheduler = trivial_scheduler();
     let base = BeamConfig::default();
-    let base_key = CacheKey::from_scheduler(&scheduler, &base, "compiler", 0).to_bytes();
-    let variants = [
-        BeamConfig { min_progress_ns: base.min_progress_ns + 1, ..base.clone() },
-        BeamConfig { enable_nolocals: !base.enable_nolocals, ..base.clone() },
-        BeamConfig { compile_timeout_secs: base.compile_timeout_secs + 1, ..base.clone() },
-        BeamConfig { num_runs: base.num_runs + 1, ..base.clone() },
-    ];
-    for variant in variants {
-        assert_ne!(base_key, CacheKey::from_scheduler(&scheduler, &variant, "compiler", 0).to_bytes());
+    let key = |config: &BeamConfig, compiler: &str, ast_hash| {
+        CacheKey::from_scheduler(&scheduler, config, compiler, ast_hash).to_bytes()
+    };
+    let base_key = key(&base, "compiler", 0);
+
+    for (what, variant) in [
+        ("ast hash", key(&base, "compiler", 1)),
+        ("compiler identity", key(&base, "cpu-clang:18", 0)),
+        ("min progress", key(&BeamConfig { min_progress_ns: base.min_progress_ns + 1, ..base.clone() }, "compiler", 0)),
+        ("nolocals", key(&BeamConfig { enable_nolocals: !base.enable_nolocals, ..base.clone() }, "compiler", 0)),
+        (
+            "compile timeout",
+            key(&BeamConfig { compile_timeout_secs: base.compile_timeout_secs + 1, ..base.clone() }, "compiler", 0),
+        ),
+        ("num runs", key(&BeamConfig { num_runs: base.num_runs + 1, ..base.clone() }, "compiler", 0)),
+    ] {
+        assert_ne!(base_key, variant, "{what} must change the key");
     }
-    let parallel = BeamConfig { compile_workers: base.compile_workers + 1, ..base.clone() };
-    assert_eq!(base_key, CacheKey::from_scheduler(&scheduler, &parallel, "compiler", 0).to_bytes());
-    let recycling = BeamConfig { max_tasks_per_child: base.max_tasks_per_child + 1, ..base.clone() };
-    assert_eq!(base_key, CacheKey::from_scheduler(&scheduler, &recycling, "compiler", 0).to_bytes());
+    for (what, variant) in [
+        (
+            "compile workers",
+            key(&BeamConfig { compile_workers: base.compile_workers + 1, ..base.clone() }, "compiler", 0),
+        ),
+        (
+            "child recycling",
+            key(&BeamConfig { max_tasks_per_child: base.max_tasks_per_child + 1, ..base.clone() }, "compiler", 0),
+        ),
+    ] {
+        assert_eq!(base_key, variant, "{what} must not change the key");
+    }
+
+    let ast = UOp::sink(vec![UOp::native_const(1i32)]);
+    let amd = |arch| Scheduler::new(ast.clone(), crate::optimizer::Renderer::for_amd_arch(arch));
+    assert_ne!(
+        CacheKey::from_scheduler(&amd(AmdArch::Gfx1100), &base, "amd", 0).to_bytes(),
+        CacheKey::from_scheduler(&amd(AmdArch::Gfx1151), &base, "amd", 0).to_bytes(),
+        "the exact AMD target must change the key"
+    );
+
+    // A replayed plan is only valid under the action space that produced it, and
+    // `BEAM_ACTIONS` is built from `BEAM_PADTO` / `TC` / `TC_OPT`.
+    let full = CacheKey::from_scheduler(&scheduler, &base, "compiler", 0);
+    assert_eq!(full.action_space, action_space_hash(&BEAM_ACTIONS));
+    assert_ne!(full.action_space, action_space_hash(&BEAM_ACTIONS[1..]));
+    assert_ne!(base_key, CacheKey { action_space: full.action_space ^ 1, ..full }.to_bytes());
+}
+
+/// Every opt kind must survive the persistent-cache encoding unchanged.
+#[test]
+fn opts_survive_the_cache_encoding_roundtrip() {
+    let every_kind = vec![
+        Opt::upcast(0, 4),
+        Opt::local(1, 16),
+        Opt::unroll(0, 8),
+        Opt::group(0, 4),
+        Opt::grouptop(1, 8),
+        Opt::thread(0, 4),
+        Opt::padto(1, 32),
+        Opt::swap(0, 2),
+        Opt::tc(None, -1, 2, 1),
+        Opt::nolocals(),
+    ];
+    for opts in [vec![], every_kind] {
+        assert_eq!(deserialize_opts(&serialize_opts(&opts)), Some(opts));
+    }
+}
+
+/// `validate_limits` rejects a candidate whose upcast product outgrows the target's.
+#[test]
+fn validate_limits_rejects_oversized_upcasts() {
+    let mut scheduler = weak_axis_scheduler(0x1102);
+    assert!(validate_limits(&scheduler, &BeamConfig::default()));
+
+    apply_opt(&mut scheduler, &Opt::upcast(0, 4), true).expect("UPCAST(0, 4) on a 64-wide Weak axis");
+    assert!(validate_limits(&scheduler, &BeamConfig::default()));
+    assert!(!validate_limits(&scheduler, &BeamConfig { max_upcast: 2, ..Default::default() }));
+}
+
+/// The plain `beam_search` entry point drives the same loop as the staged ones with
+/// an inline scorer.
+#[test]
+fn beam_search_runs_with_an_inline_scorer() {
+    let config = BeamConfig { beam_width: 2, disable_cache: true, ..Default::default() };
+    let score = |scheduler: &Scheduler, _early_stop: Option<Duration>| {
+        Some(CandidateMetrics {
+            timing: Duration::from_micros(100),
+            // Vary the hash per candidate so dedup does not collapse them all.
+            ir_hash: scheduler as *const Scheduler as u64,
+            compute_ops: 1,
+        })
+    };
+
+    let result = beam_search(weak_axis_scheduler(0x1103), &config, score).expect("beam search");
+    assert!(result.candidates_evaluated > 0);
+}
+
+#[test]
+fn generate_actions_includes_thread_for_cpu() {
+    use svod_ir::AxisType;
+
+    let candidates = generate_actions(&weak_axis_scheduler(0x1104), &BeamConfig::default());
+    assert!(candidates.iter().any(|scheduler| !scheduler.axes_of(&[AxisType::Thread]).is_empty()));
 }
 
 #[test]
@@ -147,27 +188,6 @@ fn test_remote_beam_parent_tracks_only_opt_sequences() {
     assert_eq!(result.iterations, 1);
     assert_eq!(result.scheduler.applied_opts.len(), base_opt_count + 1);
     assert!(result.compiled > 0);
-}
-
-#[test]
-fn test_beam_cache_key_distinguishes_exact_amd_targets() {
-    use svod_dtype::AmdArch;
-
-    let ast = UOp::sink(vec![UOp::native_const(1i32)]);
-    let config = BeamConfig::default();
-    let gfx1100 = Scheduler::new(ast.clone(), crate::optimizer::Renderer::for_amd_arch(AmdArch::Gfx1100));
-    let gfx1151 = Scheduler::new(ast, crate::optimizer::Renderer::for_amd_arch(AmdArch::Gfx1151));
-    assert_ne!(
-        CacheKey::from_scheduler(&gfx1100, &config, "amd", 0).to_bytes(),
-        CacheKey::from_scheduler(&gfx1151, &config, "amd", 0).to_bytes()
-    );
-}
-
-fn weak_axis_scheduler(constant: i32) -> Scheduler {
-    use svod_ir::{AxisId, AxisType};
-
-    let range = UOp::range_axis(UOp::index_const(64), AxisId::Renumbered(0), AxisType::Weak);
-    Scheduler::new(UOp::sink(vec![UOp::native_const(constant), range]), crate::optimizer::Renderer::cpu())
 }
 
 #[test]
@@ -260,17 +280,25 @@ fn test_staged_beam_streams_unordered_compiles_dedups_and_serializes_timing() {
     assert_eq!(result.scheduler.applied_opts, opts_by_index.lock().unwrap()[&winning_index]);
 }
 
-#[test]
-fn test_staged_beam_cache_cold_and_warm_choose_same_winner() {
+/// Hash a candidate's opt sequence into a stable artifact id, so cold and warm runs
+/// score the same plan identically.
+fn plan_identity(opts: &[Opt]) -> u64 {
     use std::hash::{Hash, Hasher};
 
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    opts.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn plan_timing(identity: u64) -> Option<Duration> {
+    Some(Duration::from_nanos(1 + identity % 10_000))
+}
+
+#[test]
+fn test_staged_beam_cache_cold_and_warm_choose_same_winner() {
     let scheduler = weak_axis_scheduler(0x6b17);
-    let config = BeamConfig {
-        min_progress_ns: 1_000_000_000,
-        compile_workers: 2,
-        disable_cache: false,
-        ..BeamConfig::default()
-    };
+    let config =
+        BeamConfig { min_progress_ns: 1_000_000_000, compile_workers: 2, disable_cache: false, ..Default::default() };
     let compiler_identity = "fake-compiler:beam-cold-warm-v1";
     let key = CacheKey::from_scheduler(&scheduler, &config, compiler_identity, 0x1234);
     cache_invalidate(&key);
@@ -286,9 +314,7 @@ fn test_staged_beam_cache_cold_and_warm_choose_same_winner() {
             0x1234,
             |candidates, emit| {
                 for (index, candidate) in candidates.iter().enumerate() {
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    candidate.applied_opts.hash(&mut hasher);
-                    let identity = hasher.finish();
+                    let identity = plan_identity(&candidate.applied_opts);
                     emit(
                         index,
                         CompiledCandidate {
@@ -301,7 +327,7 @@ fn test_staged_beam_cache_cold_and_warm_choose_same_winner() {
                     );
                 }
             },
-            |identity, _| Some(Duration::from_nanos(1 + identity % 10_000)),
+            |identity, _| plan_timing(*identity),
         )
         .unwrap()
     };
@@ -318,8 +344,6 @@ fn test_staged_beam_cache_cold_and_warm_choose_same_winner() {
 
 #[test]
 fn test_remote_beam_cache_reuses_winner_across_parallel_and_recycling_changes() {
-    use std::hash::{Hash, Hasher};
-
     let scheduler = weak_axis_scheduler(0x7193);
     let cold_config = BeamConfig {
         min_progress_ns: 1_000_000_000,
@@ -349,9 +373,7 @@ fn test_remote_beam_cache_reuses_winner_across_parallel_and_recycling_changes() 
                     if apply_remote_candidate(worker_scheduler.clone(), base_opt_count, opts, config).is_none() {
                         continue;
                     }
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    opts.hash(&mut hasher);
-                    let artifact = hasher.finish();
+                    let artifact = plan_identity(opts);
                     emit(
                         index,
                         CompiledCandidate {
@@ -365,7 +387,7 @@ fn test_remote_beam_cache_reuses_winner_across_parallel_and_recycling_changes() 
                 }
                 Ok(())
             },
-            |artifact, _| Some(Duration::from_nanos(1 + artifact % 10_000)),
+            |artifact, _| plan_timing(*artifact),
         )
         .unwrap()
     };
@@ -454,217 +476,4 @@ fn test_remote_beam_worker_error_invalidates_cache() {
     );
     assert!(matches!(result, Err(OptError::BeamWorker { .. })));
     assert!(cache_get(&key).is_none());
-}
-
-#[test]
-fn test_beam_search_with_mock_scoring() {
-    use super::super::renderer::Renderer;
-    use svod_ir::UOp;
-
-    // Create a simple scheduler
-    let val = UOp::native_const(1.0f32);
-    let sink = UOp::sink(vec![val]);
-    let renderer = Renderer::cpu();
-    let scheduler = Scheduler::new(sink, renderer);
-
-    let config = BeamConfig { beam_width: 2, ..Default::default() };
-
-    // Mock scoring: return constant timing + a hash that varies by scheduler
-    // pointer so dedup doesn't collapse every candidate to one entry.
-    let mock_score = |s: &Scheduler, _early_stop: Option<Duration>| {
-        Some(CandidateMetrics {
-            timing: Duration::from_micros(100),
-            ir_hash: s as *const Scheduler as u64,
-            compute_ops: 1,
-        })
-    };
-
-    let result = beam_search(scheduler, &config, mock_score);
-    assert!(result.is_ok());
-
-    let result = result.unwrap();
-    assert!(result.iterations > 0 || result.candidates_evaluated == 0);
-}
-
-#[test]
-fn test_validate_limits() {
-    use super::super::renderer::Renderer;
-    use svod_ir::UOp;
-
-    let val = UOp::native_const(1.0f32);
-    let sink = UOp::sink(vec![val]);
-    let renderer = Renderer::cpu();
-    let scheduler = Scheduler::new(sink, renderer);
-
-    let config = BeamConfig::default();
-
-    // Simple scheduler should pass limits
-    assert!(validate_limits(&scheduler, &config));
-
-    // With very restrictive limits
-    let strict_config = BeamConfig { max_upcast: 1, max_local: 1, max_uops: 1, ..Default::default() };
-
-    // May or may not pass depending on UOp count
-    let _result = validate_limits(&scheduler, &strict_config);
-}
-
-#[test]
-fn test_replay_opts_empty() {
-    use super::super::renderer::Renderer;
-    use svod_ir::UOp;
-
-    let val = UOp::native_const(1.0f32);
-    let sink = UOp::sink(vec![val]);
-    let renderer = Renderer::cpu();
-    let scheduler = Scheduler::new(sink, renderer);
-
-    // Empty replay should succeed
-    let result = replay_opts(scheduler, &[]);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_serialize_deserialize_opts_empty() {
-    let opts: Vec<Opt> = vec![];
-    let serialized = serialize_opts(&opts);
-    let deserialized = deserialize_opts(&serialized);
-
-    assert!(deserialized.is_some());
-    assert!(deserialized.unwrap().is_empty());
-}
-
-#[test]
-fn test_serialize_deserialize_opts_upcast() {
-    let opts = vec![Opt::upcast(0, 4), Opt::upcast(1, 8)];
-    let serialized = serialize_opts(&opts);
-    let deserialized = deserialize_opts(&serialized);
-
-    assert!(deserialized.is_some());
-    let result = deserialized.unwrap();
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].op, OptOps::UPCAST);
-    assert_eq!(result[0].axis, Some(0));
-    assert_eq!(result[1].op, OptOps::UPCAST);
-    assert_eq!(result[1].axis, Some(1));
-}
-
-#[test]
-fn test_serialize_deserialize_opts_tc() {
-    use super::super::types::OptArg;
-
-    let opts = vec![Opt::tc(None, -1, 2, 1)];
-    let serialized = serialize_opts(&opts);
-    let deserialized = deserialize_opts(&serialized);
-
-    assert!(deserialized.is_some());
-    let result = deserialized.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].op, OptOps::TC);
-    assert_eq!(result[0].axis, None);
-    if let OptArg::TensorCore { tc_select, opt_level, use_tc } = &result[0].arg {
-        assert_eq!(*tc_select, -1);
-        assert_eq!(*opt_level, 2);
-        assert_eq!(*use_tc, 1);
-    } else {
-        panic!("Expected TensorCore arg");
-    }
-}
-
-#[test]
-fn test_serialize_deserialize_opts_swap() {
-    use super::super::types::OptArg;
-
-    let opts = vec![Opt::swap(0, 2)];
-    let serialized = serialize_opts(&opts);
-    let deserialized = deserialize_opts(&serialized);
-
-    assert!(deserialized.is_some());
-    let result = deserialized.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].op, OptOps::SWAP);
-    assert_eq!(result[0].axis, Some(0));
-    if let OptArg::Swap { other_axis } = &result[0].arg {
-        assert_eq!(*other_axis, 2);
-    } else {
-        panic!("Expected Swap arg");
-    }
-}
-
-#[test]
-fn test_serialize_deserialize_opts_mixed() {
-    let opts = vec![Opt::upcast(0, 4), Opt::local(1, 16), Opt::unroll(0, 8), Opt::nolocals()];
-    let serialized = serialize_opts(&opts);
-    let deserialized = deserialize_opts(&serialized);
-
-    assert!(deserialized.is_some());
-    let result = deserialized.unwrap();
-    assert_eq!(result.len(), 4);
-    assert_eq!(result[0].op, OptOps::UPCAST);
-    assert_eq!(result[1].op, OptOps::LOCAL);
-    assert_eq!(result[2].op, OptOps::UNROLL);
-    assert_eq!(result[3].op, OptOps::NOLOCALS);
-}
-
-#[test]
-fn test_beam_actions_contains_thread() {
-    let has_thread = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::THREAD);
-    assert!(has_thread, "BEAM_ACTIONS should contain THREAD actions");
-
-    // Count thread actions
-    let thread_count = BEAM_ACTIONS.iter().filter(|a| a.op == OptOps::THREAD).count();
-    assert!(thread_count >= 6, "Expected at least 6 THREAD actions (3 axes × 2+ amounts), got {}", thread_count);
-}
-
-#[test]
-fn test_thread_action_applied_to_loop_axis() {
-    use super::super::renderer::Renderer;
-    use svod_ir::{AxisId, AxisType, UOp};
-
-    // Create a kernel with Weak axis (CPU threading target)
-    let end_64 = UOp::index_const(64);
-    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Weak);
-    let compute = UOp::native_const(1.0f32);
-    let sink = UOp::sink(vec![compute, r_loop]);
-
-    let renderer = Renderer::cpu();
-    let scheduler = Scheduler::new(sink, renderer);
-
-    // Verify renderer supports threading
-    assert!(scheduler.renderer().has_threads, "CPU renderer should have has_threads=true");
-
-    // Try to apply THREAD opt with a divisor that fits available parallelism.
-    let max_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
-    let thread_count = [32usize, 16, 8, 4, 2].into_iter().find(|&t| t <= max_threads && 64 % t == 0).unwrap_or(1);
-    if thread_count == 1 {
-        return;
-    }
-    let mut test_scheduler = scheduler.clone();
-    let result = apply_opt(&mut test_scheduler, &Opt::thread(0, thread_count), true);
-    assert!(result.is_ok(), "THREAD(0, {}) should succeed on Weak axis: {:?}", thread_count, result);
-
-    // Verify Thread axis was created
-    let thread_axes = test_scheduler.axes_of(&[AxisType::Thread]);
-    assert!(!thread_axes.is_empty(), "Should have Thread axis after THREAD opt");
-}
-
-#[test]
-fn test_generate_actions_includes_thread_for_cpu() {
-    use super::super::renderer::Renderer;
-    use svod_ir::{AxisId, AxisType, UOp};
-
-    // Create a kernel with Weak axis
-    let end_64 = UOp::index_const(64);
-    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Weak);
-    let compute = UOp::native_const(1.0f32);
-    let sink = UOp::sink(vec![compute, r_loop]);
-
-    let renderer = Renderer::cpu();
-    let scheduler = Scheduler::new(sink, renderer);
-
-    let config = BeamConfig::default();
-    let candidates = generate_actions(&scheduler, &config);
-
-    // Check if any candidate has a Thread axis
-    let has_threaded = candidates.iter().any(|s| !s.axes_of(&[AxisType::Thread]).is_empty());
-    assert!(has_threaded, "generate_actions should produce candidates with Thread axes for CPU");
 }

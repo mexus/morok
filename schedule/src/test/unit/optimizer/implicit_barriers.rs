@@ -128,23 +128,15 @@ fn end_computation_load_participates_in_war_detection() {
     );
 }
 
-#[test]
-fn nonpositive_range_does_not_get_war_barrier() {
-    let local = buffer(0, AddrSpace::Local);
-    let range = UOp::range_axis(UOp::index_const(0), AxisId::Renumbered(0), AxisType::Weak);
-    let load = UOp::load().index(index(local.clone(), range.clone())).call();
-    let store = index(local, range.clone()).store_value(load);
-    let result = rewrite(store.clone().end(smallvec![range]));
-
-    assert!(matches!(result.op(), Op::End { computation, .. } if Arc::ptr_eq(computation, &store)));
-}
-
-#[test]
-fn global_memory_hazard_does_not_get_war_barrier() {
-    let global = buffer(0, AddrSpace::Global);
-    let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Weak);
-    let load = UOp::load().index(index(global.clone(), range.clone())).call();
-    let store = index(global, range.clone()).store_value(load);
+/// A WAR barrier is only needed for a local buffer read and written across at least
+/// two iterations of the same range.
+#[test_case::test_case(AddrSpace::Local, 0; "range with no second iteration")]
+#[test_case::test_case(AddrSpace::Global, 4; "global memory is not thread-shared")]
+fn no_war_barrier_without_a_local_cross_iteration_hazard(addrspace: AddrSpace, extent: i64) {
+    let memory = buffer(0, addrspace);
+    let range = UOp::range_axis(UOp::index_const(extent), AxisId::Renumbered(0), AxisType::Weak);
+    let load = UOp::load().index(index(memory.clone(), range.clone())).call();
+    let store = index(memory, range.clone()).store_value(load);
     let result = rewrite(store.clone().end(smallvec![range]));
 
     assert!(matches!(result.op(), Op::End { computation, .. } if Arc::ptr_eq(computation, &store)));
