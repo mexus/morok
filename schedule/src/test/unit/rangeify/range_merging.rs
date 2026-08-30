@@ -362,10 +362,12 @@ fn test_merge_consumer_ranges_empty() {
     // Merge ranges
     let merged = merge_consumer_ranges(&buffer, &consumer_rngs, &mut ctx).unwrap();
 
-    // Should create new ranges for all dimensions
     assert_eq!(merged.len(), 1, "Should create 1 range for 1-dim buffer");
 
-    // Should mark for realization (no consumer ranges means new ranges needed)
+    // `all_same([])` is True upstream (helpers.py:31), so a dim with no consumer
+    // ranges no longer forces `all_all_same = false` across every other dim. The
+    // dim itself still gets a fresh range and is still realized — there is nothing
+    // to inherit from.
     let realize_info = ctx.realize_map.get(&svod_ir::UOpKey(buffer.clone()));
-    assert!(realize_info.is_some(), "Should mark for realization");
+    assert_eq!(realize_info, Some(&Some(vec![0])), "the empty dim is realized on its own");
 }

@@ -6,9 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use svod_dtype::DType;
+use indexmap::IndexSet;
 use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, SInt, UOp, UOpKey};
-use tracing::{debug, info_span, instrument, trace, warn};
+use tracing::{debug, info_span, instrument, trace};
 
 use crate::argsort;
 
@@ -55,12 +55,6 @@ impl IndexingContext {
             return UOp::index_const(0);
         }
 
-        self.new_range_uncollapsed(size, axistype)
-    }
-
-    /// Create new RANGE with unique ID, without collapsing size=1 to Const(0).
-    /// Use this when you need a proper Range UOp for realization/kernel boundaries.
-    pub fn new_range_uncollapsed(&mut self, size: &SInt, axistype: AxisType) -> Arc<UOp> {
         // Create range with Unrenumbered axis_id
         let axis_id = AxisId::Unrenumbered(self.range_idx);
         self.range_idx += 1;
@@ -129,12 +123,6 @@ impl IndexingContext {
     /// Check if a realization boundary must not be inlined.
     pub fn is_non_removable_realize(&self, uop: &Arc<UOp>) -> bool {
         self.non_removable_realizes.contains(&UOpKey(Arc::clone(uop)))
-    }
-
-    /// Get all keys in the realize_map (for debugging).
-    #[allow(dead_code)]
-    pub fn realize_map_keys(&self) -> Vec<&UOpKey> {
-        self.realize_map.keys().collect()
     }
 
     /// Set the range map for a UOp.
@@ -253,15 +241,19 @@ pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContex
     Ok((transformed_sink, ctx))
 }
 
+/// Consumers of each node, in discovery order and without repeats — a consumer
+/// that reads the same source twice (`y * y`) counts once, matching upstream's
+/// `consumer_map[x][c] = None` dict insert (indexing.py:202-205).
+type ConsumerMap = HashMap<UOpKey, IndexSet<UOpKey>>;
+
 #[allow(clippy::mutable_key_type)]
-fn consumer_map_for_data_sources(sink: &Arc<UOp>) -> HashMap<UOpKey, Vec<Arc<UOp>>> {
+fn consumer_map_for_data_sources(sink: &Arc<UOp>) -> ConsumerMap {
     let topo = sink.toposort_call_aware(false);
-    let mut consumer_map: HashMap<UOpKey, Vec<Arc<UOp>>> =
-        topo.iter().map(|u| (UOpKey(u.clone()), Vec::new())).collect();
+    let mut consumer_map: ConsumerMap = topo.iter().map(|u| (UOpKey(u.clone()), IndexSet::new())).collect();
     for consumer in topo {
         for source in data_sources(&consumer) {
             if let Some(consumers) = consumer_map.get_mut(&UOpKey(source)) {
-                consumers.push(consumer.clone());
+                consumers.insert(UOpKey(consumer.clone()));
             }
         }
     }
@@ -434,8 +426,10 @@ pub(crate) fn merge_consumer_ranges(
     // With PCONTIG=0 (default): condition per-dim = `all_all_same || (PCONTIG && all_same(dim))`.
     // When all_all_same=False and PCONTIG=0, this is always False → all dims realized.
     let all_all_same = all_rngs.iter().all(|dim_ranges| {
+        // `all_same([])` is True (helpers.py:31); upstream's `zip(*consumer_rngs)`
+        // (indexing.py:249) truncates such a dim away rather than realizing it.
         if dim_ranges.is_empty() {
-            return false;
+            return true;
         }
         if dim_ranges.iter().skip(1).all(|r| Arc::ptr_eq(&dim_ranges[0], r)) {
             return true;
@@ -492,7 +486,7 @@ pub(crate) fn merge_consumer_ranges(
     }
 
     if !realize_axes.is_empty() {
-        warn!(realize_axes = ?realize_axes, "range conflict detected - marking axes for realization");
+        debug!(realize_axes = ?realize_axes, "range conflict detected - marking axes for realization");
         ctx.mark_realize(uop, realize_axes.clone());
     }
 
@@ -504,7 +498,7 @@ pub(crate) fn merge_consumer_ranges(
 #[instrument(skip_all)]
 fn assign_ranges(
     reverse_topo: &[Arc<UOp>],
-    consumer_map: &HashMap<UOpKey, Vec<Arc<UOp>>>,
+    consumer_map: &ConsumerMap,
     ctx: &mut IndexingContext,
 ) -> svod_ir::Result<()> {
     // Local variable for ending_ranges - only used within this function
@@ -530,7 +524,8 @@ fn assign_ranges(
 
         let _span = info_span!("assign_range", uop_id = x.id, op = x.op().as_ref()).entered();
 
-        let consumers: Vec<_> = consumer_map.get(&UOpKey(x.clone())).cloned().unwrap_or_default();
+        let consumers: Vec<Arc<UOp>> =
+            consumer_map.get(&UOpKey(x.clone())).into_iter().flatten().map(|c| Arc::clone(&c.0)).collect();
         let consumer_rngs: Vec<Vec<Arc<UOp>>> =
             consumers.iter().filter_map(|c| ctx.get_ranges(c).map(|(inp, _)| broadcast_ranges(c, x, inp))).collect();
 
@@ -1221,29 +1216,6 @@ pub fn get_const_value(uop: &Arc<UOp>) -> Option<ConstValue> {
 /// Check if a UOp is a constant with a specific value.
 pub fn is_const(uop: &Arc<UOp>, value: &ConstValue) -> bool {
     get_const_value(uop).as_ref() == Some(value)
-}
-
-/// Check if a UOp represents a zero-size tensor.
-pub fn is_zero_size(uop: &Arc<UOp>) -> bool {
-    uop.shape().ok().flatten().map(|shape| shape.iter().any(|dim| matches!(dim, SInt::Const(0)))).unwrap_or(false)
-}
-
-/// Check if a dtype is void (used for side-effecting operations).
-pub fn is_void(dtype: &DType) -> bool {
-    *dtype == DType::Void
-}
-
-/// Get the binary operation from a UOp if it's a BINARY operation.
-pub fn get_binary_op(uop: &Arc<UOp>) -> Option<BinaryOp> {
-    match uop.op() {
-        Op::Binary(op, _, _) => Some(*op),
-        _ => None,
-    }
-}
-
-/// Check if a STAGE operation is for local memory.
-pub fn is_local_bufferize(uop: &Arc<UOp>) -> bool {
-    if let Op::Stage { opts, .. } = uop.op() { opts.addrspace == svod_ir::AddrSpace::Local } else { false }
 }
 
 // ============================================================================
