@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 use svod_ir::UOp;
 use svod_ir::types::{BinaryOp, ConstValue};
 use svod_ir::uop::cached_property::CachedProperty;
@@ -32,14 +34,20 @@ fn try_uop_sum(terms: &[Arc<UOp>], template: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(sum.unwrap_or_else(|| template.const_like(0i64)))
 }
 
-/// Fold an affine numerator modulo a positive constant divisor.
+/// Fold an affine numerator modulo a positive constant divisor
+/// (`divandmod.py:38-48`).
 ///
-/// For `x = sum(f_i*t_i) + k`, choose centered `r_i = f_i (mod c)` and
-/// construct `rem = sum(r_i*t_i) + (k mod c)`. If `rem` remains in one
-/// Euclidean quotient bucket, then:
+/// For `x = sum(f_i*t_i) + k`, choose `r_i == f_i (mod c)` and construct
+/// `rem = sum(r_i*t_i) + (k mod c)`. Then `x = rem + c*Q` exactly, so if `rem`
+/// stays in one quotient bucket:
 ///
 /// * `x % c = rem - floor(rem/c)*c`
 /// * `x // c = sum((f_i-r_i)/c*t_i) + (k-k%c+floor(rem/c)*c)/c`
+///
+/// The identity is sign-agnostic under floor division, and upstream carries no
+/// numerator sign guard here (unlike `factor_remainder`, `divandmod.py:84`).
+/// Upstream also searches both remainder signs
+/// (`rem_choices`, `divandmod.py:41-45`).
 ///
 /// This function only constructs the candidate. `exact_integer_rewrite` is the
 /// mandatory typed no-wrap proof at the pattern call site.
@@ -55,13 +63,6 @@ pub fn fold_divmod_congruence(x: &Arc<UOp>, _c_uop: &Arc<UOp>, c_val: ConstValue
     }
     let c128 = c as i128;
 
-    // Keep this rule in the non-negative indexing domain. This is sufficient
-    // for QR and avoids adding negative-domain normalization rules.
-    let (ConstValue::Int(x_min), ConstValue::Int(_)) = SoundVminVmaxProperty::get(x).as_ref()? else { return None };
-    if *x_min < 0 {
-        return None;
-    }
-
     let (without_const, constant) = x.pop_const(BinaryOp::Add);
     let ConstValue::Int(constant) = constant else { return None };
     let terms = without_const.split_uop(BinaryOp::Add);
@@ -74,19 +75,50 @@ pub fn fold_divmod_congruence(x: &Arc<UOp>, _c_uop: &Arc<UOp>, c_val: ConstValue
         .collect();
     let decomposition = decomposition?;
 
-    let remainders: Option<Vec<i64>> = decomposition
+    // Both signs of the remainder for a lone term (it covers a binary numerator
+    // that crosses one period) or on an exact `f%c == c//2` tie; otherwise the
+    // smaller one, to keep the product over terms small (`divandmod.py:41-43`).
+    let choices: Vec<SmallVec<[i64; 2]>> = decomposition
         .iter()
         .map(|(_, factor)| {
-            let positive = (*factor as i128).rem_euclid(c128);
-            let negative = positive.checked_sub(c128)?;
-            i64::try_from(if negative.unsigned_abs() < positive.unsigned_abs() { negative } else { positive }).ok()
+            let positive = i64::try_from((*factor as i128).rem_euclid(c128)).ok()?;
+            let negative = positive.checked_sub(c)?;
+            Some(if positive.checked_mul(2) == Some(c) || decomposition.len() == 1 {
+                SmallVec::from_slice(&[positive, negative])
+            } else if negative.unsigned_abs() < positive.unsigned_abs() {
+                SmallVec::from_slice(&[negative])
+            } else {
+                SmallVec::from_slice(&[positive])
+            })
         })
-        .collect();
-    let remainders = remainders?;
+        .collect::<Option<_>>()?;
+
+    // `itertools.product` order: the last choice varies fastest.
+    let combinations = choices.iter().try_fold(1usize, |count, choice| count.checked_mul(choice.len()))?;
+    let mut remainders = vec![0i64; choices.len()];
+    (0..combinations).find_map(|mut code| {
+        for (remainder, choice) in remainders.iter_mut().zip(&choices).rev() {
+            *remainder = choice[code % choice.len()];
+            code /= choice.len();
+        }
+        congruence_candidate(x, c, &decomposition, &remainders, constant, is_mod)
+    })
+}
+
+/// One `rems` combination of [`fold_divmod_congruence`]'s remainder search.
+fn congruence_candidate(
+    x: &Arc<UOp>,
+    c: i64,
+    decomposition: &[(Arc<UOp>, i64)],
+    remainders: &[i64],
+    constant: i64,
+    is_mod: bool,
+) -> Option<Arc<UOp>> {
+    let c128 = c as i128;
     let constant_remainder = constant.rem_euclid(c);
 
     let mut remainder_terms = Vec::new();
-    for ((base, _), coefficient) in decomposition.iter().zip(&remainders) {
+    for ((base, _), coefficient) in decomposition.iter().zip(remainders) {
         if *coefficient != 0 {
             remainder_terms.push(scaled(base, *coefficient)?);
         }
@@ -113,7 +145,7 @@ pub fn fold_divmod_congruence(x: &Arc<UOp>, _c_uop: &Arc<UOp>, c_val: ConstValue
     }
 
     let mut quotient_terms = Vec::new();
-    for ((base, factor), remainder) in decomposition.iter().zip(&remainders) {
+    for ((base, factor), remainder) in decomposition.iter().zip(remainders) {
         let coefficient = (*factor as i128).checked_sub(*remainder as i128)?.checked_div(c128)?;
         if coefficient != 0 {
             quotient_terms.push(scaled(base, i64::try_from(coefficient).ok()?)?);

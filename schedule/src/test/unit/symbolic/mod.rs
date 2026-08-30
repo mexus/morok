@@ -1172,6 +1172,51 @@ fn div_mod_recombine_matches_tinygrad(input: RecombineTerm, expected: RecombineT
     }
 }
 
+/// Two ranged variables for the congruence rows.
+struct CongruenceVars {
+    a: Arc<UOp>,
+    b: Arc<UOp>,
+}
+
+impl CongruenceVars {
+    fn new((a_lo, a_hi): (i64, i64), (b_lo, b_hi): (i64, i64)) -> Self {
+        Self { a: UOp::var("a", DType::WeakInt, a_lo, a_hi), b: UOp::var("b", DType::WeakInt, b_lo, b_hi) }
+    }
+
+    fn c(&self, value: i64) -> Arc<UOp> {
+        self.a.const_like(value)
+    }
+}
+
+type CongruenceTerm = fn(&CongruenceVars) -> Arc<UOp>;
+
+/// `fold_divmod_congruence` (`uop/divandmod.py:38-48`) carries no numerator sign
+/// guard and searches both signs of every coefficient's remainder. The first two
+/// rows are tinygrad's `test_floordiv_factor_nest_negative_numerator` and
+/// `test_floordiv_gcd_with_remainder_negative_numerator`
+/// (`test/null/test_uop_symbolic.py:573-582`); the last two need the negative
+/// representative, which is only reachable through `rem_choices`.
+#[test_case::test_case((-10, 10), (0, 3), |v| v.a.mul(&v.c(4)).add(&v.b).floor_div(&v.c(12)), |v| v.a.floor_div(&v.c(3)) ; "factor nest over a negative numerator")]
+#[test_case::test_case((-1, 5), (0, 0), |v| v.a.mul(&v.c(2)).add(&v.c(7)).floor_div(&v.c(8)), |v| v.a.add(&v.c(3)).floor_div(&v.c(4)) ; "gcd with remainder over a negative numerator")]
+#[test_case::test_case((2, 3), (0, 0), |v| v.a.mul(&v.c(2)).mod_(&v.c(6)), |v| v.a.mul(&v.c(-4)).add(&v.c(12)) ; "mod that needs the lone term negative remainder")]
+#[test_case::test_case((2, 3), (0, 0), |v| v.a.mul(&v.c(2)).floor_div(&v.c(6)), |v| v.a.add(&v.c(-2)) ; "quotient that needs the lone term negative remainder")]
+#[test_case::test_case((1, 2), (0, 1), |v| v.a.mul(&v.c(2)).add(&v.b.mul(&v.c(4))).mod_(&v.c(4)), |v| v.a.mul(&v.c(-2)).add(&v.c(4)) ; "mod that needs the tie break negative remainder")]
+fn divmod_congruence_matches_tinygrad(a: (i64, i64), b: (i64, i64), input: CongruenceTerm, expected: CongruenceTerm) {
+    let ranged = CongruenceVars::new(a, b);
+    let folded = graph_rewrite(symbolic(), input(&ranged), &mut ());
+    let expected_uop = expected(&ranged);
+    assert!(Arc::ptr_eq(&folded, &expected_uop), "got {}, want {}", folded.tree(), expected_uop.tree());
+
+    for point_a in a.0..=a.1 {
+        for point_b in b.0..=b.1 {
+            let pinned = CongruenceVars::new((point_a, point_a), (point_b, point_b));
+            let evaluated = eval_closed_typed(&input(&pinned));
+            assert!(evaluated.is_some(), "input did not evaluate at ({point_a}, {point_b})");
+            assert_eq!(evaluated, eval_closed_typed(&expected(&pinned)), "identity broken at ({point_a}, {point_b})");
+        }
+    }
+}
+
 /// `(x + c)//d -> (x + c%d)//d + c//d` (`uop/divandmod.py:102-105`): "split the
 /// multiple of d out of the const, holds for any d!=0". `c` is split with the
 /// floor-semantics pair `(c.rem_euclid(d), c.div_euclid(d))` and upstream
