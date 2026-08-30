@@ -63,7 +63,9 @@ fn add_war_barrier(end: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    let backward_slice = computation.backward_slice_with_self();
+    // `toposort` covers the same node set as `backward_slice_with_self` but uses
+    // the pre-sized FxHashSet visited set instead of a fresh SipHash pointer set.
+    let backward_slice = computation.toposort();
     let loop_range_ids: HashSet<_> = loop_ranges.iter().map(|range| range.id).collect();
     let store_buffers: HashSet<_> = backward_slice
         .iter()
