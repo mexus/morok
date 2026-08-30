@@ -52,9 +52,9 @@
 //! let result = graph_rewrite(&matcher, root, &mut ());
 //! ```
 
-use crate::{Op, UOp, UOpKey};
+use crate::{Op, UOp};
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::pattern::{Matcher, RewriteResult};
@@ -125,11 +125,16 @@ where
     /// Traversal mode controlling CALL/FUNCTION/PROGRAM boundary handling.
     traversal_mode: TraversalMode,
 
-    /// Results cache: maps original node → optimized result.
-    replace: HashMap<UOpKey, Arc<UOp>>,
+    /// Results cache: maps original node id → optimized result.
+    ///
+    /// Keyed on `UOp::id` with an Fx hasher. The key wrapper this replaced already
+    /// compared and hashed by id alone, so the `Arc` it carried only bought a
+    /// refcount pair per probe, and SipHash only bought cycles over an integer we
+    /// already had.
+    replace: FxHashMap<u64, Arc<UOp>>,
 
     /// BPM result cache: prevents re-running pattern matching on nodes already seen.
-    bpm_cache: HashMap<UOpKey, Option<Arc<UOp>>>,
+    bpm_cache: FxHashMap<u64, Option<Arc<UOp>>>,
 }
 
 impl<'a, PM, BPM, C> RewriteEngine<'a, PM, BPM, C>
@@ -138,7 +143,7 @@ where
     BPM: Matcher<C>,
 {
     fn new(pm: Option<&'a PM>, bpm: Option<&'a BPM>, ctx: &'a mut C, traversal_mode: TraversalMode) -> Self {
-        Self { pm, bpm, ctx, traversal_mode, replace: HashMap::new(), bpm_cache: HashMap::new() }
+        Self { pm, bpm, ctx, traversal_mode, replace: FxHashMap::default(), bpm_cache: FxHashMap::default() }
     }
 
     /// Single-shot top-down pattern application.
@@ -167,7 +172,7 @@ where
     /// Gate results are NOT cached — Gate is an exception that bypasses the cache.
     #[inline]
     fn cached_bpm_rewrite(&mut self, x: &Arc<UOp>) -> Result<Option<Arc<UOp>>, Arc<UOp>> {
-        let key = UOpKey(x.clone());
+        let key = x.id;
         if let Some(cached) = self.bpm_cache.get(&key) {
             return match cached {
                 Some(node) => Ok(Some(node.clone())),
@@ -201,20 +206,19 @@ where
         if !Arc::ptr_eq(original, &result) {
             crate::provenance::record_transformed(result.id, original.id, crate::provenance::PassName::RewritePattern);
         }
-        self.replace.insert(UOpKey(original.clone()), result);
+        self.replace.insert(original.id, result);
     }
 
     /// Main rewrite method — stack-based 3-stage traversal.
-    #[allow(clippy::mutable_key_type)]
     fn rewrite(&mut self, root: Arc<UOp>) -> Arc<UOp> {
         let mut stack: Vec<Entry> = vec![Entry { n: root.clone(), stage: 0, new_n: root.clone() }];
 
         // All UOps either on the stack or in self.replace — don't have to be placed again.
-        let mut on_stack: HashSet<UOpKey> = HashSet::new();
-        on_stack.insert(UOpKey(root.clone()));
+        let mut on_stack: FxHashSet<u64> = FxHashSet::default();
+        on_stack.insert(root.id);
 
         // UOps waiting on a dependency to be in self.replace.
-        let mut waitlist: HashMap<UOpKey, Vec<Entry>> = HashMap::new();
+        let mut waitlist: FxHashMap<u64, Vec<Entry>> = FxHashMap::default();
 
         while let Some(Entry { n, stage, new_n }) = stack.pop() {
             if stack.len() > REWRITE_STACK_LIMIT {
@@ -225,7 +229,7 @@ where
                 );
             }
 
-            let n_key = UOpKey(n.clone());
+            let n_key = n.id;
 
             if self.replace.contains_key(&n_key) {
                 continue;
@@ -237,10 +241,10 @@ where
 
                 if self.bpm.is_some() {
                     // Apply bpm rewrite rules until a fixed point is reached.
-                    let mut seen: HashSet<UOpKey> = HashSet::new();
+                    let mut seen: FxHashSet<u64> = FxHashSet::default();
                     let mut gated = false;
                     loop {
-                        let working_key = UOpKey(working.clone());
+                        let working_key = working.id;
                         if seen.contains(&working_key) {
                             panic!(
                                 "infinite loop in fixed_point_rewrite: node {:?} (id={}) seen twice",
@@ -274,11 +278,11 @@ where
 
                 let (sources, skipped) = traversal_children(&working, self.traversal_mode);
                 for skipped_child in skipped {
-                    self.replace.entry(UOpKey(skipped_child.clone())).or_insert_with(|| skipped_child.clone());
+                    self.replace.entry(skipped_child.id).or_insert_with(|| skipped_child.clone());
                 }
 
                 for child in sources.into_iter().rev() {
-                    let child_key = UOpKey(child.clone());
+                    let child_key = child.id;
                     if on_stack.contains(&child_key) {
                         continue;
                     }
@@ -295,7 +299,7 @@ where
                     let mut changed = false;
 
                     for src in sources {
-                        let src_key = UOpKey(src.clone());
+                        let src_key = src.id;
                         if let Some(rx) = self.replace.get(&src_key) {
                             changed |= !Arc::ptr_eq(rx, src);
                             tmp.push(rx.clone());
@@ -345,7 +349,7 @@ where
                 }
             } else {
                 // Stage 2: Link
-                let new_n_key = UOpKey(new_n.clone());
+                let new_n_key = new_n.id;
 
                 if let Some(replaced_new_n) = self.replace.get(&new_n_key).cloned() {
                     self.record_replace(&n, replaced_new_n);
@@ -359,7 +363,7 @@ where
             }
         }
 
-        self.replace.get(&UOpKey(root.clone())).cloned().unwrap_or(root)
+        self.replace.get(&root.id).cloned().unwrap_or(root)
     }
 
     /// MLIR-style walk pattern rewrite driver — single-pass, no re-traversal.
@@ -384,7 +388,7 @@ where
                 );
             }
 
-            let n_key = UOpKey(n.clone());
+            let n_key = n.id;
             if self.replace.contains_key(&n_key) {
                 continue;
             }
@@ -412,21 +416,18 @@ where
 
                 let (sources, skipped) = traversal_children(&n, self.traversal_mode);
                 for skipped_child in skipped {
-                    self.replace.entry(UOpKey(skipped_child.clone())).or_insert_with(|| skipped_child.clone());
+                    self.replace.entry(skipped_child.id).or_insert_with(|| skipped_child.clone());
                 }
                 for child in sources.into_iter().rev() {
-                    let child_key = UOpKey(child.clone());
-                    if !self.replace.contains_key(&child_key) {
+                    if !self.replace.contains_key(&child.id) {
                         stack.push((child.clone(), false));
                     }
                 }
             } else {
                 // Rebuild with rewritten sources.
                 let sources = n.op().children();
-                let new_src: Vec<Arc<UOp>> = sources
-                    .iter()
-                    .map(|s| self.replace.get(&UOpKey((*s).clone())).cloned().unwrap_or_else(|| (*s).clone()))
-                    .collect();
+                let new_src: Vec<Arc<UOp>> =
+                    sources.iter().map(|s| self.replace.get(&s.id).cloned().unwrap_or_else(|| (*s).clone())).collect();
                 let any_changed = new_src.iter().zip(sources.iter()).any(|(a, b)| !Arc::ptr_eq(a, b));
                 let rebuilt = if any_changed { n.with_sources(new_src) } else { n.clone() };
 
@@ -437,7 +438,7 @@ where
             }
         }
 
-        self.replace.get(&UOpKey(root.clone())).cloned().unwrap_or(root)
+        self.replace.get(&root.id).cloned().unwrap_or(root)
     }
 }
 

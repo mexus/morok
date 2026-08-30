@@ -79,6 +79,34 @@ impl Hash for UOpKey {
     }
 }
 
+/// Forwards the single pre-computed xxh64 value `UOpKey::hash` writes.
+///
+/// The table's `BuildHasher` was `RandomState`, so every probe ran SipHash over
+/// an 8-byte buffer holding a digest we had already computed. Tinygrad's `ucache`
+/// has the same property for free: its key is a tuple of five pointers hashed by
+/// CPython's identity hash.
+#[derive(Default)]
+struct PrecomputedHasher(u64);
+
+impl Hasher for PrecomputedHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, _bytes: &[u8]) {
+        unreachable!("UOpKey::hash must write exactly one pre-computed u64");
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+type PrecomputedHash = std::hash::BuildHasherDefault<PrecomputedHasher>;
+
 impl PartialEq for UOpKey {
     fn eq(&self, other: &Self) -> bool {
         // Fast path: different hashes → definitely not equal
@@ -287,10 +315,10 @@ impl UOpKey {
 // 2. Strong refs held by Tensor, Scheduler, etc. keep UOps alive
 // 3. When all strong refs dropped, UOp deallocated, weak ref becomes dead
 // 4. Dead weak refs cleaned up lazily or via gc_dead_refs()
-static UOPS: OnceLock<HashMap<UOpKey, Weak<UOp>>> = OnceLock::new();
+static UOPS: OnceLock<HashMap<UOpKey, Weak<UOp>, PrecomputedHash>> = OnceLock::new();
 
-fn uops() -> &'static HashMap<UOpKey, Weak<UOp>> {
-    UOPS.get_or_init(HashMap::new)
+fn uops() -> &'static HashMap<UOpKey, Weak<UOp>, PrecomputedHash> {
+    UOPS.get_or_init(HashMap::default)
 }
 
 /// Remove dead weak references from the cache.
