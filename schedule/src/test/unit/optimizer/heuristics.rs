@@ -46,28 +46,18 @@ fn create_tc_retry_pattern() -> Arc<UOp> {
     UOp::sink(vec![red, m_range, n_good_range, n_bad_range])
 }
 
-#[test]
-fn test_apply_matvec_fast_path_applies_group_local_upcast() {
-    let sink = create_matvec_like_pattern(64, 128);
-    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
+/// The matvec fast path applies GROUP + LOCAL + UPCAST in one shot, unless
+/// `matvec_enabled` turns it off.
+#[test_case(true; "enabled")]
+#[test_case(false; "disabled by config")]
+fn test_apply_matvec_fast_path(enabled: bool) {
+    let mut scheduler = Scheduler::new(create_matvec_like_pattern(64, 128), Renderer::cuda());
+    let config = HeuristicsConfig::builder().matvec_enabled(enabled).build();
 
-    let config = HeuristicsConfig::default();
-    let applied = apply_matvec_fast_path(&mut scheduler, &config);
-    assert!(applied, "matvec fast-path should apply on matching pattern");
-
-    assert!(!scheduler.axes_of(&[AxisType::GroupReduce]).is_empty(), "GROUP should be applied");
-    assert!(!scheduler.axes_of(&[AxisType::Local]).is_empty(), "LOCAL should be applied");
-    assert!(!scheduler.axes_of(&[AxisType::Upcast]).is_empty(), "UPCAST should be applied");
-}
-
-#[test]
-fn test_apply_matvec_fast_path_respects_disable_flag() {
-    let sink = create_matvec_like_pattern(64, 128);
-    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
-
-    let config = HeuristicsConfig::builder().matvec_enabled(false).build();
-    let applied = apply_matvec_fast_path(&mut scheduler, &config);
-    assert!(!applied, "matvec fast-path should be disabled by config");
+    assert_eq!(apply_matvec_fast_path(&mut scheduler, &config), enabled);
+    for axis in [AxisType::GroupReduce, AxisType::Local, AxisType::Upcast] {
+        assert_eq!(!scheduler.axes_of(&[axis]).is_empty(), enabled, "{axis:?}");
+    }
 }
 
 #[test_case(DType::Image { kind: svod_dtype::ImageKind::Float, shape: vec![2, 8, 4] }, true; "image buffer")]

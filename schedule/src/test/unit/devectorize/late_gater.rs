@@ -98,45 +98,35 @@ fn test_where_after_gated_load_becomes_load_alt() {
     assert!(Arc::ptr_eq(result_alt, &alt));
 }
 
+/// tinygrad folds a fully-invalid memory access away: the LOAD becomes its alt (zero
+/// when it has none) with the shape preserved, and the STORE becomes a noop.
 #[test]
-fn test_symbolic_simple_folds_fully_invalid_memory_accesses() {
+fn symbolic_simple_folds_fully_invalid_memory_accesses() {
     let buffer = create_buffer(16);
-    let invalid_index = UOp::index()
-        .buffer(buffer)
-        .indices(vec![UOp::invalid_marker()])
-        .call()
-        .expect("invalid index is legal before late lowering");
-    let load = UOp::load().index(invalid_index.clone()).call();
-    let store = invalid_index.store(UOp::native_const(2.0f32));
+    let fold = |root| graph_rewrite(crate::symbolic::symbolic_simple(), root, &mut ());
+    let invalid_index = |lanes: Vec<Arc<UOp>>| {
+        let indices = if lanes.len() == 1 { lanes[0].clone() } else { UOp::stack(lanes.into()) };
+        UOp::index().buffer(buffer.clone()).indices(vec![indices]).call().expect("legal before late lowering")
+    };
 
-    let load = graph_rewrite(crate::symbolic::symbolic_simple(), load, &mut ());
-    let store = graph_rewrite(crate::symbolic::symbolic_simple(), store, &mut ());
-
+    let scalar = invalid_index(vec![UOp::invalid_marker()]);
+    let load = fold(UOp::load().index(scalar.clone()).call());
     assert!(matches!(load.op(), Op::Const(value) if value.0 == ConstValue::Float(0.0)));
+    let store = fold(scalar.store(UOp::native_const(2.0f32)));
     assert!(matches!(store.op(), Op::Noop));
-    assert!(!load.toposort().iter().any(UOp::is_invalid_marker));
-    assert!(!store.toposort().iter().any(UOp::is_invalid_marker));
-}
+    assert!(![&load, &store].iter().any(|root| root.toposort().iter().any(UOp::is_invalid_marker)));
 
-#[test]
-fn test_invalid_load_uses_alt_and_preserves_shape() {
-    let buffer = create_buffer(16);
-    let invalid_lanes = UOp::stack(vec![UOp::invalid_marker(), UOp::invalid_marker()].into());
-    let invalid_index = UOp::index().buffer(buffer).indices(vec![invalid_lanes]).call().unwrap();
-
-    let load = UOp::load().index(invalid_index.clone()).call();
-    let result = graph_rewrite(crate::symbolic::symbolic_simple(), load, &mut ());
-    assert_eq!(result.dtype(), DType::Float32);
-    assert_eq!(result.shape().unwrap().unwrap().as_slice(), &[svod_ir::SInt::Const(2)]);
-    assert!(
-        matches!(result.op(), Op::Stack { sources } if sources.iter().all(|source| matches!(source.op(), Op::Const(value) if value.0 == ConstValue::Float(0.0))))
-    );
+    let shaped = invalid_index(vec![UOp::invalid_marker(), UOp::invalid_marker()]);
+    let load = fold(UOp::load().index(shaped.clone()).call());
+    assert_eq!(load.dtype(), DType::Float32);
+    assert_eq!(load.shape().unwrap().unwrap().as_slice(), &[svod_ir::SInt::Const(2)]);
+    assert!(matches!(load.op(), Op::Stack { sources }
+        if sources.iter().all(|lane| matches!(lane.op(), Op::Const(value) if value.0 == ConstValue::Float(0.0)))));
 
     let alt = UOp::stack(vec![UOp::native_const(7.0f32), UOp::native_const(7.0f32)].into());
     let gated =
-        UOp::load().index(invalid_index).alt(alt.clone()).gate(UOp::const_(DType::Bool, ConstValue::Bool(true))).call();
-    let result = graph_rewrite(crate::symbolic::symbolic_simple(), gated, &mut ());
-    assert!(Arc::ptr_eq(&result, &alt), "an invalid gated LOAD returns its existing alt");
+        UOp::load().index(shaped).alt(alt.clone()).gate(UOp::const_(DType::Bool, ConstValue::Bool(true))).call();
+    assert!(Arc::ptr_eq(&fold(gated), &alt), "an invalid gated LOAD returns its existing alt");
 }
 
 #[test]

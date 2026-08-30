@@ -1,466 +1,159 @@
-//! ALU devectorization tests (no_vectorized_alu).
-//!
-//! Tests for the no_vectorized_alu patterns which convert vectorized
-//! ALU operations to VECTORIZE of scalar operations.
-//!
-//! Based on Tinygrad's no_vectorized_alu (devectorizer.py:219-223).
+//! `no_vectorized_alu` (tinygrad `devectorizer.py:219-223`): a vector ALU op becomes
+//! a STACK of scalar ones; a scalar op is left alone.
 
-use svod_dtype::DType;
+use std::sync::Arc;
+
+use svod_dtype::{DType, ScalarDType};
 use svod_ir::types::ConstValue;
 use svod_ir::{BinaryOp, Op, TernaryOp, UOp, UnaryOp};
+use test_case::test_case;
 
 use super::helpers::*;
 
-// =============================================================================
-// Binary Op Tests
-// =============================================================================
+#[derive(Clone, Copy, Debug)]
+enum Alu {
+    Binary(BinaryOp),
+    Unary(UnaryOp),
+    Cast,
+    Where,
+    MulAcc,
+}
 
-/// Test: Add<vec4> devectorizes to VECTORIZE of scalar Adds.
-///
-/// Add(<4 x f32>, <4 x f32>) -> VECTORIZE(Add(f32, f32), ...)
+/// `width == 1` builds the scalar form of the same expression.
+fn operand(elem: ScalarDType, width: usize, base: i64) -> Arc<UOp> {
+    let lane = |i: i64| match elem {
+        ScalarDType::Float32 => UOp::const_(DType::Float32, ConstValue::Float((base + i) as f64)),
+        _ => UOp::const_(DType::Int64, ConstValue::Int(base + i)),
+    };
+    if width == 1 { lane(0) } else { UOp::stack((0..width as i64).map(lane).collect()) }
+}
+
+fn build(alu: Alu, width: usize, elem: ScalarDType) -> Arc<UOp> {
+    let widen = |dtype: DType| if width == 1 { dtype } else { dtype.vec(width).unwrap() };
+    let dtype = widen(DType::Scalar(elem));
+    let (a, b) = (operand(elem, width, 0), operand(elem, width, 10));
+    match alu {
+        Alu::Binary(op) => UOp::new(Op::Binary(op, a, b), dtype),
+        Alu::Unary(op) => UOp::new(Op::Unary(op, a), dtype),
+        Alu::Cast => a.cast(widen(DType::Int64)),
+        Alu::Where => {
+            let cond = if width == 1 {
+                create_bool_const(true)
+            } else {
+                create_vector_bool((0..width).map(|i| i % 2 == 0).collect())
+            };
+            UOp::new(Op::Ternary(TernaryOp::Where, cond, a, b), dtype)
+        }
+        Alu::MulAcc => UOp::try_mulacc(a.clone(), b, a).expect("MulAcc"),
+    }
+}
+
+fn is_lane_of(alu: Alu, uop: &Arc<UOp>) -> bool {
+    match (alu, uop.op()) {
+        (Alu::Binary(op), Op::Binary(got, ..)) => *got == op,
+        (Alu::Unary(op), Op::Unary(got, ..)) => *got == op,
+        (Alu::Cast, Op::Cast { .. }) => true,
+        (Alu::Where, Op::Ternary(TernaryOp::Where, ..)) => true,
+        (Alu::MulAcc, Op::Ternary(TernaryOp::MulAcc, ..)) => true,
+        _ => false,
+    }
+}
+
+#[test_case(Alu::Binary(BinaryOp::Add), 4, ScalarDType::Float32; "add")]
+#[test_case(Alu::Binary(BinaryOp::Sub), 4, ScalarDType::Float32; "sub")]
+#[test_case(Alu::Binary(BinaryOp::Mul), 8, ScalarDType::Float32; "mul vec8")]
+#[test_case(Alu::Binary(BinaryOp::Add), 16, ScalarDType::Float32; "add vec16")]
+#[test_case(Alu::Binary(BinaryOp::Add), 4, ScalarDType::Int64; "integer add")]
+#[test_case(Alu::Binary(BinaryOp::And), 4, ScalarDType::Int64; "bitwise and")]
+#[test_case(Alu::Unary(UnaryOp::Neg), 4, ScalarDType::Float32; "neg")]
+#[test_case(Alu::Unary(UnaryOp::Sqrt), 4, ScalarDType::Float32; "sqrt")]
+#[test_case(Alu::Unary(UnaryOp::Exp2), 4, ScalarDType::Float32; "exp2")]
+#[test_case(Alu::Cast, 4, ScalarDType::Float32; "cast")]
+#[test_case(Alu::Where, 4, ScalarDType::Float32; "where select")]
+#[test_case(Alu::MulAcc, 4, ScalarDType::Float32; "mulacc")]
+fn vector_alu_becomes_a_stack_of_scalar_lanes(alu: Alu, width: usize, elem: ScalarDType) {
+    let result = apply_no_vectorized_alu(&build(alu, width, elem));
+
+    let Op::Stack { sources } = result.op() else { panic!("expected a STACK of lanes: {}", result.tree()) };
+    assert_eq!(sources.len(), width);
+    assert!(sources.iter().all(|lane| is_lane_of(alu, lane) && lane.dtype().vcount() == 1), "{}", result.tree());
+}
+
+#[test_case(Alu::Binary(BinaryOp::Add); "binary")]
+#[test_case(Alu::Unary(UnaryOp::Sqrt); "unary")]
+#[test_case(Alu::Cast; "cast")]
+#[test_case(Alu::Where; "where select")]
+#[test_case(Alu::MulAcc; "mulacc")]
+fn scalar_alu_is_left_alone(alu: Alu) {
+    let scalar = build(alu, 1, ScalarDType::Float32);
+    let result = apply_no_vectorized_alu(&scalar);
+
+    assert!(Arc::ptr_eq(&result, &scalar), "{}", result.tree());
+    assert!(is_lane_of(alu, &result));
+}
+
+/// A broadcast scalar operand is scalarized along with the vector one.
 #[test]
-fn test_add_vec4_devectorize() {
-    let a = create_vector_float_iota(4);
-    let b = create_vector_float_values(vec![10.0, 20.0, 30.0, 40.0]);
-
-    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32.vec(4).unwrap());
+fn broadcast_operand_is_scalarized_with_its_vector_partner() {
+    let add = UOp::new(
+        Op::Binary(BinaryOp::Add, create_vector_float_iota(4), create_float_const(10.0).broadcast(4)),
+        DType::Float32.vec(4).unwrap(),
+    );
 
     let result = apply_no_vectorized_alu(&add);
 
-    // Should become VECTORIZE of 4 scalar Adds
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 4, "Should have 4 scalar Adds");
-            for elem in elements.iter() {
-                assert!(matches!(elem.op(), Op::Binary(BinaryOp::Add, _, _)));
-                assert_eq!(elem.dtype().vcount(), 1, "Each Add should be scalar");
-            }
-        }
-        // Could remain Binary if vcount <= 1
-        Op::Binary(BinaryOp::Add, _, _) => {}
-        other => panic!("Expected VECTORIZE or Binary, got {:?}", other),
-    }
+    let Op::Stack { sources } = result.op() else { panic!("expected a STACK of lanes: {}", result.tree()) };
+    assert_eq!(sources.len(), 4);
+    assert!(sources.iter().all(|lane| matches!(lane.op(), Op::Binary(BinaryOp::Add, ..))));
 }
 
-/// Test: Mul<vec8> devectorizes to VECTORIZE of 8 Muls.
+/// A source narrower than the result has no lane to select, so the op stays vectorized.
 #[test]
-fn test_mul_vec8_devectorize() {
-    let a = create_vector_float_iota(8);
-    let b = create_vector_float_iota(8);
+fn mismatched_source_extent_is_not_scalarized() {
+    let add = UOp::new(
+        Op::Binary(BinaryOp::Add, create_vector_float_iota(4), create_float_const(10.0)),
+        DType::Float32.vec(4).unwrap(),
+    );
 
-    let mul = UOp::new(Op::Binary(BinaryOp::Mul, a, b), DType::Float32.vec(8).unwrap());
-
-    let result = apply_no_vectorized_alu(&mul);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 8, "Should have 8 scalar Muls");
-            for elem in elements.iter() {
-                assert!(matches!(elem.op(), Op::Binary(BinaryOp::Mul, _, _)));
-            }
-        }
-        Op::Binary(BinaryOp::Mul, _, _) => {}
-        other => panic!("Expected VECTORIZE or Binary, got {:?}", other),
-    }
+    assert!(matches!(apply_no_vectorized_alu(&add).op(), Op::Binary(BinaryOp::Add, ..)));
 }
 
-/// Test: Binary<scalar> remains unchanged.
+/// A shaped LOAD has no STACK to index into, so each lane reads it back through a
+/// scalar INDEX rather than being duplicated.
 #[test]
-fn test_binary_scalar_unchanged() {
-    let a = create_float_const(1.0);
-    let b = create_float_const(2.0);
-
-    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32);
-
-    let result = apply_no_vectorized_alu(&add);
-
-    // Scalar binary should remain unchanged
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Add, _, _)));
-    assert_eq!(result.dtype().vcount(), 1);
-}
-
-/// Test: Sub<vec4> devectorizes.
-#[test]
-fn test_sub_vec4_devectorize() {
-    let a = create_vector_float_iota(4);
-    let b = create_vector_float_iota(4);
-
-    let sub = UOp::new(Op::Binary(BinaryOp::Sub, a, b), DType::Float32.vec(4).unwrap());
-
-    let result = apply_no_vectorized_alu(&sub);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 4);
-            for elem in elements.iter() {
-                assert!(matches!(elem.op(), Op::Binary(BinaryOp::Sub, _, _)));
-            }
-        }
-        Op::Binary(BinaryOp::Sub, _, _) => {}
-        other => panic!("Expected VECTORIZE or Binary, got {:?}", other),
-    }
-}
-
-// =============================================================================
-// Unary Op Tests
-// =============================================================================
-
-/// Test: Neg<vec4> devectorizes to VECTORIZE of Negs.
-#[test]
-fn test_neg_vec4_devectorize() {
-    let a = create_vector_float_iota(4);
-
-    let neg = UOp::new(Op::Unary(UnaryOp::Neg, a), DType::Float32.vec(4).unwrap());
-
-    let result = apply_no_vectorized_alu(&neg);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 4);
-            for elem in elements.iter() {
-                assert!(matches!(elem.op(), Op::Unary(UnaryOp::Neg, _)));
-                assert_eq!(elem.dtype().vcount(), 1);
-            }
-        }
-        Op::Unary(UnaryOp::Neg, _) => {}
-        other => panic!("Expected VECTORIZE or Unary, got {:?}", other),
-    }
-}
-
-/// Test: Sqrt<vec4> devectorizes to VECTORIZE of Sqrts.
-#[test]
-fn test_sqrt_vec4_devectorize() {
-    let a = create_vector_float_iota(4);
-
-    let sqrt = UOp::new(Op::Unary(UnaryOp::Sqrt, a), DType::Float32.vec(4).unwrap());
-
-    let result = apply_no_vectorized_alu(&sqrt);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 4);
-            for elem in elements.iter() {
-                assert!(matches!(elem.op(), Op::Unary(UnaryOp::Sqrt, _)));
-            }
-        }
-        Op::Unary(UnaryOp::Sqrt, _) => {}
-        other => panic!("Expected VECTORIZE or Unary, got {:?}", other),
-    }
-}
-
-/// Test: Exp2<vec4> devectorizes.
-#[test]
-fn test_exp2_vec4_devectorize() {
-    let a = create_vector_float_iota(4);
-
-    let exp2 = UOp::new(Op::Unary(UnaryOp::Exp2, a), DType::Float32.vec(4).unwrap());
-
-    let result = apply_no_vectorized_alu(&exp2);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 4);
-        }
-        Op::Unary(UnaryOp::Exp2, _) => {}
-        other => panic!("Expected VECTORIZE or Unary, got {:?}", other),
-    }
-}
-
-/// Test: Scalar unary remains unchanged.
-#[test]
-fn test_unary_scalar_unchanged() {
-    let a = create_float_const(4.0);
-
-    let sqrt = UOp::new(Op::Unary(UnaryOp::Sqrt, a), DType::Float32);
-
-    let result = apply_no_vectorized_alu(&sqrt);
-
-    assert!(matches!(result.op(), Op::Unary(UnaryOp::Sqrt, _)));
-    assert_eq!(result.dtype().vcount(), 1);
-}
-
-// =============================================================================
-// Cast Tests
-// =============================================================================
-
-/// Test: Cast<vec4> devectorizes to VECTORIZE of Casts.
-#[test]
-fn test_cast_vec4_devectorize() {
-    let a = create_vector_float_iota(4);
-
-    let cast = a.cast(DType::Int64.vec(4).unwrap());
-
-    let result = apply_no_vectorized_alu(&cast);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 4);
-            for elem in elements.iter() {
-                assert!(matches!(elem.op(), Op::Cast { .. }));
-                assert_eq!(elem.dtype().vcount(), 1);
-            }
-        }
-        Op::Cast { .. } => {}
-        other => panic!("Expected VECTORIZE or Cast, got {:?}", other),
-    }
-}
-
-/// Test: Scalar Cast remains unchanged.
-#[test]
-fn test_cast_scalar_unchanged() {
-    let a = create_float_const(3.0);
-
-    let cast = a.cast(DType::Int64);
-
-    let result = apply_no_vectorized_alu(&cast);
-
-    assert!(matches!(result.op(), Op::Cast { .. }));
-    assert_eq!(result.dtype().vcount(), 1);
-}
-
-// =============================================================================
-// WHERE Tests
-// =============================================================================
-
-/// Test: WHERE<vec4> devectorizes to VECTORIZE of WHEREs.
-#[test]
-fn test_where_vec4_devectorize() {
-    let cond = create_vector_bool(vec![true, false, true, false]);
-    let t_val = create_vector_float_iota(4);
-    let f_val = create_vector_float_values(vec![10.0, 11.0, 12.0, 13.0]);
-
-    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, t_val, f_val), DType::Float32.vec(4).unwrap());
-
-    let result = apply_no_vectorized_alu(&where_op);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 4);
-            for elem in elements.iter() {
-                assert!(matches!(elem.op(), Op::Ternary(TernaryOp::Where, _, _, _)));
-                assert_eq!(elem.dtype().vcount(), 1);
-            }
-        }
-        Op::Ternary(TernaryOp::Where, _, _, _) => {}
-        other => panic!("Expected VECTORIZE or WHERE, got {:?}", other),
-    }
-}
-
-/// Test: Scalar WHERE remains unchanged.
-#[test]
-fn test_where_scalar_unchanged() {
-    let cond = create_bool_const(true);
-    let t_val = create_float_const(1.0);
-    let f_val = create_float_const(0.0);
-
-    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, t_val, f_val), DType::Float32);
-
-    let result = apply_no_vectorized_alu(&where_op);
-
-    assert!(matches!(result.op(), Op::Ternary(TernaryOp::Where, _, _, _)));
-    assert_eq!(result.dtype().vcount(), 1);
-}
-
-// =============================================================================
-// MulAcc Tests
-// =============================================================================
-
-/// Test: MulAcc<vec4> devectorizes to VECTORIZE of MulAccs.
-#[test]
-fn test_mulacc_vec4_devectorize() {
-    let a = create_vector_float_iota(4);
-    let b = create_vector_float_iota(4);
-    let c = create_vector_float_values(vec![100.0, 100.0, 100.0, 100.0]);
-
-    let mulacc = UOp::try_mulacc(a, b, c).expect("MulAcc creation should succeed");
-
-    // Verify initial vector dtype
-    assert_vcount(&mulacc, 4);
-
-    let result = apply_no_vectorized_alu(&mulacc);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 4, "Should have 4 scalar MulAccs");
-            for elem in elements.iter() {
-                assert!(matches!(elem.op(), Op::Ternary(TernaryOp::MulAcc, _, _, _)));
-                assert_eq!(elem.dtype().vcount(), 1);
-            }
-        }
-        Op::Ternary(TernaryOp::MulAcc, _, _, _) => {}
-        other => panic!("Expected VECTORIZE or MulAcc, got {:?}", other),
-    }
-}
-
-/// Test: Scalar MulAcc remains unchanged.
-#[test]
-fn test_mulacc_scalar_unchanged() {
-    let a = create_float_const(2.0);
-    let b = create_float_const(3.0);
-    let c = create_float_const(1.0);
-
-    let mulacc = UOp::try_mulacc(a, b, c).expect("MulAcc creation should succeed");
-
-    let result = apply_no_vectorized_alu(&mulacc);
-
-    assert!(matches!(result.op(), Op::Ternary(TernaryOp::MulAcc, _, _, _)));
-    assert_eq!(result.dtype().vcount(), 1);
-}
-
-// =============================================================================
-// Mixed Operand Tests
-// =============================================================================
-
-/// Test: Vector + scalar broadcast handling.
-///
-/// Add(vec4, scalar) where scalar is broadcast to vec4.
-#[test]
-fn test_binary_mixed_operands() {
-    let a = create_vector_float_iota(4);
-    let scalar = create_float_const(10.0);
-    let b = scalar.broadcast(4);
-
-    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32.vec(4).unwrap());
-
-    let result = apply_no_vectorized_alu(&add);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 4);
-            for elem in elements.iter() {
-                assert!(matches!(elem.op(), Op::Binary(BinaryOp::Add, _, _)));
-            }
-        }
-        Op::Binary(BinaryOp::Add, _, _) => {}
-        other => panic!("Expected VECTORIZE or Binary, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_mismatched_source_extent_is_not_scalarized() {
-    let vector = create_vector_float_iota(4);
-    let scalar = create_float_const(10.0);
-    let add = UOp::new(Op::Binary(BinaryOp::Add, vector, scalar), DType::Float32.vec(4).unwrap());
-
-    let result = apply_no_vectorized_alu(&add);
-
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Add, _, _)));
-}
-
-#[test]
-fn test_shaped_load_uses_index_extraction() {
+fn shaped_load_lanes_go_through_index_extraction() {
     let param = UOp::param(0, 8, DType::Float32, None);
     let offsets = UOp::stack(smallvec::smallvec![UOp::index_const(0), UOp::index_const(1)]);
     let address = UOp::index().buffer(param).indices(vec![offsets]).call().unwrap();
     let load = UOp::load().index(address).call();
-    let add = load.add(&load);
 
-    let result = apply_no_vectorized_alu(&add);
+    let result = apply_no_vectorized_alu(&load.add(&load));
+
     let Op::Stack { sources } = result.op() else { panic!("expected shaped result to become STACK") };
     assert_eq!(sources.len(), 2);
     for source in sources {
         let Op::Binary(BinaryOp::Add, lhs, rhs) = source.op() else { panic!("expected scalar ADD") };
         assert!(matches!(lhs.op(), Op::Index { buffer, indices }
             if matches!(buffer.op(), Op::Load { .. }) && indices.len() == 1 && matches!(indices[0].op(), Op::Const(_))));
-        assert!(std::sync::Arc::ptr_eq(lhs, rhs));
+        assert!(Arc::ptr_eq(lhs, rhs));
         assert_eq!(lhs.dtype(), DType::Float32);
     }
 }
 
+/// A STACK of Invalid markers is a shaped value like any other: each lane selects
+/// its own marker instead of the whole STACK being treated as one Invalid.
 #[test]
-fn test_shaped_invalid_is_indexed_not_treated_as_invalid_base() {
-    let cond = UOp::stack(smallvec::smallvec![
-        UOp::native_const(true),
-        UOp::native_const(false),
-        UOp::native_const(true),
-        UOp::native_const(false),
-    ]);
-    let invalid = UOp::stack(smallvec::smallvec![
-        UOp::invalid_marker(),
-        UOp::invalid_marker(),
-        UOp::invalid_marker(),
-        UOp::invalid_marker(),
-    ]);
+fn shaped_invalid_is_indexed_lane_by_lane() {
+    let cond = create_vector_bool(vec![true, false, true, false]);
+    let invalid = UOp::stack((0..4).map(|_| UOp::invalid_marker()).collect());
     let indices = UOp::stack((0..4).map(UOp::index_const).collect());
     let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, invalid, indices), DType::WeakInt);
 
     let result = apply_no_vectorized_alu(&where_op);
-    let Op::Stack { sources: elements } = result.op() else { panic!("expected scalarized WHERE lanes") };
-    for element in elements {
+
+    let Op::Stack { sources } = result.op() else { panic!("expected scalarized WHERE lanes") };
+    for element in sources {
         let Op::Ternary(TernaryOp::Where, _, invalid, _) = element.op() else { panic!("expected WHERE lane") };
         assert!(UOp::is_invalid_marker(invalid), "STACK indexing must select the corresponding Invalid lane");
-    }
-}
-
-// =============================================================================
-// Large Vector Tests
-// =============================================================================
-
-/// Test: Vec16 devectorization.
-#[test]
-fn test_add_vec16_devectorize() {
-    let elements_a: smallvec::SmallVec<[std::sync::Arc<UOp>; 4]> =
-        (0..16).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect();
-    let a = UOp::stack(elements_a);
-
-    let elements_b: smallvec::SmallVec<[std::sync::Arc<UOp>; 4]> =
-        (0..16).map(|i| UOp::const_(DType::Float32, ConstValue::Float((i * 2) as f64))).collect();
-    let b = UOp::stack(elements_b);
-
-    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32.vec(16).unwrap());
-
-    let result = apply_no_vectorized_alu(&add);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 16, "Should have 16 scalar Adds");
-        }
-        Op::Binary(BinaryOp::Add, _, _) => {}
-        other => panic!("Expected VECTORIZE or Binary, got {:?}", other),
-    }
-}
-
-// =============================================================================
-// Integer Op Tests
-// =============================================================================
-
-/// Test: Integer add devectorization.
-#[test]
-fn test_int_add_devectorize() {
-    let a = create_vector_int_iota(4);
-    let b = create_vector_int_values(vec![10, 20, 30, 40]);
-
-    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Int64.vec(4).unwrap());
-
-    let result = apply_no_vectorized_alu(&add);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 4);
-            for elem in elements.iter() {
-                assert!(matches!(elem.op(), Op::Binary(BinaryOp::Add, _, _)));
-            }
-        }
-        Op::Binary(BinaryOp::Add, _, _) => {}
-        other => panic!("Expected VECTORIZE or Binary, got {:?}", other),
-    }
-}
-
-/// Test: Bitwise and devectorization.
-#[test]
-fn test_bitwise_and_devectorize() {
-    let a = create_vector_int_values(vec![0xFF, 0xF0, 0x0F, 0x00]);
-    let b = create_vector_int_values(vec![0x0F, 0x0F, 0x0F, 0x0F]);
-
-    let and = UOp::new(Op::Binary(BinaryOp::And, a, b), DType::Int64.vec(4).unwrap());
-
-    let result = apply_no_vectorized_alu(&and);
-
-    match result.op() {
-        Op::Stack { sources: elements } => {
-            assert_eq!(elements.len(), 4);
-        }
-        Op::Binary(BinaryOp::And, _, _) => {}
-        other => panic!("Expected VECTORIZE or Binary, got {:?}", other),
     }
 }

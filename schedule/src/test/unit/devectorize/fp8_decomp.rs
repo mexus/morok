@@ -1,61 +1,95 @@
+//! Storage-dtype decomposition: FP8/BF16 widening (`pm_float_decomp`) and the
+//! 64-bit word split (`pm_long_decomp`), plus the target table that picks them.
+
 use std::sync::Arc;
 
-use svod_dtype::{DType, ScalarDType};
+use svod_dtype::{AmdArch, DType, ScalarDType};
 use svod_ir::types::ConstValue;
 use svod_ir::{Op, UOp};
 
 use super::helpers::{create_bool_const, create_buffer_typed};
+use crate::devectorize::{Fp8DecompCtx, pm_float_decomp};
+use crate::optimizer::{Renderer, apply_dtype_decomps, get_dtype_decomps};
 
-/// Post-gater boundary: FP8 decomposition preserves the load gate/alt pair.
+fn decompose(from: ScalarDType, root: Arc<UOp>) -> Arc<UOp> {
+    let mut ctx = Fp8DecompCtx { from, to: ScalarDType::Float16 };
+    svod_ir::rewrite::graph_rewrite_bottom_up(&pm_float_decomp(), root, &mut ctx)
+}
+
+fn store_value_dtypes(root: &Arc<UOp>) -> Vec<DType> {
+    root.toposort()
+        .into_iter()
+        .filter_map(|node| match node.op() {
+            Op::Store { value, .. } => Some(value.dtype()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Widening an FP8 load must not drop the gate/alt pair the late gater installed.
 #[test]
-fn test_fp8_decomp_preserves_alt_on_gated_load() {
-    let buffer = create_buffer_typed(64, ScalarDType::FP8E5M2);
-    let idx = UOp::const_(DType::Index, ConstValue::Int(0));
-    let gate = create_bool_const(false);
-    let index = UOp::index().buffer(buffer).indices(vec![idx]).call().unwrap();
+fn fp8_decomp_preserves_alt_on_gated_load() {
+    let index = UOp::index()
+        .buffer(create_buffer_typed(64, ScalarDType::FP8E5M2))
+        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+        .call()
+        .unwrap();
     let load = UOp::load()
         .index(index)
         .alt(UOp::const_(DType::Scalar(ScalarDType::FP8E5M2), ConstValue::Float(0.0)))
-        .gate(gate)
+        .gate(create_bool_const(false))
         .call();
 
-    assert_eq!(count_gated_loads_without_alt(&load), 0);
+    let decomposed = decompose(ScalarDType::FP8E5M2, load);
 
-    let mut ctx = crate::devectorize::Fp8DecompCtx { from: ScalarDType::FP8E5M2, to: ScalarDType::Float16 };
-    let decomposed = svod_ir::rewrite::graph_rewrite_bottom_up(&crate::devectorize::pm_float_decomp(), load, &mut ctx);
-
-    assert!(count_gated_loads(&decomposed) > 0, "expected at least one gated load after FP8 decomposition");
-    assert_eq!(count_gated_loads_without_alt(&decomposed), 0, "FP8 decomposition must preserve alt on gated loads");
+    let gated: Vec<_> =
+        decomposed.toposort().into_iter().filter(|node| matches!(node.op(), Op::Load { gate: Some(_), .. })).collect();
+    assert!(!gated.is_empty(), "the gated load must survive decomposition");
+    assert!(gated.iter().all(|node| matches!(node.op(), Op::Load { alt: Some(_), .. })), "{}", decomposed.tree());
 }
 
 #[test]
 fn vector_fp8_load_decomposes_to_scalar_loads_and_stack() {
-    let buffer = create_buffer_typed(4, ScalarDType::FP8E4M3);
     let indices = UOp::stack((0..4).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect());
-    let index =
-        UOp::index().buffer(buffer).indices(vec![indices]).call().unwrap().with_dtype(DType::FP8E4M3.vec(4).unwrap());
+    let index = UOp::index()
+        .buffer(create_buffer_typed(4, ScalarDType::FP8E4M3))
+        .indices(vec![indices])
+        .call()
+        .unwrap()
+        .with_dtype(DType::FP8E4M3.vec(4).unwrap());
     let load = UOp::load().index(index).dtype(DType::FP8E4M3.vec(4).unwrap()).call();
-    let mut ctx = crate::devectorize::Fp8DecompCtx { from: ScalarDType::FP8E4M3, to: ScalarDType::Float16 };
-    let decomposed = svod_ir::rewrite::graph_rewrite_bottom_up(&crate::devectorize::pm_float_decomp(), load, &mut ctx);
+
+    let decomposed = decompose(ScalarDType::FP8E4M3, load);
 
     assert!(matches!(decomposed.op(), Op::Stack { .. }), "{}", decomposed.tree());
     assert_eq!(decomposed.dtype(), DType::Float16);
     assert_eq!(decomposed.toposort().iter().filter(|u| matches!(u.op(), Op::Load { .. })).count(), 4);
 }
 
-fn count_gated_loads(root: &Arc<UOp>) -> usize {
-    root.toposort().into_iter().filter(|node| matches!(node.op(), Op::Load { gate: Some(_), .. })).count()
+/// Both directions are rewritten: the STORE narrows to the uint8 storage form and
+/// the LOAD reads it back, leaving no FNUZ node behind.
+#[test]
+fn fnuz_store_and_load_are_both_decomposed() {
+    let index = UOp::index()
+        .buffer(create_buffer_typed(4, ScalarDType::FP8E4M3FNUZ))
+        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+        .call()
+        .unwrap();
+    let root = UOp::sink(vec![
+        index.clone().store(UOp::const_(DType::Scalar(ScalarDType::FP8E4M3FNUZ), ConstValue::Float(1.0))),
+        UOp::load().index(index).call(),
+    ]);
+
+    let decomposed = decompose(ScalarDType::FP8E4M3FNUZ, root);
+
+    assert!(!decomposed.toposort().iter().any(|u| u.dtype().base() == ScalarDType::FP8E4M3FNUZ));
+    assert!(store_value_dtypes(&decomposed).contains(&DType::UInt8), "{}", decomposed.tree());
+    assert!(decomposed.toposort().iter().any(|u| matches!(u.op(), Op::Load { .. }) && u.dtype() == DType::UInt8));
 }
 
-fn count_gated_loads_without_alt(root: &Arc<UOp>) -> usize {
-    root.toposort().into_iter().filter(|node| matches!(node.op(), Op::Load { alt: None, gate: Some(_), .. })).count()
-}
-
+/// Which storage dtypes need decomposing is a property of the target, not of the AST.
 #[test]
 fn dtype_decomposition_mapping_is_target_sensitive() {
-    use crate::optimizer::{Renderer, get_dtype_decomps};
-    use svod_dtype::AmdArch;
-
     let values = [
         (ScalarDType::FP8E4M3, ConstValue::Float(1.0)),
         (ScalarDType::FP8E4M3FNUZ, ConstValue::Float(1.0)),
@@ -67,33 +101,21 @@ fn dtype_decomposition_mapping_is_target_sensitive() {
         (ScalarDType::UInt64, ConstValue::UInt(1)),
     ];
     let sink = UOp::sink(values.into_iter().map(|(dt, value)| UOp::const_(DType::Scalar(dt), value)).collect());
+    let all_fp8_to_half = vec![
+        (ScalarDType::FP8E4M3, ScalarDType::Float16),
+        (ScalarDType::FP8E5M2, ScalarDType::Float16),
+        (ScalarDType::FP8E4M3FNUZ, ScalarDType::Float16),
+        (ScalarDType::FP8E5M2FNUZ, ScalarDType::Float16),
+    ];
+    let fnuz_only =
+        vec![(ScalarDType::FP8E4M3FNUZ, ScalarDType::Float16), (ScalarDType::FP8E5M2FNUZ, ScalarDType::Float16)];
 
-    assert_eq!(
-        get_dtype_decomps(&sink, &Renderer::cpu()),
-        vec![
-            (ScalarDType::FP8E4M3, ScalarDType::Float16),
-            (ScalarDType::FP8E5M2, ScalarDType::Float16),
-            (ScalarDType::FP8E4M3FNUZ, ScalarDType::Float16),
-            (ScalarDType::FP8E5M2FNUZ, ScalarDType::Float16),
-        ]
-    );
-    assert_eq!(
-        get_dtype_decomps(&sink, &Renderer::for_amd_arch(AmdArch::Gfx942)),
-        vec![(ScalarDType::FP8E4M3FNUZ, ScalarDType::Float16), (ScalarDType::FP8E5M2FNUZ, ScalarDType::Float16),]
-    );
-    assert_eq!(
-        get_dtype_decomps(&sink, &Renderer::for_amd_arch(AmdArch::Gfx950)),
-        vec![(ScalarDType::FP8E4M3FNUZ, ScalarDType::Float16), (ScalarDType::FP8E5M2FNUZ, ScalarDType::Float16),]
-    );
-    assert_eq!(
-        get_dtype_decomps(&sink, &Renderer::for_amd_arch(AmdArch::Gfx1151)),
-        vec![
-            (ScalarDType::FP8E4M3, ScalarDType::Float16),
-            (ScalarDType::FP8E5M2, ScalarDType::Float16),
-            (ScalarDType::FP8E4M3FNUZ, ScalarDType::Float16),
-            (ScalarDType::FP8E5M2FNUZ, ScalarDType::Float16),
-        ]
-    );
+    assert_eq!(get_dtype_decomps(&sink, &Renderer::cpu()), all_fp8_to_half);
+    // CDNA renders OCP FP8 natively and only lacks the FNUZ encodings.
+    assert_eq!(get_dtype_decomps(&sink, &Renderer::for_amd_arch(AmdArch::Gfx942)), fnuz_only);
+    assert_eq!(get_dtype_decomps(&sink, &Renderer::for_amd_arch(AmdArch::Gfx950)), fnuz_only);
+    assert_eq!(get_dtype_decomps(&sink, &Renderer::for_amd_arch(AmdArch::Gfx1151)), all_fp8_to_half);
+    // WebGPU has neither 64-bit integers nor any sub-f32 float.
     assert_eq!(
         get_dtype_decomps(&sink, &Renderer::webgpu()),
         vec![
@@ -108,86 +130,42 @@ fn dtype_decomposition_mapping_is_target_sensitive() {
     );
 }
 
+/// The combined pass must commit weak dtypes before decomposing, or the stored value
+/// keeps a weak type the narrowing rules never match.
 #[test]
-fn fnuz_store_and_load_are_both_decomposed() {
-    let buffer = create_buffer_typed(4, ScalarDType::FP8E4M3FNUZ);
-    let idx = UOp::const_(DType::Index, ConstValue::Int(0));
-    let index = UOp::index().buffer(buffer).indices(vec![idx]).call().unwrap();
-    let load = UOp::load().index(index.clone()).call();
+fn combined_dtype_pass_commits_weak_stores_before_decomposition() {
+    let index = |scalar| {
+        UOp::index()
+            .buffer(create_buffer_typed(4, scalar))
+            .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+            .call()
+            .unwrap()
+    };
     let root = UOp::sink(vec![
-        index.store(UOp::const_(DType::Scalar(ScalarDType::FP8E4M3FNUZ), ConstValue::Float(1.0))),
-        load,
+        index(ScalarDType::FP8E4M3).store(UOp::const_(DType::WeakFloat, ConstValue::Float(1.5))),
+        index(ScalarDType::BFloat16).store(UOp::const_(DType::WeakFloat, ConstValue::Float(-2.0))),
     ]);
-    let mut ctx = crate::devectorize::Fp8DecompCtx { from: ScalarDType::FP8E4M3FNUZ, to: ScalarDType::Float16 };
-    let decomposed = svod_ir::rewrite::graph_rewrite_bottom_up(&crate::devectorize::pm_float_decomp(), root, &mut ctx);
 
-    assert!(!decomposed.toposort().iter().any(|u| u.dtype().base() == ScalarDType::FP8E4M3FNUZ));
+    let decomposed = apply_dtype_decomps(root, Renderer::webgpu());
+
     assert!(
-        decomposed
-            .toposort()
-            .iter()
-            .any(|u| matches!(u.op(), Op::Store { value, .. } if value.dtype() == DType::UInt8))
-    );
-    assert!(decomposed.toposort().iter().any(|u| matches!(u.op(), Op::Load { .. }) && u.dtype() == DType::UInt8));
-}
-
-#[test]
-fn long_store_splits_but_native_long_is_untouched() {
-    let buffer = create_buffer_typed(4, ScalarDType::Int64);
-    let idx = UOp::const_(DType::Index, ConstValue::Int(0));
-    let index = UOp::index().buffer(buffer).indices(vec![idx]).call().unwrap();
-    let root = index.store(UOp::const_(DType::Int64, ConstValue::Int(0x1234_5678_7654_3210)));
-    let decomposed =
-        svod_ir::rewrite::graph_rewrite_bottom_up(&crate::devectorize::pm_long_decomp(), root.clone(), &mut ());
-
-    assert_eq!(root.toposort().iter().filter(|u| matches!(u.op(), Op::Store { .. })).count(), 1);
-    assert_eq!(
-        decomposed.toposort().iter().filter(|u| matches!(u.op(), Op::Store { .. })).count(),
-        2,
+        !decomposed.toposort().iter().any(|u| matches!(u.dtype().base(), ScalarDType::FP8E4M3 | ScalarDType::BFloat16)),
         "{}",
         decomposed.tree()
     );
-    assert!(!decomposed.toposort().iter().any(|u| u.dtype().base() == ScalarDType::Int64));
+    let dtypes = store_value_dtypes(&decomposed);
+    assert!(dtypes.contains(&DType::UInt8) && dtypes.contains(&DType::UInt16), "{}", decomposed.tree());
 }
 
-#[test]
-fn combined_dtype_pass_commits_mixed_fp8_bf16_weak_stores_before_decomposition() {
-    let fp8 = create_buffer_typed(4, ScalarDType::FP8E4M3);
-    let bf16 = create_buffer_typed(4, ScalarDType::BFloat16);
-    let offset = UOp::const_(DType::Index, ConstValue::Int(0));
-    let fp8_index = UOp::index().buffer(fp8).indices(vec![offset.clone()]).call().unwrap();
-    let bf16_index = UOp::index().buffer(bf16).indices(vec![offset]).call().unwrap();
-    let root = UOp::sink(vec![
-        fp8_index.store(UOp::const_(DType::WeakFloat, ConstValue::Float(1.5))),
-        bf16_index.store(UOp::const_(DType::WeakFloat, ConstValue::Float(-2.0))),
-    ]);
-
-    let decomposed = crate::optimizer::apply_dtype_decomps(root, crate::optimizer::Renderer::webgpu());
-    assert!(
-        decomposed
-            .toposort()
-            .iter()
-            .all(|u| { !matches!(u.dtype().base(), ScalarDType::FP8E4M3 | ScalarDType::BFloat16) }),
-        "{}",
-        decomposed.tree()
-    );
-    let store_dtypes: Vec<_> = decomposed
-        .toposort()
-        .into_iter()
-        .filter_map(|u| match u.op() {
-            Op::Store { value, .. } => Some(value.dtype()),
-            _ => None,
-        })
-        .collect();
-    assert!(store_dtypes.contains(&DType::UInt8), "{}", decomposed.tree());
-    assert!(store_dtypes.contains(&DType::UInt16), "{}", decomposed.tree());
-}
-
+/// Same for the word split: a weak 64-bit value must be committed to `Int64` before
+/// it can be cut into two `Int32` words.
 #[test]
 fn combined_dtype_pass_commits_long_weak_store_before_word_split() {
-    let buffer = create_buffer_typed(4, ScalarDType::Int64);
-    let offset = UOp::const_(DType::Index, ConstValue::Int(0));
-    let index = UOp::index().buffer(buffer).indices(vec![offset]).call().unwrap();
+    let index = UOp::index()
+        .buffer(create_buffer_typed(4, ScalarDType::Int64))
+        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+        .call()
+        .unwrap();
     let value = UOp::new(
         Op::Binary(
             svod_ir::BinaryOp::Shl,
@@ -197,56 +175,15 @@ fn combined_dtype_pass_commits_long_weak_store_before_word_split() {
         DType::WeakInt,
     );
 
-    let decomposed = crate::optimizer::apply_dtype_decomps(
-        UOp::sink(vec![index.store(value)]),
-        crate::optimizer::Renderer::webgpu(),
-    );
-    let stores: Vec<_> = decomposed
-        .toposort()
-        .into_iter()
-        .filter_map(|u| match u.op() {
-            Op::Store { value, .. } => Some(value.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(stores.len(), 2, "{}", decomposed.tree());
-    assert!(stores.iter().all(|value| value.dtype() == DType::Int32), "{}", decomposed.tree());
-    assert!(stores.iter().all(|value| !value.dtype().is_weak()), "{}", decomposed.tree());
-}
+    let decomposed = apply_dtype_decomps(UOp::sink(vec![index.store(value)]), Renderer::webgpu());
 
-/// Word split of `x << s` / `x >> s` at the 32-bit boundary (Svod-only pass; see
-/// `test/property/long_shift.rs`).
-#[test_case::test_case(0)]
-#[test_case::test_case(31)]
-#[test_case::test_case(32)]
-#[test_case::test_case(33)]
-#[test_case::test_case(63)]
-fn long_shift_word_split_matches_native(shift: u64) {
-    use crate::test::property::long_shift::assert_shift_words;
-    use svod_ir::types::BinaryOp::{Shl, Shr};
-
-    for from in [ScalarDType::Int64, ScalarDType::UInt64] {
-        for op in [Shl, Shr] {
-            assert_shift_words(op, 0x89ab_cdef_0123_4567, shift, from);
-        }
-    }
-}
-
-/// Word split of `a * b`, `-a` and the cast away from a long (Svod-only pass; see
-/// `test/property/long_shift.rs`).
-#[test_case::test_case(0x89ab_cdef_0123_4567, 0x0000_0001_0000_0003; "mixed words")]
-#[test_case::test_case(u64::MAX, u64::MAX; "all ones")]
-#[test_case::test_case(0x0000_0000_ffff_ffff, 0x0000_0000_0000_0002; "low word carry")]
-fn long_arithmetic_word_split_matches_native(a: u64, b: u64) {
-    use crate::test::property::long_shift::assert_long_arithmetic;
-
-    for from in [ScalarDType::Int64, ScalarDType::UInt64] {
-        assert_long_arithmetic(a, b, from);
-    }
+    let dtypes = store_value_dtypes(&decomposed);
+    assert_eq!(dtypes, vec![DType::Int32; 2], "{}", decomposed.tree());
 }
 
 /// The two words of a split 64-bit STORE address *adjacent* elements of the doubled
-/// 32-bit buffer, at `2*i` and `2*i+1`.
+/// 32-bit buffer, at `2*i` and `2*i+1`. The word values themselves are covered by
+/// `test/property/long_shift.rs`.
 #[test_case::test_case(0)]
 #[test_case::test_case(3)]
 fn long_store_words_address_adjacent_elements(at: i64) {
@@ -256,5 +193,15 @@ fn long_store_words_address_adjacent_elements(at: i64) {
         let split = split_store(from, at, long_const(from, 0xdead_beef_feed_face));
         assert_eq!(split.map(|(_, address)| address), [2 * at, 2 * at + 1], "{from:?} at {at}");
         assert_eq!(split.map(|(word, _)| word), [0xfeed_face, 0xdead_beef], "{from:?} at {at}");
+    }
+}
+
+/// `any::<u64>()` never samples these, so the property test cannot reach the carry
+/// and all-ones boundaries of the multiply word split.
+#[test_case::test_case(u64::MAX, u64::MAX; "all ones")]
+#[test_case::test_case(0x0000_0000_ffff_ffff, 0x0000_0000_0000_0002; "low word carry")]
+fn long_arithmetic_word_split_matches_native_at_boundaries(a: u64, b: u64) {
+    for from in [ScalarDType::Int64, ScalarDType::UInt64] {
+        crate::test::property::long_shift::assert_long_arithmetic(a, b, from);
     }
 }

@@ -1,247 +1,108 @@
-//! End-to-end devectorize() pipeline tests.
-//!
-//! Tests for the complete devectorize pass running all phases.
-//! Verifies that the combined pipeline produces correct results.
+//! End-to-end `devectorize()`.
 
 use std::sync::Arc;
 
-use svod_dtype::{DType, ScalarDType};
+use svod_dtype::{AddrSpace, DType, ScalarDType};
 use svod_ir::types::ConstValue;
-use svod_ir::{AxisId, AxisType, BinaryOp, Op, UOp};
+use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::properties::InScopeRangesProperty;
+use svod_ir::{AxisId, AxisType, Op, UOp};
+use test_case::test_case;
 
 use super::helpers::*;
 
-// =============================================================================
-// Contiguous Access Pipeline Tests
-// =============================================================================
+/// A shaped memory read of `n` lanes becomes `n` scalar LOADs under one STACK,
+/// whatever the offsets or element type.
+#[test_case(ScalarDType::Float32, &[0, 1, 2, 3]; "contiguous")]
+#[test_case(ScalarDType::Float32, &[0, 1, 2, 3, 4, 5, 6, 7]; "eight wide output upcast")]
+#[test_case(ScalarDType::Float32, &[0, 2, 4, 6]; "strided")]
+#[test_case(ScalarDType::Float32, &[3, 4, 5, 6]; "unaligned start")]
+#[test_case(ScalarDType::Float32, &[0, 1, 2]; "three lanes")]
+#[test_case(ScalarDType::Float32, &[0, 1, 2, 3, 4]; "five lanes")]
+#[test_case(ScalarDType::Float32, &[9000, 9001, 9002, 9003]; "large offset")]
+#[test_case(ScalarDType::Float16, &[0, 1, 2, 3]; "half precision")]
+#[test_case(ScalarDType::Int8, &[0, 1, 2, 3]; "int8")]
+#[test_case(ScalarDType::UInt8, &[0, 1, 2, 3]; "uint8")]
+#[test_case(ScalarDType::Int32, &[0, 1, 2, 3]; "int32")]
+fn shaped_load_becomes_one_scalar_load_per_lane(scalar: ScalarDType, offsets: &[i64]) {
+    let index = create_vector_index(create_buffer_typed(16384, scalar), offsets.iter().copied());
+    let result = apply_devectorize(&UOp::load().index(index).call());
 
-/// Test: Full pipeline for contiguous vec4 load.
-///
-/// INDEX(buffer, [0,1,2,3]) -> LOAD -> single contiguous vector load
-#[test]
-fn test_devectorize_contiguous_load() {
-    let buffer = create_buffer(64);
-    let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load().index(index).call();
-
-    let result = apply_devectorize(&load);
-
-    // Final result should have vcount 4 and be a valid load structure
-    assert_vcount(&result, 4);
-
-    // Should have LOADs somewhere in the tree
-    let load_count = count_loads(&result);
-    assert!(load_count >= 1, "Should have at least one LOAD");
+    assert_vcount(&result, offsets.len());
+    assert_eq!(count_loads(&result), offsets.len());
+    let Op::Stack { sources } = result.op() else { panic!("expected a STACK of lanes: {}", result.tree()) };
+    assert_eq!(sources.len(), offsets.len());
+    assert!(sources.iter().all(|lane| lane.dtype() == DType::Scalar(scalar)));
 }
 
-/// Test: Full pipeline for contiguous vec4 store.
-#[test]
-fn test_devectorize_contiguous_store() {
-    let buffer = create_buffer(64);
-    let value = create_vector_float_iota(4);
-    let index = create_vector_index_iota(buffer.clone(), 4);
-    let store = index.store(value);
+/// Wide vectors are scalarized the same way, without a width cap.
+#[test_case(32; "vec32")]
+#[test_case(64; "vec64")]
+fn wide_shaped_load_is_fully_scalarized(width: usize) {
+    let index = create_vector_index_iota(create_buffer(16384), width);
+    let result = apply_devectorize(&UOp::load().index(index).call());
 
-    let result = apply_devectorize(&store);
-
-    // Should have STOREs somewhere in the tree
-    let store_count = count_stores(&result);
-    assert!(store_count >= 1, "Should have at least one STORE");
+    assert_vcount(&result, width);
+    assert_eq!(count_loads(&result), width);
 }
 
-/// Test: Full pipeline for strided vec4 access.
+/// `c[0..4] = a[0..4] + b[0..4]` scalarizes on both sides, and no memory op keeps
+/// a vector dtype.
 #[test]
-fn test_devectorize_strided_load() {
-    let buffer = create_buffer(128);
-    // Strided access: [0, 2, 4, 6]
-    let index = create_vector_index_scaled(buffer.clone(), 4, 2);
-    let load = UOp::load().index(index).call();
+fn shaped_elementwise_kernel_scalarizes_loads_and_stores() {
+    let load = |buffer| UOp::load().index(create_vector_index_iota(buffer, 4)).call();
+    let sum = load(create_buffer(64)).add(&load(create_buffer(64)));
+    let result = apply_devectorize(&create_vector_index_iota(create_buffer(64), 4).store(sum));
 
-    let result = apply_devectorize(&load);
-
-    // Strided access results in multiple scalar loads
-    let load_count = count_loads(&result);
-    assert!(load_count >= 1, "Should have LOADs for strided access");
-}
-
-// =============================================================================
-// Complex Pattern Tests
-// =============================================================================
-
-/// Test: Matmul-like memory access pattern (8x8 tile).
-///
-/// Simulates typical tiled matmul memory access with output upcast.
-#[test]
-fn test_devectorize_matmul_pattern() {
-    use crate::devectorize::devectorize;
-
-    let buffer = create_buffer(256);
-
-    // Create 8 contiguous accesses (simulating 8-wide output upcast)
-    let index = create_vector_index_iota(buffer.clone(), 8);
-    let load = UOp::load().index(index).call();
-
-    let result = devectorize(&load, &crate::optimizer::Renderer::cpu());
-
-    // Should produce vec8 result through devectorization
-    assert_vcount(&result, 8);
-    let load_count = count_loads(&result);
-    assert!(load_count >= 1, "Should have at least one LOAD");
-}
-
-/// Test: Reduction with vector accumulator.
-#[test]
-fn test_devectorize_reduction_accumulator() {
-    let buffer = create_buffer(64);
-
-    // Load vec4 accumulator
-    let acc_index = create_vector_index_iota(buffer.clone(), 4);
-    let acc_load = UOp::load().index(acc_index).call();
-
-    // Add to accumulator
-    let values = create_vector_float_iota(4);
-    let add = UOp::new(Op::Binary(BinaryOp::Add, acc_load, values), DType::Float32.vec(4).unwrap());
-
-    // Store back
-    let store_index = create_vector_index_iota(buffer.clone(), 4);
-    let store = store_index.store(add);
-
-    let result = apply_devectorize(&store);
-
-    // Should have both LOADs and STOREs
-    let load_count = count_loads(&result);
-    let store_count = count_stores(&result);
-    assert!(load_count >= 1 && store_count >= 1);
-}
-
-/// Test: Multiple buffers in same kernel.
-#[test]
-fn test_devectorize_multiple_buffers() {
-    let buffer_a = create_buffer(64);
-    let buffer_b = create_buffer(64);
-    let buffer_c = create_buffer(64);
-
-    // Load from A
-    let index_a = create_vector_index_iota(buffer_a.clone(), 4);
-    let load_a = UOp::load().index(index_a).call();
-
-    // Load from B
-    let index_b = create_vector_index_iota(buffer_b.clone(), 4);
-    let load_b = UOp::load().index(index_b).call();
-
-    // Compute A + B
-    let add = UOp::new(Op::Binary(BinaryOp::Add, load_a, load_b), DType::Float32.vec(4).unwrap());
-
-    // Store to C
-    let index_c = create_vector_index_iota(buffer_c.clone(), 4);
-    let store = index_c.store(add);
-
-    let result = apply_devectorize(&store);
-
-    // Should have multiple LOADs and STOREs
-    let load_count = count_loads(&result);
-    let store_count = count_stores(&result);
-    assert!(load_count >= 2, "Should have LOADs from both A and B");
-    assert!(store_count >= 1, "Should have STORE to C");
-}
-
-// =============================================================================
-// Integration with pre_expand Tests
-// =============================================================================
-
-/// Test: Devectorize after pre_expand (simulated).
-///
-/// Tests the typical pipeline: pre_expand -> devectorize
-#[test]
-fn test_devectorize_after_pre_expand() {
-    let buffer = create_buffer(64);
-
-    // Create a simple kernel pattern that would come from pre_expand
-    let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load().index(index).call();
-    let value = create_vector_float_iota(4);
-    let add = UOp::new(Op::Binary(BinaryOp::Add, load, value), DType::Float32.vec(4).unwrap());
-
-    let store_index = create_vector_index_iota(buffer.clone(), 4);
-    let store = store_index.store(add);
-
-    // Apply devectorize
-    let result = apply_devectorize(&store);
-
-    // Should produce valid structure
-    assert!(count_stores(&result) >= 1);
-}
-
-/// Test: Output upcast pattern.
-///
-/// Simulates output upcast where STORE has a shaped index.
-#[test]
-fn test_devectorize_with_output_upcast() {
-    let buffer = create_buffer(256);
-
-    // Create output upcast pattern: store vec8 to consecutive locations
-    let index = create_vector_index_iota(buffer.clone(), 8);
-    let value = create_vector_float_iota(8);
-    let store = index.store(value);
-
-    let result = apply_devectorize(&store);
-
-    // Should handle vec8 output upcast
-    let store_count = count_stores(&result);
-    assert!(store_count >= 1);
-}
-
-// =============================================================================
-// Symbolic Index Tests
-// =============================================================================
-
-/// Test: Loop-dependent index through full pipeline.
-#[test]
-fn test_devectorize_loop_index() {
-    let buffer = create_buffer(256);
-
-    // Create codegen PARAM to match the stacked INDEX rule.
-    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(20000);
-    let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let define = UOp::param(def_id, 256, buffer.dtype(), None);
-
-    // Create index: range * 4 + [0,1,2,3]
-    let range = UOp::new(
-        Op::Range {
-            end: UOp::const_(DType::Index, ConstValue::Int(64)),
-            axis_id: AxisId::Renumbered(0),
-            axis_type: AxisType::Loop,
-            deps: smallvec::SmallVec::new(),
-        },
-        DType::Index,
+    assert_eq!(count_loads(&result), 8);
+    assert_eq!(count_stores(&result), 4);
+    assert!(
+        !result
+            .toposort()
+            .iter()
+            .any(|node| { matches!(node.op(), Op::Load { .. } | Op::Store { .. }) && node.dtype().vcount() > 1 })
     );
-
-    let base = UOp::new(Op::Binary(BinaryOp::Mul, range, UOp::const_(DType::Index, ConstValue::Int(4))), DType::Index);
-
-    let indices: smallvec::SmallVec<[Arc<UOp>; 4]> = (0..4)
-        .map(|i| {
-            if i == 0 {
-                base.clone()
-            } else {
-                UOp::new(
-                    Op::Binary(BinaryOp::Add, base.clone(), UOp::const_(DType::Index, ConstValue::Int(i))),
-                    DType::Index,
-                )
-            }
-        })
-        .collect();
-
-    let vec_idx = UOp::stack(indices);
-    let index = UOp::new(Op::Index { buffer: define, indices: smallvec::smallvec![vec_idx] }, DType::Float32);
-
-    let load = UOp::load().index(index).call();
-    let result = apply_devectorize(&load);
-
-    // Should produce valid vectorized load with vec4
-    assert_vcount(&result, 4);
-    assert!(count_loads(&result) >= 1, "Should have at least one LOAD");
 }
 
+#[test]
+fn sink_scalarizes_every_shaped_store() {
+    let store = |value| create_vector_index_iota(create_buffer(64), 4).store(value);
+    let sink = UOp::sink(vec![store(create_vector_float_iota(4)), store(create_vector_float_values(vec![9.0; 4]))]);
+
+    assert_eq!(count_stores(&apply_devectorize(&sink)), 8);
+}
+
+/// A loop-dependent address (`range * 4 + lane`) scalarizes like a constant one.
+#[test]
+fn loop_dependent_shaped_load_is_scalarized() {
+    let buffer = UOp::param(20000, 256, DType::Float32, None);
+    let base = create_range(64, 0, AxisType::Loop).mul(&UOp::index_const(4));
+    let offsets = UOp::stack((0..4).map(|lane| base.add(&UOp::index_const(lane))).collect());
+    let index = UOp::new(Op::Index { buffer, indices: smallvec::smallvec![offsets] }, DType::Float32);
+
+    let result = apply_devectorize(&UOp::load().index(index).call());
+
+    assert_vcount(&result, 4);
+    assert_eq!(count_loads(&result), 4);
+}
+
+/// A shaped STORE into a register file keeps every lane inside the enclosing loop.
+#[test]
+fn shaped_register_store_preserves_outer_range() {
+    let outer = UOp::range_axis(UOp::index_const(4), AxisId::Unrenumbered(0), AxisType::Loop);
+    let register = UOp::buffer(0, 2, DType::Float32, AddrSpace::Reg, None);
+    let zeros = UOp::stack(vec![create_float_const(0.0), create_float_const(0.0)].into());
+
+    let result = apply_devectorize(&register.after(vec![outer.clone()].into()).store(zeros));
+
+    let stores = result.toposort().into_iter().filter(|node| matches!(node.op(), Op::Store { .. }));
+    let stores = stores.collect::<Vec<_>>();
+    assert_eq!(stores.len(), 2);
+    assert!(stores.iter().all(|store| InScopeRangesProperty::get(store).iter().any(|range| range.0.id == outer.id)));
+}
+
+/// A memory address stays `INDEX(PARAM, flat_offset)` with a scalar offset; only a
+/// value-space INDEX (into a STACK) keeps a shape.
 #[test]
 fn flat_2d_memory_index_and_shaped_value_index_remain_distinct() {
     let buffer = UOp::param(22000, 64, DType::Float32, None);
@@ -264,7 +125,7 @@ fn flat_2d_memory_index_and_shaped_value_index_remain_distinct() {
         }
     }
 
-    let shaped = UOp::stack((0..4).map(|value| UOp::native_const(value as i32)).collect())
+    let shaped = UOp::stack((0i32..4).map(UOp::native_const).collect())
         .try_reshape(&smallvec::smallvec![svod_ir::SInt::Const(2), svod_ir::SInt::Const(2)])
         .unwrap();
     let shaped_index =
@@ -272,81 +133,6 @@ fn flat_2d_memory_index_and_shaped_value_index_remain_distinct() {
     assert!(shaped_index.addrspace().is_none());
     assert_eq!(shaped_index.shape().unwrap().unwrap().as_slice(), &[svod_ir::SInt::Const(2)]);
     assert!(matches!(shaped_index.op(), Op::Index { buffer: source, .. } if Arc::ptr_eq(source, &shaped)));
-}
-
-// =============================================================================
-// Sink Tests
-// =============================================================================
-
-/// Test: Devectorize with SINK containing multiple stores.
-#[test]
-fn test_devectorize_sink_multiple_stores() {
-    let buffer_a = create_buffer(64);
-    let buffer_b = create_buffer(64);
-
-    // Store to A
-    let index_a = create_vector_index_iota(buffer_a.clone(), 4);
-    let value_a = create_vector_float_iota(4);
-    let store_a = index_a.store(value_a);
-
-    // Store to B
-    let index_b = create_vector_index_iota(buffer_b.clone(), 4);
-    let value_b = create_vector_float_values(vec![10.0, 11.0, 12.0, 13.0]);
-    let store_b = index_b.store(value_b);
-
-    // SINK both stores
-    let sink = UOp::sink(vec![store_a, store_b]);
-
-    let result = apply_devectorize(&sink);
-
-    // Should process both stores in SINK
-    let store_count = count_stores(&result);
-    assert!(store_count >= 2, "Should have stores from both operations");
-}
-
-// =============================================================================
-// Dtype Preservation Tests
-// =============================================================================
-
-/// Test: Float16 through pipeline.
-#[test]
-fn test_devectorize_float16() {
-    let buffer = create_buffer_typed(64, ScalarDType::Float16);
-    let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load().index(index).call();
-
-    let result = apply_devectorize(&load);
-
-    // Base dtype should be preserved
-    assert_eq!(result.dtype().base(), ScalarDType::Float16);
-}
-
-/// Test: Int32 through pipeline.
-#[test]
-fn test_devectorize_int32() {
-    let buffer = create_buffer_typed(64, ScalarDType::Int32);
-    let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load().index(index).call();
-
-    let result = apply_devectorize(&load);
-
-    assert_eq!(result.dtype().base(), ScalarDType::Int32);
-}
-
-/// Test: Bool through pipeline (special handling).
-#[test]
-fn test_devectorize_bool_pipeline() {
-    let buffer = create_bool_buffer(64);
-    let index = create_index(buffer.clone(), 0); // Scalar index for bool
-    let load = UOp::load().index(index).call();
-
-    let result = apply_devectorize(&load);
-
-    // Bool loads go through special uint8 conversion
-    assert!(
-        result.dtype().base() == ScalarDType::Bool || result.dtype().base() == ScalarDType::UInt8,
-        "Bool should be handled correctly"
-    );
 }
 
 /// `devectorize` is a single `graph_rewrite` (tinygrad `codegen/__init__.py:333`), so it
@@ -360,4 +146,44 @@ fn test_devectorize_is_idempotent() {
         let once = apply_devectorize(&root);
         assert!(Arc::ptr_eq(&apply_devectorize(&once), &once), "{}", once.tree());
     }
+}
+
+/// The devectorizer's index grouping relies on `is_increasing` to tell a monotone
+/// address apart from an arbitrary one.
+#[test]
+fn is_increasing_tracks_monotone_index_expressions() {
+    let range = create_range(16, 0, AxisType::Loop);
+    let weak = |value| UOp::const_(DType::WeakInt, ConstValue::Int(value));
+    assert!(range.is_increasing());
+    assert!(UOp::const_(DType::Int32, ConstValue::Int(5)).is_increasing());
+    assert!(range.try_add(&weak(5)).unwrap().is_increasing());
+    assert!(range.try_mul(&weak(4)).unwrap().is_increasing());
+    assert!(
+        !UOp::var("x", DType::Int32, 0, 100)
+            .try_mul(&UOp::const_(DType::Int32, ConstValue::Int(-1)))
+            .unwrap()
+            .is_increasing()
+    );
+}
+
+/// A scalar access is already devectorized and must survive untouched.
+#[test]
+fn scalar_memory_ops_pass_through() {
+    let index = create_index(create_buffer(64), 5);
+    assert_is_index(&apply_devectorize(&index));
+    let load = apply_devectorize(&UOp::load().index(index).call());
+    assert_is_load(&load);
+    assert_eq!(load.dtype(), DType::Float32);
+}
+
+/// Devectorize runs tinygrad's `symbolic_simple` tier, which does not flatten SINK.
+#[test]
+fn sink_structure_is_preserved() {
+    assert!(matches!(apply_devectorize(&UOp::sink(vec![])).op(), Op::Sink { sources, .. } if sources.is_empty()));
+    let result = apply_devectorize(&UOp::sink(vec![UOp::noop()]));
+    assert!(
+        matches!(result.op(), Op::Sink { sources, .. } if sources.len() == 1 && matches!(sources[0].op(), Op::Noop)),
+        "devectorize must not run the larger sym cleanup tier: {}",
+        result.tree()
+    );
 }
