@@ -133,12 +133,15 @@ pub(crate) fn add_local_buffer(stage: &Arc<UOp>, ctx: &mut LocalBufferContext) -
     Some(buffer.after(smallvec::smallvec![end]))
 }
 
-fn pm_add_local_buffers() -> crate::TypedPatternMatcher<LocalBufferContext> {
-    let add_local_buffers = crate::patterns! {
-        @context LocalBufferContext;
-        stage @ Stage { compute: _ } => |stage, ctx| add_local_buffer(stage, ctx),
-    };
-    add_local_buffers + crate::rangeify::patterns::movement_op_patterns().with_context::<LocalBufferContext>()
+fn pm_add_local_buffers() -> &'static crate::TypedPatternMatcher<LocalBufferContext> {
+    static PM: LazyLock<crate::TypedPatternMatcher<LocalBufferContext>> = LazyLock::new(|| {
+        let add_local_buffers = crate::patterns! {
+            @context LocalBufferContext;
+            stage @ Stage { compute: _ } => |stage, ctx| add_local_buffer(stage, ctx),
+        };
+        add_local_buffers + crate::rangeify::patterns::movement_op_patterns().with_context::<LocalBufferContext>()
+    });
+    &PM
 }
 
 // Tinygrad 8c8b43de codegen/__init__.py:314. Keep source order because the
@@ -340,7 +343,7 @@ fn apply_post_optimization_configured_with_capture(
     // Tinygrad adds local buffers after reduction lowering creates grouped
     // STAGE nodes, and before GPU dimensions are assigned.
     let t_stage = std::time::Instant::now();
-    let with_local_buffers = { graph_rewrite(&pm_add_local_buffers(), reduced, &mut LocalBufferContext::default()) };
+    let with_local_buffers = { graph_rewrite(pm_add_local_buffers(), reduced, &mut LocalBufferContext::default()) };
     tracing::debug!(
         ast.optimized = with_local_buffers.tree(),
         node_count = with_local_buffers.node_count(),
@@ -498,8 +501,7 @@ fn apply_post_optimization_configured_with_capture(
     // Dtype decompositions run before late op decompositions and gate movement.
     let t_stage = std::time::Instant::now();
     let mut dtype_ctx = DTypeDecompCtx::new(renderer_ctx.clone());
-    let pm_dtype = pm_dtype_decomps() + crate::symbolic::pm_commit_weak().with_context::<DTypeDecompCtx>();
-    let dtype_decomposed = graph_rewrite(&pm_dtype, early_decomposed, &mut dtype_ctx);
+    let dtype_decomposed = graph_rewrite(pm_dtype_decomp_commit(), early_decomposed, &mut dtype_ctx);
     tracing::debug!(
         ast.optimized = dtype_decomposed.tree(),
         node_count = dtype_decomposed.node_count(),
@@ -533,7 +535,7 @@ fn apply_post_optimization_configured_with_capture(
     let gates_moved =
         graph_rewrite(crate::devectorize::pm_scalarize_register_stack_index_preserve_deps(), gates_moved, &mut ());
     let gates_moved = crate::devectorize::merge_register_read_ends(gates_moved);
-    assert!(
+    debug_assert!(
         !gates_moved.toposort().iter().any(crate::devectorize::is_register_stack_index),
         "direct register-stack lane selection must preserve all ordering dependencies",
     );
@@ -585,6 +587,10 @@ fn apply_post_optimization_configured_with_capture(
 }
 
 fn assert_target_renderer_boundary(root: &Arc<UOp>) {
+    // Debug-only invariant sweep: a full toposort plus a shape query per node.
+    if !cfg!(debug_assertions) {
+        return;
+    }
     for node in root.toposort() {
         match node.op() {
             Op::Index { buffer, indices } if indices.len() > 1 => {
@@ -691,6 +697,14 @@ impl DTypeDecompCtx {
 
 /// Tinygrad `pm_dtype_decomps`: discover while walking, then decompose all
 /// selected dtypes from the SINK rule in deterministic dtype order.
+/// Dtype decompositions followed by the weak-dtype commit, shared by the
+/// post-opt pipeline and the WMMA path.
+fn pm_dtype_decomp_commit() -> &'static crate::TypedPatternMatcher<DTypeDecompCtx> {
+    static PM: LazyLock<crate::TypedPatternMatcher<DTypeDecompCtx>> =
+        LazyLock::new(|| pm_dtype_decomps() + crate::symbolic::pm_commit_weak().with_context::<DTypeDecompCtx>());
+    &PM
+}
+
 fn pm_dtype_decomps() -> crate::TypedPatternMatcher<DTypeDecompCtx> {
     crate::patterns! {
         @context DTypeDecompCtx;
@@ -738,11 +752,7 @@ fn pm_dtype_decomps() -> crate::TypedPatternMatcher<DTypeDecompCtx> {
 #[cfg(test)]
 pub(crate) fn apply_dtype_decomps(root: Arc<UOp>, renderer: Renderer) -> Arc<UOp> {
     let mut ctx = DTypeDecompCtx::new(renderer);
-    graph_rewrite(
-        &(pm_dtype_decomps() + crate::symbolic::pm_commit_weak().with_context::<DTypeDecompCtx>()),
-        root,
-        &mut ctx,
-    )
+    graph_rewrite(pm_dtype_decomp_commit(), root, &mut ctx)
 }
 
 #[cfg(test)]
@@ -904,9 +914,10 @@ pub fn apply_pre_optimization(ast: Arc<svod_ir::UOp>) -> Result<Arc<svod_ir::UOp
     );
 
     let t_stage = std::time::Instant::now();
+    static PM_SPLIT_FLATTEN: LazyLock<crate::TypedPatternMatcher<SplitRangesContext>> =
+        LazyLock::new(|| pm_split_ranges() + pm_flatten_range().with_context::<SplitRangesContext>());
     let mut split_ctx = SplitRangesContext::new();
-    let pm_split_flatten = pm_split_ranges() + pm_flatten_range().with_context::<SplitRangesContext>();
-    sink = graph_rewrite(&pm_split_flatten, sink, &mut split_ctx);
+    sink = graph_rewrite(&*PM_SPLIT_FLATTEN, sink, &mut split_ctx);
     tracing::debug!(
         ast.pre = sink.tree(),
         node_count = sink.node_count(),

@@ -803,20 +803,15 @@ impl Scheduler {
             return vec![];
         }
 
-        // Get ranges from all stores, excluding REDUCE axes
-        let mut output_ranges = Vec::new();
+        // `ranges()` is the cached RangesProperty: every RANGE in the backward
+        // slice, already deduplicated. Avoids a fresh DFS per store.
+        let mut output_ranges: Vec<Arc<UOp>> = Vec::new();
         for store in stores {
-            // Use backward_slice to get all dependencies
-            let deps = store.backward_slice();
-            for dep in deps {
-                if let Op::Range { axis_type, .. } = dep.op() {
-                    // Include all non-REDUCE ranges
-                    if *axis_type != AxisType::Reduce {
-                        // Only add if not already in list (use pointer equality)
-                        if !output_ranges.iter().any(|r: &Arc<UOp>| Arc::ptr_eq(r, &dep)) {
-                            output_ranges.push(dep);
-                        }
-                    }
+            for range in store.ranges() {
+                if matches!(range.op(), Op::Range { axis_type, .. } if *axis_type != AxisType::Reduce)
+                    && !output_ranges.iter().any(|r| Arc::ptr_eq(r, range))
+                {
+                    output_ranges.push(range.clone());
                 }
             }
         }
@@ -853,11 +848,7 @@ impl Scheduler {
 
         // Keep only ranges that appear in ALL stores
         for store in &stores {
-            let store_deps = store.backward_slice();
-            let store_ranges: Vec<_> =
-                store_deps.into_iter().filter(|dep| matches!(dep.op(), Op::Range { .. })).collect();
-
-            // Filter candidates to keep only those in this store's ranges
+            let store_ranges = store.ranges();
             candidates.retain(|candidate| store_ranges.iter().any(|r| Arc::ptr_eq(r, candidate)));
         }
 

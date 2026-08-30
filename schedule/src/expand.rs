@@ -5,7 +5,7 @@
 //! the hardware operands and reconstructs the output coordinates.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use smallvec::{SmallVec, smallvec};
 use svod_ir::{AxisId, AxisType, ConstValue, Op, SInt, UOp};
@@ -175,11 +175,13 @@ pub fn expander2() -> &'static TypedPatternMatcher<RangeMap> {
 }
 
 pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
+    static PM: LazyLock<TypedPatternMatcher<RangeMap>> = LazyLock::new(|| {
+        expander2().clone()
+            + crate::rangeify::pm_flatten_range().clone().with_context::<RangeMap>()
+            + crate::devectorize::mop_cleanup_patterns().with_context::<RangeMap>()
+    });
     let mut range_map = build_range_map(ast);
-    let matcher = expander2().clone()
-        + crate::rangeify::pm_flatten_range().clone().with_context::<RangeMap>()
-        + crate::devectorize::mop_cleanup_patterns().with_context::<RangeMap>();
-    crate::rewrite::graph_rewrite(&matcher, ast.clone(), &mut range_map)
+    crate::rewrite::graph_rewrite(&*PM, ast.clone(), &mut range_map)
 }
 
 fn fix_group_for_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
