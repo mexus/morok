@@ -42,6 +42,7 @@ fn mark_codegen_param(node: Arc<UOp>) -> Arc<UOp> {
 
 // Forward declarations for types from other modules
 use super::indexing::IndexingContext;
+use super::indexing::no_range;
 use super::indexing::ranges_equal;
 use super::kernel::{LocalAddBufferContext, RangeifyBufferContext};
 use super::kernel::{SplitReduceOpConfig, split_reduceop};
@@ -1459,17 +1460,13 @@ pub fn pm_fma_decomposition() -> &'static TypedPatternMatcher<()> {
 // PM_LOAD_COLLAPSE - Collapse REDUCE with conditional loads
 // ============================================================================
 
-/// Check if UOp has no RANGE in backward slice (loop-invariant).
-fn no_range(u: &Arc<UOp>) -> bool {
-    !u.any_in_subtree(|x| matches!(x.op(), Op::Range { .. }))
-}
-
 /// Check if UOp has no INDEX (load) in backward slice.
 ///
 /// Used for index overflow protection pattern - we want to ensure
 /// we don't do math on a loaded index since that can cause overflow.
-fn no_load(u: &Arc<UOp>) -> bool {
-    !u.any_in_subtree(|x| matches!(x.op(), Op::Index { .. }))
+/// Backed by the cached `has_index_in_sources` flag rather than a per-call DFS.
+pub(crate) fn no_load(u: &Arc<UOp>) -> bool {
+    !u.has_index_in_sources()
 }
 
 /// Check if a UOp represents a zero constant.

@@ -21,6 +21,7 @@ pub mod movement_patterns;
 pub mod patterns;
 pub mod pipeline;
 pub mod pipeline_integration;
+pub mod range_load_guards;
 pub mod range_merging;
 pub mod reduce_simplify;
 pub mod remove_bufferize;

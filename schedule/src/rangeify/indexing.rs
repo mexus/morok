@@ -1121,11 +1121,12 @@ pub fn is_dead_axis(range: &Arc<UOp>) -> bool {
     }
 }
 
-/// Check if UOp has no RANGE dependencies.
-#[allow(clippy::mutable_key_type)]
+/// Check if UOp has no RANGE anywhere in its backward slice (loop-invariant).
+///
+/// Backed by the cached `RangesProperty`, so this is O(1) after the graph's
+/// first traversal instead of a fresh DFS per call.
 pub fn no_range(uop: &Arc<UOp>) -> bool {
-    let in_scope_ranges = uop.in_scope_ranges();
-    !in_scope_ranges.iter().any(|key| matches!(key.0.op(), Op::Range { .. }))
+    uop.ranges().is_empty()
 }
 
 /// Extract RANGE size as i64. Returns None for symbolic ranges.
