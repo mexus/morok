@@ -3,13 +3,13 @@
 
 use std::sync::Arc;
 
-use crate::patterns;
+use crate::pattern::RewriteResult;
 use crate::rewrite::graph_rewrite;
+use crate::types::{AddrSpace, BufferizeOpts, ReduceOp};
+use crate::{BinaryOp, ConstValue, Op, UOp, UnaryOp};
 use smallvec::smallvec;
 use svod_dtype::DType;
-use svod_ir::pattern::RewriteResult;
-use svod_ir::types::{AddrSpace, BufferizeOpts, ReduceOp};
-use svod_ir::{BinaryOp, ConstValue, Op, UOp, UnaryOp};
+use svod_macros::patterns;
 
 fn binary(op: BinaryOp, lhs: Arc<UOp>, rhs: Arc<UOp>) -> Arc<UOp> {
     let dtype = lhs.dtype();
@@ -343,7 +343,7 @@ fn rest_pattern_matches_any_arity() {
 /// and ignores the remaining fields, whatever their number.
 #[test]
 fn struct_rest_pattern_ignores_the_remaining_fields() {
-    use svod_device::DeviceSpec;
+    use crate::DeviceSpec;
 
     let matcher = patterns! {
         Stage { compute: c, .. } ~> c,
@@ -550,16 +550,4 @@ fn context_matchers_compose() {
     let mul = binary(BinaryOp::Mul, x.clone(), UOp::native_const(1i32));
     assert_rewrites_to(combined.rewrite(&mul, &mut ctx), &x);
     assert_eq!(ctx.counter, 3);
-}
-
-/// The crate's own DSL-authored symbolic matchers compose and fold through `graph_rewrite`.
-#[test]
-fn symbolic_dsl_matchers_compose() {
-    use crate::symbolic::patterns::{constant_folding_dsl_patterns, identity_and_zero_patterns};
-
-    let matcher = constant_folding_dsl_patterns() + identity_and_zero_patterns();
-    let x = UOp::var("a", DType::Int32, 0, i64::MAX);
-    let add = binary(BinaryOp::Add, UOp::native_const(0i32), x.clone());
-
-    assert!(Arc::ptr_eq(&graph_rewrite(&matcher, add, &mut ()), &x));
 }

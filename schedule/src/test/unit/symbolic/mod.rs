@@ -7,9 +7,9 @@ use crate::{
     rewrite::graph_rewrite,
     symbolic::patterns::{
         advanced_division_dsl_patterns, commutative_canonicalization, comparison_dsl_patterns,
-        div_mod_recombine_dsl_patterns, division_dsl_patterns, pm_remove_invalid, propagate_invalid,
-        range_based_mod_div_patterns, sym_phase3_patterns, term_combining_dsl_patterns, vmin_vmax_collapse_patterns,
-        weak_float_values_are_committed,
+        constant_folding_dsl_patterns, div_mod_recombine_dsl_patterns, division_dsl_patterns,
+        identity_and_zero_patterns, pm_remove_invalid, propagate_invalid, range_based_mod_div_patterns,
+        sym_phase3_patterns, term_combining_dsl_patterns, vmin_vmax_collapse_patterns, weak_float_values_are_committed,
     },
     symbolic::{
         pm_fold_cast_const, sym, symbolic, symbolic_simple,
@@ -1156,4 +1156,13 @@ fn sound_vmin_vmax_reports_bounds_only_for_analyzable_nodes() {
         let expect = expect.map(|(lo, hi)| (ConstValue::Int(lo), ConstValue::Int(hi)));
         assert_eq!(compute_sound_vmin_vmax(&node), expect, "{}", node.tree());
     }
+}
+
+/// The crate's own DSL-authored symbolic matchers compose and fold through `graph_rewrite`.
+#[test]
+fn symbolic_dsl_matchers_compose() {
+    let matcher = constant_folding_dsl_patterns() + identity_and_zero_patterns();
+    let x = UOp::var("a", DType::Int32, 0, i64::MAX);
+    let add = UOp::new(Op::Binary(BinaryOp::Add, UOp::native_const(0i32), x.clone()), DType::Int32);
+    assert!(Arc::ptr_eq(&graph_rewrite(&matcher, add, &mut ()), &x));
 }
