@@ -399,6 +399,8 @@ impl UOp {
             has_index_in_sources_cache: std::sync::OnceLock::new(),
             backward_slice_cache: std::sync::OnceLock::new(),
             has_weak_float_cache: std::sync::OnceLock::new(),
+            device_spec_cache: std::sync::OnceLock::new(),
+            addrspace_cache: std::sync::OnceLock::new(),
             metadata: None,
         });
         let new_weak = Arc::downgrade(&new_arc);
@@ -488,6 +490,8 @@ impl UOp {
             has_index_in_sources_cache: std::sync::OnceLock::new(),
             backward_slice_cache: std::sync::OnceLock::new(),
             has_weak_float_cache: std::sync::OnceLock::new(),
+            device_spec_cache: std::sync::OnceLock::new(),
+            addrspace_cache: std::sync::OnceLock::new(),
             metadata: Some(metadata),
         })
     }

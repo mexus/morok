@@ -1364,3 +1364,33 @@ fn test_cached_property_diamond_fast_path_matches_slow_path(warm_children: bool)
     assert_eq!(root.vmin(), &ConstValue::Int(0));
     assert_eq!(root.vmax(), &ConstValue::Int(45));
 }
+
+/// `device_spec` and `addrspace` recurse through every child. Before they were
+/// memoised, a diamond DAG (each level's two nodes both feeding the next level's
+/// two nodes) gave them 2^levels distinct paths: 20 levels took tens of seconds.
+/// Both must now resolve in linear time.
+#[test]
+fn test_device_and_addrspace_are_memoised_on_diamond_dags() {
+    use crate::UnaryOp;
+    use svod_dtype::AddrSpace;
+
+    let mut a = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let mut b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    for level in 0..20 {
+        let sum = UOp::new(Op::Binary(BinaryOp::Add, a.clone(), b.clone()), DType::Float32);
+        let product = UOp::new(Op::Binary(BinaryOp::Mul, a.clone(), b.clone()), DType::Float32);
+        // Distinct ops per level so hash consing cannot collapse the levels.
+        let (first, second) =
+            if level % 2 == 0 { (UnaryOp::Sqrt, UnaryOp::Exp2) } else { (UnaryOp::Exp2, UnaryOp::Sqrt) };
+        a = UOp::new(Op::Unary(first, sum), DType::Float32);
+        b = UOp::new(Op::Unary(second, product), DType::Float32);
+    }
+    let root = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32);
+
+    let start = std::time::Instant::now();
+    assert_eq!(root.device_spec(), Some(DeviceSpec::Cpu), "device must propagate up from the BUFFER leaf");
+    assert_eq!(root.addrspace(), Some(AddrSpace::Global), "addrspace must propagate up from the BUFFER leaf");
+    let elapsed = start.elapsed();
+
+    assert!(elapsed < std::time::Duration::from_millis(100), "20-level diamond took {elapsed:?}; memo is not working");
+}

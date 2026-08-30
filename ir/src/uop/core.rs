@@ -155,6 +155,14 @@ pub struct UOp {
     /// Cached O(1) lookup used by the value-sensitive symbolic guard.
     #[debug(skip)]
     pub(crate) has_weak_float_cache: std::sync::OnceLock<bool>,
+    /// Cached device specification carried by this node's backward slice.
+    /// Without the memo the recursive walk is exponential on shared (diamond) DAGs.
+    #[debug(skip)]
+    pub(crate) device_spec_cache: std::sync::OnceLock<Option<svod_dtype::DeviceSpec>>,
+    /// Cached storage address space carried by this value. Same exponential-blowup
+    /// reason as `device_spec_cache`.
+    #[debug(skip)]
+    pub(crate) addrspace_cache: std::sync::OnceLock<Option<svod_dtype::AddrSpace>>,
     /// Structural content hash — deterministic regardless of allocation order.
     /// Computed at creation time: hash(op_discriminant, dtype, op_data, children_content_hashes).
     /// O(1) per node since children are already created with their content_hash set.
@@ -275,7 +283,12 @@ impl UOp {
     /// project source zero, and elementwise/shaped containers preserve only a
     /// common non-ALU address space. `None` covers ALU values and operations
     /// without address semantics.
-    pub fn addrspace(&self) -> Option<svod_dtype::AddrSpace> {
+    pub fn addrspace(self: &Arc<Self>) -> Option<svod_dtype::AddrSpace> {
+        use crate::uop::cached_property::CachedProperty;
+        *crate::uop::properties::AddrSpaceProperty::get(self)
+    }
+
+    pub(crate) fn compute_addrspace(self: &Arc<Self>) -> Option<svod_dtype::AddrSpace> {
         use Op::*;
 
         let common = |sources: SmallVec<[Arc<UOp>; 4]>| {
@@ -476,19 +489,17 @@ impl UOp {
     /// let buffer = UOp::new_buffer(DeviceSpec::Cpu, 10, DType::Float32);
     /// assert_eq!(buffer.device_spec(), Some(DeviceSpec::Cpu));
     /// ```
-    pub fn device_spec(&self) -> Option<svod_dtype::DeviceSpec> {
+    pub fn device_spec(self: &Arc<Self>) -> Option<svod_dtype::DeviceSpec> {
+        use crate::uop::cached_property::CachedProperty;
+        crate::uop::properties::DeviceSpecProperty::get(self).clone()
+    }
+
+    pub(crate) fn compute_device_spec(self: &Arc<Self>) -> Option<svod_dtype::DeviceSpec> {
         match self.op() {
             Op::Buffer { arg, .. } | Op::Param { arg, .. } => arg.device.clone(),
             Op::Copy { device, .. } | Op::AllReduce { device, .. } => Some(device.clone()),
-            _ => {
-                // Search children for device
-                for child in self.op().children() {
-                    if let Some(spec) = child.device_spec() {
-                        return Some(spec);
-                    }
-                }
-                None
-            }
+            // Children are memoised, so this is a single level, not a re-walk.
+            _ => self.op().children().iter().find_map(|child| child.device_spec()),
         }
     }
 
@@ -1444,6 +1455,8 @@ impl Clone for UOp {
             has_index_in_sources_cache: std::sync::OnceLock::new(),
             backward_slice_cache: std::sync::OnceLock::new(),
             has_weak_float_cache: std::sync::OnceLock::new(),
+            device_spec_cache: std::sync::OnceLock::new(),
+            addrspace_cache: std::sync::OnceLock::new(),
             metadata: self.metadata.clone(),
         }
     }
