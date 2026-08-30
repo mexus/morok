@@ -3441,3 +3441,50 @@ fn weak_float_guard_is_memoized_per_node(leaf_dtype: DType, committed: bool) {
     }
     assert!(std::ptr::eq(HasWeakFloatProperty::get(&root), HasWeakFloatProperty::get(&root)));
 }
+
+// =========================================================================
+// uint64 pack/unpack cancellation (tinygrad uop/symbolic.py:170-173)
+// =========================================================================
+
+/// `(hi.cast(u64) << shift) | lo.cast(u64)` — the THREEFRY packing idiom.
+fn packed_u64(hi: &Arc<UOp>, lo: &Arc<UOp>, shift: i64) -> Arc<UOp> {
+    let amount = UOp::const_(DType::UInt64, ConstValue::Int(shift));
+    hi.cast(DType::UInt64).shl(&amount).or_(&lo.cast(DType::UInt64))
+}
+
+fn u32_var(name: &str) -> Arc<UOp> {
+    UOp::var(name, DType::UInt32, 0, u32::MAX as i64)
+}
+
+#[test_case::test_case(32, true; "shift of thirty two cancels")]
+#[test_case::test_case(16, false; "shift of sixteen must not cancel")]
+fn uint64_pack_low_half_cancels_only_at_thirty_two(shift: i64, folds: bool) {
+    let (hi, lo) = (u32_var("hi"), u32_var("lo"));
+    let expr = packed_u64(&hi, &lo, shift).cast(DType::UInt32);
+    let folded = graph_rewrite(symbolic_simple(), expr.clone(), &mut ());
+
+    assert_eq!(Arc::ptr_eq(&folded, &lo), folds, "got {}", folded.tree());
+}
+
+#[test_case::test_case(32, true; "shift of thirty two cancels")]
+#[test_case::test_case(31, false; "shift of thirty one must not cancel")]
+fn uint64_pack_high_half_cancels_only_at_thirty_two(shift: i64, folds: bool) {
+    let (hi, lo) = (u32_var("hi"), u32_var("lo"));
+    let amount = UOp::const_(DType::UInt64, ConstValue::Int(shift));
+    let expr = packed_u64(&hi, &lo, shift).shr(&amount);
+    let folded = graph_rewrite(symbolic_simple(), expr.clone(), &mut ());
+
+    assert_eq!(Arc::ptr_eq(&folded, &hi.cast(DType::UInt64)), folds, "got {}", folded.tree());
+}
+
+#[test]
+fn uint64_pack_high_half_needs_a_narrow_low_arm() {
+    // A wide low arm can carry bits into the high half, so `>> 32` is not `hi`.
+    let hi = u32_var("hi");
+    let wide = UOp::var("wide", DType::UInt64, 0, i64::MAX);
+    let amount = UOp::const_(DType::UInt64, ConstValue::Int(32));
+    let expr = hi.cast(DType::UInt64).shl(&amount).or_(&wide).shr(&amount);
+    let folded = graph_rewrite(symbolic_simple(), expr.clone(), &mut ());
+
+    assert!(!Arc::ptr_eq(&folded, &hi.cast(DType::UInt64)), "must not cancel: {}", folded.tree());
+}

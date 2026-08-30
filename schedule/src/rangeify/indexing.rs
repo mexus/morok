@@ -657,6 +657,8 @@ fn assign_ranges(
                     out_rngs.clone()
                 }
             }
+            // STACK prepends a selection axis; its sources live one axis below.
+            Op::Stack { .. } => out_rngs.iter().skip(1).cloned().collect(),
             Op::Reduce { src, num_axes, .. } if *num_axes > 0 => {
                 if let Some(in_shape) = src.shape()? {
                     if tracing::enabled!(tracing::Level::TRACE) {

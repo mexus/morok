@@ -701,6 +701,35 @@ fn test_cat_negative_axis() {
     assert_eq!(get_shape(&c), vec![1, 4]);
 }
 
+#[test_case::test_case(2, 0, vec![2, 3], vec![0.0, 1.0, 2.0, 10.0, 11.0, 12.0]; "two inputs dim0")]
+#[test_case::test_case(2, 1, vec![1, 6], vec![0.0, 1.0, 2.0, 10.0, 11.0, 12.0]; "two inputs dim1")]
+#[test_case::test_case(3, 0, vec![3, 3], vec![0.0, 1.0, 2.0, 10.0, 11.0, 12.0, 20.0, 21.0, 22.0]; "three inputs dim0")]
+#[test_case::test_case(3, -1, vec![1, 9], vec![0.0, 1.0, 2.0, 10.0, 11.0, 12.0, 20.0, 21.0, 22.0]; "three inputs negative dim")]
+fn equal_size_cat_keeps_slice_order(count: usize, dim: isize, shape: Vec<usize>, expected: Vec<f32>) {
+    // Equal-size inputs take the STACK fast path; values and order must be unchanged.
+    let parts: Vec<Tensor> = (0..count)
+        .map(|i| Tensor::from_slice([i as f32 * 10.0, i as f32 * 10.0 + 1.0, i as f32 * 10.0 + 2.0]))
+        .map(|t| t.try_reshape([1, 3]).unwrap())
+        .collect();
+    let mut c = Tensor::cat(&parts.iter().collect::<Vec<_>>(), dim).unwrap();
+    assert_eq!(get_shape(&c), shape);
+    c.realize().unwrap();
+    assert_eq!(c.as_vec::<f32>().unwrap(), expected);
+}
+
+#[test]
+fn equal_size_cat_uses_stack_not_pad() {
+    // The fast path must not emit PAD — padding is what forces each slice to
+    // carry its own index expression and blocks hash-consing of shared producers.
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let c = Tensor::cat(&[&a, &a], 0).unwrap();
+
+    let nodes = c.uop().toposort();
+    let has = |f: fn(&Op) -> bool| nodes.iter().any(|u| f(u.op()));
+    assert!(!has(|op| matches!(op, Op::Pad { .. })), "equal-size cat must not pad:\n{}", c.uop().tree());
+    assert!(has(|op| matches!(op, Op::Stack { .. })), "equal-size cat must stack:\n{}", c.uop().tree());
+}
+
 #[test]
 fn test_cat_error_empty() {
     let result = Tensor::cat(&[], 0);

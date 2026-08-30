@@ -76,9 +76,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     apply_unroll(scheduler);
 
     // 7. Default upcast
-    if scheduler.axes_of(&[AxisType::Upcast]).is_empty() {
-        apply_default_upcast(scheduler);
-    }
+    apply_default_upcast(scheduler);
 
     // 8. Local dims
     apply_local_dims(scheduler, config);
@@ -266,33 +264,26 @@ pub fn apply_image_upcasts(scheduler: &mut Scheduler) -> bool {
     applied
 }
 
-/// Default upcast fallback: 4x vectorization on first upcastable axis.
+/// Default upcast fallback: 4x vectorization on the innermost upcastable axis.
+///
+/// Tinygrad `hand_coded_optimizations` (codegen/opt/heuristic.py:155-158):
+/// `if not k.upcasted and k.upcastable_dims and full_shape[upcastable_dims[-1]] % 4 == 0`.
+/// `upcasted` counts UPCAST *and* UNROLL axes, so an unrolled reduce already
+/// suppresses this fallback.
 pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
-    use svod_ir::Op;
     use tracing::debug;
 
-    if !scheduler.axes_of(&[AxisType::Upcast]).is_empty() {
-        debug!("apply_default_upcast: skipping (already upcasted)");
+    if scheduler.upcasted() {
+        debug!("apply_default_upcast: skipping (already upcasted or unrolled)");
         return false;
     }
-    let upcastable = scheduler.upcastable_dims();
-    debug!(upcastable_dims = ?upcastable, "apply_default_upcast: checking upcastable dims");
-    if upcastable.is_empty() {
+    let Some(axis_idx) = scheduler.upcastable_dims().last().copied() else {
         debug!("apply_default_upcast: no upcastable dims");
         return false;
-    }
+    };
 
-    // Innermost upcastable axis.
-    let axis_idx = *upcastable.last().unwrap();
-    let rngs = scheduler.rngs();
-
-    // Get axis size and check divisibility.
-    if axis_idx < rngs.len()
-        && let Op::Range { end, .. } = rngs[axis_idx].op()
-        && let Op::Const(cv) = end.op()
-        && let svod_ir::ConstValue::Int(size) = cv.0
-        && size % DEFAULT_UPCAST_FACTOR as i64 != 0
-    {
+    let size = scheduler.full_shape()[axis_idx];
+    if size % DEFAULT_UPCAST_FACTOR as i64 != 0 {
         debug!(axis_idx, size, factor = DEFAULT_UPCAST_FACTOR, "apply_default_upcast: skipping (size not divisible)");
         return false;
     }
