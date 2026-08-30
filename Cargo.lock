@@ -3479,6 +3479,7 @@ dependencies = [
  "proptest",
  "proptest-derive",
  "ptree",
+ "rustc-hash",
  "serde",
  "serde_json",
  "smallvec",
