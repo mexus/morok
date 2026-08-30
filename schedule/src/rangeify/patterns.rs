@@ -167,6 +167,8 @@ pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
             => |x, ctx| convert_reduce_with_context(x, ctx),
         // PAD → WHERE conversion BEFORE bufferization.
         x @ Pad { src: _, begin_pads: _, end_pads: _ } => |x, ctx| convert_pad_to_where(x, ctx),
+        // STACK → WHERE select on the leading range, BEFORE bufferization.
+        x @ Stack { sources: _ } => |x, ctx| convert_stack_to_where(x, ctx),
         // ALL ops (including movement) get source bufferization.
         x => |x, ctx| apply_bufferize_transform(x, ctx),
         // Movement ops get removed AFTER bufferization - simple logic
@@ -211,6 +213,25 @@ fn convert_pad_to_where(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<U
     let base = x.dtype().scalar()?;
     let zero = UOp::const_(x.dtype(), ConstValue::zero(base));
     UOp::try_where(valid, bx.op().sources().first()?.clone(), zero).ok()
+}
+
+/// Convert a shaped STACK into a WHERE chain selecting on its leading range.
+///
+/// Every source is indexed at the *same* trailing ranges, so producers shared
+/// between the stacked slices collapse to one node (Tinygrad
+/// `convert_stack_to_where`). Shape-payload STACKs carry no ranges and are left
+/// alone.
+fn convert_stack_to_where(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
+    if x.dtype() == DType::Void {
+        return None;
+    }
+    let selector = ctx.get_ranges(x)?.1.first()?.clone();
+    let sources = transform_sources_with_bufferize(x, ctx).unwrap_or_else(|| x.op().sources().into_iter().collect());
+    let (last, rest) = sources.split_last()?;
+    rest.iter().enumerate().try_rfold(last.clone(), |acc, (k, source)| {
+        let key = UOp::const_(selector.dtype(), ConstValue::Int(k as i64));
+        UOp::try_where(selector.try_cmpeq(&key).ok()?, source.clone(), acc).ok()
+    })
 }
 
 /// Remove movement ops after source bufferization.

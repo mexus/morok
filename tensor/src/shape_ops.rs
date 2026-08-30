@@ -536,6 +536,29 @@ impl Tensor {
             }
         }
 
+        // Equal-length inputs concatenate through a stacked axis instead of
+        // interleaved pads (Tinygrad `Tensor.cat`). Every input is then read at
+        // the same offset within `dim`, so shared producers hash-cons into a
+        // single node rather than one copy per slice.
+        if tensors[1..].iter().all(|t| t.shape().is_ok_and(|s| s[dim] == first_shape[dim])) {
+            let stacked = Self::stack(tensors, dim as isize)?;
+            let stacked_shape = stacked.shape()?;
+            let merged: Vec<SInt> = stacked_shape[..dim]
+                .iter()
+                .cloned()
+                .chain([&stacked_shape[dim] * &stacked_shape[dim + 1]])
+                .chain(stacked_shape[dim + 2..].iter().cloned())
+                .collect();
+            return stacked.try_reshape(merged);
+        }
+
+        Self::cat_padded(tensors, dim, ndim)
+    }
+
+    /// Concatenate by padding each input to the output extent and summing.
+    ///
+    /// Shapes are assumed validated by the caller.
+    fn cat_padded(tensors: &[&Tensor], dim: usize, ndim: usize) -> Result<Tensor> {
         // Compute cumulative sizes along concat dimension
         let dim_sizes: Vec<usize> = tensors.iter().map(|t| t.shape().unwrap()[dim].as_const().unwrap_or(0)).collect();
         let total_dim: usize = dim_sizes.iter().sum();
@@ -557,20 +580,43 @@ impl Tensor {
             .collect::<Result<Vec<_>>>()?;
 
         // Sum all padded tensors
-        let mut result = padded[0].clone();
-        for t in padded.iter().skip(1) {
-            result = result.try_add(t)?;
-        }
-        Ok(result)
+        padded[1..].iter().try_fold(padded[0].clone(), |acc, t| acc.try_add(t))
     }
 
     /// Stack tensors along a new dimension.
     ///
     /// Creates a new axis at `dim` by unsqueezing each tensor, then concatenating.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if `tensors` is empty or the shapes are not all identical.
     #[track_caller]
     pub fn stack(tensors: &[&Tensor], dim: isize) -> Result<Tensor> {
-        let unsqueezed: Vec<Tensor> = tensors.iter().map(|t| t.try_unsqueeze(dim)).collect::<Result<_>>()?;
-        Tensor::cat(&unsqueezed.iter().collect::<Vec<_>>(), dim)
+        let first = tensors
+            .first()
+            .ok_or_else(|| IrConstructionSnafu { details: "stack requires at least one tensor".to_string() }.build())?;
+        let first_shape = first.shape()?;
+        for (i, t) in tensors.iter().enumerate().skip(1) {
+            let t_shape = t.shape()?;
+            snafu::ensure!(
+                t_shape == first_shape,
+                ShapeMismatchSnafu {
+                    context: "stack",
+                    expected: format!("{:?}", first_shape),
+                    actual: format!("{:?} for tensor {}", t_shape, i)
+                }
+            );
+        }
+
+        let ndim = first_shape.len() + 1;
+        let dim = Self::normalize_axis(dim, ndim)?;
+        let stacked = Self::new(UOp::stack(tensors.iter().map(|t| t.uop().clone()).collect()));
+        if dim == 0 {
+            return Ok(stacked);
+        }
+        // Move the new leading axis into position `dim`.
+        let axes: Vec<isize> = (1..=dim).chain([0]).chain(dim + 1..ndim).map(|a| a as isize).collect();
+        stacked.try_permute(&axes)
     }
 
     /// Replace a single dimension with multiple dimensions.
