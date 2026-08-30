@@ -316,11 +316,29 @@ fn is_broadcastable_op(uop: &Arc<UOp>) -> bool {
 /// - SINK sources (if not always-contiguous)
 /// - COPY, CONTIGUOUS, STORE (always realized)
 /// - Sources of COPY, MSTACK, MSELECT (realized if not always-contiguous)
+/// - Inputs of custom-kernel CALLs (realized and pinned non-removable)
 ///
 /// Patterns return `None` (no rewrite) — context side-effects mark nodes in the realize map.
-fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingContext> {
+pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingContext> {
     crate::cached_patterns! {
         @context IndexingContext;
+
+        // `realize_custom_kernel_srcs` (indexing.py:44-49): a hand-written kernel
+        // reads its inputs through PARAM slots, so each one must already be a
+        // buffer — and must stay one, hence non-removable.
+        _c @ Call { body, args, info: _ }
+            if matches!(body.op(), Op::Sink { .. } | Op::Program { .. }) => |_c, args, ctx| {
+            for arg in args {
+                let mut src = Arc::clone(arg);
+                while let Op::Reshape { src: inner, .. } = src.op() {
+                    src = Arc::clone(inner);
+                }
+                if !is_always_contiguous(&src) {
+                    ctx.mark_realize_non_removable(&src);
+                }
+            }
+            None
+        },
 
         // Always realize STORE, and realize its value first when it reads the
         // same base buffer (WAR hazard: without the temp, overlapping
@@ -328,6 +346,18 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
         // already overwrote).
         x @ Store { index, value } => |x, index, value, ctx| {
             ctx.mark_realize_pending(x);
+            // `realize_store_after_src` (indexing.py:37-40): a SLICE that is the
+            // direct source of the STORE needs no buffer of its own — the store
+            // target already is the output. A movement op on the destination
+            // means the two do not line up, so the SLICE keeps its buffer.
+            if matches!(value.op(), Op::Slice { .. })
+                && ctx.should_realize(value)
+                && !index.any_in_subtree(|n| {
+                    matches!(n.op(), Op::Shrink { .. } | Op::Permute { .. } | Op::Flip { .. } | Op::Pad { .. })
+                })
+            {
+                ctx.clear_realize(value);
+            }
             if value.backward_slice_ids().contains(&index.base().id) {
                 ctx.mark_realize_non_removable(value);
             }

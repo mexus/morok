@@ -23,6 +23,7 @@ pub mod pipeline;
 pub mod pipeline_integration;
 pub mod range_load_guards;
 pub mod range_merging;
+pub mod realize_map;
 pub mod reduce_simplify;
 pub mod remove_bufferize;
 pub mod resolve_call;
