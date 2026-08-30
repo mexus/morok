@@ -81,9 +81,10 @@ fn test_fa_mw_rdb_renders_bounded() {
             false,
         );
         let sink = ker.finish(1);
-        let pm = svod_schedule::symbolic::pm_lower_index_dtype().clone()
-            + svod_ir::decompositions::divmod_decomposition_patterns();
-        let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut ());
+        let pm = svod_schedule::symbolic::pm_lower_index_dtype()
+            + svod_ir::decompositions::divmod_decomposition_patterns()
+                .with_context::<svod_schedule::symbolic::WeakMemo>();
+        let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut svod_schedule::symbolic::WeakMemo::default());
         let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu)
             .expect("final target graph");
         let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
@@ -287,9 +288,9 @@ fn test_fa_mw_rdb_renders_wave32() {
         false,
     );
     let sink = ker.finish(1);
-    let pm = svod_schedule::symbolic::pm_lower_index_dtype().clone()
-        + svod_ir::decompositions::divmod_decomposition_patterns();
-    let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut ());
+    let pm = svod_schedule::symbolic::pm_lower_index_dtype()
+        + svod_ir::decompositions::divmod_decomposition_patterns().with_context::<svod_schedule::symbolic::WeakMemo>();
+    let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut svod_schedule::symbolic::WeakMemo::default());
     let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu)
         .expect("final target graph");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");

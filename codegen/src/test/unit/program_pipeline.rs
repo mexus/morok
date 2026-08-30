@@ -4,7 +4,11 @@ use svod_ir::{BinaryOp, InsArg, Op, ParamArg, RewriteResult, TypedPatternMatcher
 
 fn committed_sink(sources: Vec<std::sync::Arc<UOp>>) -> std::sync::Arc<UOp> {
     let sink = UOp::sink(sources);
-    let sink = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
+    let sink = svod_schedule::graph_rewrite(
+        &svod_schedule::symbolic::pm_lower_index_dtype(),
+        sink,
+        &mut svod_schedule::symbolic::WeakMemo::default(),
+    );
     assert!(sink.toposort().iter().all(|u| !u.dtype().is_weak()), "end-to-end fixture must commit weak dtypes");
     sink
 }

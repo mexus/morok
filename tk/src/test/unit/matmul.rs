@@ -103,9 +103,10 @@ fn test_mma_unroll_flattens_mfma() {
     assert_eq!(wmma_count(&build(true)), 8, "unrolled mma → 8 flat WMMA nodes (2×2 output × 2 K-steps)");
 
     let render = |sink: Arc<UOp>| {
-        let pm = svod_schedule::symbolic::pm_lower_index_dtype().clone()
-            + svod_ir::decompositions::divmod_decomposition_patterns();
-        let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut ());
+        let pm = svod_schedule::symbolic::pm_lower_index_dtype()
+            + svod_ir::decompositions::divmod_decomposition_patterns()
+                .with_context::<svod_schedule::symbolic::WeakMemo>();
+        let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut svod_schedule::symbolic::WeakMemo::default());
         let program =
             svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu).expect("final target graph");
         let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
@@ -142,9 +143,9 @@ fn test_matmul_rdna_renders_wmma() {
     );
     build_matmul_cfg(&ker, n, SMALL_CFG);
     let sink = ker.finish(SMALL_CFG.n_accum);
-    let pm = svod_schedule::symbolic::pm_lower_index_dtype().clone()
-        + svod_ir::decompositions::divmod_decomposition_patterns();
-    let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut ());
+    let pm = svod_schedule::symbolic::pm_lower_index_dtype()
+        + svod_ir::decompositions::divmod_decomposition_patterns().with_context::<svod_schedule::symbolic::WeakMemo>();
+    let lowered = svod_schedule::graph_rewrite(&pm, sink, &mut svod_schedule::symbolic::WeakMemo::default());
     let program =
         svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu).expect("final target graph");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
