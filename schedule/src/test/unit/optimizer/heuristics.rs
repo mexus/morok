@@ -5,7 +5,9 @@ use svod_ir::{AxisId, AxisType, Op, ParamArg, ReduceOp, UOp};
 use test_case::test_case;
 
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
-use crate::optimizer::heuristics::{apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores};
+use crate::optimizer::heuristics::{
+    apply_default_upcast, apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores,
+};
 use crate::optimizer::{OptOps, Renderer, Scheduler};
 
 fn create_matvec_like_pattern(rows: i64, cols: i64) -> Arc<UOp> {
@@ -115,4 +117,53 @@ fn test_try_tensor_cores_amx_discards_trial() {
         scheduler.applied_opts, snapshot_opts_before,
         "AMX path must leave the scheduler's applied_opts untouched (no TC commit)"
     );
+}
+
+/// Elementwise SINK with one WEAK axis plus an optional extra axis of `extra`
+/// type, so `apply_default_upcast`'s gate and axis pick can be exercised.
+fn create_default_upcast_pattern(size: i64, extra: Option<(i64, AxisType)>) -> Arc<UOp> {
+    let weak = UOp::range_axis(UOp::index_const(size), AxisId::Renumbered(0), AxisType::Weak);
+    let buf = UOp::new_buffer(DeviceSpec::Cpu, size as usize * 64, DType::Float32);
+    let (idx, mut sink_srcs) = match extra {
+        Some((extra_size, axis_type)) => {
+            let other = UOp::range_axis(UOp::index_const(extra_size), AxisId::Renumbered(1), axis_type);
+            (weak.try_add(&other).expect("index add"), vec![weak.clone(), other])
+        }
+        None => (weak.clone(), vec![weak.clone()]),
+    };
+    let val = UOp::index().buffer(buf).indices(vec![idx]).call().expect("index should build");
+    let doubled = val.try_add(&val).expect("add should succeed");
+    sink_srcs.insert(0, doubled);
+    UOp::sink(sink_srcs)
+}
+
+#[test_case(16, None, true; "divisible weak axis upcasts")]
+#[test_case(6, None, false; "size not divisible by four")]
+#[test_case(1, None, false; "size one axis is not upcastable")]
+#[test_case(16, Some((4, AxisType::Unroll)), false; "unrolled kernel skips the fallback")]
+#[test_case(16, Some((4, AxisType::Upcast)), false; "already upcast kernel skips the fallback")]
+#[test_case(16, Some((8, AxisType::Reduce)), true; "reduce axis does not block the fallback")]
+fn default_upcast_follows_tinygrad_gate(size: i64, extra: Option<(i64, AxisType)>, expected: bool) {
+    let pre_existing = usize::from(matches!(extra, Some((_, AxisType::Upcast))));
+    let mut scheduler = Scheduler::new(create_default_upcast_pattern(size, extra), Renderer::cpu());
+
+    assert_eq!(apply_default_upcast(&mut scheduler), expected);
+    assert_eq!(
+        scheduler.axes_of(&[AxisType::Upcast]).len(),
+        pre_existing + usize::from(expected),
+        "UPCAST axis count after the fallback"
+    );
+}
+
+#[test]
+fn default_upcast_picks_the_innermost_upcastable_axis() {
+    // Tinygrad takes `k.upcastable_dims[-1]`; both axes qualify here, and only
+    // the trailing one must be split.
+    let sink = create_default_upcast_pattern(16, Some((8, AxisType::Global)));
+    let mut scheduler = Scheduler::new(sink, Renderer::cpu());
+    let innermost = *scheduler.upcastable_dims().last().expect("two upcastable dims");
+
+    assert!(apply_default_upcast(&mut scheduler));
+    let opt = scheduler.applied_opts.iter().find(|opt| opt.op == OptOps::UPCAST).expect("UPCAST recorded");
+    assert_eq!(opt.axis, Some(innermost));
 }
