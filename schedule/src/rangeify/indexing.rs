@@ -6,9 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use svod_dtype::DType;
+use indexmap::IndexSet;
 use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, SInt, UOp, UOpKey};
-use tracing::{debug, info_span, instrument, trace, warn};
+use tracing::{debug, info_span, instrument, trace};
 
 use crate::argsort;
 
@@ -55,12 +55,6 @@ impl IndexingContext {
             return UOp::index_const(0);
         }
 
-        self.new_range_uncollapsed(size, axistype)
-    }
-
-    /// Create new RANGE with unique ID, without collapsing size=1 to Const(0).
-    /// Use this when you need a proper Range UOp for realization/kernel boundaries.
-    pub fn new_range_uncollapsed(&mut self, size: &SInt, axistype: AxisType) -> Arc<UOp> {
         // Create range with Unrenumbered axis_id
         let axis_id = AxisId::Unrenumbered(self.range_idx);
         self.range_idx += 1;
@@ -129,12 +123,6 @@ impl IndexingContext {
     /// Check if a realization boundary must not be inlined.
     pub fn is_non_removable_realize(&self, uop: &Arc<UOp>) -> bool {
         self.non_removable_realizes.contains(&UOpKey(Arc::clone(uop)))
-    }
-
-    /// Get all keys in the realize_map (for debugging).
-    #[allow(dead_code)]
-    pub fn realize_map_keys(&self) -> Vec<&UOpKey> {
-        self.realize_map.keys().collect()
     }
 
     /// Set the range map for a UOp.
@@ -253,15 +241,19 @@ pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContex
     Ok((transformed_sink, ctx))
 }
 
+/// Consumers of each node, in discovery order and without repeats — a consumer
+/// that reads the same source twice (`y * y`) counts once, matching upstream's
+/// `consumer_map[x][c] = None` dict insert (indexing.py:202-205).
+type ConsumerMap = HashMap<UOpKey, IndexSet<UOpKey>>;
+
 #[allow(clippy::mutable_key_type)]
-fn consumer_map_for_data_sources(sink: &Arc<UOp>) -> HashMap<UOpKey, Vec<Arc<UOp>>> {
+fn consumer_map_for_data_sources(sink: &Arc<UOp>) -> ConsumerMap {
     let topo = sink.toposort_call_aware(false);
-    let mut consumer_map: HashMap<UOpKey, Vec<Arc<UOp>>> =
-        topo.iter().map(|u| (UOpKey(u.clone()), Vec::new())).collect();
+    let mut consumer_map: ConsumerMap = topo.iter().map(|u| (UOpKey(u.clone()), IndexSet::new())).collect();
     for consumer in topo {
         for source in data_sources(&consumer) {
             if let Some(consumers) = consumer_map.get_mut(&UOpKey(source)) {
-                consumers.push(consumer.clone());
+                consumers.insert(UOpKey(consumer.clone()));
             }
         }
     }
@@ -285,26 +277,31 @@ pub(crate) fn data_sources(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     }
 }
 
+/// Consumer axes the source is broadcast over: the ones added on its left plus
+/// the ones expanding a singleton source dim (`broadcast_axes`, ops.py:80-83).
+/// `None` when the two shapes do not broadcast.
+fn broadcast_axes(source: &Arc<UOp>, consumer: &Arc<UOp>) -> Option<(usize, Vec<usize>)> {
+    let (Ok(Some(consumer_shape)), Ok(Some(source_shape))) = (consumer.shape(), source.shape()) else {
+        return None;
+    };
+    let left_pad = consumer_shape.len().checked_sub(source_shape.len())?;
+    let mut axes: Vec<usize> = (0..left_pad).collect();
+    axes.extend(source_shape.iter().enumerate().filter_map(|(axis, source_dim)| {
+        let consumer_axis = left_pad + axis;
+        (source_dim.as_const() == Some(1) && consumer_shape[consumer_axis].as_const() != Some(1))
+            .then_some(consumer_axis)
+    }));
+    Some((left_pad, axes))
+}
+
 /// Map a consumer's ranges onto one broadcastable source.
 pub(crate) fn broadcast_ranges(consumer: &Arc<UOp>, source: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     if !is_broadcastable_op(consumer) {
         return ranges.to_vec();
     }
-    let (Ok(Some(consumer_shape)), Ok(Some(source_shape))) = (consumer.shape(), source.shape()) else {
+    let Some((left_pad, target_axes)) = broadcast_axes(source, consumer) else {
         return ranges.to_vec();
     };
-    let Some(left_pad) = consumer_shape.len().checked_sub(source_shape.len()) else {
-        return ranges.to_vec();
-    };
-
-    // Tinygrad's broadcast_axes returns consumer axes that are either newly
-    // added on the left or expand a singleton source dimension.
-    let mut target_axes: Vec<usize> = (0..left_pad).collect();
-    target_axes.extend(source_shape.iter().enumerate().filter_map(|(axis, source_dim)| {
-        let consumer_axis = left_pad + axis;
-        (source_dim.as_const() == Some(1) && consumer_shape[consumer_axis].as_const() != Some(1))
-            .then_some(consumer_axis)
-    }));
 
     ranges
         .iter()
@@ -312,6 +309,24 @@ pub(crate) fn broadcast_ranges(consumer: &Arc<UOp>, source: &Arc<UOp>, ranges: &
         .filter(|(axis, _)| *axis >= left_pad)
         .map(|(axis, range)| if target_axes.contains(&axis) { UOp::index_const(0) } else { range.clone() })
         .collect()
+}
+
+/// The ranges `x`'s consumers iterate that `x` itself broadcasts over —
+/// upstream's `broadcast_ending_ranges` (indexing.py:221-223):
+///
+///   ended = [rctx.range_map[c][0][i] for c in consumer_map[x]
+///            if c in rctx.range_map and c.op in GroupOp.Broadcastable
+///            for i in broadcast_axes(x.shape, c.shape)]
+///   broadcast_ending_ranges = list(UOp.sink(*ended).ranges)
+fn broadcast_ending_ranges(x: &Arc<UOp>, consumers: &[Arc<UOp>], ctx: &IndexingContext) -> Vec<Arc<UOp>> {
+    let mut ended = Vec::new();
+    for consumer in consumers.iter().filter(|c| is_broadcastable_op(c)) {
+        let (Some((_, axes)), Some((consumer_in, _))) = (broadcast_axes(x, consumer), ctx.get_ranges(consumer)) else {
+            continue;
+        };
+        ended.extend(axes.into_iter().filter_map(|axis| consumer_in.get(axis).cloned()));
+    }
+    ended.iter().flat_map(collect_ranges_from_uop).collect()
 }
 
 fn is_broadcastable_op(uop: &Arc<UOp>) -> bool {
@@ -324,11 +339,29 @@ fn is_broadcastable_op(uop: &Arc<UOp>) -> bool {
 /// - SINK sources (if not always-contiguous)
 /// - COPY, CONTIGUOUS, STORE (always realized)
 /// - Sources of COPY, MSTACK, MSELECT (realized if not always-contiguous)
+/// - Inputs of custom-kernel CALLs (realized and pinned non-removable)
 ///
 /// Patterns return `None` (no rewrite) — context side-effects mark nodes in the realize map.
-fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingContext> {
+pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingContext> {
     crate::cached_patterns! {
         @context IndexingContext;
+
+        // `realize_custom_kernel_srcs` (indexing.py:44-49): a hand-written kernel
+        // reads its inputs through PARAM slots, so each one must already be a
+        // buffer — and must stay one, hence non-removable.
+        _c @ Call { body, args, info: _ }
+            if matches!(body.op(), Op::Sink { .. } | Op::Program { .. }) => |_c, args, ctx| {
+            for arg in args {
+                let mut src = Arc::clone(arg);
+                while let Op::Reshape { src: inner, .. } = src.op() {
+                    src = Arc::clone(inner);
+                }
+                if !is_always_contiguous(&src) {
+                    ctx.mark_realize_non_removable(&src);
+                }
+            }
+            None
+        },
 
         // Always realize STORE, and realize its value first when it reads the
         // same base buffer (WAR hazard: without the temp, overlapping
@@ -336,6 +369,18 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
         // already overwrote).
         x @ Store { index, value } => |x, index, value, ctx| {
             ctx.mark_realize_pending(x);
+            // `realize_store_after_src` (indexing.py:37-40): a SLICE that is the
+            // direct source of the STORE needs no buffer of its own — the store
+            // target already is the output. A movement op on the destination
+            // means the two do not line up, so the SLICE keeps its buffer.
+            if matches!(value.op(), Op::Slice { .. })
+                && ctx.should_realize(value)
+                && !index.any_in_subtree(|n| {
+                    matches!(n.op(), Op::Shrink { .. } | Op::Permute { .. } | Op::Flip { .. } | Op::Pad { .. })
+                })
+            {
+                ctx.clear_realize(value);
+            }
             if value.backward_slice_ids().contains(&index.base().id) {
                 ctx.mark_realize_non_removable(value);
             }
@@ -434,8 +479,10 @@ pub(crate) fn merge_consumer_ranges(
     // With PCONTIG=0 (default): condition per-dim = `all_all_same || (PCONTIG && all_same(dim))`.
     // When all_all_same=False and PCONTIG=0, this is always False → all dims realized.
     let all_all_same = all_rngs.iter().all(|dim_ranges| {
+        // `all_same([])` is True (helpers.py:31); upstream's `zip(*consumer_rngs)`
+        // (indexing.py:249) truncates such a dim away rather than realizing it.
         if dim_ranges.is_empty() {
-            return false;
+            return true;
         }
         if dim_ranges.iter().skip(1).all(|r| Arc::ptr_eq(&dim_ranges[0], r)) {
             return true;
@@ -492,7 +539,7 @@ pub(crate) fn merge_consumer_ranges(
     }
 
     if !realize_axes.is_empty() {
-        warn!(realize_axes = ?realize_axes, "range conflict detected - marking axes for realization");
+        debug!(realize_axes = ?realize_axes, "range conflict detected - marking axes for realization");
         ctx.mark_realize(uop, realize_axes.clone());
     }
 
@@ -504,7 +551,7 @@ pub(crate) fn merge_consumer_ranges(
 #[instrument(skip_all)]
 fn assign_ranges(
     reverse_topo: &[Arc<UOp>],
-    consumer_map: &HashMap<UOpKey, Vec<Arc<UOp>>>,
+    consumer_map: &ConsumerMap,
     ctx: &mut IndexingContext,
 ) -> svod_ir::Result<()> {
     // Local variable for ending_ranges - only used within this function
@@ -530,7 +577,8 @@ fn assign_ranges(
 
         let _span = info_span!("assign_range", uop_id = x.id, op = x.op().as_ref()).entered();
 
-        let consumers: Vec<_> = consumer_map.get(&UOpKey(x.clone())).cloned().unwrap_or_default();
+        let consumers: Vec<Arc<UOp>> =
+            consumer_map.get(&UOpKey(x.clone())).into_iter().flatten().map(|c| Arc::clone(&c.0)).collect();
         let consumer_rngs: Vec<Vec<Arc<UOp>>> =
             consumers.iter().filter_map(|c| ctx.get_ranges(c).map(|(inp, _)| broadcast_ranges(c, x, inp))).collect();
 
@@ -554,6 +602,12 @@ fn assign_ranges(
                 consumer_ids = ?consumers.iter().map(|c| c.id).collect::<Vec<_>>(),
                 "ending_ranges: node inherits from consumers"
             );
+        }
+        // `ended` / `broadcast_ending_ranges` (indexing.py:221-223), plus the
+        // "fusion decision: REDUCE before the broadcast" row at :225.
+        let broadcast_ending = broadcast_ending_ranges(x, &consumers, ctx);
+        if matches!(x.op(), Op::Reduce { .. }) {
+            inherited_ending.extend(broadcast_ending.iter().cloned());
         }
         ending_ranges.insert(UOpKey(x.clone()), inherited_ending);
 
@@ -667,6 +721,11 @@ fn assign_ranges(
                 ending_ranges.insert(UOpKey(x.clone()), Vec::new());
             }
         }
+
+        // `ending_ranges[x] += broadcast_ending_ranges` (indexing.py:284): the
+        // ranges a consumer broadcasts this node over keep propagating to its
+        // producers even when the clears above emptied the inherited set.
+        ending_ranges.entry(UOpKey(x.clone())).or_default().extend(broadcast_ending);
 
         // NOW compute in_rngs from the FINAL out_rngs (after any realization updates)
         let in_rngs = match x.op() {
@@ -1221,29 +1280,6 @@ pub fn get_const_value(uop: &Arc<UOp>) -> Option<ConstValue> {
 /// Check if a UOp is a constant with a specific value.
 pub fn is_const(uop: &Arc<UOp>, value: &ConstValue) -> bool {
     get_const_value(uop).as_ref() == Some(value)
-}
-
-/// Check if a UOp represents a zero-size tensor.
-pub fn is_zero_size(uop: &Arc<UOp>) -> bool {
-    uop.shape().ok().flatten().map(|shape| shape.iter().any(|dim| matches!(dim, SInt::Const(0)))).unwrap_or(false)
-}
-
-/// Check if a dtype is void (used for side-effecting operations).
-pub fn is_void(dtype: &DType) -> bool {
-    *dtype == DType::Void
-}
-
-/// Get the binary operation from a UOp if it's a BINARY operation.
-pub fn get_binary_op(uop: &Arc<UOp>) -> Option<BinaryOp> {
-    match uop.op() {
-        Op::Binary(op, _, _) => Some(*op),
-        _ => None,
-    }
-}
-
-/// Check if a STAGE operation is for local memory.
-pub fn is_local_bufferize(uop: &Arc<UOp>) -> bool {
-    if let Op::Stage { opts, .. } = uop.op() { opts.addrspace == svod_ir::AddrSpace::Local } else { false }
 }
 
 // ============================================================================

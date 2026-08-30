@@ -440,7 +440,7 @@ pub fn pm_remove_bufferize() -> TypedPatternMatcher {
 /// 1. `src` is an always-run op or the Stage is non-removable
 ///    (multi-consumer realize boundary).
 /// 2. The compute touches more than 3 distinct GLOBAL Bufferizes / MStacks /
-///    Params (would expand kernel input pressure).
+///    Params / AFTER buffers (would expand kernel input pressure).
 /// 3. Any reduce body reads a buffer (would compound reads inside the loop).
 ///
 /// CONST range keys are skipped during substitution — they're broadcast slots,
@@ -478,6 +478,12 @@ fn remove_bufferize(
             return;
         }
         match uop.op() {
+            // AFTER is a buffer identity: it costs its own buffer, once, and the
+            // producers it orders against are not read by this compute.
+            Op::After { .. } => {
+                buffers.push(uop.buf_uop());
+                return;
+            }
             // STORE doesn't count, and we don't look inside it.
             Op::Store { .. } => return,
             // GLOBAL Stage and MStack count + stop traversal.
