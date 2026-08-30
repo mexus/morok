@@ -1172,6 +1172,61 @@ fn div_mod_recombine_matches_tinygrad(input: RecombineTerm, expected: RecombineT
     }
 }
 
+/// `(x + c)//d -> (x + c%d)//d + c//d` (`uop/divandmod.py:102-105`): "split the
+/// multiple of d out of the const, holds for any d!=0". `c` is split with the
+/// floor-semantics pair `(c.rem_euclid(d), c.div_euclid(d))` and upstream
+/// carries no sign guard, so a negative `c` and a numerator that crosses zero
+/// both fold. Every row checks the rewritten form and then the identity at
+/// every point of the numerator's range.
+#[test_case::test_case(0, 224, -15, 14, 13, -2 ; "negative const over the resnet conv index")]
+#[test_case::test_case(0, 10, 17, 5, 2, 3 ; "const larger than the divisor")]
+#[test_case::test_case(-10, 10, -1, 4, 3, -1 ; "numerator that crosses zero")]
+#[test_case::test_case(-5, 5, -15, 7, 6, -3 ; "negative const and a crossing numerator")]
+#[test_case::test_case(0, 10, -9, -4, -1, 2 ; "negative divisor")]
+#[test_case::test_case(0, 100, 28, 14, 0, 2 ; "const that is an exact multiple of the divisor")]
+fn const_offset_split_matches_tinygrad(x_min: i64, x_max: i64, c: i64, d: i64, rem: i64, quo: i64) {
+    assert_eq!(rem + quo * d, c, "row is not a valid (r, q) split of c");
+    let build = |lo, hi| {
+        let x = UOp::var("split_x", DType::WeakInt, lo, hi);
+        let split = x.add(&x.const_like(rem)).floor_div(&x.const_like(d)).add(&x.const_like(quo));
+        (x.add(&x.const_like(c)).floor_div(&x.const_like(d)), split)
+    };
+
+    let (input, expected) = build(x_min, x_max);
+    let RewriteResult::Rewritten(folded) =
+        crate::symbolic::patterns::range_based_mod_div_patterns().rewrite(&input, &mut ())
+    else {
+        panic!("const offset split did not fire for {}", input.tree());
+    };
+    assert!(Arc::ptr_eq(&folded, &expected), "got {}, want {}", folded.tree(), expected.tree());
+
+    for point in x_min..=x_max {
+        let (pinned_input, pinned_split) = build(point, point);
+        let evaluated = eval_closed_typed(&pinned_input);
+        assert!(evaluated.is_some(), "input did not evaluate at {point}");
+        assert_eq!(evaluated, eval_closed_typed(&pinned_split), "identity broken at {point}");
+    }
+}
+
+/// The rule declines exactly where upstream's `c.val%d.val==c.val` does: the
+/// const is already the reduced representative, so re-splitting would not
+/// terminate.
+#[test_case::test_case(0, 100, 3, 14 ; "const already reduced")]
+#[test_case::test_case(-10, 10, 0, 7 ; "zero const")]
+#[test_case::test_case(0, 10, -1, -4 ; "negative const already reduced for a negative divisor")]
+fn const_offset_split_declines_a_reduced_const(x_min: i64, x_max: i64, c: i64, d: i64) {
+    let x = UOp::var("split_x", DType::WeakInt, x_min, x_max);
+    let input = x.add(&x.const_like(c)).floor_div(&x.const_like(d));
+    assert!(
+        matches!(
+            crate::symbolic::patterns::range_based_mod_div_patterns().rewrite(&input, &mut ()),
+            RewriteResult::NoMatch
+        ),
+        "reduced const was split again: {}",
+        input.tree()
+    );
+}
+
 #[test]
 fn signed_floor_division_rewrites_keep_negative_cases_exact() {
     let i8_const = |value| UOp::const_(DType::Int8, ConstValue::Int(value));
