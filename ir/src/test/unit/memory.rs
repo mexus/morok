@@ -6,8 +6,10 @@ use svod_dtype::DeviceSpec;
 use crate::types::{AddrSpace, AxisId, AxisType, BufferizeOpts};
 use crate::{Op, UOp};
 
+/// GETADDR reads a buffer's device address: a plain scalar u64 with no address space of
+/// its own, carrying its device as typed metadata rather than as a source.
 #[test]
-fn getaddr_is_scalar_uint64_with_exact_storage_metadata() {
+fn getaddr_is_a_scalar_device_address() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let address = buffer.getaddr(None);
 
@@ -15,11 +17,6 @@ fn getaddr_is_scalar_uint64_with_exact_storage_metadata() {
     assert_eq!(address.shape().unwrap().unwrap().as_slice(), &[]);
     assert_eq!(address.addrspace(), None);
     assert!(address.tree().contains("GETADDR(CPU)"));
-    let graph = crate::CanonicalGraph::from_root("hcq", &address).unwrap();
-    let node = graph.nodes.last().unwrap();
-    assert_eq!(node.op, "GETADDR");
-    assert_eq!(node.src.len(), 1);
-    assert_eq!(node.arg, crate::CanonicalArg::Device { name: "CPU".to_string() });
     match address.op() {
         Op::GetAddr { src, device } => {
             assert!(std::sync::Arc::ptr_eq(src, &buffer));
@@ -28,56 +25,40 @@ fn getaddr_is_scalar_uint64_with_exact_storage_metadata() {
         }
         op => panic!("expected GETADDR, got {op:?}"),
     }
-}
 
-#[test]
-fn getaddr_hash_reconstruction_and_source_filter_match_target() {
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::UInt8);
-    let cpu = buffer.getaddr(None);
-    let cuda = buffer.getaddr(Some(DeviceSpec::Cuda { device_id: 0 }));
-    assert_ne!(cpu.id, cuda.id, "device argument participates in hash consing");
-    assert!(std::sync::Arc::ptr_eq(&cpu.with_sources(vec![buffer.clone()]), &cpu));
+    let graph = crate::CanonicalGraph::from_root("hcq", &address).unwrap();
+    let node = graph.nodes.last().unwrap();
+    assert_eq!(node.op, "GETADDR");
+    assert_eq!(node.src.len(), 1);
+    assert_eq!(node.arg, crate::CanonicalArg::Device { name: "CPU".to_string() });
 
+    assert_ne!(address.id, buffer.getaddr(Some(DeviceSpec::Cuda { device_id: 0 })).id, "device is part of identity");
+    assert!(std::sync::Arc::ptr_eq(&address.with_sources(vec![buffer]), &address));
+
+    // Already-scalar sources have no address to take.
     let scalar = UOp::native_const(1u64);
     assert!(std::sync::Arc::ptr_eq(&scalar.getaddr(Some(DeviceSpec::Cpu)), &scalar));
 }
 
 #[test]
-fn test_bufferize() {
+fn test_stage_records_ranges_and_address_space() {
     let compute = UOp::native_const(1.0f32);
     let r1 = UOp::range_axis(UOp::native_const(10i32), AxisId::Renumbered(0), AxisType::Loop);
     let r2 = UOp::range_axis(UOp::native_const(20i32), AxisId::Renumbered(1), AxisType::Loop);
 
-    let opts = BufferizeOpts::new(DeviceSpec::Cpu);
-    let stage = UOp::stage(compute.clone(), vec![r1, r2], opts);
+    let stage = UOp::stage(compute.clone(), vec![r1, r2], BufferizeOpts::new(DeviceSpec::Cpu));
+    assert_eq!(stage.dtype(), DType::Float32, "STAGE keeps the computed dtype");
+    let Op::Stage { compute: staged, ranges, opts } = stage.op() else {
+        panic!("expected STAGE, got {:?}", stage.op())
+    };
+    assert!(std::sync::Arc::ptr_eq(staged, &compute));
+    assert_eq!(ranges.len(), 2);
+    assert_eq!(opts.device, Some(DeviceSpec::Cpu));
+    assert_eq!(opts.addrspace, AddrSpace::Global);
 
-    // Should have same dtype as compute
-    assert_eq!(stage.dtype(), DType::Float32);
-
-    // Should be Stage op
-    if let Op::Stage { compute: c, ranges, opts: o } = stage.op() {
-        assert!(std::sync::Arc::ptr_eq(c, &compute));
-        assert_eq!(ranges.len(), 2);
-        assert_eq!(o.device, Some(DeviceSpec::Cpu));
-        assert_eq!(o.addrspace, AddrSpace::Global);
-    } else {
-        panic!("Expected Stage op");
-    }
-}
-
-#[test]
-fn test_bufferize_local() {
-    let compute = UOp::native_const(1.0f32);
-    let r = UOp::range_axis(UOp::native_const(10i32), AxisId::Renumbered(0), AxisType::Loop);
-
-    let opts = BufferizeOpts::local();
-    let stage = UOp::stage(compute, vec![r], opts);
-
-    if let Op::Stage { opts: o, .. } = stage.op() {
-        assert_eq!(o.addrspace, AddrSpace::Local);
-    } else {
-        panic!("Expected Stage op");
-    }
+    let local = UOp::stage(compute, vec![], BufferizeOpts::local());
+    let Op::Stage { opts, .. } = local.op() else { panic!("expected STAGE, got {:?}", local.op()) };
+    assert_eq!(opts.addrspace, AddrSpace::Local);
 }
 
 #[test]
@@ -87,16 +68,14 @@ fn test_load() {
     let index = UOp::index().buffer(buffer.clone()).indices(vec![offset]).call().unwrap();
 
     let load = UOp::load().index(index.clone()).call();
+    let gated = UOp::load().index(index.clone()).alt(UOp::native_const(0.0f32)).gate(UOp::native_const(true)).call();
 
-    // Should have same dtype as buffer
-    assert_eq!(load.dtype(), DType::Float32);
-
-    // Should be Load op
-    if let Op::Load { index: i, .. } = load.op() {
-        assert!(std::sync::Arc::ptr_eq(i, &index));
-    } else {
-        panic!("Expected Load op");
+    assert_eq!(load.dtype(), DType::Float32, "LOAD has the buffer's dtype");
+    match load.op() {
+        Op::Load { index: i, alt: None, gate: None } => assert!(std::sync::Arc::ptr_eq(i, &index)),
+        op => panic!("expected an ungated Load, got {op:?}"),
     }
+    assert!(matches!(gated.op(), Op::Load { alt: Some(_), gate: Some(_), .. }));
 }
 
 #[test]
@@ -143,18 +122,14 @@ fn test_codegen_param() {
     }
 }
 
+/// INDEX and LOAD take the buffer's scalar element dtype; a shaped index contributes a
+/// shape, never lanes in the dtype.
 #[test]
-fn test_index_infers_buffer_dtype() {
+fn test_index_and_load_keep_scalar_element_dtype() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 16, DType::Float32);
-    let offset = UOp::index_const(0);
+    let scalar = UOp::index().buffer(buffer.clone()).indices(vec![UOp::index_const(0)]).call().unwrap();
+    assert_eq!(scalar.dtype(), DType::Float32);
 
-    let inferred = UOp::index().buffer(buffer).indices(vec![offset]).call().unwrap();
-    assert_eq!(inferred.dtype(), DType::Float32);
-}
-
-#[test]
-fn test_shaped_index_and_load_keep_scalar_element_dtype() {
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 16, DType::Float32);
     let offsets = UOp::stack(smallvec::smallvec![UOp::index_const(0), UOp::index_const(1)]);
     let index = UOp::index().buffer(buffer).indices(vec![offsets]).call().unwrap();
     let load = UOp::load().index(index.clone()).call();

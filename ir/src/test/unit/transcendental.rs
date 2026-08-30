@@ -12,26 +12,24 @@ fn rewrite_transcendental(op: UnaryOp, supported: RendererOps, force: bool) -> s
     graph_rewrite(&get_transcendental_patterns(&supported, force), root, &mut ())
 }
 
+/// A transcendental survives lowering exactly when the renderer supports it and the force
+/// threshold is off; otherwise it is decomposed away entirely.
 #[test]
-fn supported_transcendentals_stay_native() {
+fn transcendentals_are_decomposed_unless_natively_supported() {
     for op in [UnaryOp::Exp2, UnaryOp::Log2, UnaryOp::Sin, UnaryOp::Sqrt] {
-        let result = rewrite_transcendental(op, RendererOps::all(), false);
-        assert!(matches!(result.op(), Op::Unary(found, _) if *found == op));
-    }
-}
+        let native = rewrite_transcendental(op, RendererOps::all(), false);
+        assert!(matches!(native.op(), Op::Unary(found, _) if *found == op), "{op:?} is supported");
 
-#[test]
-fn unsupported_transcendentals_are_decomposed() {
-    for op in [UnaryOp::Exp2, UnaryOp::Log2, UnaryOp::Sin, UnaryOp::Sqrt] {
-        let result = rewrite_transcendental(op, RendererOps::default(), false);
-        assert!(!result.toposort().iter().any(|node| matches!(node.op(), Op::Unary(found, _) if *found == op)));
+        for lowered in [
+            rewrite_transcendental(op, RendererOps::default(), false),
+            rewrite_transcendental(op, RendererOps::all(), true),
+        ] {
+            assert!(
+                !lowered.toposort().iter().any(|node| matches!(node.op(), Op::Unary(found, _) if *found == op)),
+                "{op:?} must be decomposed"
+            );
+        }
     }
-}
-
-#[test]
-fn force_threshold_decomposes_supported_transcendentals() {
-    let result = rewrite_transcendental(UnaryOp::Exp2, RendererOps::all(), true);
-    assert!(!result.toposort().iter().any(|node| matches!(node.op(), Op::Unary(UnaryOp::Exp2, _))));
 }
 
 // =========================================================================

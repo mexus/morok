@@ -108,13 +108,20 @@ fn function_shape_reports_missing_mismatch_and_unsupported_actuals() {
         Err(Error::CallArgDTypeMismatch { arg_index: 0, .. })
     ));
 
-    let free = UOp::variable("free".into(), 1, 8, DType::WeakInt);
-    let free_shape = smallvec![SInt::Symbolic(free)];
-    let void_actual = UOp::sink(vec![]);
+    // A free variable in a formal shape reads slot -1, i.e. the last actual; a void actual
+    // there has no shape to substitute.
+    let free_shape = smallvec![SInt::Symbolic(UOp::variable("free".into(), 1, 8, DType::WeakInt))];
+    let no_outputs = UOp::tuple(smallvec![]);
     assert!(matches!(
-        crate::shape::substitute_selected_shape(&free_shape, &UOp::tuple(smallvec![]), &[void_actual]),
+        crate::shape::substitute_selected_shape(&free_shape, &no_outputs, &[UOp::sink(vec![])]),
         Err(Error::CallShapeSubstitutionUnsupported { slot: -1, .. })
     ));
+
+    let actual = UOp::define_var("actual".into(), 1, 8);
+    let substituted =
+        crate::shape::substitute_selected_shape(&free_shape, &no_outputs, &[UOp::native_const(0i32), actual.clone()])
+            .unwrap();
+    assert_eq!(substituted.as_slice(), &[SInt::Symbolic(actual)]);
 }
 
 #[test]
@@ -143,21 +150,6 @@ fn selected_fixed_output_ignores_missing_formal_in_other_output() {
         function.try_gettuple(1).unwrap().shape(),
         Err(Error::CallFormalSlotMissing { slot: 3, arg_count: 1 })
     ));
-}
-
-#[test]
-fn selected_shape_slot_minus_one_uses_last_actual() {
-    let free = UOp::variable("free".into(), 1, 8, DType::WeakInt);
-    let shape = smallvec![SInt::Symbolic(free)];
-    let actual = UOp::define_var("actual".into(), 1, 8);
-    let substituted = crate::shape::substitute_selected_shape(
-        &shape,
-        &UOp::tuple(smallvec![]),
-        &[UOp::native_const(0i32), actual.clone()],
-    )
-    .unwrap();
-
-    assert_eq!(substituted.as_slice(), &[SInt::Symbolic(actual)]);
 }
 
 #[test]

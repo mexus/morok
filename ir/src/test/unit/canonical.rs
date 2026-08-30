@@ -15,38 +15,29 @@ fn graph_json() -> String {
     CanonicalGraph::from_root("tensor", &sub).unwrap().to_pretty_json().unwrap()
 }
 
-#[test]
-fn ins_survives_hash_canonical_and_tree() {
-    let source = UOp::const_(DType::Int32, ConstValue::Int(7));
-    let first = UOp::ins(
-        [source.clone()],
-        DType::Int32,
-        InsArg::with_attributes("mock.mov", vec![("z".into(), "2".into()), ("a".into(), "1".into())]),
-    );
-    let second = UOp::ins(
-        [source],
-        DType::Int32,
-        InsArg::with_attributes("mock.mov", vec![("a".into(), "1".into()), ("z".into(), "2".into())]),
-    );
-    assert!(std::sync::Arc::ptr_eq(&first, &second), "INS metadata participates deterministically in hash consing");
-
-    let graph = CanonicalGraph::from_root("isa", &first).unwrap();
-    assert_eq!(graph.nodes.last().unwrap().op, "INS");
-    assert!(matches!(
-        &graph.nodes.last().unwrap().arg,
-        CanonicalArg::Ins { opcode, attributes }
-            if opcode == "mock.mov" && attributes == &vec![("a".into(), "1".into()), ("z".into(), "2".into())]
-    ));
-    assert!(first.tree().contains("INS(mock.mov)"));
+fn range_arg(axis: AxisId, axis_type: AxisType) -> CanonicalArg {
+    let range = UOp::range_axis(UOp::index_const(8), axis, axis_type);
+    CanonicalGraph::from_root("kernel_ast", &range).unwrap().nodes.last().unwrap().arg.clone()
 }
 
+// =========================================================================
+// Graph shape and stability
+// =========================================================================
+
+/// The oracle is a pure function of graph content: interning ids never leak into it,
+/// and it parses as ordinary JSON at the pinned schema version.
 #[test]
-fn canonical_graph_is_independent_of_runtime_ids() {
+fn canonical_json_is_stable_generic_json_free_of_runtime_ids() {
     let first = graph_json();
     gc_dead_refs();
     let second = graph_json();
     assert_eq!(first, second);
     assert!(!first.contains("runtime_id"));
+
+    let parsed: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(parsed["schema_version"], 6);
+    assert_eq!(parsed["stage"], "tensor");
+    assert_eq!(parsed["nodes"][2]["op"], "SUB");
 }
 
 #[test]
@@ -63,12 +54,14 @@ fn canonical_verbose_mode_is_explicit_and_not_in_default_oracle() {
     assert!(diagnostics[0].backend_dtype.contains("Int32"));
 }
 
+/// Shared subgraphs are emitted once and referenced by index, in source order, whether
+/// the sharing is within one root or across several roots.
 #[test]
 fn canonical_graph_preserves_dag_sharing_and_source_order() {
     let shared = UOp::const_(DType::Int32, ConstValue::Int(3));
     let rhs = UOp::const_(DType::Int32, ConstValue::Int(1));
     let sub = UOp::new(Op::Binary(BinaryOp::Sub, shared.clone(), rhs), DType::Int32);
-    let root = UOp::new(Op::Binary(BinaryOp::Add, sub, shared), DType::Int32);
+    let root = UOp::new(Op::Binary(BinaryOp::Add, sub, shared.clone()), DType::Int32);
     let graph = CanonicalGraph::from_root("tensor", &root).unwrap();
 
     assert_eq!(graph.nodes.len(), 4);
@@ -76,7 +69,106 @@ fn canonical_graph_preserves_dag_sharing_and_source_order() {
     assert_eq!(graph.nodes[2].op, "SUB");
     assert_eq!(graph.nodes[2].src, vec![0, 1]);
     assert_eq!(graph.nodes[3].src, vec![2, 0]);
+
+    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let lhs = UOp::new(Op::Binary(BinaryOp::Add, one.clone(), one.clone()), DType::Int32);
+    let rhs = UOp::new(Op::Binary(BinaryOp::Mul, one.clone(), one), DType::Int32);
+    let graph = CanonicalGraph::from_roots("scheduled", &[lhs, rhs]).unwrap();
+
+    assert_eq!(graph.roots, vec![1, 2]);
+    assert_eq!(graph.nodes.len(), 3);
+    assert_eq!(graph.nodes[1].src, vec![0, 0]);
+    assert_eq!(graph.nodes[2].src, vec![0, 0]);
 }
+
+#[test]
+fn canonical_symbolic_shape_never_serializes_null() {
+    let variable = UOp::variable("n".into(), 1, 16, DType::Int32);
+    let source = UOp::param(0, 16, DType::Float32, None);
+    let shape = crate::shape::Shape::from_iter([crate::SInt::Symbolic(variable)]);
+    let reshaped = source.try_reshape(&shape).unwrap();
+    let json = CanonicalGraph::from_root("shape", &reshaped).unwrap().to_pretty_json().unwrap();
+    assert!(json.contains("\"kind\": \"symbolic\""));
+    assert!(!json.contains("\"node\": null"));
+}
+
+/// Identity-only and type-erased metadata has no content-addressable form, so the strict
+/// oracle refuses it; verbose mode records a length and a content hash instead.
+#[test]
+fn canonical_rejects_identity_and_type_erased_metadata() {
+    let call = UOp::native_const(1.0f32)
+        .function(smallvec::smallvec![], CallInfo { grad_tag: Some("unstable".into()), ..Default::default() });
+    let roots = [
+        UOp::buffer_id(Some(7)),
+        UOp::lunique(Some(9)),
+        UOp::source("source".into()),
+        UOp::binary(vec![1, 2, 3]),
+        call,
+    ];
+    for root in roots {
+        assert!(matches!(CanonicalGraph::from_root("strict", &root), Err(crate::Error::CanonicalSerialization { .. })));
+    }
+
+    let verbose = CanonicalGraph::from_root_verbose("strict", &UOp::binary(vec![1, 2, 3])).unwrap();
+    assert!(matches!(verbose.nodes[0].arg, CanonicalArg::Binary { length: 3 }));
+    assert!(verbose.verbose.unwrap()[0].content_xxh64.is_some());
+}
+
+// =========================================================================
+// DTypes and constants
+// =========================================================================
+
+#[test]
+fn canonical_float_constants_use_committed_semantic_bits() {
+    let f64_negative_zero = UOp::const_(DType::Float64, ConstValue::Float(-0.0));
+    let half = UOp::const_(DType::Float16, ConstValue::Float(1.0 / 123_008.0));
+    let fp8 = UOp::vconst(vec![ConstValue::Float(1.0625), ConstValue::Float(-3.2)], DType::FP8E4M3);
+    let graph = CanonicalGraph::from_roots("tensor", &[f64_negative_zero, half, fp8]).unwrap();
+
+    assert_eq!(
+        graph.nodes[0].arg,
+        CanonicalArg::Const { value: CanonicalConst::Float { bits: "0x8000000000000000".to_string() } }
+    );
+    assert_eq!(
+        graph.nodes[1].arg,
+        CanonicalArg::Const { value: CanonicalConst::Float { bits: "0x3ee1000000000000".to_string() } }
+    );
+    assert_eq!(
+        graph.nodes[2].arg,
+        CanonicalArg::Constants {
+            values: vec![
+                CanonicalConst::Float { bits: "0x3ff0000000000000".to_string() },
+                CanonicalConst::Float { bits: "0xc00a000000000000".to_string() },
+            ]
+        }
+    );
+}
+
+#[test]
+fn canonical_graph_preserves_vector_pointer_image_and_fnuz_dtype_metadata() {
+    let vector = UOp::new(Op::Noop, DType::Float16.vec(4).unwrap());
+    let pointer = UOp::new(Op::Noop, DType::Float32.ptr(Some(64), AddrSpace::Local).unwrap());
+    let image = UOp::new(Op::Noop, DType::Image { kind: ImageKind::Half, shape: vec![8, 16, 4] });
+    let fnuz = UOp::const_(DType::FP8E4M3FNUZ, ConstValue::Float(1.0));
+    let graph = CanonicalGraph::from_roots("dtype", &[vector, pointer, image, fnuz]).unwrap();
+
+    assert_eq!(graph.nodes[0].dtype, CanonicalDType::Vector { scalar: "float16".into(), count: 4 });
+    assert_eq!(
+        graph.nodes[1].dtype,
+        CanonicalDType::Pointer {
+            base: Box::new(CanonicalDType::Scalar { name: "float32".into() }),
+            address_space: "local".into(),
+            size: Some(64),
+            count: 1,
+        }
+    );
+    assert_eq!(graph.nodes[2].dtype, CanonicalDType::Image { image_kind: "half".into(), shape: vec![8, 16, 4] });
+    assert_eq!(graph.nodes[3].dtype, CanonicalDType::Scalar { name: "fp8e4m3fnuz".to_string() });
+}
+
+// =========================================================================
+// Params, buffers, ranges
+// =========================================================================
 
 #[test]
 fn canonical_graph_records_structured_param_and_shape_source() {
@@ -102,25 +194,22 @@ fn canonical_graph_records_structured_param_and_shape_source() {
     );
 }
 
+/// An authored high-bit slot is content, so it survives every stage; only the slot of a
+/// buffer explicitly tagged schedule-local is stripped back to its namespace-free form.
 #[test]
-fn canonical_buffer_preserves_authored_high_bit_slot_at_every_stage() {
+fn canonical_buffer_slots_are_stripped_only_when_marked_schedule_local() {
     let slot = (1usize << (usize::BITS - 1)) | 17;
     let buffer = UOp::buffer(slot, 4, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu));
-
     for stage in ["tensor", "kernel_ast", "scheduled"] {
         let graph = CanonicalGraph::from_root(stage, &buffer).unwrap();
         assert!(
-            matches!(graph.nodes.last().unwrap().arg, CanonicalArg::Param { slot: actual, .. } if actual == slot as i128)
+            matches!(graph.nodes.last().unwrap().arg, CanonicalArg::Param { slot: actual, .. } if actual == slot as i128),
+            "{stage}"
         );
     }
-}
 
-#[test]
-fn canonical_buffer_strips_only_marked_schedule_local_slot_namespace() {
-    let slot = (1usize << (usize::BITS - 1)) | 17;
-    let buffer = UOp::buffer(slot, 4, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu))
-        .with_tag(smallvec::smallvec![crate::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER]);
-    let graph = CanonicalGraph::from_root("kernel_ast", &buffer).unwrap();
+    let marked = buffer.with_tag(smallvec::smallvec![crate::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER]);
+    let graph = CanonicalGraph::from_root("kernel_ast", &marked).unwrap();
     assert!(matches!(graph.nodes.last().unwrap().arg, CanonicalArg::Param { slot: 17, .. }));
 }
 
@@ -139,27 +228,32 @@ fn canonical_range_and_special_record_explicit_dtype_and_direct_extent() {
     assert_eq!(special.src, vec![0]);
 }
 
+/// The whole axis path is content, grouped-reduce-loop suffix included.
 #[test]
-fn canonical_weak_range_uses_weak_axis_name() {
-    let range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Weak);
-    let graph = CanonicalGraph::from_root("kernel_ast", &range).unwrap();
-    assert_eq!(
-        graph.nodes.last().unwrap().arg,
-        CanonicalArg::Range { axis: vec![0], renumbered: true, axis_type: "WEAK".to_string() }
-    );
+fn canonical_range_records_axis_path_and_type() {
+    for (axis, axis_type, expected) in [
+        (
+            AxisId::Renumbered(0),
+            AxisType::Weak,
+            CanonicalArg::Range { axis: vec![0], renumbered: true, axis_type: "WEAK".to_string() },
+        ),
+        (
+            AxisId::Renumbered(4).child(1).child(0),
+            AxisType::Reduce,
+            CanonicalArg::Range { axis: vec![4, 1, 0], renumbered: true, axis_type: "REDUCE".to_string() },
+        ),
+        (
+            AxisId::Renumbered(4).child(1).group_reduce_loop(),
+            AxisType::Reduce,
+            CanonicalArg::Range { axis: vec![4, 1, 2], renumbered: true, axis_type: "REDUCE".to_string() },
+        ),
+    ] {
+        assert_eq!(range_arg(axis, axis_type), expected);
+    }
 }
 
-#[test]
-fn canonical_range_preserves_nested_axis_path() {
-    let axis = AxisId::Renumbered(4).child(1).child(0);
-    let range = UOp::range_axis(UOp::index_const(8), axis, AxisType::Reduce);
-    let graph = CanonicalGraph::from_root("kernel_ast", &range).unwrap();
-    assert_eq!(
-        graph.nodes.last().unwrap().arg,
-        CanonicalArg::Range { axis: vec![4, 1, 0], renumbered: true, axis_type: "REDUCE".to_string() }
-    );
-}
-
+/// `Unrenumbered(n)` and a one-element `UnrenumberedPath` denote the same axis, so Eq, Ord
+/// and Hash must all agree; the renumbered/unrenumbered namespaces stay disjoint.
 #[test]
 fn axis_id_equality_ordering_and_hash_agree() {
     use std::hash::{BuildHasher, RandomState};
@@ -174,17 +268,6 @@ fn axis_id_equality_ordering_and_hash_agree() {
     }
     assert_ne!(AxisId::Unrenumbered(3), AxisId::Renumbered(3));
     assert_ne!(AxisId::Unrenumbered(3), AxisId::UnrenumberedPath(smallvec::smallvec![3, 0]));
-}
-
-#[test]
-fn canonical_range_preserves_grouped_reduce_loop_path() {
-    let axis = AxisId::Renumbered(4).child(1).group_reduce_loop();
-    let range = UOp::range_axis(UOp::index_const(8), axis, AxisType::Reduce);
-    let graph = CanonicalGraph::from_root("kernel_ast", &range).unwrap();
-    assert_eq!(
-        graph.nodes.last().unwrap().arg,
-        CanonicalArg::Range { axis: vec![4, 1, 2], renumbered: true, axis_type: "REDUCE".to_string() }
-    );
 }
 
 #[test]
@@ -215,61 +298,33 @@ fn grouped_stage_axis_survives_hash_canonical_serde_and_tree() {
 }
 
 #[test]
-fn canonical_float_uses_exact_bits() {
-    let constant = UOp::const_(DType::Float64, ConstValue::Float(-0.0));
-    let graph = CanonicalGraph::from_root("tensor", &constant).unwrap();
-    assert_eq!(
-        graph.nodes[0].arg,
-        CanonicalArg::Const { value: CanonicalConst::Float { bits: "0x8000000000000000".to_string() } }
+fn ins_survives_hash_canonical_and_tree() {
+    let source = UOp::const_(DType::Int32, ConstValue::Int(7));
+    let first = UOp::ins(
+        [source.clone()],
+        DType::Int32,
+        InsArg::with_attributes("mock.mov", vec![("z".into(), "2".into()), ("a".into(), "1".into())]),
     );
+    let second = UOp::ins(
+        [source],
+        DType::Int32,
+        InsArg::with_attributes("mock.mov", vec![("a".into(), "1".into()), ("z".into(), "2".into())]),
+    );
+    assert!(std::sync::Arc::ptr_eq(&first, &second), "INS metadata participates deterministically in hash consing");
+
+    let graph = CanonicalGraph::from_root("isa", &first).unwrap();
+    assert_eq!(graph.nodes.last().unwrap().op, "INS");
+    assert!(matches!(
+        &graph.nodes.last().unwrap().arg,
+        CanonicalArg::Ins { opcode, attributes }
+            if opcode == "mock.mov" && attributes == &vec![("a".into(), "1".into()), ("z".into(), "2".into())]
+    ));
+    assert!(first.tree().contains("INS(mock.mov)"));
 }
 
-#[test]
-fn canonical_reduced_float_uses_committed_semantic_bits() {
-    let half = UOp::const_(DType::Float16, ConstValue::Float(1.0 / 123_008.0));
-    let fp8 = UOp::vconst(vec![ConstValue::Float(1.0625), ConstValue::Float(-3.2)], DType::FP8E4M3);
-    let graph = CanonicalGraph::from_roots("tensor", &[half, fp8]).unwrap();
-    assert_eq!(
-        graph.nodes[0].arg,
-        CanonicalArg::Const { value: CanonicalConst::Float { bits: "0x3ee1000000000000".to_string() } }
-    );
-    assert_eq!(
-        graph.nodes[1].arg,
-        CanonicalArg::Constants {
-            values: vec![
-                CanonicalConst::Float { bits: "0x3ff0000000000000".to_string() },
-                CanonicalConst::Float { bits: "0xc00a000000000000".to_string() },
-            ]
-        }
-    );
-}
-
-#[test]
-fn canonical_graph_preserves_fnuz_dtype_identity() {
-    let constant = UOp::const_(DType::FP8E4M3FNUZ, ConstValue::Float(1.0));
-    let graph = CanonicalGraph::from_root("tensor", &constant).unwrap();
-    assert_eq!(graph.nodes[0].dtype, CanonicalDType::Scalar { name: "fp8e4m3fnuz".to_string() });
-}
-
-#[test]
-fn canonical_graph_preserves_vector_pointer_and_image_dtype_metadata() {
-    let vector = UOp::new(Op::Noop, DType::Float16.vec(4).unwrap());
-    let pointer = UOp::new(Op::Noop, DType::Float32.ptr(Some(64), AddrSpace::Local).unwrap());
-    let image = UOp::new(Op::Noop, DType::Image { kind: ImageKind::Half, shape: vec![8, 16, 4] });
-    let graph = CanonicalGraph::from_roots("dtype", &[vector, pointer, image]).unwrap();
-
-    assert_eq!(graph.nodes[0].dtype, CanonicalDType::Vector { scalar: "float16".into(), count: 4 });
-    assert_eq!(
-        graph.nodes[1].dtype,
-        CanonicalDType::Pointer {
-            base: Box::new(CanonicalDType::Scalar { name: "float32".into() }),
-            address_space: "local".into(),
-            size: Some(64),
-            count: 1,
-        }
-    );
-    assert_eq!(graph.nodes[2].dtype, CanonicalDType::Image { image_kind: "half".into(), shape: vec![8, 16, 4] });
-}
+// =========================================================================
+// Typed op metadata
+// =========================================================================
 
 #[test]
 fn canonical_call_sink_and_allreduce_metadata_are_typed() {
@@ -397,6 +452,8 @@ fn canonical_program_info_preserves_launch_and_abi_metadata() {
     ));
 }
 
+/// A symbolic launch bound is a real node in the topology, emitted before the PROGRAM
+/// that references it, and shared with the `vars` list rather than duplicated.
 #[test]
 fn canonical_program_metadata_nodes_are_added_to_topology() {
     let variable = UOp::variable("n".into(), 1, 16, DType::Int32);
@@ -419,45 +476,22 @@ fn canonical_program_metadata_nodes_are_added_to_topology() {
     assert!(node < program.id);
 }
 
-#[test]
-fn canonical_symbolic_shape_never_serializes_null() {
-    let variable = UOp::variable("n".into(), 1, 16, DType::Int32);
-    let source = UOp::param(0, 16, DType::Float32, None);
-    let shape = crate::shape::Shape::from_iter([crate::SInt::Symbolic(variable)]);
-    let reshaped = source.try_reshape(&shape).unwrap();
-    let json = CanonicalGraph::from_root("shape", &reshaped).unwrap().to_pretty_json().unwrap();
-    assert!(json.contains("\"kind\": \"symbolic\""));
-    assert!(!json.contains("\"node\": null"));
-}
+// =========================================================================
+// Tinygrad source layouts
+// =========================================================================
 
-#[test]
-fn canonical_rejects_identity_and_non_verbose_binary_metadata() {
-    for root in
-        [UOp::buffer_id(Some(7)), UOp::lunique(Some(9)), UOp::source("source".into()), UOp::binary(vec![1, 2, 3])]
-    {
-        assert!(matches!(CanonicalGraph::from_root("strict", &root), Err(crate::Error::CanonicalSerialization { .. })));
-    }
-    let verbose = CanonicalGraph::from_root_verbose("strict", &UOp::binary(vec![1, 2, 3])).unwrap();
-    assert!(matches!(verbose.nodes[0].arg, CanonicalArg::Binary { length: 3 }));
-    assert!(verbose.verbose.unwrap()[0].content_xxh64.is_some());
-}
-
-#[test]
-fn canonical_rejects_svod_only_call_metadata() {
-    let call = UOp::native_const(1.0f32)
-        .function(smallvec::smallvec![], CallInfo { grad_tag: Some("unstable".into()), ..Default::default() });
-    assert!(matches!(CanonicalGraph::from_root("call", &call), Err(crate::Error::CanonicalSerialization { .. })));
-}
-
+/// STACK is tinygrad's VECTORIZE: scalar dtype, lane count as a shape, sources in order,
+/// at every stage.
 #[test]
 fn canonical_stack_has_scalar_dtype_shape_and_ordered_sources() {
     let stack = UOp::stack(smallvec::smallvec![UOp::native_const(1i32), UOp::native_const(2i32)]);
-    let graph = CanonicalGraph::from_root("tensor", &stack).unwrap();
-
-    assert_eq!(graph.nodes[2].op, "STACK");
-    assert_eq!(graph.nodes[2].dtype, CanonicalDType::Scalar { name: "int32".to_string() });
-    assert_eq!(graph.nodes[2].shape, Some(vec![CanonicalShapeDim::Const { value: 2 }]));
-    assert_eq!(graph.nodes[2].src, vec![0, 1]);
+    for stage in ["tensor", "kernel_ast"] {
+        let graph = CanonicalGraph::from_root(stage, &stack).unwrap();
+        assert_eq!(graph.nodes[2].op, "STACK", "{stage}");
+        assert_eq!(graph.nodes[2].dtype, CanonicalDType::Scalar { name: "int32".to_string() }, "{stage}");
+        assert_eq!(graph.nodes[2].shape, Some(vec![CanonicalShapeDim::Const { value: 2 }]), "{stage}");
+        assert_eq!(graph.nodes[2].src, vec![0, 1], "{stage}");
+    }
 }
 
 #[test]
@@ -476,87 +510,42 @@ fn canonical_pad_uses_logical_begin_end_metadata() {
     assert_eq!(pad.shape, Some(vec![CanonicalShapeDim::Const { value: 6 }]));
 }
 
+/// LOAD/STORE take their address from INDEX alone — no redundant buffer source, and the
+/// validity gate stays on INDEX until late gating moves it into the memory op's tail.
 #[test]
-fn canonical_vectorize_maps_to_tinygrad_stack() {
-    let stack = UOp::stack(smallvec::smallvec![UOp::native_const(1i32), UOp::native_const(2i32)]);
-    let graph = CanonicalGraph::from_root("kernel_ast", &stack).unwrap();
-
-    assert_eq!(graph.nodes[2].op, "STACK");
-    assert_eq!(graph.nodes[2].dtype, CanonicalDType::Scalar { name: "int32".to_string() });
-    assert_eq!(graph.nodes[2].shape, Some(vec![CanonicalShapeDim::Const { value: 2 }]));
-}
-
-#[test]
-fn canonical_multiple_roots_are_ordered_and_deduplicated() {
-    let shared = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let lhs = UOp::new(Op::Binary(BinaryOp::Add, shared.clone(), shared.clone()), DType::Int32);
-    let rhs = UOp::new(Op::Binary(BinaryOp::Mul, shared.clone(), shared), DType::Int32);
-    let graph = CanonicalGraph::from_roots("scheduled", &[lhs, rhs]).unwrap();
-
-    assert_eq!(graph.roots, vec![1, 2]);
-    assert_eq!(graph.nodes.len(), 3);
-    assert_eq!(graph.nodes[1].src, vec![0, 0]);
-    assert_eq!(graph.nodes[2].src, vec![0, 0]);
-}
-
-#[test]
-fn canonical_scalar_load_sources_follow_direct_tinygrad_layout() {
+fn canonical_memory_sources_follow_direct_tinygrad_layout() {
     let param = UOp::param(0, 16, DType::Float32, None);
-    let index = UOp::index().buffer(param).indices(vec![UOp::index_const(3)]).call().unwrap();
-    let load = UOp::load().index(index).call();
-    let graph = CanonicalGraph::from_root("tensor", &load).unwrap();
-
+    let index = UOp::index().buffer(param.clone()).indices(vec![UOp::index_const(3)]).call().unwrap();
+    let graph = CanonicalGraph::from_root("tensor", &UOp::load().index(index).call()).unwrap();
     let index_node = graph.nodes.iter().find(|node| node.op == "INDEX").unwrap();
     let load_node = graph.nodes.iter().find(|node| node.op == "LOAD").unwrap();
-
     assert_eq!(index_node.src.len(), 2, "INDEX sources are param and scalar index");
     assert_eq!(load_node.src, vec![index_node.id], "LOAD has no redundant buffer source");
-}
 
-#[test]
-fn canonical_valid_load_sources_follow_direct_tinygrad_layout() {
-    let param = UOp::param(0, 16, DType::Float32, None);
     let offset = UOp::index_const(3);
     let gate = offset.lt(&UOp::index_const(5));
-    let index = UOp::index().buffer(param).indices(vec![offset.valid(gate)]).call().unwrap();
-    let load = UOp::load().index(index).call();
-    let graph = CanonicalGraph::from_root("tensor", &load).unwrap();
-
+    let valid = UOp::index().buffer(param).indices(vec![offset.valid(gate)]).call().unwrap();
+    let graph = CanonicalGraph::from_root("tensor", &UOp::load().index(valid).call()).unwrap();
     let where_id = graph.nodes.iter().position(|node| node.op == "WHERE").unwrap();
     let index_node = graph.nodes.iter().find(|node| node.op == "INDEX").unwrap();
     let load_node = graph.nodes.iter().find(|node| node.op == "LOAD").unwrap();
-
     assert_eq!(index_node.src.len(), 2, "INDEX sources are param and validity-bearing index");
     assert_eq!(index_node.src[1], where_id);
     assert_eq!(load_node.src, vec![index_node.id], "validity remains on INDEX before late gating");
-}
 
-#[test]
-fn canonical_late_gated_memory_sources_follow_direct_tinygrad_layout() {
     let param = UOp::param(0, 4, DType::Float32, None);
     let index = UOp::index().buffer(param).indices(vec![UOp::index_const(0)]).call().unwrap();
     let gate = UOp::native_const(true);
     let load = UOp::load().index(index.clone()).alt(UOp::native_const(0.0f32)).gate(gate.clone()).call();
     let store = index.store_gated(UOp::native_const(1.0f32), gate);
     let graph = CanonicalGraph::from_roots("kernel_ast", &[load, store]).unwrap();
-
     let index_id = graph.nodes.iter().position(|node| node.op == "INDEX").unwrap();
     let load_node = graph.nodes.iter().find(|node| node.op == "LOAD").unwrap();
     let store_node = graph.nodes.iter().find(|node| node.op == "STORE").unwrap();
-
-    assert_eq!(load_node.src[0], index_id);
     assert_eq!(load_node.src.len(), 3, "LOAD sources are index, alt, gate");
-    assert_eq!(store_node.src[0], index_id);
+    assert_eq!(load_node.src[0], index_id);
     assert_eq!(store_node.src.len(), 3, "STORE sources are index, value, gate");
-}
-
-#[test]
-fn canonical_json_round_trips_as_generic_json() {
-    let serialized = graph_json();
-    let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-    assert_eq!(parsed["schema_version"], 6);
-    assert_eq!(parsed["stage"], "tensor");
-    assert_eq!(parsed["nodes"][2]["op"], "SUB");
+    assert_eq!(store_node.src[0], index_id);
 }
 
 #[test]
@@ -572,33 +561,28 @@ fn canonical_copy_stores_device_as_metadata_not_source() {
     assert!(graph.nodes.iter().all(|node| node.op != "DEVICE"));
 }
 
-#[test]
-fn canonical_reduce_records_leading_shaped_axis_count() {
-    let src = UOp::stack(smallvec::smallvec![UOp::native_const(1.0f32), UOp::native_const(2.0f32)]);
-    let reduce = src.reduce_with_num_axes(smallvec::smallvec![], ReduceOp::Add, 1);
-    let graph = CanonicalGraph::from_root("kernel_ast", &reduce).unwrap();
-    let node = graph.nodes.iter().find(|node| node.op == "REDUCE").unwrap();
+// =========================================================================
+// Reduce
+// =========================================================================
 
-    assert_eq!(node.arg, CanonicalArg::Reduce { op: "ADD".to_string(), axes: None, num_axes: Some(1) });
-    assert_eq!(node.shape, Some(vec![]));
-}
-
+/// `num_axes` counts leading shaped axes, is part of REDUCE's structural identity, and
+/// may not exceed the source rank.
 #[test]
-fn reduce_metadata_participates_in_hash_consing_and_reconstruction() {
+fn canonical_reduce_records_and_hash_conses_leading_shaped_axis_count() {
     let src = UOp::stack(smallvec::smallvec![UOp::native_const(1.0f32), UOp::native_const(2.0f32)]);
     let scalar = src.reduce_with_num_axes(smallvec::smallvec![], ReduceOp::Add, 0);
     let horizontal = src.reduce_with_num_axes(smallvec::smallvec![], ReduceOp::Add, 1);
+
+    let graph = CanonicalGraph::from_root("kernel_ast", &horizontal).unwrap();
+    let node = graph.nodes.iter().find(|node| node.op == "REDUCE").unwrap();
+    assert_eq!(node.arg, CanonicalArg::Reduce { op: "ADD".to_string(), axes: None, num_axes: Some(1) });
+    assert_eq!(node.shape, Some(vec![]));
 
     assert!(!std::sync::Arc::ptr_eq(&scalar, &horizontal));
     let rebuilt = horizontal.with_sources(horizontal.op().sources().into_vec());
     assert!(std::sync::Arc::ptr_eq(&horizontal, &rebuilt));
     assert!(matches!(rebuilt.op(), Op::Reduce { num_axes: 1, .. }));
-}
 
-#[test]
-fn reduce_rejects_num_axes_larger_than_source_rank() {
-    let src = UOp::stack(smallvec::smallvec![UOp::native_const(1.0f32), UOp::native_const(2.0f32)]);
-    let reduce = src.reduce_with_num_axes(smallvec::smallvec![], ReduceOp::Add, 2);
-
-    assert!(matches!(reduce.shape(), Err(crate::Error::ReduceInvalidNumAxes { num_axes: 2, shape_dims: 1 })));
+    let too_many = src.reduce_with_num_axes(smallvec::smallvec![], ReduceOp::Add, 2);
+    assert!(matches!(too_many.shape(), Err(crate::Error::ReduceInvalidNumAxes { num_axes: 2, shape_dims: 1 })));
 }

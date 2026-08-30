@@ -43,37 +43,12 @@ fn test_weak_int_bitwise_and_shift_graph_construction() {
 // Shift Operations
 // =========================================================================
 
+/// A shift is typed by its value operand alone: the count is never promoted into it and
+/// never promotes it, so a weak value stays weak next to any strong count.
 #[test]
-fn test_shl_int32() {
-    let value = UOp::native_const(8i32);
-    let shift = UOp::native_const(2i32);
-
-    let result = value.try_shl_op(&shift).unwrap();
-    assert_eq!(result.dtype(), DType::Int32);
-}
-
-#[test]
-fn test_shr_int32() {
-    let value = UOp::native_const(32i32);
-    let shift = UOp::native_const(2i32);
-
-    let result = value.try_shr_op(&shift).unwrap();
-    assert_eq!(result.dtype(), DType::Int32);
-}
-
-#[test]
-fn test_shift_preserves_lhs_dtype() {
-    let value = UOp::native_const(100i64);
-    let shift = UOp::native_const(3i32);
-
-    // Shift should preserve LHS dtype (Int64), not promote
-    let result = value.try_shl_op(&shift).unwrap();
-    assert_eq!(result.dtype(), DType::Int64);
-}
-
-#[test]
-fn test_shift_dtype_matrix_preserves_lhs_and_rhs_types() {
-    let integer_dtypes = [
+fn test_shift_is_typed_by_its_value_operand() {
+    let counts = [UOp::index_const(1), UOp::native_const(1u32), UOp::const_(DType::Int8, ConstValue::Int(1))];
+    let values = [
         DType::Int8,
         DType::UInt8,
         DType::Int16,
@@ -82,31 +57,18 @@ fn test_shift_dtype_matrix_preserves_lhs_and_rhs_types() {
         DType::UInt32,
         DType::Int64,
         DType::UInt64,
+        DType::WeakInt,
     ];
 
-    for lhs_dtype in integer_dtypes {
-        let lhs = UOp::const_(lhs_dtype.clone(), ConstValue::Int(1));
-        for rhs in [UOp::index_const(1), UOp::native_const(1u32)] {
-            for shifted in [lhs.try_shl_op(&rhs).unwrap(), lhs.try_shr_op(&rhs).unwrap()] {
-                let Op::Binary(_, actual_lhs, actual_rhs) = shifted.op() else { panic!("expected shift") };
-                assert_eq!(shifted.dtype(), lhs_dtype);
-                assert_eq!(actual_lhs.dtype(), lhs_dtype);
-                assert_eq!(actual_rhs.dtype(), rhs.dtype());
+    for value_dtype in values {
+        let value = UOp::const_(value_dtype.clone(), ConstValue::Int(8));
+        for count in &counts {
+            for shifted in [value.try_shl_op(count).unwrap(), value.try_shr_op(count).unwrap()] {
+                let Op::Binary(_, lhs, rhs) = shifted.op() else { panic!("expected shift") };
+                assert_eq!(shifted.dtype(), value_dtype, "count {:?}", count.dtype());
+                assert_eq!(lhs.dtype(), value_dtype);
+                assert_eq!(rhs.dtype(), count.dtype(), "count operand must not be retyped");
             }
-        }
-    }
-}
-
-#[test]
-fn test_weak_shift_lhs_is_not_promoted_by_strong_count() {
-    let lhs = UOp::index_const(8);
-    for rhs_dtype in [DType::Int8, DType::UInt16, DType::Int64, DType::UInt32] {
-        let rhs = UOp::const_(rhs_dtype.clone(), ConstValue::Int(1));
-        for shifted in [lhs.try_shl_op(&rhs).unwrap(), lhs.try_shr_op(&rhs).unwrap()] {
-            let Op::Binary(_, actual_lhs, actual_rhs) = shifted.op() else { panic!("expected shift") };
-            assert_eq!(shifted.dtype(), DType::WeakInt);
-            assert_eq!(actual_lhs.dtype(), DType::WeakInt);
-            assert_eq!(actual_rhs.dtype(), rhs_dtype);
         }
     }
 }
