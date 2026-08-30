@@ -1330,3 +1330,67 @@ fn test_multiple_properties_coexist() {
     assert_eq!(ranges.len(), ranges2.len());
     assert_eq!(in_scope.len(), in_scope2.len());
 }
+
+/// The warm-children fast path in `CachedProperty::get` must produce exactly what
+/// the filtered-toposort path produces. Both rows build the same diamond shape
+/// (`root = r*2 + r*3`, both arms sharing one RANGE) over a distinct axis id so
+/// hash consing hands each row a genuinely cold graph.
+#[test_case::test_case(true ; "children warmed first takes the fast path")]
+#[test_case::test_case(false ; "cold children fall back to filtered toposort")]
+fn test_cached_property_diamond_fast_path_matches_slow_path(warm_children: bool) {
+    use crate::AxisType;
+    use crate::uop::cached_property::CachedProperty;
+    use crate::uop::properties::{RangesProperty, VminVmaxProperty};
+
+    let axis = AxisId::Renumbered(if warm_children { 9001 } else { 9002 });
+    let range = UOp::range_axis(UOp::index_const(10), axis, AxisType::Loop);
+    let left = range.try_mul(&UOp::index_const(2)).unwrap();
+    let right = range.try_mul(&UOp::index_const(3)).unwrap();
+    let root = left.try_add(&right).unwrap();
+
+    if warm_children {
+        RangesProperty::get(&left);
+        RangesProperty::get(&right);
+        VminVmaxProperty::get(&left);
+        VminVmaxProperty::get(&right);
+    }
+    assert!(RangesProperty::cache(&root).get().is_none(), "root must be cold before the measured get");
+    assert!(VminVmaxProperty::cache(&root).get().is_none(), "root must be cold before the measured get");
+
+    let ranges = RangesProperty::get(&root);
+    assert_eq!(ranges.len(), 1, "diamond must dedup the shared RANGE");
+    assert!(Arc::ptr_eq(&ranges[0], &range));
+    // range in [0, 9] => 2*r + 3*r in [0, 45].
+    assert_eq!(root.vmin(), &ConstValue::Int(0));
+    assert_eq!(root.vmax(), &ConstValue::Int(45));
+}
+
+/// `device_spec` and `addrspace` recurse through every child. Before they were
+/// memoised, a diamond DAG (each level's two nodes both feeding the next level's
+/// two nodes) gave them 2^levels distinct paths: 20 levels took tens of seconds.
+/// Both must now resolve in linear time.
+#[test]
+fn test_device_and_addrspace_are_memoised_on_diamond_dags() {
+    use crate::UnaryOp;
+    use svod_dtype::AddrSpace;
+
+    let mut a = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let mut b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    for level in 0..20 {
+        let sum = UOp::new(Op::Binary(BinaryOp::Add, a.clone(), b.clone()), DType::Float32);
+        let product = UOp::new(Op::Binary(BinaryOp::Mul, a.clone(), b.clone()), DType::Float32);
+        // Distinct ops per level so hash consing cannot collapse the levels.
+        let (first, second) =
+            if level % 2 == 0 { (UnaryOp::Sqrt, UnaryOp::Exp2) } else { (UnaryOp::Exp2, UnaryOp::Sqrt) };
+        a = UOp::new(Op::Unary(first, sum), DType::Float32);
+        b = UOp::new(Op::Unary(second, product), DType::Float32);
+    }
+    let root = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32);
+
+    let start = std::time::Instant::now();
+    assert_eq!(root.device_spec(), Some(DeviceSpec::Cpu), "device must propagate up from the BUFFER leaf");
+    assert_eq!(root.addrspace(), Some(AddrSpace::Global), "addrspace must propagate up from the BUFFER leaf");
+    let elapsed = start.elapsed();
+
+    assert!(elapsed < std::time::Duration::from_millis(100), "20-level diamond took {elapsed:?}; memo is not working");
+}

@@ -19,7 +19,7 @@ use derive_more::Display;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     panic::Location,
     path::{Path, PathBuf},
@@ -235,6 +235,50 @@ impl ProvenanceTracker {
 thread_local! {
     /// Global thread-local provenance tracker.
     pub static PROVENANCE_TRACKER: RefCell<ProvenanceTracker> = RefCell::default();
+
+    /// Whether this thread captures provenance. Seeded from the environment.
+    static TRACKING: Cell<bool> = Cell::new(tracking_default());
+}
+
+/// Process-wide default for [`tracking_enabled`], read once from
+/// `SVOD_TRACK_PROVENANCE` (unset, empty or `0` means off).
+fn tracking_default() -> bool {
+    static DEFAULT: OnceLock<bool> = OnceLock::new();
+    *DEFAULT.get_or_init(|| std::env::var("SVOD_TRACK_PROVENANCE").is_ok_and(|v| !matches!(v.as_str(), "" | "0")))
+}
+
+/// Whether provenance capture is on for the current thread.
+///
+/// Capture sits on `UOp::new`'s hot path, which runs ~1M times for one resnet50
+/// schedule, and the tracker is a debugging aid with no production readers — so
+/// it is off unless asked for, mirroring tinygrad's `TRACK_MATCH_STATS=0`
+/// default. Enable it with `SVOD_TRACK_PROVENANCE=1` or [`set_tracking`].
+#[inline]
+pub fn tracking_enabled() -> bool {
+    TRACKING.with(Cell::get)
+}
+
+/// Turn provenance capture on or off for the current thread, returning the
+/// previous setting. The tracker is thread-local, so this is too.
+pub fn set_tracking(enabled: bool) -> bool {
+    TRACKING.with(|tracking| tracking.replace(enabled))
+}
+
+/// Record a `Created` event for a freshly interned UOp. No-op when tracking is off.
+#[inline]
+pub fn record_created(uop_id: u64, location: &'static Location<'static>) {
+    if tracking_enabled() {
+        PROVENANCE_TRACKER.with(|tracker| tracker.borrow_mut().capture(uop_id, location));
+    }
+}
+
+/// Record a `Transformed` event linking a rewritten UOp to its source. No-op
+/// when tracking is off.
+#[inline]
+pub fn record_transformed(new_id: u64, old_id: u64, pass_name: PassName) {
+    if tracking_enabled() {
+        PROVENANCE_TRACKER.with(|tracker| tracker.borrow_mut().record_transform(new_id, old_id, pass_name));
+    }
 }
 
 /// Get the workspace root path, computed from CARGO_MANIFEST_DIR at compile time.

@@ -223,3 +223,27 @@ cached_property! {
         }
     }
 }
+
+// ============================================================================
+// Device / Address Space Properties
+// ============================================================================
+
+cached_property! {
+    /// Cached device specification carried by a node's backward slice.
+    ///
+    /// Tinygrad memoises the equivalent walk with `@functools.cached_property`
+    /// (`ops.py` `UOp.device`). Without the memo the plain recursion revisits
+    /// every shared node once per path, which is exponential on diamond DAGs.
+    DeviceSpecProperty: Option<svod_dtype::DeviceSpec> {
+        cache_field: device_spec_cache,
+        compute: |uop| uop.compute_device_spec()
+    }
+}
+
+cached_property! {
+    /// Cached storage address space (Tinygrad: `UOp.addrspace`, also memoised).
+    AddrSpaceProperty: Option<svod_dtype::AddrSpace> {
+        cache_field: addrspace_cache,
+        compute: |uop| uop.compute_addrspace()
+    }
+}
