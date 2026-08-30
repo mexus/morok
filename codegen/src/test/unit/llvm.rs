@@ -18,6 +18,10 @@ fn volatile_param(slot: usize, size: usize) -> std::sync::Arc<UOp> {
     UOp::new(Op::Param { shape: UOp::native_const(size as i32), arg }, DType::Float32)
 }
 
+fn shrink4(src: std::sync::Arc<UOp>) -> std::sync::Arc<UOp> {
+    UOp::new(Op::Shrink { src, offsets: UOp::native_const(0i32), sizes: UOp::native_const(4i32) }, DType::Float32)
+}
+
 #[test]
 fn test_render_linear_input_succeeds() {
     let sink = UOp::sink(vec![UOp::const_(DType::Float32, ConstValue::Float(1.0))]);
@@ -40,18 +44,8 @@ fn llvm_constants_use_committed_storage_bits() {
 
 #[test]
 fn grouped_shrink_renders_single_vector_load_and_store() {
-    let shrink = |src| {
-        UOp::new(
-            Op::Shrink {
-                src,
-                offsets: UOp::const_(DType::Int32, ConstValue::Int(0)),
-                sizes: UOp::const_(DType::Int32, ConstValue::Int(4)),
-            },
-            DType::Float32,
-        )
-    };
-    let output = shrink(UOp::param(0, 8, DType::Float32, None));
-    let input = shrink(UOp::param(1, 8, DType::Float32, None));
+    let output = shrink4(UOp::param(0, 8, DType::Float32, None));
+    let input = shrink4(UOp::param(1, 8, DType::Float32, None));
     let sink = UOp::sink(vec![output.store(UOp::load().index(input).call())]);
 
     let rendered = render_linearized(&sink, Some("grouped_memory")).expect("render grouped LLVM memory");
@@ -69,11 +63,8 @@ fn volatile_scalar_and_grouped_memory_accesses_render_explicitly() {
     assert!(scalar.code.contains("load volatile float"), "{}", scalar.code);
     assert!(scalar.code.contains("store volatile float"), "{}", scalar.code);
 
-    let shrink = |src| {
-        UOp::new(Op::Shrink { src, offsets: UOp::native_const(0i32), sizes: UOp::native_const(4i32) }, DType::Float32)
-    };
-    let grouped_input = shrink(volatile_param(1, 8));
-    let grouped_output = shrink(volatile_param(0, 8));
+    let grouped_input = shrink4(volatile_param(1, 8));
+    let grouped_output = shrink4(volatile_param(0, 8));
     let grouped = UOp::sink(vec![grouped_output.store(UOp::load().index(grouped_input).call())]);
     let grouped = render_linearized(&grouped, Some("volatile_grouped")).expect("render volatile grouped LLVM");
     assert!(grouped.code.contains("load volatile <4 x float>"), "{}", grouped.code);
@@ -93,62 +84,26 @@ fn test_render_rejects_non_linear_inputs() {
     assert!(format!("{err}").contains("expects LINEAR input"), "unexpected error: {err:?}");
 }
 
-/// Test basic RANGE/END loop codegen.
-///
-/// Creates the equivalent of:
-/// ```c
-/// for (int i = 0; i < 10; i++) {
-///     // empty body
-/// }
-/// ```
+/// A `for i in 0..10` loop lowers to the Tinygrad block layout
+/// (entry / latch / body / footer / exit) with the induction variable in a PHI.
+/// Block names embed the axis id, so only the prefixes are pinned.
 #[test]
 fn test_range_end_basic() {
-    // Create range: for i in 0..10
     let end = UOp::const_(DType::Int64, ConstValue::Int(10));
     let range = UOp::new(
         Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop, deps: SmallVec::new() },
         DType::Int64,
     );
-
-    // Create a NOOP as the computation (empty loop body)
-    let noop = UOp::noop();
-
-    // End the loop - END wraps computation and references the range
     let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
-    let end_op = noop.end(ranges);
+    let sink = UOp::sink(vec![UOp::noop().end(ranges)]);
 
-    // Wrap in SINK
-    let sink = UOp::sink(vec![end_op]);
+    let kernel = render_linearized(&sink, Some("test_loop")).expect("render loop");
 
-    // Render to LLVM IR
-    let result = render_linearized(&sink, Some("test_loop"));
-    if let Err(ref e) = result {
-        eprintln!("Codegen failed: {:?}", e);
+    for needle in ["loop_entry_", "loop_latch_", "loop_body_", "loop_footer_", "loop_exit_", "phi i64"] {
+        assert!(kernel.code.contains(needle), "missing {needle}:\n{}", kernel.code);
     }
-    assert!(result.is_ok(), "Codegen failed: {:?}", result.err());
-
-    let kernel = result.unwrap();
-    let ir = &kernel.code;
-
-    // Verify loop structure in generated IR (Tinygrad-style: entry/latch/body/footer/exit)
-    // Block names use axis_id which varies, so just check for the patterns
-    assert!(ir.contains("loop_entry_"), "Missing entry block:\n{}", ir);
-    assert!(ir.contains("loop_latch_"), "Missing latch block:\n{}", ir);
-    assert!(ir.contains("loop_body_"), "Missing body block:\n{}", ir);
-    assert!(ir.contains("loop_footer_"), "Missing footer block:\n{}", ir);
-    assert!(ir.contains("loop_exit_"), "Missing exit block:\n{}", ir);
-    assert!(ir.contains("phi i64"), "Missing PHI node:\n{}", ir);
 }
 
-/// Test basic REDUCE codegen with sum operation.
-///
-/// Creates the equivalent of:
-/// ```c
-/// float acc = 0.0;
-/// for (int i = 0; i < 10; i++) {
-///     acc += 5.0;  // constant value
-/// }
-/// return acc;  // should be 50.0
 #[test]
 fn test_multi_index_requires_linearization() {
     let buffer = UOp::param(0, 1024, DType::Float32, None);
@@ -166,59 +121,45 @@ fn test_multi_index_requires_linearization() {
     );
 }
 
-#[test]
-fn shaped_reg_index_renders_as_memory_load() {
+/// A REG buffer is storage, not a vector value: indexing it is a GEP + load,
+/// including when the buffer arrives through an AFTER edge.
+#[test_case::test_case(false; "direct")]
+#[test_case::test_case(true; "through after")]
+fn shaped_reg_index_renders_as_memory_load(through_after: bool) {
     let reg = UOp::buffer(0, 4, DType::Float32, AddrSpace::Reg, None);
-    let index = UOp::index().buffer(reg).indices(vec![UOp::const_(DType::Int32, ConstValue::Int(2))]).call().unwrap();
+    let buffer = if through_after {
+        let after = reg.after(smallvec::smallvec![UOp::noop()]);
+        assert_eq!(after.addrspace(), Some(AddrSpace::Reg));
+        after
+    } else {
+        reg
+    };
+    let index =
+        UOp::index().buffer(buffer).indices(vec![UOp::const_(DType::Int32, ConstValue::Int(2))]).call().unwrap();
     let sink = UOp::sink(vec![UOp::load().index(index).call()]);
 
-    let result = render_linearized(&sink, Some("shaped_reg_load")).unwrap();
+    let result = render_linearized(&sink, Some("shaped_reg_load")).expect("render REG load");
     assert!(result.code.contains("getelementptr inbounds float, ptr %reg0, i32 2"), "{}", result.code);
     assert!(result.code.contains("load float, ptr"), "{}", result.code);
     assert!(!result.code.contains("extractelement <4 x float> %reg0"), "{}", result.code);
 }
 
+/// A typed CUSTOM renders its template as the RHS of an SSA assignment; a
+/// CUSTOMI is inlined as an operand string into its consumer instead.
 #[test]
-fn shaped_reg_after_index_renders_as_memory_load() {
-    let reg = UOp::buffer(0, 4, DType::Float32, AddrSpace::Reg, None);
-    let after = reg.after(smallvec::smallvec![UOp::noop()]);
-    assert_eq!(after.addrspace(), Some(AddrSpace::Reg));
-    let index = UOp::index().buffer(after).indices(vec![UOp::const_(DType::Int32, ConstValue::Int(2))]).call().unwrap();
-    let sink = UOp::sink(vec![UOp::load().index(index).call()]);
-
-    let result = render_linearized(&sink, Some("shaped_reg_after_load")).unwrap();
-    assert!(result.code.contains("getelementptr inbounds float, ptr %reg0, i32 2"), "{}", result.code);
-    assert!(result.code.contains("load float, ptr"), "{}", result.code);
-    assert!(!result.code.contains("extractelement <4 x float> %reg0"), "{}", result.code);
-}
-
-#[test]
-fn test_custom_renders_typed_statement_in_llvm_backend() {
+fn custom_renders_a_typed_rhs_and_customi_inlines_into_its_consumer() {
     let one = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let custom = UOp::custom(smallvec::smallvec![one], "add i32 {0}, 3".to_string(), DType::Int32);
-    let sink = UOp::sink(vec![custom]);
+    let custom = UOp::custom(smallvec::smallvec![one.clone()], "add i32 {0}, 3".to_string(), DType::Int32);
+    let typed = render_linearized(&UOp::sink(vec![custom]), Some("test_custom")).expect("render CUSTOM");
+    assert!(typed.code.contains("= add i32 1, 3"), "typed CUSTOM should render its RHS:\n{}", typed.code);
 
-    let result = render_linearized(&sink, Some("test_custom")).expect("LLVM backend should render CUSTOM");
-    assert!(result.code.contains("= add i32 1, 3"), "typed CUSTOM should render its RHS:\n{}", result.code);
-}
-
-#[test]
-fn test_customi_inlines_into_consumer_in_llvm_backend() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(2));
-    let c = UOp::const_(DType::Int32, ConstValue::Int(3));
-    // `{2}` selects the third dep (const 3); CUSTOMI is inlined as the operand
-    // string "3" into the consuming CUSTOM rather than emitting its own line.
-    let inline = UOp::customi(smallvec::smallvec![a, b, c], "{2}".to_string(), DType::Int32);
-    let custom = UOp::custom(smallvec::smallvec![inline], "add i32 {0}, 10".to_string(), DType::Int32);
-    let sink = UOp::sink(vec![custom]);
-
-    let result = render_linearized(&sink, Some("test_customi")).expect("LLVM backend should render CUSTOMI");
-    assert!(
-        result.code.contains("= add i32 3, 10"),
-        "CUSTOMI operand should be inlined into the consumer:\n{}",
-        result.code
-    );
+    // `{2}` selects the third dep (const 3).
+    let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+    let three = UOp::const_(DType::Int32, ConstValue::Int(3));
+    let inline = UOp::customi(smallvec::smallvec![one, two, three], "{2}".to_string(), DType::Int32);
+    let consumer = UOp::custom(smallvec::smallvec![inline], "add i32 {0}, 10".to_string(), DType::Int32);
+    let inlined = render_linearized(&UOp::sink(vec![consumer]), Some("test_customi")).expect("render CUSTOMI");
+    assert!(inlined.code.contains("= add i32 3, 10"), "CUSTOMI should inline into the consumer:\n{}", inlined.code);
 }
 
 /// A gated LOAD renders as branch + phi, and the phi is typed by the load's
