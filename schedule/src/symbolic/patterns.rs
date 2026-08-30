@@ -185,33 +185,41 @@ value_sensitive_matchers! {
     pub fn power_dsl_patterns => power_dsl_patterns_unchecked;
 }
 
+/// Materialise a folded constant at `dtype`.
+///
+/// tinygrad's `fold_const_alu` (uop/symbolic.py:31-33) evaluates with
+/// `exec_alu(a.op, a.dtype, vals, False)` — `truncate=False` — and returns
+/// `a.const_like(...)`, so it folds every dtype including the weak ones. Weak dtypes
+/// have no storage width to wrap at, so they take the untruncated value directly;
+/// strong dtypes still commit through their scalar format.
+fn folded_const(dtype: DType, value: ConstValue) -> Option<Arc<UOp>> {
+    let value = if dtype.is_weak() { value } else { value.cast(&DType::Scalar(dtype.base()))? };
+    Some(UOp::const_(dtype, value))
+}
+
 /// Constant folding patterns.
 ///
 /// Folds constant expressions at compile time for unary, binary, and ternary operations.
 /// Uses dtype-aware evaluation to ensure results respect type boundaries (e.g., Int32 wraps at 32 bits).
 fn constant_folding_dsl_patterns_unchecked() -> &'static TypedPatternMatcher {
-    use svod_ir::uop::eval::{eval_binary_op_typed, eval_ternary_op_typed, eval_unary_op_typed};
+    use svod_ir::uop::eval::{eval_ternary_op, eval_unary_op};
 
     crate::cached_patterns! {
-        // Weak operands must first commit at their consumer's concrete dtype.
         // Unary constant folding - 6 operations in one declaration
         // Neg is not here: neg() produces MUL(x, -1), folded by binary constant folding.
         for op in unary [Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
             op(c @const(c_val))
-              if !c.dtype().is_weak()
-              => eval_unary_op_typed(op, c_val, c.dtype().base()).map(|r| UOp::const_(c.dtype(), r)),
+              => eval_unary_op(op, c_val).and_then(|r| folded_const(c.dtype(), r)),
         },
 
         // Binary constant folding - 13 operations in one declaration
         for op in binary [Add, Mul, Sub, FloorMod, Max, Pow, FloorDiv, Fdiv, And, Or, Xor, Shl, Shr] {
-            op(a @const(a_val), b @const(b_val))
-              if !a.dtype().is_weak() && !b.dtype().is_weak()
-              => eval_binary_op_typed(op, a_val, b_val, a.dtype().base()).map(|r| UOp::const_(a.dtype(), r)),
+            op(a @const(a_val), _b @const(b_val))
+              => eval_binary_op(op, a_val, b_val).and_then(|r| folded_const(a.dtype(), r)),
         },
 
         for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
-            op(a @const(a_val), b @const(b_val))
-              if !a.dtype().is_weak() && !b.dtype().is_weak()
+            op(a @const(a_val), _b @const(b_val))
               => {
                   let dtype = DType::Bool.vec(a.dtype().vcount())?;
                   eval_binary_op(op, a_val, b_val).map(|r| UOp::const_(dtype, r))
@@ -220,13 +228,12 @@ fn constant_folding_dsl_patterns_unchecked() -> &'static TypedPatternMatcher {
 
         // Ternary constant folding - 2 operations in one declaration
         Where(_a @const(a_val), b @const(b_val), _c @const(c_val))
-          => eval_ternary_op_typed(svod_ir::TernaryOp::Where, a_val, b_val, c_val, b.dtype().base())
-              .map(|r| UOp::const_(b.dtype(), r)),
+          => eval_ternary_op(svod_ir::TernaryOp::Where, a_val, b_val, c_val)
+              .and_then(|r| folded_const(b.dtype(), r)),
 
-        MulAcc(a @const(a_val), b @const(b_val), c @const(c_val))
-          if !a.dtype().is_weak() && !b.dtype().is_weak() && !c.dtype().is_weak()
-          => eval_ternary_op_typed(svod_ir::TernaryOp::MulAcc, a_val, b_val, c_val, b.dtype().base())
-              .map(|r| UOp::const_(b.dtype(), r)),
+        MulAcc(_a @const(a_val), b @const(b_val), _c @const(c_val))
+          => eval_ternary_op(svod_ir::TernaryOp::MulAcc, a_val, b_val, c_val)
+              .and_then(|r| folded_const(b.dtype(), r)),
     }
 }
 

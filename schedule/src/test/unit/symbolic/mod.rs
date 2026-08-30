@@ -1,3 +1,4 @@
+mod devectorize_pin;
 mod index_lowering;
 
 use crate::{
@@ -3487,4 +3488,47 @@ fn uint64_pack_high_half_needs_a_narrow_low_arm() {
     let folded = graph_rewrite(symbolic_simple(), expr.clone(), &mut ());
 
     assert!(!Arc::ptr_eq(&folded, &hi.cast(DType::UInt64)), "must not cancel: {}", folded.tree());
+}
+
+// =========================================================================
+// weak-dtype constant folding (tinygrad uop/symbolic.py:31-33, registered :139-142)
+// =========================================================================
+
+/// `fold_const_alu` folds `exec_alu(a.op, a.dtype, vals, False)` for every dtype —
+/// weak included — and returns `a.const_like(...)` at the node's own dtype.
+fn weak_int(value: i64) -> Arc<UOp> {
+    UOp::const_(DType::WeakInt, ConstValue::Int(value))
+}
+
+fn raw_add(lhs: Arc<UOp>, rhs: Arc<UOp>) -> Arc<UOp> {
+    let dtype = lhs.dtype();
+    UOp::new(Op::Binary(BinaryOp::Add, lhs, rhs), dtype)
+}
+
+#[test_case::test_case(BinaryOp::Add, 1, 14, 15 ; "add")]
+#[test_case::test_case(BinaryOp::Mul, 7, 28, 196 ; "mul")]
+#[test_case::test_case(BinaryOp::Sub, 1, 14, -13 ; "sub")]
+fn weak_int_constant_operands_fold(op: BinaryOp, lhs: i64, rhs: i64, expect: i64) {
+    let expr = UOp::new(Op::Binary(op, weak_int(lhs), weak_int(rhs)), DType::WeakInt);
+    let folded = graph_rewrite(symbolic_simple(), expr, &mut ());
+
+    assert_eq!(folded.dtype(), DType::WeakInt, "the fold stays at the weak dtype: {}", folded.tree());
+    assert_eq!(
+        crate::rangeify::indexing::get_const_value(&folded),
+        Some(ConstValue::Int(expect)),
+        "got {}",
+        folded.tree()
+    );
+}
+
+#[test]
+fn weak_int_constants_cancel_across_an_index_sum() {
+    // The resnet50 `r_16_32_7_7_512_3_3` index shape: `((1+14) + R*196) + (-15)`.
+    let range = UOp::range_const(512, 0);
+    let scaled = UOp::new(Op::Binary(BinaryOp::Mul, range, weak_int(196)), DType::WeakInt);
+    let expr = raw_add(raw_add(raw_add(weak_int(1), weak_int(14)), scaled.clone()), weak_int(-15));
+
+    let folded = graph_rewrite(symbolic(), expr, &mut ());
+
+    assert!(Arc::ptr_eq(&folded, &scaled), "the constants must cancel, got {}", folded.tree());
 }
