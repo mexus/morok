@@ -164,8 +164,6 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// When `try_simplex` is true (called from `simplify_valid`), also tries per-addend
 /// simplex decomposition for constraints like `X0 + X1 + ... >= 1`.
 pub(crate) fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<UOp> {
-    use svod_ir::rewrite::graph_rewrite;
-
     // Parse valid into {expr: [lower_bound, upper_bound]}
     type BoundsEntry = (Arc<UOp>, Option<i64>, Option<i64>);
     let mut bounds: indexmap::IndexMap<u64, BoundsEntry> = indexmap::IndexMap::new();
@@ -221,28 +219,21 @@ pub(crate) fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: boo
             }
 
             for candidates in &candidate_sets {
-                // Substitute each candidate independently
-                let new_uops: Vec<Arc<UOp>> = candidates
+                // `if any(X not in uop.backward_slice_with_self for X,_ in candidate): continue`
+                // — upstream skips the branch before substituting, not after.
+                if candidates.iter().any(|(x, _)| !uop.backward_slice_ids().contains(&x.id)) {
+                    continue;
+                }
+                // Substitute each candidate, simplify, substitute back, simplify again
+                let simplified: Vec<Arc<UOp>> = candidates
                     .iter()
                     .map(|(x, new_x)| {
                         #[allow(clippy::mutable_key_type)]
                         let map: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(x.clone()), new_x.clone())].into();
-                        uop.substitute(&map)
-                    })
-                    .collect();
-                // Skip if any branch doesn't contain the expression
-                if new_uops.iter().any(|u| Arc::ptr_eq(u, &uop)) {
-                    continue;
-                }
-                // Simplify each branch, substitute back, simplify again
-                let simplified: Vec<Arc<UOp>> = candidates
-                    .iter()
-                    .zip(new_uops.iter())
-                    .map(|((x, new_x), u)| {
-                        let s = graph_rewrite(crate::symbolic::patterns::symbolic(), u.clone(), &mut ());
+                        let s = simplify(uop.substitute(&map));
                         #[allow(clippy::mutable_key_type)]
                         let rev: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(new_x.clone()), x.clone())].into();
-                        graph_rewrite(crate::symbolic::patterns::symbolic(), s.substitute(&rev), &mut ())
+                        simplify(s.substitute(&rev))
                     })
                     .collect();
                 // If all branches produce the same result, accept it
@@ -287,14 +278,32 @@ pub(crate) fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: boo
     }
 
     // Simplify with full symbolic (tier 2) including divmod rules
-    let simplified = graph_rewrite(crate::symbolic::patterns::symbolic(), substituted, &mut ());
+    let simplified = simplify(substituted);
 
     // Substitute back and simplify again
     #[allow(clippy::mutable_key_type)]
     let reverse_map: HashMap<UOpKey, Arc<UOp>> =
         all_candidates.iter().map(|(x, f)| (UOpKey(f.clone()), x.clone())).collect();
-    let result = simplified.substitute(&reverse_map);
-    graph_rewrite(crate::symbolic::patterns::symbolic(), result, &mut ())
+    simplify(simplified.substitute(&reverse_map))
+}
+
+/// `UOp.simplify` (tinygrad/uop/ops.py:527-532), including its two fast-outs:
+/// `if self.op is Ops.CONST: return self` and `if self.op is Ops.SINK and all(s.op is
+/// Ops.CONST or (s.op is Ops.STACK and len(s.src) == 0) for s in self.src): return self`.
+fn simplify(uop: Arc<UOp>) -> Arc<UOp> {
+    let settled = match uop.op() {
+        Op::Const(_) => true,
+        Op::Sink { sources, .. } => sources.iter().all(|s| match s.op() {
+            Op::Const(_) => true,
+            Op::Stack { sources } => sources.is_empty(),
+            _ => false,
+        }),
+        _ => false,
+    };
+    if settled {
+        return uop;
+    }
+    svod_ir::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic(), uop, &mut ())
 }
 
 /// Simplify WHERE(cond, x, Invalid) using cond as bounds context

@@ -79,6 +79,7 @@ use crate::rangeify::patterns::{
 };
 use crate::rangeify::transforms::{SimplifyRangesContext, pm_flatten_range, pm_simplify_ranges, pm_split_ranges};
 use crate::rewrite::graph_rewrite;
+use crate::symbolic::index_lowering::WeakMemo;
 use crate::symbolic::patterns::{pm_fold_cast_const, sym, symbolic, symbolic_simple};
 use implicit_barriers::pm_implicit_barriers;
 use std::collections::HashSet;
@@ -159,12 +160,12 @@ pub(crate) fn extra_symbolic_patterns() -> &'static crate::TypedPatternMatcher {
     &PM
 }
 
-pub(crate) fn lower_index_patterns() -> &'static crate::TypedPatternMatcher {
-    static PM: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
-        symbolic_simple().clone()
-            + pm_fold_cast_const().clone()
+pub(crate) fn lower_index_patterns() -> &'static crate::TypedPatternMatcher<WeakMemo> {
+    static PM: LazyLock<crate::TypedPatternMatcher<WeakMemo>> = LazyLock::new(|| {
+        symbolic_simple().with_context::<WeakMemo>()
+            + pm_fold_cast_const().with_context()
             + crate::symbolic::pm_lower_index_dtype()
-            + crate::late::indexing_simplify().clone()
+            + crate::late::indexing_simplify().with_context()
     });
     &PM
 }
@@ -451,7 +452,8 @@ fn apply_post_optimization_configured_with_capture(
     // Tinygrad 8c8b43de codegen/__init__.py:347-349. Source order is required:
     // symbolic/cast folding exposes index lowering and indexing_simplify consumes it.
     let t_stage = std::time::Instant::now();
-    let with_lowered_idx = graph_rewrite(lower_index_patterns(), extra_symbolic, &mut ());
+    // One memo per kernel, matching upstream's single `ctx={}` at codegen/__init__.py:349.
+    let with_lowered_idx = graph_rewrite(lower_index_patterns(), extra_symbolic, &mut WeakMemo::default());
     tracing::debug!(
         ast.optimized = with_lowered_idx.tree(),
         node_count = with_lowered_idx.node_count(),

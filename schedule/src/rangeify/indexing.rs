@@ -157,32 +157,59 @@ impl IndexingContext {
 // Core Algorithm
 // ============================================================================
 
-/// Cache for memoizing expensive `graph_rewrite` calls during rangeify.
-///
-/// Matches upstream `@functools.cache` on `_apply_reshape` and `apply_movement_op`.
-/// Keyed by input UOp's `content_hash` (structural, O(1) — pre-computed at creation).
-/// Hash-consing ensures same expression = same Arc = same `id` = cache hit.
-///
-/// Scoped to a single `run_rangeify` call — automatically freed when the function returns.
-/// Uses `UOp.id` (identity) as key — collision-free because all UOps are held alive
-/// within a single run, and hash consing guarantees same structure = same Arc = same id.
-#[derive(Default)]
-pub struct SimplifyCache {
-    cache: HashMap<u64, Arc<UOp>>,
+/// Key for the movement-op cache: everything upstream's `@functools.cache` sees on
+/// `apply_movement_op(op, in_shape, arg, rngs)` and `_apply_reshape(in_shape, out_shape,
+/// urngs)` (tinygrad/schedule/indexing.py:158,171) — the op, its own arg, the input
+/// shape and the range tuple, never the source being moved. Shapes and range tuples
+/// collapse to one hash-consed `id` each.
+#[derive(PartialEq, Eq, Hash)]
+struct MovementKey {
+    op: std::mem::Discriminant<Op>,
+    arg: UOpKey,
+    in_shape: UOpKey,
+    rngs: UOpKey,
 }
 
-impl SimplifyCache {
-    /// Look up or compute a graph_rewrite simplification.
-    /// `input` is the UOp to simplify; `f` computes the result if not cached.
-    #[inline]
-    fn get_or_simplify(&mut self, input: &Arc<UOp>, f: impl FnOnce() -> Arc<UOp>) -> Arc<UOp> {
-        if let Some(cached) = self.cache.get(&input.id) {
-            return cached.clone();
-        }
-        let result = f();
-        self.cache.insert(input.id, result.clone());
-        result
+/// `_apply_reshape(in_shape, out_shape, urngs)`.
+#[derive(PartialEq, Eq, Hash)]
+struct ReshapeKey {
+    in_shape: UOpKey,
+    out_shape: UOpKey,
+    rngs: UOpKey,
+}
+
+/// Both caches are process-global, exactly as upstream's `@functools.cache`: a hit
+/// skips building the index chain and its `graph_rewrite` entirely, across every
+/// `run_rangeify`.
+#[allow(clippy::mutable_key_type)]
+type Memo<K> = std::sync::LazyLock<std::sync::Mutex<rustc_hash::FxHashMap<K, Vec<Arc<UOp>>>>>;
+static MOVEMENT_CACHE: Memo<MovementKey> = std::sync::LazyLock::new(Default::default);
+static RESHAPE_CACHE: Memo<ReshapeKey> = std::sync::LazyLock::new(Default::default);
+
+/// One hash-consed identity per input tuple. The key owns the node, which is what
+/// keeps its `id` stable: interning holds only weak references, so a tuple that no
+/// live key mentions is re-interned with a fresh id.
+fn tuple_key(sources: Vec<Arc<UOp>>) -> UOpKey {
+    UOpKey(UOp::sink(sources))
+}
+
+fn shape_key(shape: &[SInt]) -> UOpKey {
+    tuple_key(shape.iter().map(SInt::arithmetic_uop).collect())
+}
+
+/// Whether these inputs are already memoised, for the reuse test.
+#[cfg(test)]
+pub(crate) fn movement_cache_holds(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> bool {
+    MOVEMENT_CACHE.lock().expect("movement cache poisoned").contains_key(&movement_key(op, in_shape, rngs))
+}
+
+fn cached<K: Eq + std::hash::Hash>(memo: &Memo<K>, key: K, f: impl FnOnce() -> Vec<Arc<UOp>>) -> Vec<Arc<UOp>> {
+    if let Some(hit) = memo.lock().expect("movement cache poisoned").get(&key) {
+        return hit.clone();
     }
+    let result = f();
+    memo.lock().expect("movement cache poisoned").insert(key, result.clone());
+    result
 }
 
 /// Run range assignment on a UOp graph. Returns (transformed_sink, context).
@@ -190,7 +217,6 @@ impl SimplifyCache {
 #[instrument(skip(sink), fields(sink_id = sink.id))]
 pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContext)> {
     let mut ctx = IndexingContext::new();
-    let mut simplify_cache = SimplifyCache::default();
 
     // Step 1: Generate realize map via pattern matcher (pm_generate_realize_map)
     // bottom_up=True — patterns see ORIGINAL children
@@ -204,7 +230,7 @@ pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContex
     let forward_topo: Vec<_> = sink.toposort_call_aware(false).into_iter().rev().collect();
 
     // Step 3: Assign ranges via forward traversal
-    assign_ranges(&forward_topo, &consumer_map, &mut ctx, &mut simplify_cache)?;
+    assign_ranges(&forward_topo, &consumer_map, &mut ctx)?;
 
     // Step 4: Apply rangeify patterns (pm_apply_rangeify)
     // Converts tensor REDUCE to ranged REDUCE, PAD→WHERE, creates STAGE+INDEX, removes movement ops.
@@ -480,7 +506,6 @@ fn assign_ranges(
     reverse_topo: &[Arc<UOp>],
     consumer_map: &HashMap<UOpKey, Vec<Arc<UOp>>>,
     ctx: &mut IndexingContext,
-    simplify_cache: &mut SimplifyCache,
 ) -> svod_ir::Result<()> {
     // Local variable for ending_ranges - only used within this function
     let mut ending_ranges: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
@@ -652,7 +677,7 @@ fn assign_ranges(
             | Op::Shrink { src, .. }
             | Op::Flip { src, .. } => {
                 if let Some(in_shape) = src.shape()? {
-                    apply_movement_op(x.op(), in_shape, &out_rngs, simplify_cache)
+                    apply_movement_op(x.op(), in_shape, &out_rngs)
                 } else {
                     out_rngs.clone()
                 }
@@ -740,12 +765,21 @@ fn assign_ranges(
 // ============================================================================
 
 /// Transform ranges through a movement op (SHRINK, PERMUTE, FLIP, EXPAND, PAD, RESHAPE).
-pub fn apply_movement_op(
-    op: &Op,
-    in_shape: &[SInt],
-    rngs: &[Arc<UOp>],
-    simplify_cache: &mut SimplifyCache,
-) -> Vec<Arc<UOp>> {
+fn movement_key(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> MovementKey {
+    let arg = match op {
+        Op::Permute { axes, .. } => tuple_key(axes.iter().map(|&a| UOp::index_const(a as i64)).collect()),
+        Op::Flip { axes, .. } => tuple_key(axes.iter().map(|&f| UOp::index_const(i64::from(f))).collect()),
+        // Every other movement arg is itself a UOp source behind the moved one.
+        _ => tuple_key(op.sources().iter().skip(1).cloned().collect()),
+    };
+    MovementKey { op: std::mem::discriminant(op), arg, in_shape: shape_key(in_shape), rngs: tuple_key(rngs.to_vec()) }
+}
+
+pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+    cached(&MOVEMENT_CACHE, movement_key(op, in_shape, rngs), || apply_movement_op_uncached(op, in_shape, rngs))
+}
+
+fn apply_movement_op_uncached(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     match op {
         Op::Shrink { offsets, .. } => {
             // Matches upstream:
@@ -849,9 +883,7 @@ pub fn apply_movement_op(
                             crate::symbolic::patterns::symbolic()
                                 + crate::symbolic::valid_simplification::pm_simplify_valid()
                         });
-                    let valid = simplify_cache.get_or_simplify(&valid, || {
-                        crate::rewrite::graph_rewrite(&*PAD_SIMPLIFY, valid.clone(), &mut ())
-                    });
+                    let valid = crate::rewrite::graph_rewrite(&*PAD_SIMPLIFY, valid, &mut ());
                     let adjusted_rng = rng.try_sub(begin).unwrap();
                     UOp::try_where(valid, adjusted_rng, UOp::invalid_marker()).unwrap()
                 })
@@ -881,7 +913,7 @@ pub fn apply_movement_op(
 
             // PLACEHOLDER canonicalization + reshape
             with_placeholder_canonicalization(rngs, |canonical| {
-                apply_reshape_core(in_shape, &new_shape_vals, canonical, simplify_cache)
+                apply_reshape_core(in_shape, &new_shape_vals, canonical)
             })
         }
 
@@ -894,13 +926,14 @@ pub fn apply_movement_op(
 ///
 /// Matches upstream `_apply_reshape`.
 /// Callers should PLACEHOLDER-canonicalize `rngs` before calling this.
-fn apply_reshape_core(
-    in_shape: &[SInt],
-    out_shape: &[SInt],
-    rngs: &[Arc<UOp>],
-    simplify_cache: &mut SimplifyCache,
-) -> Vec<Arc<UOp>> {
+fn apply_reshape_core(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     use svod_ir::rewrite::graph_rewrite;
+
+    let key =
+        ReshapeKey { in_shape: shape_key(in_shape), out_shape: shape_key(out_shape), rngs: tuple_key(rngs.to_vec()) };
+    if let Some(hit) = RESHAPE_CACHE.lock().expect("movement cache poisoned").get(&key) {
+        return hit.clone();
+    }
 
     // Pad with CONST(0) on the left when rngs.len() < out_shape.len()
     // (trailing-dimension alignment for partial INDEX)
@@ -943,12 +976,13 @@ fn apply_reshape_core(
             + crate::symbolic::valid_simplification::pm_simplify_valid()
             + crate::symbolic::valid_simplification::pm_drop_and_clauses()
     });
-    let sink = UOp::sink(axes_out);
-    let simplified = simplify_cache.get_or_simplify(&sink, || graph_rewrite(&*RESHAPE_SIMPLIFY, sink.clone(), &mut ()));
-    match simplified.op() {
+    let simplified = graph_rewrite(&*RESHAPE_SIMPLIFY, UOp::sink(axes_out), &mut ());
+    let result = match simplified.op() {
         Op::Sink { sources, .. } => sources.iter().cloned().collect(),
         _ => vec![simplified],
-    }
+    };
+    RESHAPE_CACHE.lock().expect("movement cache poisoned").insert(key, result.clone());
+    result
 }
 
 /// Reshape ranges from `out_shape` to `in_shape` via flatten + unflatten.
@@ -956,8 +990,7 @@ fn apply_reshape_core(
 /// Public wrapper around `apply_reshape_core` with PLACEHOLDER canonicalization.
 /// Used by `flatten_bufferize` to convert multi-dim ranges to 1D.
 pub fn apply_reshape_ranges(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
-    let mut cache = SimplifyCache::default();
-    with_placeholder_canonicalization(rngs, |canonical| apply_reshape_core(in_shape, out_shape, canonical, &mut cache))
+    with_placeholder_canonicalization(rngs, |canonical| apply_reshape_core(in_shape, out_shape, canonical))
 }
 
 /// Canonicalize RANGE UOps to PLACEHOLDER before calling `f`, then restore.

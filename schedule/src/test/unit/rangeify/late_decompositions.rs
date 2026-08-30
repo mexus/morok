@@ -460,7 +460,8 @@ fn test_weak_lowering_concretizes_compact_weak_stack_before_final_rewrite() {
     let lanes = UOp::vconst((0..4).map(ConstValue::Int).collect(), DType::WeakInt);
     let root = UOp::sink(vec![lanes]);
 
-    let lowered = graph_rewrite(&crate::symbolic::pm_lower_index_dtype(), root, &mut ());
+    let lowered =
+        graph_rewrite(&crate::symbolic::pm_lower_index_dtype(), root, &mut crate::symbolic::WeakMemo::default());
     let result = graph_rewrite(crate::optimizer::final_rewrite_patterns(), lowered, &mut ());
 
     assert!(

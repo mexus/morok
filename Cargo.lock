@@ -3602,6 +3602,7 @@ dependencies = [
  "once_cell",
  "proptest",
  "proptest-derive",
+ "rustc-hash",
  "serde",
  "sled",
  "smallvec",

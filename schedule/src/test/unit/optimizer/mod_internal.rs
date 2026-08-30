@@ -111,14 +111,15 @@ mod lower_index_stage_tests {
 
     fn production_value(value: Arc<UOp>) -> Arc<UOp> {
         let root = graph_rewrite(extra_symbolic_patterns(), UOp::sink(vec![value]), &mut ());
-        let root = graph_rewrite(lower_index_patterns(), root, &mut ());
+        let root = graph_rewrite(lower_index_patterns(), root, &mut crate::symbolic::WeakMemo::default());
         let lowered = graph_rewrite(symbolic(), root, &mut ());
         let Op::Sink { sources, .. } = lowered.op() else { panic!("expected SINK") };
         sources[0].clone()
     }
 
     fn lower_value(value: Arc<UOp>) -> Arc<UOp> {
-        let lowered = graph_rewrite(lower_index_patterns(), UOp::sink(vec![value]), &mut ());
+        let lowered =
+            graph_rewrite(lower_index_patterns(), UOp::sink(vec![value]), &mut crate::symbolic::WeakMemo::default());
         let Op::Sink { sources, .. } = lowered.op() else { panic!("expected SINK") };
         sources[0].clone()
     }
@@ -130,7 +131,7 @@ mod lower_index_stage_tests {
         let valid = x.lt(&weak(8));
         let index = UOp::index().buffer(buffer).indices(vec![x.valid(valid).cast(DType::Int64)]).call().unwrap();
 
-        let lowered = graph_rewrite(lower_index_patterns(), index, &mut ());
+        let lowered = graph_rewrite(lower_index_patterns(), index, &mut crate::symbolic::WeakMemo::default());
         let Op::Index { indices, .. } = lowered.op() else { panic!("expected INDEX") };
         let Op::Ternary(_, _, value, invalid) = indices[0].op() else { panic!("expected gated index") };
         assert_eq!(value.dtype(), DType::Int32, "{}", lowered.tree());
@@ -159,7 +160,7 @@ mod lower_index_stage_tests {
         let Op::Index { indices, .. } = distributed.op() else { panic!("expected INDEX") };
         assert!(matches!(indices[0].op(), Op::Binary(BinaryOp::Add, ..)), "{}", distributed.tree());
 
-        let lowered = graph_rewrite(lower_index_patterns(), distributed, &mut ());
+        let lowered = graph_rewrite(lower_index_patterns(), distributed, &mut crate::symbolic::WeakMemo::default());
         assert!(lowered.toposort().iter().all(|node| !node.dtype().is_weak()), "{}", lowered.tree());
     }
 
