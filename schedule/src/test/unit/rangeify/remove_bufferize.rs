@@ -137,6 +137,24 @@ fn four_accessed_buffers_is_kept() {
 }
 
 #[test]
+fn after_stops_the_accessed_buffer_walk() {
+    // Three params sit behind an AFTER's ordering dep; this compute reads only
+    // the buffer the AFTER passes through. Walking into the dep would count 4
+    // buffers and keep the bufferize; the AFTER costs its own buffer, once.
+    let r = range(8, 0);
+    let reads: Vec<Arc<UOp>> =
+        (1..4).map(|slot| UOp::index().buffer(param(slot, 8)).indices(vec![r.clone()]).call().expect("idx")).collect();
+    let ordered = reads[0].try_add(&reads[1]).expect("add").try_add(&reads[2]).expect("add");
+    let after = param(0, 8).after(smallvec![ordered]);
+    let compute = UOp::index().buffer(after).indices(vec![r.clone()]).call().expect("idx");
+
+    let idx = index_bufferize(compute, vec![r.clone()], vec![r]);
+    let result = pm_remove_bufferize().rewrite(&idx, &mut ());
+
+    assert!(matches!(result, RewriteResult::Rewritten(_)), "the AFTER's deps must not count toward the >3 cutoff");
+}
+
+#[test]
 fn buffer_in_reduce_is_kept() {
     // Reduce body reads a Param — would compound buffer reads inside the loop.
     let r_loop = range(8, 0);
