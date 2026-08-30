@@ -1,6 +1,7 @@
 use super::*;
 use smallvec::SmallVec;
 use svod_dtype::DType;
+use test_case::test_case;
 
 #[test]
 fn beam_behavior_fingerprint_ignores_parallelism() {
@@ -99,112 +100,53 @@ fn test_output_indices_from_program_metadata_rejects_out_of_range_position() {
     assert!(format!("{err}").contains("out of range"));
 }
 
-#[test]
-fn test_input_indices_use_only_program_ins() {
-    let inputs = input_indices_from_program_metadata(&[2, 4, 7], &[4], 3).expect("metadata mapping should succeed");
-    assert_eq!(inputs, vec![1]);
+/// `ins` names the readable globals by slot; a write-only global (absent from
+/// `ins`) and an in-place one (present in both roles) are equally legal.
+#[test_case(&[2, 4, 7], &[4], &[1]; "only program ins")]
+#[test_case(&[0, 1], &[], &[]; "write-only globals")]
+#[test_case(&[0, 1], &[0], &[0]; "in-place global")]
+fn test_input_indices_from_program_metadata(globals: &[usize], ins: &[usize], expected: &[usize]) {
+    let inputs = input_indices_from_program_metadata(globals, ins, globals.len()).expect("metadata mapping");
+    assert_eq!(inputs, expected);
 }
 
-#[test]
-fn test_input_indices_allow_write_only_and_in_place_globals() {
-    assert_eq!(input_indices_from_program_metadata(&[0, 1], &[], 2).unwrap(), Vec::<usize>::new());
-    assert_eq!(input_indices_from_program_metadata(&[0, 1], &[0], 2).unwrap(), vec![0]);
-}
-
-#[test]
-fn test_resolve_compiled_kernel_buffer_indices_reorders_by_program_globals() {
-    let p0 = UOp::param(0, 4, svod_dtype::DType::Float32, None);
-    let p1 = UOp::param(1, 4, svod_dtype::DType::Float32, None);
-    let body = UOp::sink(vec![p0.clone(), p1.clone()]);
-    let call = body.call(SmallVec::from_vec(vec![p1.clone(), p0.clone()]), svod_ir::CallInfo::default());
+/// A CALL passing `count` PARAMs, with the runtime buffer index each argument
+/// resolves to (10, 11, ...) in CALL argument order.
+fn param_call_item(count: usize) -> (crate::schedule::ScheduleItem, std::collections::HashMap<u64, usize>) {
+    let params = (0..count).map(|slot| UOp::param(slot, 4, DType::Float32, None)).collect::<Vec<_>>();
+    let body = UOp::sink(params.clone());
     let item = crate::schedule::ScheduleItem {
-        kernel: call,
+        kernel: body.call(SmallVec::from_vec(params.clone()), svod_ir::CallInfo::default()),
         ast: body,
         buffers: vec![],
-        buffer_uop_ids: vec![p1.id, p0.id],
+        buffer_uop_ids: params.iter().map(|param| param.id).collect(),
         fixedvars: std::collections::HashMap::new(),
         dependencies: vec![],
         instance_dependencies: vec![],
         alias_registered_ids: vec![],
         loop_var_names: std::collections::HashSet::new(),
     };
-    let uop_id_to_idx = std::collections::HashMap::from([(p1.id, 11), (p0.id, 10)]);
+    (item, params.iter().enumerate().map(|(position, param)| (param.id, 10 + position)).collect())
+}
 
+/// `globals` only tells the caller how many compact buffers the compiled
+/// PROGRAM expects — the slots are neither positions nor an ordering, so the
+/// buffer order always comes from the CALL's argument order.
+#[test_case(&[0, 1]; "dense slots")]
+#[test_case(&[1, 0]; "descending slots")]
+#[test_case(&[0, 5]; "sparse slots")]
+fn test_resolve_compiled_kernel_buffer_indices_follows_call_argument_order(globals: &[usize]) {
+    let (item, uop_id_to_idx) = param_call_item(2);
     let ordered =
-        resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, &[0, 1]).expect("compiled buffer ABI ordering");
-
-    assert_eq!(ordered, vec![11, 10]);
-}
-
-#[test]
-fn test_resolve_compiled_kernel_buffer_indices_treats_globals_as_slots_not_positions() {
-    let p0 = UOp::param(0, 4, svod_dtype::DType::Float32, None);
-    let p1 = UOp::param(1, 4, svod_dtype::DType::Float32, None);
-    let body = UOp::sink(vec![p0.clone(), p1.clone()]);
-    let call = body.call(SmallVec::from_vec(vec![p1.clone(), p0.clone()]), svod_ir::CallInfo::default());
-    let item = crate::schedule::ScheduleItem {
-        kernel: call,
-        ast: body,
-        buffers: vec![],
-        buffer_uop_ids: vec![p1.id, p0.id],
-        fixedvars: std::collections::HashMap::new(),
-        dependencies: vec![],
-        instance_dependencies: vec![],
-        alias_registered_ids: vec![],
-        loop_var_names: std::collections::HashSet::new(),
-    };
-    let uop_id_to_idx = std::collections::HashMap::from([(p1.id, 11), (p0.id, 10)]);
-
-    let ordered =
-        resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, &[1, 0]).expect("compiled buffer ABI ordering");
-
-    assert_eq!(ordered, vec![11, 10]);
-}
-
-#[test]
-fn test_resolve_compiled_kernel_buffer_indices_accepts_sparse_slots() {
-    let p0 = UOp::param(0, 4, svod_dtype::DType::Float32, None);
-    let p5 = UOp::param(5, 4, svod_dtype::DType::Float32, None);
-    let body = UOp::sink(vec![p0.clone(), p5.clone()]);
-    let call = body.call(SmallVec::from_vec(vec![p0.clone(), p5.clone()]), svod_ir::CallInfo::default());
-    let item = crate::schedule::ScheduleItem {
-        kernel: call,
-        ast: body,
-        buffers: vec![],
-        buffer_uop_ids: vec![p0.id, p5.id],
-        fixedvars: std::collections::HashMap::new(),
-        dependencies: vec![],
-        instance_dependencies: vec![],
-        alias_registered_ids: vec![],
-        loop_var_names: std::collections::HashSet::new(),
-    };
-    let uop_id_to_idx = std::collections::HashMap::from([(p0.id, 10), (p5.id, 15)]);
-
-    let ordered = resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, &[0, 5]).unwrap();
-    assert_eq!(ordered, vec![10, 15]);
+        resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, globals).expect("compiled buffer ABI ordering");
+    assert_eq!(ordered, vec![10, 11]);
 }
 
 #[test]
 fn test_resolve_compiled_kernel_buffer_indices_rejects_wrong_compact_count() {
-    let p0 = UOp::param(0, 4, svod_dtype::DType::Float32, None);
-    let body = UOp::sink(vec![p0.clone()]);
-    let call = body.call(SmallVec::from_vec(vec![p0.clone()]), svod_ir::CallInfo::default());
-    let item = crate::schedule::ScheduleItem {
-        kernel: call,
-        ast: body,
-        buffers: vec![],
-        buffer_uop_ids: vec![p0.id],
-        fixedvars: std::collections::HashMap::new(),
-        dependencies: vec![],
-        instance_dependencies: vec![],
-        alias_registered_ids: vec![],
-        loop_var_names: std::collections::HashSet::new(),
-    };
-    let uop_id_to_idx = std::collections::HashMap::from([(p0.id, 10)]);
-
+    let (item, uop_id_to_idx) = param_call_item(1);
     let err = resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, &[0, 5])
         .expect_err("wrong compact count should fail");
-
     assert!(format!("{err}").contains("expected 2 compact buffers"), "unexpected error: {err}");
 }
 
@@ -323,35 +265,16 @@ fn test_optimized_kernel_key_includes_exact_compiler_and_renderer_identity() {
     let renderer = svod_schedule::OptimizerRenderer::cpu();
     let mut changed_renderer = renderer.clone();
     changed_renderer.supports_float4 = false;
+    let key = |compiler: &str, renderer: &svod_schedule::OptimizerRenderer| {
+        optimized_kernel_key(&ast, &svod_dtype::DeviceSpec::Cpu, compiler, renderer.cache_fingerprint(), 7)
+    };
 
-    let base = optimized_kernel_key(
-        &ast,
-        &svod_dtype::DeviceSpec::Cpu,
-        "cpu-clang:17:flags-a",
-        renderer.cache_fingerprint(),
-        7,
-    );
+    let base = key("cpu-clang:17:flags-a", &renderer);
+    assert_ne!(base, key("cpu-clang:18:flags-a", &renderer), "exact compiler identity must key optimized kernels");
     assert_ne!(
         base,
-        optimized_kernel_key(
-            &ast,
-            &svod_dtype::DeviceSpec::Cpu,
-            "cpu-clang:18:flags-a",
-            renderer.cache_fingerprint(),
-            7,
-        ),
-        "exact compiler identity must participate in optimized-kernel caching"
-    );
-    assert_ne!(
-        base,
-        optimized_kernel_key(
-            &ast,
-            &svod_dtype::DeviceSpec::Cpu,
-            "cpu-clang:17:flags-a",
-            changed_renderer.cache_fingerprint(),
-            7,
-        ),
-        "optimizer-visible renderer capabilities must participate in optimized-kernel caching"
+        key("cpu-clang:17:flags-a", &changed_renderer),
+        "renderer capabilities must key optimized kernels"
     );
 }
 

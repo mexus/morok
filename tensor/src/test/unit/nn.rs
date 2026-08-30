@@ -358,18 +358,18 @@ crate::codegen_tests! {
     }
 
     fn test_max_pool2d_large_symmetric_pad(config) {
+        // Padding as wide as the kernel's reach: every window is clamped to the
+        // input, so out[i][j] is the element at (min(i, 2) + 2, min(j, 2) + 2).
         let x_data: Vec<f32> = (1..=25).map(|v| v as f32).collect();
         let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 5, 5), x_data).unwrap());
-        let mut result = x
-            .max_pool2d()
-            .kernel_size(&[5, 5])
-            .stride(&[1, 1])
-            .padding(&[(2, 2), (2, 2)])
-            .call()
-            .unwrap();
+        let mut result =
+            x.max_pool2d().kernel_size(&[5, 5]).stride(&[1, 1]).padding(&[(2, 2), (2, 2)]).call().unwrap();
         result.realize_with(&config).unwrap();
-        let values = result.as_vec::<f32>().unwrap();
-        assert_eq!(values[0], 13.0);
+        assert_eq!(get_shape(&result), vec![1, 1, 5, 5]);
+        let expected: Vec<f32> = (0..5)
+            .flat_map(|i: usize| (0..5).map(move |j: usize| ((i.min(2) + 2) * 5 + j.min(2) + 3) as f32))
+            .collect();
+        assert_eq!(result.as_vec::<f32>().unwrap(), expected);
     }
 
     fn test_max_pool2d_with_indices_basic(config) {

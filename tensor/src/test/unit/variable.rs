@@ -509,9 +509,7 @@ crate::codegen_tests! {
             assert_close_f32(&[result], &[expected], 1e-5);
         }
     }
-}
 
-crate::codegen_tests! {
     /// Prepare-once with an UNBOUND variable, then supply `N` at execute time —
     /// the flow `Variable`'s docs describe. Preparing must not demand a binding.
     fn test_prepare_unbound_variable_binds_at_execute(config) {

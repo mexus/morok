@@ -8,7 +8,7 @@ fn overdue(timeout: Duration) -> BusyTask {
     BusyTask { index: 0, started: Instant::now() - timeout }
 }
 
-/// TA6: a response written exactly on the deadline is already in the channel,
+/// A response written exactly on the deadline is already in the channel,
 /// so it must be delivered instead of dropping the candidate and SIGKILLing a
 /// healthy helper.
 #[test]
@@ -42,7 +42,7 @@ fn a_closed_helper_fails_the_slot_regardless_of_the_deadline() {
     assert!(matches!(poll_slot(&responses, Some(&overdue(timeout)), timeout), SlotOutcome::Failed(None)));
 }
 
-/// TA5: a resolution failure must not be latched — the next attempt has to run
+/// A resolution failure must not be latched — the next attempt has to run
 /// the resolver again, and only a success is remembered.
 #[test]
 fn helper_resolution_failures_are_not_cached() {
@@ -96,7 +96,7 @@ fn last_executable_takes_cargos_final_artifact() {
     assert_eq!(last_executable(b"not json\n"), None);
 }
 
-/// CV3: pool failures are typed, so a caller can tell an out-of-order helper
+/// Pool failures are typed, so a caller can tell an out-of-order helper
 /// from an unavailable one instead of matching on a rendered string.
 #[test]
 fn worker_misorder_is_a_distinguishable_variant() {

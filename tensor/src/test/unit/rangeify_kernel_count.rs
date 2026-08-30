@@ -31,7 +31,7 @@ fn ln(x: &Tensor) -> Tensor {
 
 /// Layernorm with the per-channel affine the conformer conv module applies.
 fn ln_affine(x: &Tensor) -> Tensor {
-    let c = x.shape().expect("shape").last().and_then(|d| d.as_const()).expect("static channels") as usize;
+    let c = x.shape().expect("shape").last().and_then(|d| d.as_const()).expect("static channels");
     let (w, b) = (f32_in(&[c]), f32_in(&[c]));
     ln(x).try_mul(&w).expect("scale").try_add(&b).expect("shift")
 }
