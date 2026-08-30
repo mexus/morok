@@ -124,24 +124,33 @@ pub fn pm_lower_weak() -> &'static TypedPatternMatcher {
     }
 }
 
-/// Python carries a per-rewrite dictionary here. Rust's outer matcher has `()`
-/// context, so each edge uses a graph-local rewrite; hash-consing preserves the
-/// same graph result, with only the memoization lifetime differing.
-pub fn lower_weak_srcs(u: &Arc<UOp>) -> Option<Arc<UOp>> {
-    fn lower(s: &Arc<UOp>) -> Arc<UOp> {
+/// The `ctx:dict[UOp, UOp]` upstream threads through `pm_lower_index_dtype`
+/// (`tinygrad/uop/weak.py:29-40`, `:70`), created once per `to_program` by the
+/// single `ctx={}` at `tinygrad/codegen/__init__.py:349`. Keyed by source
+/// identity: hash-consing makes `s.id` the same key `UOp` is upstream.
+pub type WeakMemo = rustc_hash::FxHashMap<u64, Arc<UOp>>;
+
+pub fn lower_weak_srcs(memo: &mut WeakMemo, u: &Arc<UOp>) -> Option<Arc<UOp>> {
+    fn lower(memo: &mut WeakMemo, s: &Arc<UOp>) -> Arc<UOp> {
+        if let Some(cached) = memo.get(&s.id) {
+            return cached.clone();
+        }
         let r = crate::rewrite::graph_rewrite(pm_lower_weak(), s.clone(), &mut ());
-        match r.op() {
+        // the consumer absorbs the cast on its own edge
+        let r = match r.op() {
             Op::Cast { src, dtype } if dtype.is_weak() => src.clone(),
             _ => r,
-        }
+        };
+        memo.insert(s.id, r.clone());
+        r
     }
 
     if matches!(u.op(), Op::Binary(op, ..) if op.is_comparison()) {
-        let ret = lower(u);
+        let ret = lower(memo, u);
         return (!Arc::ptr_eq(&ret, u)).then_some(ret);
     }
     let old_src = u.op().sources();
-    let src: Vec<_> = old_src.iter().map(|s| if s.dtype().is_weak() { lower(s) } else { s.clone() }).collect();
+    let src: Vec<_> = old_src.iter().map(|s| if s.dtype().is_weak() { lower(memo, s) } else { s.clone() }).collect();
     if src.iter().zip(&old_src).all(|(a, b)| Arc::ptr_eq(a, b)) {
         return None;
     }
@@ -211,10 +220,11 @@ fn max_numel_fits_i32(buf: &Arc<UOp>) -> bool {
         .is_some_and(|n| n.saturating_sub(1) <= i32::MAX as usize)
 }
 
-pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
-    pm_commit_weak()
-        + pm_cast_weak()
+pub fn pm_lower_index_dtype() -> TypedPatternMatcher<WeakMemo> {
+    pm_commit_weak().with_context::<WeakMemo>()
+        + pm_cast_weak().with_context()
         + crate::patterns! {
+            @context WeakMemo;
             u @ Shrink { src, offsets, sizes }
                 if offsets.dtype().is_weak() || sizes.dtype().is_weak() => |u, src, offsets, sizes| {
                 let offsets = if offsets.dtype().is_weak() {
@@ -229,7 +239,7 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
                 };
                 Some(u.with_sources(vec![src.clone(), offsets, sizes]))
             },
-            u if !u.dtype().is_weak() && u.op().sources().iter().any(|s| s.dtype().is_weak()) => |u| lower_weak_srcs(u),
+            u if !u.dtype().is_weak() && u.op().sources().iter().any(|s| s.dtype().is_weak()) => |u| lower_weak_srcs(ctx, u),
             u @ Index { buffer, indices } => |u, buffer, indices| {
                 let first = indices.first()?;
                 let Op::Ternary(TernaryOp::Where, gate, idx, invalid) = first.op() else { return None };

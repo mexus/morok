@@ -4,7 +4,7 @@ use svod_dtype::{AddrSpace, DType};
 use svod_ir::{BinaryOp, ConstValue, ConstValueHash, Op, ParamArg, TernaryOp, UOp};
 
 use crate::rewrite::graph_rewrite;
-use crate::symbolic::index_lowering::{pm_commit_weak, pm_lower_index_dtype, pm_lower_weak};
+use crate::symbolic::index_lowering::{WeakMemo, pm_commit_weak, pm_lower_index_dtype, pm_lower_weak};
 
 #[test]
 fn weak_const_selects_i32_or_i64() {
@@ -44,7 +44,7 @@ fn weak_vconst_selects_mechanically_shaped_default() {
 fn weak_vconst_f32_midpoint_commits_before_comparison() {
     let midpoint = 1.0 + 2f64.powi(-24);
     let weak = UOp::vconst(vec![ConstValue::Float(midpoint); 2], DType::WeakFloat);
-    let lowered = graph_rewrite(&pm_lower_index_dtype(), UOp::sink(vec![weak]), &mut ());
+    let lowered = graph_rewrite(&pm_lower_index_dtype(), UOp::sink(vec![weak]), &mut WeakMemo::default());
     let Op::Sink { sources, .. } = lowered.op() else { panic!("expected sink") };
     let committed = &sources[0];
     assert_eq!(committed.dtype(), DType::Float32.vec(2).unwrap());
@@ -64,7 +64,7 @@ fn weak_vconst_commit_preserves_invalid_lane_and_width() {
     let midpoint = 1.0 + 2f64.powi(-24);
     let weak =
         UOp::vconst(vec![ConstValue::Float(midpoint), ConstValue::Invalid, ConstValue::Float(2.0)], DType::WeakFloat);
-    let lowered = graph_rewrite(&pm_lower_index_dtype(), UOp::sink(vec![weak]), &mut ());
+    let lowered = graph_rewrite(&pm_lower_index_dtype(), UOp::sink(vec![weak]), &mut WeakMemo::default());
     let Op::Sink { sources, .. } = lowered.op() else { panic!("expected sink") };
     assert_eq!(sources[0].dtype(), DType::Float32.vec(3).unwrap());
     assert!(matches!(sources[0].op(), Op::VConst { values }
@@ -86,7 +86,7 @@ fn concrete_int_plus_weak_int_resolves_as_target() {
     let index = UOp::variable("idx".into(), 0, 31, DType::Int64);
     let weak = UOp::const_(DType::WeakInt, ConstValue::Int(1));
     let add = UOp::new(Op::Binary(BinaryOp::Add, index, weak), DType::Int64);
-    let lowered = graph_rewrite(&pm_lower_index_dtype(), add, &mut ());
+    let lowered = graph_rewrite(&pm_lower_index_dtype(), add, &mut WeakMemo::default());
     let Op::Binary(BinaryOp::Add, _, rhs) = lowered.op() else { panic!("expected add") };
     assert_eq!(lowered.dtype(), DType::Int64);
     assert_eq!(rhs.dtype(), DType::Int64);
@@ -98,7 +98,7 @@ fn comparison_lowers_whole_node_to_unify_operand_width() {
     let lhs = UOp::const_(DType::WeakInt, ConstValue::Int(i32::MAX as i64 + 1));
     let rhs = UOp::const_(DType::WeakInt, ConstValue::Int(1));
     let comparison = UOp::new(Op::Binary(BinaryOp::Lt, lhs, rhs), DType::Bool);
-    let lowered = graph_rewrite(&pm_lower_index_dtype(), comparison, &mut ());
+    let lowered = graph_rewrite(&pm_lower_index_dtype(), comparison, &mut WeakMemo::default());
     let Op::Binary(BinaryOp::Lt, lhs, rhs) = lowered.op() else { panic!("expected comparison") };
     assert_eq!(lowered.dtype(), DType::Bool);
     assert_eq!(lhs.dtype(), DType::Int64);
@@ -110,7 +110,7 @@ fn committing_shift_lhs_rederives_result_dtype() {
     let lhs = UOp::const_(DType::WeakInt, ConstValue::Int(1));
     let rhs = UOp::native_const(2i64);
     let shift = UOp::new(Op::Binary(BinaryOp::Shl, lhs, rhs), DType::WeakInt);
-    let lowered = graph_rewrite(&pm_lower_index_dtype(), shift, &mut ());
+    let lowered = graph_rewrite(&pm_lower_index_dtype(), shift, &mut WeakMemo::default());
     let Op::Binary(BinaryOp::Shl, lhs, _) = lowered.op() else { panic!("expected shift") };
     assert_eq!(lhs.dtype(), DType::Int64);
     assert_eq!(lowered.dtype(), DType::Int64);
@@ -157,7 +157,7 @@ fn weak_bitwise_and_shift_indices_commit_before_program() {
     for expression in expressions {
         assert_eq!(expression.dtype(), DType::WeakInt, "graph construction must preserve mathematical integers");
         let index = UOp::index().buffer(buffer.clone()).indices(vec![expression]).call().unwrap();
-        let lowered = graph_rewrite(&pm_lower_index_dtype(), index, &mut ());
+        let lowered = graph_rewrite(&pm_lower_index_dtype(), index, &mut WeakMemo::default());
         assert!(
             lowered.toposort().iter().all(|u| !u.dtype().is_weak()),
             "weak dtype reached program boundary:\n{}",
@@ -209,7 +209,7 @@ fn shape_weak_constants_commit_at_concrete_consumer() {
     assert_eq!(weak_shape.dtype(), DType::WeakInt);
     let concrete = UOp::variable("n".into(), 0, 10, DType::Int32);
     let add = UOp::new(Op::Binary(BinaryOp::Add, concrete, weak_shape), DType::Int32);
-    let lowered = graph_rewrite(&pm_lower_index_dtype(), add, &mut ());
+    let lowered = graph_rewrite(&pm_lower_index_dtype(), add, &mut WeakMemo::default());
     assert!(!lowered.op().sources().iter().any(|s| s.dtype().is_weak()));
 }
 
@@ -221,8 +221,8 @@ fn lowering_weak_index_preserves_scalar_load_shape_for_index_extraction() {
     let load = UOp::load().index(index).call();
     let lane = UOp::index().buffer(load).indices(vec![UOp::index_const(3)]).call().unwrap();
 
-    let matcher = crate::symbolic::patterns::symbolic_simple().clone() + pm_lower_index_dtype();
-    let lowered = graph_rewrite(&matcher, lane, &mut ());
+    let matcher = crate::symbolic::patterns::symbolic_simple().with_context::<WeakMemo>() + pm_lower_index_dtype();
+    let lowered = graph_rewrite(&matcher, lane, &mut WeakMemo::default());
 
     let shaped_load = lowered
         .toposort()
@@ -281,7 +281,7 @@ fn stack_invalid_lowers_weak_lane_without_replacing_marker() {
 fn weak_lane_index_commits_hardware_vector_source() {
     let lanes = UOp::vconst((0..4).map(ConstValue::Int).collect(), DType::WeakInt);
     let lane = UOp::index().buffer(lanes).indices(vec![UOp::index_const(2)]).call().unwrap();
-    let lowered = graph_rewrite(&pm_lower_index_dtype(), UOp::sink(vec![lane]), &mut ());
+    let lowered = graph_rewrite(&pm_lower_index_dtype(), UOp::sink(vec![lane]), &mut WeakMemo::default());
     assert!(lowered.toposort().iter().all(|node| !node.dtype().is_weak()), "{}", lowered.tree());
 }
 
@@ -290,7 +290,7 @@ fn mixed_shaped_and_hardware_vector_weak_binary_commits() {
     let shaped = UOp::stack((0..8).map(|value| UOp::native_const(value as i64)).collect());
     let hardware = UOp::vconst(vec![ConstValue::Int(1); 8], DType::WeakInt);
     let add = UOp::new(Op::Binary(BinaryOp::Add, shaped, hardware), DType::WeakInt.vec(8).unwrap());
-    let lowered = graph_rewrite(&pm_lower_index_dtype(), UOp::sink(vec![add]), &mut ());
+    let lowered = graph_rewrite(&pm_lower_index_dtype(), UOp::sink(vec![add]), &mut WeakMemo::default());
     assert!(lowered.toposort().iter().all(|node| !node.dtype().is_weak()), "{}", lowered.tree());
 }
 
@@ -299,7 +299,7 @@ fn concrete_cast_is_a_width_floor() {
     let lhs = UOp::const_(DType::WeakInt, ConstValue::Int(i32::MAX as i64 + 1));
     let rhs = UOp::const_(DType::WeakInt, ConstValue::Int(1));
     let weak_add = UOp::new(Op::Binary(BinaryOp::Add, lhs, rhs), DType::WeakInt);
-    let lowered = graph_rewrite(&pm_lower_index_dtype(), weak_add.cast(DType::Int32), &mut ());
+    let lowered = graph_rewrite(&pm_lower_index_dtype(), weak_add.cast(DType::Int32), &mut WeakMemo::default());
     let Op::Cast { src, dtype } = lowered.op() else { panic!("expected concrete cast") };
     assert_eq!(*dtype, DType::Int32);
     assert!(src.op().sources().iter().all(|s| s.dtype() == DType::Int64));
@@ -326,10 +326,39 @@ fn gated_long_index_narrows_only_for_small_buffers() {
         let idx = UOp::variable("idx".into(), 0, i64::MAX / 2, DType::Int64);
         let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));
         let index = UOp::index().buffer(buffer).indices(vec![idx.valid(gate)]).call().unwrap();
-        let lowered = graph_rewrite(&pm_lower_index_dtype(), index, &mut ());
+        let lowered = graph_rewrite(&pm_lower_index_dtype(), index, &mut WeakMemo::default());
         let Op::Index { indices, .. } = lowered.op() else { panic!("expected index") };
         let Op::Ternary(TernaryOp::Where, _, idx, invalid) = indices[0].op() else { panic!("expected gated index") };
         assert_eq!(idx.dtype() == DType::Int32, narrowed);
         assert!(UOp::is_invalid_marker(invalid));
     }
+}
+
+/// `lower_weak_srcs` (tinygrad/uop/weak.py:29-40) keeps a `ctx` dict keyed by source:
+/// `if (r:=ctx.get(s)) is None: r = graph_rewrite(s, pm_lower_weak)`. The memo lives for
+/// one `to_program` (`ctx={}`, codegen/__init__.py:349), so a source shared by several
+/// consumers is rewritten once, not once per edge.
+#[test]
+fn shared_weak_sources_are_lowered_once_per_pass() {
+    let weak_index = |offset: i64| {
+        UOp::new(
+            Op::Binary(BinaryOp::Add, UOp::range_const(64, 0), UOp::const_(DType::WeakInt, ConstValue::Int(offset))),
+            DType::WeakInt,
+        )
+    };
+    let read = |slot: usize, index: Arc<UOp>| {
+        let buffer = UOp::param(slot, 64, DType::Float32, None);
+        UOp::index().buffer(buffer).indices(vec![index]).call().unwrap()
+    };
+
+    // Three consumers over two distinct weak indices.
+    let shared = weak_index(3);
+    let sink = UOp::sink(vec![read(0, shared.clone()), read(1, shared), read(2, weak_index(5))]);
+
+    let mut memo = WeakMemo::default();
+    graph_rewrite(&pm_lower_index_dtype(), sink, &mut memo);
+
+    // Six weak edges reach a non-weak consumer here: three INDEX indices and the shared
+    // WeakInt extent of the three PARAM shapes. They collapse to three rewrites.
+    assert_eq!(memo.len(), 3, "one entry per distinct weak source, not per consumer edge");
 }
