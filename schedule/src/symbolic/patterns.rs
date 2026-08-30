@@ -154,6 +154,19 @@ fn typed_integer_rewrite_is_exact(original: &Arc<UOp>, replacement: &Arc<UOp>) -
         && integer_arithmetic_does_not_wrap(replacement)
 }
 
+/// Python's `divmod`: the `(q, r)` pair with `c == q*d + r` and `r` carrying the
+/// sign of `d`. This is the semantics of `Op::Binary(FloorDiv | FloorMod)`
+/// (`ir/uop/eval.rs`) and of tinygrad's `//`/`%`, so the divmod normalisation
+/// rules split a constant exactly the way upstream does.
+fn floor_divmod(c: i64, d: i64) -> Option<(i64, i64)> {
+    let (quotient, remainder) = (c.checked_div(d)?, c.checked_rem(d)?);
+    if remainder != 0 && (remainder < 0) != (d < 0) {
+        Some((quotient.checked_sub(1)?, remainder + d))
+    } else {
+        Some((quotient, remainder))
+    }
+}
+
 fn exact_integer_rewrite(original: &Arc<UOp>, replacement: Arc<UOp>) -> Option<Arc<UOp>> {
     typed_integer_rewrite_is_exact(original, &replacement).then_some(replacement)
 }
@@ -899,35 +912,18 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
             None
         },
 
-        // Phase 1: (x + c) // d → (x + (c % d)) // d + (c // d)
-        // When c >= d, split the offset into quotient and remainder parts.
-        // This canonicalizes large offsets, allowing further simplification.
-        // Based on upstream divandmod
+        // (x + c) // d -> (x + c%d) // d + c//d, for any d != 0
+        // (`uop/divandmod.py:102-105`): "split the multiple of d out of the
+        // const, holds for any d!=0". Floor division satisfies
+        // `(x + r + q*d)//d == (x + r)//d + q` for every integer `x` and every
+        // `d != 0`, so upstream's only guard is `c.val%d.val==c.val`.
         original @ FloorDiv(Add[x, _c @const(c_val)], d @const(d_val)) => {
-            let c_int = c_val.try_int()?;
-            let d_int = d_val.try_int()?;
-            if d_int <= 0 { return None; }
+            let (c_div_d, c_mod_d) = floor_divmod(c_val.try_int()?, d_val.try_int()?)?;
+            if c_mod_d == c_val.try_int()? { return None; }
 
-            let c_mod_d = c_int % d_int;
-            let c_div_d = c_int / d_int;
-
-            // Only apply if remainder differs from original (i.e., c >= d or c < 0)
-            if c_mod_d == c_int { return None; }
-
-            // Guard: BOTH (x + c) AND (x + c%d) must be non-negative.
-            // The transform splits: (x+c)//d = (x+c%d)//d + c//d
-            // This guard retains the indexing-domain form used by the surrounding rules.
-            let (vmin, _) = SoundVminVmaxProperty::get(x).as_ref()?;
-            if let ConstValue::Int(min) = vmin {
-                if min.checked_add(c_int)? < 0 || min.checked_add(c_mod_d)? < 0 { return None; }
-            } else { return None; }
-
-            // Transform: (x + c) // d → (x + c%d) // d + c//d
             let remainder_const = UOp::const_(d.dtype(), ConstValue::Int(c_mod_d));
-            let inner = x.add(&remainder_const);
-            let div_result = inner.floor_div(d);
             let quotient_const = UOp::const_(d.dtype(), ConstValue::Int(c_div_d));
-            exact_integer_rewrite(original, div_result.add(&quotient_const))
+            exact_integer_rewrite(original, x.add(&remainder_const).floor_div(d).add(&quotient_const))
         },
 
         // Phase 1b: (x + c) // d for negative x
