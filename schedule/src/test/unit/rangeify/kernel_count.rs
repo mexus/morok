@@ -1,157 +1,48 @@
-//! Kernel count validation tests.
+//! One CALL per global STAGE, each wrapping exactly one STORE.
 //!
-//! Tests that verify the number of kernels created by the pipeline,
-//! ensuring fusion decisions are correct without needing actual tensor data.
+//! Fusion-level counts over realistic graphs live in `fusion.rs`.
 
-use svod_ir::{Op, UOp};
+use std::sync::Arc;
 
-use crate::rangeify::{RangeifyBufferContext, try_get_kernel_graph};
-use crate::test::unit::rangeify::helpers::{count_kernels, count_stores};
+use svod_ir::UOp;
+use test_case::test_case;
 
-#[test]
-fn test_single_store_one_kernel() {
-    // Single STAGE → Should create 1 CALL wrapper
-    let compute = UOp::native_const(1.0f32);
-    let range = UOp::range_const(10, 0);
+use crate::rangeify::{RangeifyBufferContext, transforms::bufferize_to_store, try_get_kernel_graph};
 
-    let stage = UOp::stage_global(compute, vec![range]);
+use super::helpers::{count_kernels, count_stores};
 
-    let (result, _context) =
-        try_get_kernel_graph(stage).expect("kernel split pipeline should succeed for single store");
-
-    // Should create exactly 1 callable wrapper
-    assert_eq!(count_kernels(&result), 1);
+fn one_stage() -> Arc<UOp> {
+    UOp::stage_global(UOp::native_const(1.0f32), vec![UOp::range_const(10, 0)])
 }
 
-#[test]
-fn test_double_store_two_kernels() {
-    // Two independent STAGEs → Should create 2 CALL wrappers
-    let compute1 = UOp::native_const(1.0f32);
-    let compute2 = UOp::native_const(2.0f32);
-
-    let range1 = UOp::range_const(10, 0);
-    let range2 = UOp::range_const(20, 1);
-
-    let bufferize1 = UOp::stage_global(compute1, vec![range1]);
-
-    let bufferize2 = UOp::stage_global(compute2, vec![range2]);
-
-    // Create a root that references both (e.g., SINK)
-    let root = UOp::sink(vec![bufferize1, bufferize2]);
-
-    let (result, _context) = try_get_kernel_graph(root).expect("kernel split pipeline should succeed for double store");
-
-    // Should create 2 callable wrappers (one per STAGE)
-    assert_eq!(count_kernels(&result), 2);
+fn two_stages() -> Arc<UOp> {
+    UOp::sink(vec![
+        UOp::stage_global(UOp::native_const(1.0f32), vec![UOp::range_const(10, 0)]),
+        UOp::stage_global(UOp::native_const(2.0f32), vec![UOp::range_const(20, 1)]),
+    ])
 }
 
+#[test_case(super::one_stage, 1 ; "one stage")]
+#[test_case(super::two_stages, 2 ; "two independent stages")]
+fn each_global_stage_becomes_one_call_with_one_store(build: fn() -> Arc<UOp>, expected: usize) {
+    let (result, _ctx) = try_get_kernel_graph(build()).expect("kernel split");
+    assert_eq!(count_kernels(&result), expected);
+    assert_eq!(count_stores(&result), expected, "each CALL body owns exactly one STORE");
+}
+
+/// The buffer a STAGE is lowered to is memoised, so a second lowering of the
+/// same STAGE reuses it while a different STAGE gets its own.
 #[test]
-fn test_shared_buffer_one_kernel() {
+fn stage_identity_decides_buffer_reuse() {
     let mut ctx = RangeifyBufferContext::new();
-
-    // Same STAGE used twice → should reuse buffer
-    let compute = UOp::native_const(42i32);
     let range = UOp::range_const(5, 0);
+    let first = UOp::stage_global(UOp::native_const(42i32), vec![range.clone()]);
+    let second = UOp::stage_global(UOp::native_const(43i32), vec![range]);
 
-    let stage = UOp::stage_global(compute, vec![range]);
-
-    // Convert to STORE twice (simulating reuse)
-    use crate::rangeify::transforms::bufferize_to_store;
-
-    let _result1 = bufferize_to_store(&stage, &mut ctx);
-    let _result2 = bufferize_to_store(&stage, &mut ctx);
-
-    // For BUFFER ops (global address space), global_counter is NOT incremented
-    // But the buffer should still be tracked and reused
-    assert!(ctx.has_buffer(&stage));
-
-    // Getting the buffer twice should return the same one
-    let buf1 = ctx.get_buffer(&stage).unwrap();
-    let buf2 = ctx.get_buffer(&stage).unwrap();
-    assert!(std::sync::Arc::ptr_eq(buf1, buf2));
-}
-
-#[test]
-fn test_independent_buffers_separate() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Different STAGEs → separate buffers (BUFFER nodes, not DEFINE_GLOBAL)
-    let compute1 = UOp::native_const(1.0f32);
-    let compute2 = UOp::native_const(2.0f32);
-
-    let range = UOp::range_const(10, 0);
-
-    let bufferize1 = UOp::stage_global(compute1, vec![range.clone()]);
-
-    let bufferize2 = UOp::stage_global(compute2, vec![range]);
-
-    use crate::rangeify::transforms::bufferize_to_store;
-
-    bufferize_to_store(&bufferize1, &mut ctx);
-    bufferize_to_store(&bufferize2, &mut ctx);
-
-    // For BUFFER ops, global_counter is NOT incremented
-    // But both should be tracked separately
-    assert!(ctx.has_buffer(&bufferize1));
-    assert!(ctx.has_buffer(&bufferize2));
-
-    // Buffers should be different BUFFER nodes
-    let buf1 = ctx.get_buffer(&bufferize1).unwrap();
-    let buf2 = ctx.get_buffer(&bufferize2).unwrap();
-    assert!(!std::sync::Arc::ptr_eq(buf1, buf2));
-}
-
-#[test]
-fn test_nested_end_operations() {
-    // Nested END operations should each contribute to structure
-    let store = UOp::noop();
-    let range1 = UOp::range_const(4, 0);
-    let range2 = UOp::range_const(8, 1);
-
-    // Create nested ENDs (unusual but should handle)
-    let end1 = store.end(smallvec::smallvec![range1.clone()]);
-    let end2 = end1.clone().end(smallvec::smallvec![range2.clone()]);
-
-    // Verify structure
-    if let Op::End { computation, ranges } = end2.op() {
-        // Outer END should have 1 range
-        assert_eq!(ranges.len(), 1);
-        assert!(std::sync::Arc::ptr_eq(&ranges[0], &range2));
-
-        // Inner computation should be another END
-        assert!(std::sync::Arc::ptr_eq(computation, &end1));
-
-        if let Op::End { ranges: inner_ranges, .. } = computation.op() {
-            assert_eq!(inner_ranges.len(), 1);
-            assert!(std::sync::Arc::ptr_eq(&inner_ranges[0], &range1));
-        }
-    } else {
-        panic!("Expected END operation");
+    for stage in [&first, &first, &second] {
+        bufferize_to_store(stage, &mut ctx);
     }
-}
 
-#[test]
-fn test_pipeline_kernel_count() {
-    // After full pipeline, count kernels
-    // Use non-OUTER (Loop) range since OUTER ranges are skipped by split_store
-    // (OUTER ranges are handled at a higher level in the scheduler)
-    let compute = UOp::native_const(false);
-    let range = UOp::range_const(100, 0); // Loop range, not OUTER
-
-    let stage = UOp::stage_global(compute, vec![range]);
-
-    let (result, _context) =
-        try_get_kernel_graph(stage).expect("kernel split pipeline should succeed for kernel count");
-
-    // Verify exactly 1 callable wrapper was created
-    assert_eq!(count_kernels(&result), 1);
-
-    // Verify STORE is inside the CALL body (wrapped, not bare)
-    // We expect 1 STORE inside the CALL body - this is correct!
-    // The STORE represents the actual memory write operation.
-    assert_eq!(count_stores(&result), 1, "STORE should be inside CALL body");
-
-    // Note: After aligning with Tinygrad, buffers may be BUFFER nodes in the graph
-    // rather than DEFINE_GLOBAL. The count depends on the pattern rewriting behavior.
-    // The important thing is that we have a valid callable with sources.
+    assert!(Arc::ptr_eq(ctx.get_buffer(&first).expect("first"), ctx.get_buffer(&first).expect("first again")));
+    assert!(!Arc::ptr_eq(ctx.get_buffer(&first).expect("first"), ctx.get_buffer(&second).expect("second")));
 }

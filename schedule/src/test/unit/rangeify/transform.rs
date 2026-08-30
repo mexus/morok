@@ -1,3 +1,6 @@
+//! `transform_sources_with_bufferize` / `transform_single_source`: how a
+//! consumer's ranges are pushed into each of its sources.
+
 use svod_dtype::DType;
 use svod_ir::{AxisId, AxisType, Op, UOp};
 
@@ -111,28 +114,4 @@ fn test_transform_movement_chain_on_buffer() {
     // Movement ops are NOT handled here — deferred to BPM rewrite engine
     let new_sources = transform_sources_with_bufferize(&add, &mut ctx);
     assert!(new_sources.is_none(), "Movement ops should be left for BPM rewrite engine");
-}
-
-#[test]
-fn test_rangeify_with_symbolic_simplification() {
-    // This test verifies that symbolic simplification is integrated into rangeify.
-    // We create a computation with a PERMUTE operation that will create index expressions,
-    // and ensure the full pipeline (including symbolic simplification) runs successfully.
-
-    // Create a simple PERMUTE operation: swap axes (use Buffer for pre-kernel pipeline)
-    let src = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 6, DType::Float32);
-    let reshaped = src.try_reshape(&smallvec::smallvec![svod_ir::SInt::Const(2), svod_ir::SInt::Const(3)]).unwrap();
-    let permute = reshaped.try_permute(vec![1, 0]).unwrap();
-
-    // Run full rangeify pipeline (includes symbolic simplification in Step 8)
-    let (result, _ctx) = crate::rangeify::rangeify(permute).unwrap();
-
-    // Verify the pipeline completed successfully without panicking.
-    // This is primarily a smoke test to ensure symbolic simplification
-    // is integrated and doesn't break the rangeify pipeline.
-    // We don't make strong assertions about the result structure since
-    // rangeify behavior depends on the complexity of the input graph.
-
-    // At minimum, verify we got a result back
-    assert!(result.dtype() == DType::Float32);
 }

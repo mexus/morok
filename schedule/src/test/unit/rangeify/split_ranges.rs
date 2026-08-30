@@ -3,6 +3,8 @@ use std::sync::Arc;
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ParamArg, UOp};
 
+use test_case::test_case;
+
 use crate::rangeify::{SplitRangesContext, pm_flatten_range, pm_split_ranges};
 use crate::rewrite::graph_rewrite;
 
@@ -13,44 +15,38 @@ fn split_modulo_range(axis_type: AxisType) -> (Arc<UOp>, Arc<UOp>, Arc<UOp>) {
     (range, sink, result)
 }
 
-#[test]
-fn test_modulo_split_eligible_axis_types() {
-    for axis_type in [
-        AxisType::Global,
-        AxisType::Local,
-        AxisType::Weak,
-        AxisType::Loop,
-        AxisType::Reduce,
-        AxisType::GroupReduce,
-        AxisType::Upcast,
-    ] {
-        let (original, _, result) = split_modulo_range(axis_type);
-        let ranges: Vec<_> = result.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::Range { .. })).collect();
+/// `r % k` splits `r` into an outer and an inner range of the same axis type.
+/// WARP and DEVICE are launch lanes with fixed extents and are never split.
+#[test_case(AxisType::Global, true ; "global")]
+#[test_case(AxisType::Local, true ; "local")]
+#[test_case(AxisType::Weak, true ; "weak")]
+#[test_case(AxisType::Loop, true ; "loop axis")]
+#[test_case(AxisType::Reduce, true ; "reduce")]
+#[test_case(AxisType::GroupReduce, true ; "group reduce")]
+#[test_case(AxisType::Upcast, true ; "upcast")]
+#[test_case(AxisType::Warp, false ; "warp")]
+#[test_case(AxisType::Device, false ; "device")]
+fn modulo_splits_every_axis_type_but_the_launch_lanes(axis_type: AxisType, splits: bool) {
+    let (original, sink, result) = split_modulo_range(axis_type);
+    let ranges: Vec<_> = result.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::Range { .. })).collect();
 
-        assert_eq!(ranges.len(), 2, "{axis_type:?} range should split");
-        assert!(
-            ranges
-                .iter()
-                .all(|range| matches!(range.op(), Op::Range { axis_type: split_type, .. } if *split_type == axis_type))
-        );
-        assert!(!ranges.iter().any(|range| Arc::ptr_eq(range, &original)));
-    }
-}
-
-#[test]
-fn test_modulo_split_rejects_only_warp_and_device_axes() {
-    for axis_type in [AxisType::Warp, AxisType::Device] {
-        let (range, sink, result) = split_modulo_range(axis_type);
-        let ranges: Vec<_> = result.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::Range { .. })).collect();
-
-        assert!(Arc::ptr_eq(&result, &sink), "{axis_type:?} range must not split");
+    if !splits {
+        assert!(Arc::ptr_eq(&result, &sink));
         assert_eq!(ranges.len(), 1);
-        assert!(Arc::ptr_eq(&ranges[0], &range));
+        assert!(Arc::ptr_eq(&ranges[0], &original));
+        return;
     }
+
+    assert_eq!(ranges.len(), 2);
+    assert!(
+        ranges.iter().all(|range| matches!(range.op(), Op::Range { axis_type: split, .. } if *split == axis_type)),
+        "the split children inherit the axis type"
+    );
+    assert!(!ranges.iter().any(|range| Arc::ptr_eq(range, &original)));
 }
 
 #[test]
-fn test_image_store_ranges_are_never_split() {
+fn an_image_dtype_index_is_never_split() {
     let range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Loop);
     let image = UOp::new(Op::Noop, DType::Image { kind: svod_dtype::ImageKind::Float, shape: vec![4, 2, 4] });
     let address = UOp::new(

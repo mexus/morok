@@ -1,19 +1,15 @@
-//! Comprehensive tests for reduction simplification optimizations.
-//!
-//! Tests verify `reduce_unparented` and `reduce_collapse` optimizations:
-//! - reduce_unparented: Remove ranges that don't appear in source (2-10x speedup)
-//! - reduce_collapse: Lift range-independent computations outside reductions
-//! - Helper functions: no_range(), range_size_as_i64()
+//! `reduce_unparented` (drop ranges the source never reads, factor constants out
+//! of a MUL chain) and `reduce_collapse` (lift a range-independent body out).
 
-use std::{f32::consts::PI, sync::Arc};
+use std::sync::Arc;
 
 use svod_dtype::DType;
 use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp, pattern::RewriteResult};
 use test_case::test_case;
 
+use crate::rangeify::indexing::{no_range, range_size_as_i64};
 use crate::rangeify::transforms::reduce_collapse as reduce_collapse_inner;
 
-/// Test helper - thin wrapper around pattern matcher for reduce_unparented tests.
 fn reduce_unparented(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     match crate::rangeify::patterns::pm_reduce_simplify().rewrite(reduce, &mut ()) {
         RewriteResult::Rewritten(r) => Some(r),
@@ -21,485 +17,170 @@ fn reduce_unparented(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 }
 
-/// Test helper - wrapper for reduce_collapse that extracts src/ranges from REDUCE node.
 fn reduce_collapse(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, ranges, .. } = reduce.op() else {
-        return None;
-    };
+    let Op::Reduce { src, ranges, .. } = reduce.op() else { return None };
     reduce_collapse_inner(src, ranges)
 }
 
-// ===== Test Helper Functions =====
+fn reduce_range(end: i64, axis_id: usize) -> Arc<UOp> {
+    UOp::range_axis(UOp::index_const(end), AxisId::Renumbered(axis_id), AxisType::Reduce)
+}
 
-/// Check if graph contains any REDUCE operations
-fn has_reduce_op(uop: &Arc<UOp>) -> bool {
+fn has_reduce(uop: &Arc<UOp>) -> bool {
     uop.toposort().iter().any(|n| matches!(n.op(), Op::Reduce { .. } | Op::ReduceAxis { .. }))
 }
 
-/// Check if graph contains any RANGE operations
-fn has_ranges_in_graph(uop: &Arc<UOp>) -> bool {
+fn has_range(uop: &Arc<UOp>) -> bool {
     uop.toposort().iter().any(|n| matches!(n.op(), Op::Range { .. }))
 }
 
-// ===== reduce_unparented Tests =====
+// ===== reduce_unparented =====
 
-#[test]
-fn test_reduce_unparented_add_basic() {
-    // Input: REDUCE(CONST(5), [range(10)], ADD)
-    // Expected: CONST(5) * 10
-    let const_val = UOp::native_const(5i32);
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = const_val.reduce(vec![range].into(), ReduceOp::Add);
+/// A range the source never reads is folded into arithmetic on the source:
+/// ADD scales it, MUL raises it to the extent, MAX is idempotent. Tinygrad
+/// 8c8b43de handles exactly these three; MIN is deliberately absent.
+#[test_case(ReduceOp::Add, Some(BinaryOp::Mul) ; "add becomes a multiply")]
+#[test_case(ReduceOp::Mul, Some(BinaryOp::Pow) ; "mul becomes a power")]
+#[test_case(ReduceOp::Max, None ; "max returns the source")]
+fn an_unparented_range_is_folded_into_the_source(op: ReduceOp, expected: Option<BinaryOp>) {
+    let src = UOp::native_const(5i32);
+    let reduce = src.clone().reduce(vec![reduce_range(10, 0)].into(), op);
 
-    let result = reduce_unparented(&reduce).expect("Should simplify");
-
-    // Verify result is MUL operation
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)));
+    let result = reduce_unparented(&reduce).expect("an unparented range must fold");
+    match expected {
+        Some(binary) => assert!(matches!(result.op(), Op::Binary(op, _, _) if *op == binary), "{}", result.tree()),
+        None => assert!(Arc::ptr_eq(&result, &src)),
+    }
 }
 
 #[test]
-fn test_reduce_unparented_mul() {
-    // Input: REDUCE(CONST(2), [range(3)], MUL)
-    // Expected: CONST(2)^3
-    let const_val = UOp::native_const(2i32);
-    let range = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = const_val.reduce(vec![range].into(), ReduceOp::Mul);
-
-    let result = reduce_unparented(&reduce).expect("Should simplify");
-
-    // Verify result is POW operation
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Pow, _, _)));
-}
-
-#[test]
-fn test_reduce_unparented_max() {
-    // Input: REDUCE(CONST(42), [range(5)], MAX)
-    // Expected: CONST(42)
-    let const_val = UOp::native_const(42i32);
-    let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = const_val.clone().reduce(vec![range].into(), ReduceOp::Max);
-
-    let result = reduce_unparented(&reduce).expect("Should simplify");
-
-    // Result should be the constant value itself
-    assert!(Arc::ptr_eq(&result, &const_val));
-}
-
-#[test]
-fn test_reduce_unparented_min_is_not_supported_counterexample() {
-    // Tinygrad 8c8b43de only removes unparented ADD, MAX, and MUL reductions.
-    let const_val = UOp::native_const(42i32);
-    let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = const_val.reduce(vec![range].into(), ReduceOp::Min);
-
+fn min_is_not_an_unparented_fold() {
+    let reduce = UOp::native_const(42i32).reduce(vec![reduce_range(5, 0)].into(), ReduceOp::Min);
     assert!(reduce_unparented(&reduce).is_none());
 }
 
 #[test]
-fn test_reduce_unparented_all_parented() {
-    // Input: REDUCE(range, [range], ADD) - can't optimize
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
+fn a_range_the_source_reads_is_not_unparented() {
+    let range = reduce_range(10, 0);
     let reduce = Arc::clone(&range).reduce(vec![range].into(), ReduceOp::Add);
+    assert!(reduce_unparented(&reduce).is_none());
+}
 
-    let result = reduce_unparented(&reduce);
+/// Two unparented ranges fold one at a time, nesting the scale factors.
+#[test]
+fn every_unparented_range_folds() {
+    let ranges = vec![reduce_range(3, 0), reduce_range(4, 1)];
+    let reduce = UOp::native_const(5i32).reduce(ranges.into(), ReduceOp::Add);
 
-    // Should return None because range is parented
-    assert!(result.is_none());
+    let result = reduce_unparented(&reduce).expect("both ranges must fold");
+    let Op::Binary(BinaryOp::Mul, inner, _) = result.op() else { panic!("expected MUL, got {}", result.tree()) };
+    assert!(matches!(inner.op(), Op::Binary(BinaryOp::Mul, _, _)), "{}", result.tree());
+}
+
+/// A mix keeps the parented range inside the REDUCE and scales by the other.
+#[test]
+fn a_parented_range_stays_inside_the_reduce() {
+    let (parented, unparented) = (reduce_range(5, 0), reduce_range(10, 1));
+    let src = UOp::native_const(3i32).try_add(&parented.cast(DType::Int32)).expect("add");
+    let reduce = src.reduce(vec![parented.clone(), unparented].into(), ReduceOp::Add);
+
+    let result = reduce_unparented(&reduce).expect("the unparented range must fold");
+    let Op::Binary(BinaryOp::Mul, inner, _) = result.op() else { panic!("expected MUL, got {}", result.tree()) };
+    let Op::Reduce { ranges, .. } = inner.op() else { panic!("expected an inner REDUCE, got {}", result.tree()) };
+    assert_eq!(ranges.as_slice().len(), 1);
+    assert!(Arc::ptr_eq(&ranges[0], &parented));
+}
+
+/// Constant factors in a MUL chain lift out of ADD unconditionally, and out of
+/// MAX only when non-negative (a negative factor inverts the ordering).
+#[test_case(ReduceOp::Add, 3, true ; "add with a positive factor")]
+#[test_case(ReduceOp::Add, -1, true ; "add with a negative factor")]
+#[test_case(ReduceOp::Max, 3, true ; "max with a positive factor")]
+#[test_case(ReduceOp::Max, -1, false ; "max with a negative factor")]
+fn constant_factors_lift_out_of_the_reduce(op: ReduceOp, factor: i64, lifts: bool) {
+    let range = reduce_range(10, 0);
+    let src = range.cast(DType::Int32).mul(&UOp::native_const(factor as i32));
+    let reduce = src.reduce(vec![range].into(), op);
+
+    let lifted = reduce_unparented(&reduce).is_some_and(|result| {
+        matches!(result.op(), Op::Binary(BinaryOp::Mul, _, f)
+            if matches!(f.op(), Op::Const(c) if c.0 == ConstValue::Int(factor)))
+    });
+    assert_eq!(lifted, lifts);
 }
 
 #[test]
-fn test_reduce_unparented_mixed_ranges() {
-    // Input: REDUCE(x + range_0, [range_0, range_1], ADD)
-    // range_0 is parented, range_1 is unparented
-    // Expected: REDUCE(x + range_0, [range_0], ADD) * 10
-    let range_0 = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
-    let range_1 = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(1), AxisType::Reduce);
-
-    let x = UOp::native_const(3i32);
-    let src = x.try_add(&range_0.cast(DType::Int32)).unwrap();
-
-    let reduce = src.reduce(vec![range_0.clone(), range_1].into(), ReduceOp::Add);
-
-    let result = reduce_unparented(&reduce).expect("Should simplify");
-
-    // Result should be: (... * 10)
-    // Verify outer op is MUL
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)));
-
-    // Verify inner REDUCE still has range_0
-    if let Op::Binary(_, inner, _) = result.op() {
-        if let Op::Reduce { ranges, .. } = inner.op() {
-            assert_eq!(ranges.len(), 1);
-            assert!(Arc::ptr_eq(&ranges[0], &range_0));
-        } else {
-            panic!("Expected REDUCE in inner op, got {:?}", inner.op());
-        }
-    }
-}
-
-#[test]
-fn test_reduce_unparented_multiple_unparented() {
-    // Input: REDUCE(CONST(5), [range(3), range(4)], ADD)
-    // Expected: CONST(5) * 3 * 4
-    let const_val = UOp::native_const(5i32);
-    let range_0 = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(0), AxisType::Reduce);
-    let range_1 = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(1), AxisType::Reduce);
-
-    let reduce = const_val.reduce(vec![range_0, range_1].into(), ReduceOp::Add);
-
-    let result = reduce_unparented(&reduce).expect("Should simplify");
-
-    // Result should be nested MUL operations: (5 * 3) * 4
-    // Top level should be MUL
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)));
-
-    // Inner should also be MUL
-    if let Op::Binary(_, inner, _) = result.op() {
-        assert!(matches!(inner.op(), Op::Binary(BinaryOp::Mul, _, _)));
-    }
-}
-
-#[test]
-fn test_reduce_unparented_non_reduce_returns_none() {
-    // Test that non-REDUCE operations return None
-    let const_op = UOp::native_const(1.0f32);
-
-    let result = reduce_unparented(&const_op);
-    assert!(result.is_none());
-}
-
-// ===== reduce_collapse Tests =====
-
-#[test]
-fn test_reduce_collapse_basic() {
-    // Input: REDUCE(const, [range], ADD) where const doesn't depend on range
-    // Expected: After symbolic simplification, range dependency should be eliminated
-    // Note: This is a simple case - reduce_unparented would also handle this
-    let const_val = UOp::native_const(5i32);
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = const_val.clone().reduce(vec![range].into(), ReduceOp::Add);
-
-    let result = reduce_collapse(&reduce).expect("reduce_collapse should succeed on constant");
-
-    // Verify no range dependencies remain
-    assert!(!has_ranges_in_graph(&result), "Result should have no range dependencies");
-
-    // Verify REDUCE operation was eliminated
-    assert!(!has_reduce_op(&result), "Result should not contain REDUCE operations");
-
-    // Verify dtype preserved
-    assert_eq!(result.dtype(), const_val.dtype(), "Should preserve dtype");
-}
-
-#[test]
-fn test_reduce_collapse_with_range_dependency() {
-    // Input: REDUCE(range + 1, [range], ADD)
-    // This creates a true dependency on the range variable
-    // Expected: reduce_collapse may succeed (substitution works), but won't eliminate the REDUCE
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let one = UOp::native_const(1i32);
+fn several_constant_factors_lift_together() {
+    let range = reduce_range(10, 0);
     let range_int = range.cast(DType::Int32);
-    let src = range_int.try_add(&one).unwrap();
-
+    let src = UOp::native_const(2i32).mul(&range_int).mul(&UOp::native_const(5i32));
     let reduce = src.reduce(vec![range].into(), ReduceOp::Add);
 
-    let result = reduce_collapse(&reduce);
+    let result = reduce_unparented(&reduce).expect("constants must lift");
+    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)), "{}", result.tree());
+}
 
-    // With the fixed logic, this should now return None since the var dependency remains
-    assert!(result.is_none(), "reduce_collapse should return None when range dependency can't be eliminated");
+// ===== reduce_collapse =====
+
+/// A body that does not read the range collapses: neither the RANGE nor the
+/// REDUCE survives, and the dtype is unchanged.
+#[test_case(ReduceOp::Add ; "add")]
+#[test_case(ReduceOp::Mul ; "mul")]
+#[test_case(ReduceOp::Max ; "max")]
+#[test_case(ReduceOp::Min ; "min")]
+fn a_range_independent_body_collapses(op: ReduceOp) {
+    let src = UOp::native_const(2.5f64);
+    let reduce = src.clone().reduce(vec![reduce_range(100, 0)].into(), op);
+
+    let result = reduce_collapse(&reduce).expect("a range-independent body must collapse");
+    assert!(!has_range(&result));
+    assert!(!has_reduce(&result));
+    assert_eq!(result.dtype(), src.dtype());
 }
 
 #[test]
-fn test_reduce_collapse_non_reduce_returns_none() {
-    // Test that non-REDUCE operations return None
-    let const_op = UOp::native_const(1.0f32);
+fn independent_ranges_all_collapse_together() {
+    let ranges = vec![reduce_range(10, 0), reduce_range(20, 1)];
+    let reduce = UOp::native_const(5i32).reduce(ranges.into(), ReduceOp::Add);
 
-    let result = reduce_collapse(&const_op);
-    assert!(result.is_none());
+    let result = reduce_collapse(&reduce).expect("both ranges must collapse");
+    assert!(no_range(&result));
 }
 
-#[test]
-fn test_reduce_collapse_empty_ranges() {
-    // REDUCE with no ranges should return None
-    let const_val = UOp::native_const(5i32);
-    let reduce = const_val.reduce(vec![].into(), ReduceOp::Add);
-
-    let result = reduce_collapse(&reduce);
-    assert!(result.is_none(), "reduce_collapse should return None for empty ranges");
-}
-
-#[test]
-fn test_reduce_collapse_multiple_ranges_all_independent() {
-    // REDUCE(const, [range1, range2], ADD) where const doesn't depend on either range
-    let const_val = UOp::native_const(5i32);
-    let range1 = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let range2 = UOp::range_axis(UOp::index_const(20), AxisId::Renumbered(1), AxisType::Reduce);
-
-    let reduce = const_val.clone().reduce(vec![range1, range2].into(), ReduceOp::Add);
-
-    let result = reduce_collapse(&reduce);
-
-    // Should successfully collapse since const has no range dependency
-    assert!(result.is_some(), "reduce_collapse should succeed with multiple independent ranges");
-
-    if let Some(res) = result {
-        // Result should have no range dependencies
-        assert!(crate::rangeify::indexing::no_range(&res), "Result should have no range dependencies");
-    }
-}
-
-#[test]
-fn test_reduce_collapse_algebraic_simplification() {
-    // Test that reduce_collapse works with algebraic patterns
-    // REDUCE(x + 0, [range], ADD) where x is constant
+/// Symbolic simplification runs first, so a body that only *looks* like it reads
+/// the range collapses once the algebra cancels.
+#[test_case(ReduceOp::Add, 0i32, BinaryOp::Add ; "x plus zero")]
+#[test_case(ReduceOp::Mul, 1i32, BinaryOp::Mul ; "x times one")]
+fn algebra_runs_before_the_collapse(op: ReduceOp, identity: i32, binary: BinaryOp) {
     let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-    let x_plus_0 = x.try_add(&zero).unwrap();
-
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-
-    let reduce = x_plus_0.reduce(vec![range].into(), ReduceOp::Add);
-
-    let result = reduce_collapse(&reduce).expect("reduce_collapse should succeed after x+0 simplification");
-
-    // Verify symbolic simplification eliminated both x+0 AND range dependency
-    assert!(!has_ranges_in_graph(&result), "x+0 simplification should eliminate ranges");
-    assert!(!has_reduce_op(&result), "Result should not contain REDUCE");
-
-    // Verify result is simplified (no ADD operation for x+0)
-    let has_add = result.toposort().iter().any(|n| matches!(n.op(), Op::Binary(BinaryOp::Add, _, _)));
-    assert!(!has_add, "x+0 should be simplified away");
-}
-
-#[test]
-fn test_reduce_collapse_multiplication_by_one() {
-    // REDUCE(x * 1, [range], MUL) where x is constant
-    let x = UOp::native_const(PI);
-    let one = UOp::native_const(1.0f32);
-    let x_times_1 = x.try_mul(&one).unwrap();
-
-    let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
-
-    let reduce = x_times_1.reduce(vec![range].into(), ReduceOp::Mul);
-
-    let result = reduce_collapse(&reduce).expect("reduce_collapse should succeed after x*1 simplification");
-
-    // Verify symbolic simplification eliminated both x*1 AND range dependency
-    assert!(!has_ranges_in_graph(&result), "x*1 simplification should eliminate ranges");
-    assert!(!has_reduce_op(&result), "Result should not contain REDUCE");
-
-    // Verify result is simplified (no MUL operation for x*1)
-    let has_mul = result.toposort().iter().any(|n| matches!(n.op(), Op::Binary(BinaryOp::Mul, _, _)));
-    assert!(!has_mul, "x*1 should be simplified away");
-}
-
-#[test]
-fn test_reduce_collapse_preserves_dtype() {
-    // Verify that reduce_collapse preserves data types correctly
-    let const_val = UOp::native_const(2.5f64);
-    let range = UOp::range_axis(UOp::index_const(100), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = const_val.clone().reduce(vec![range].into(), ReduceOp::Add);
-
-    let result = reduce_collapse(&reduce);
-
-    assert!(result.is_some(), "reduce_collapse should succeed");
-
-    if let Some(res) = result {
-        // The result dtype should match the source (Float64 in this case)
-        assert_eq!(res.dtype(), const_val.dtype(), "reduce_collapse should preserve dtype");
+    let src = match binary {
+        BinaryOp::Add => x.try_add(&UOp::native_const(identity)),
+        _ => x.try_mul(&UOp::native_const(identity)),
     }
+    .expect("identity op");
+    let reduce = src.reduce(vec![reduce_range(10, 0)].into(), op);
+
+    let result = reduce_collapse(&reduce).expect("the identity must cancel and let the reduce collapse");
+    assert!(!has_range(&result));
+    assert!(!has_reduce(&result));
+    assert!(
+        !result.toposort().iter().any(|n| matches!(n.op(), Op::Binary(op, _, _) if *op == binary)),
+        "the identity operand must be gone: {}",
+        result.tree()
+    );
 }
 
 #[test]
-fn test_reduce_collapse_different_reduce_ops() {
-    // Test reduce_collapse with different ReduceOp types
-    let const_val = UOp::native_const(10i32);
-    let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
+fn a_body_that_reads_the_range_does_not_collapse() {
+    let range = reduce_range(10, 0);
+    let src = range.cast(DType::Int32).try_add(&UOp::native_const(1i32)).expect("add");
 
-    // Test ADD
-    let reduce_add = const_val.clone().reduce(vec![range.clone()].into(), ReduceOp::Add);
-    assert!(reduce_collapse(&reduce_add).is_some(), "reduce_collapse should work with ReduceOp::Add");
-
-    // Test MUL
-    let reduce_mul = const_val.clone().reduce(vec![range.clone()].into(), ReduceOp::Mul);
-    assert!(reduce_collapse(&reduce_mul).is_some(), "reduce_collapse should work with ReduceOp::Mul");
-
-    // Test MAX
-    let reduce_max = const_val.clone().reduce(vec![range.clone()].into(), ReduceOp::Max);
-    assert!(reduce_collapse(&reduce_max).is_some(), "reduce_collapse should work with ReduceOp::Max");
-
-    // Test MIN
-    let reduce_min = const_val.reduce(vec![range].into(), ReduceOp::Min);
-    assert!(reduce_collapse(&reduce_min).is_some(), "reduce_collapse should work with ReduceOp::Min");
-}
-
-// ===== Helper Function Tests =====
-
-#[test]
-fn test_no_range_with_ranges() {
-    // UOp with RANGE dependencies should return false
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let const_5 = UOp::native_const(5i32);
-
-    // Create expression that depends on range: range + 5
-    let sum = range.cast(DType::Int32).try_add(&const_5).unwrap();
-
-    // Should return false because sum depends on range
-    assert!(!crate::rangeify::indexing::no_range(&sum));
+    assert!(reduce_collapse(&src.reduce(vec![range].into(), ReduceOp::Add)).is_none());
 }
 
 #[test]
-fn test_no_range_without_ranges() {
-    // UOp without RANGE dependencies should return true
-    let const_val = UOp::native_const(42i32);
-    assert!(crate::rangeify::indexing::no_range(&const_val));
-
-    // Arithmetic operations on constants also have no ranges
-    let a = UOp::native_const(10i32);
-    let b = UOp::native_const(20i32);
-    let sum = a.try_add(&b).unwrap();
-    assert!(crate::rangeify::indexing::no_range(&sum));
-}
-
-#[test]
-fn test_range_size_extraction_constant() {
-    // Extract size from constant RANGE
-    let range = UOp::range_axis(UOp::index_const(100), AxisId::Renumbered(0), AxisType::Loop);
-
-    assert_eq!(crate::rangeify::indexing::range_size_as_i64(&range), Some(100));
-
-    // Test with different constant values
-    let range_42 = UOp::range_axis(UOp::index_const(42), AxisId::Renumbered(1), AxisType::Reduce);
-
-    assert_eq!(crate::rangeify::indexing::range_size_as_i64(&range_42), Some(42));
-}
-
-#[test]
-fn test_range_size_extraction_symbolic() {
-    // Symbolic RANGE should return None
-    let symbolic_var = UOp::define_var("N".to_string(), 0, 1000);
-    let range = UOp::range_axis(symbolic_var, AxisId::Renumbered(0), AxisType::Loop);
-
-    assert_eq!(crate::rangeify::indexing::range_size_as_i64(&range), None);
-}
-
-#[test]
-fn test_range_size_extraction_non_range() {
-    // Non-RANGE UOp should return None
-    let const_op = UOp::native_const(100i32);
-    assert_eq!(crate::rangeify::indexing::range_size_as_i64(&const_op), None);
-
-    // Binary operation also returns None
-    let a = UOp::native_const(10i32);
-    let b = UOp::native_const(20i32);
-    let sum = a.try_add(&b).unwrap();
-    assert_eq!(crate::rangeify::indexing::range_size_as_i64(&sum), None);
-}
-
-// ===== reduce_mul_chain Tests =====
-
-#[test]
-fn test_reduce_mul_chain_simple_const() {
-    // REDUCE(range * 3, [range], ADD) → REDUCE(range, [range], ADD) * 3
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let three = UOp::native_const(3i32);
-    let src = range.cast(DType::Int32).mul(&three);
-    let reduce = src.reduce(vec![range].into(), ReduceOp::Add);
-
-    let result = reduce_unparented(&reduce).expect("Should factor const out of reduce");
-
-    // Result should have MUL at top level (reduce * 3)
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)));
-
-    // Inner should be REDUCE
-    if let Op::Binary(BinaryOp::Mul, inner, _factor) = result.op() {
-        assert!(matches!(inner.op(), Op::Reduce { .. }));
-    }
-}
-
-#[test]
-fn test_reduce_mul_chain_no_outside_factors() {
-    // REDUCE(range * range, [range], ADD) — all factors reference the range
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let range_int = range.cast(DType::Int32);
-    let src = range_int.mul(&range_int);
-    let reduce = src.reduce(vec![range].into(), ReduceOp::Add);
-
-    // reduce_unparented may still work (via reduce_collapse), but reduce_mul_chain
-    // specifically shouldn't factor anything out since both factors reference the range.
-    // We just verify it doesn't crash.
-    let _result = reduce_unparented(&reduce);
-}
-
-#[test]
-fn test_reduce_mul_chain_multiple_factors() {
-    // REDUCE(a * range * b, [range], ADD) where a, b are constants
-    // → REDUCE(range, [range], ADD) * a * b
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let a = UOp::native_const(2i32);
-    let b = UOp::native_const(5i32);
-    let range_int = range.cast(DType::Int32);
-    let src = a.mul(&range_int).mul(&b);
-    let reduce = src.reduce(vec![range].into(), ReduceOp::Add);
-
-    let result = reduce_unparented(&reduce).expect("Should factor constants out");
-
-    // Result should be: REDUCE(range_int, ...) * 2 * 5
-    // Top level should be MUL
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)));
-}
-
-#[test]
-fn test_reduce_mul_chain_max_positive_factor() {
-    // REDUCE(range * 3, [range], MAX) → REDUCE(range, [range], MAX) * 3
-    // (3 >= 0, so it can be factored out)
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let three = UOp::native_const(3i32);
-    let range_int = range.cast(DType::Int32);
-    let src = range_int.mul(&three);
-    let reduce = src.reduce(vec![range].into(), ReduceOp::Max);
-
-    let result = reduce_unparented(&reduce).expect("Should factor positive const out of MAX reduce");
-
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)));
-}
-
-#[test]
-fn test_reduce_mul_chain_max_negative_factor_stays() {
-    // REDUCE(range * (-1), [range], MAX) — should NOT factor out (-1 < 0)
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let neg_one = UOp::native_const(-1i32);
-    let range_int = range.cast(DType::Int32);
-    let src = range_int.mul(&neg_one);
-    let reduce = src.reduce(vec![range].into(), ReduceOp::Max);
-
-    // The mul_chain pattern should not fire (only 2 factors, one inside, one negative outside)
-    // The result should either be None or not have factored the -1 outside
-    let result = reduce_unparented(&reduce);
-    if let Some(ref res) = result {
-        // If some other pattern rewrote it, that's fine. But if it's a MUL at top,
-        // the REDUCE shouldn't have been split incorrectly.
-        if let Op::Binary(BinaryOp::Mul, _inner, factor) = res.op() {
-            // The -1 should NOT be factored outside a MAX reduce
-            if let Op::Const(c) = factor.op() {
-                assert!(
-                    c.0 != svod_ir::ConstValue::Int(-1),
-                    "Negative factor should not be factored out of MAX reduce"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn test_reduce_mul_chain_single_factor_no_op() {
-    // REDUCE(range, [range], ADD) — single factor, should not trigger mul_chain
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = range.cast(DType::Int32).reduce(vec![range].into(), ReduceOp::Add);
-
-    // This might succeed via reduce_collapse, but not via mul_chain
-    // (mul_chain requires the src to be a MUL op)
-    let _result = reduce_unparented(&reduce);
+fn a_reduce_without_ranges_does_not_collapse() {
+    assert!(reduce_collapse(&UOp::native_const(5i32).reduce(vec![].into(), ReduceOp::Add)).is_none());
 }
 
 /// The arange fold: `sum(r in [0, 32) of (r + v < 31 ? 0 : 1))` must collapse to
@@ -510,7 +191,7 @@ fn test_reduce_mul_chain_single_factor_no_op() {
 #[test_case(true ; "range on the left")]
 #[test_case(false ; "range on the right")]
 fn reduce_collapse_lifts_a_commutative_add_in_either_order(range_first: bool) {
-    let range = UOp::range_axis(UOp::index_const(32), AxisId::Renumbered(0), AxisType::Reduce);
+    let range = reduce_range(32, 0);
     let scalar = UOp::variable("in0".into(), 0, 31, range.dtype());
     let sum = if range_first { range.try_add(&scalar) } else { scalar.try_add(&range) }
         .expect("range and scalar share a dtype");
@@ -520,6 +201,20 @@ fn reduce_collapse_lifts_a_commutative_add_in_either_order(range_first: bool) {
     let reduce = body.reduce(vec![range].into(), ReduceOp::Add);
 
     let result = reduce_collapse(&reduce).expect("the arange fold must collapse this reduce");
-    assert!(!has_ranges_in_graph(&result), "reduce_collapse left a RANGE behind: {:?}", result.op());
-    assert!(!has_reduce_op(&result), "reduce_collapse left a REDUCE behind: {:?}", result.op());
+    assert!(!has_range(&result), "reduce_collapse left a RANGE behind: {}", result.tree());
+    assert!(!has_reduce(&result), "reduce_collapse left a REDUCE behind: {}", result.tree());
+}
+
+// ===== range_size_as_i64 =====
+
+/// Only a RANGE with a constant extent has a size; `no_range` truth table rows
+/// live in `range_load_guards.rs`.
+#[test]
+fn only_a_constant_range_reports_a_size() {
+    assert_eq!(range_size_as_i64(&UOp::range_const(100, 0)), Some(100));
+    assert_eq!(range_size_as_i64(&reduce_range(42, 1)), Some(42));
+
+    let symbolic = UOp::range_axis(UOp::define_var("N".to_string(), 0, 1000), AxisId::Renumbered(0), AxisType::Loop);
+    assert_eq!(range_size_as_i64(&symbolic), None);
+    assert_eq!(range_size_as_i64(&UOp::native_const(100i32)), None);
 }

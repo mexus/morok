@@ -1,14 +1,5 @@
-//! Unit tests for [`pm_remove_bufferize`].
-//!
-//! Covered behavior:
-//! - `INDEX(STAGE)` inlining:
-//!     - always-run sources (Contiguous / Copy / Noop) are kept,
-//!     - non-removable bufferizes are kept,
-//!     - the >3 accessed-buffer threshold,
-//!     - the `buffer_in_reduce` rejection,
-//!     - successful substitution with CONST range keys skipped.
-//! - `STORE(x, x) → NOOP`.
-//! - `END(NOOP, ..) → NOOP`.
+//! `pm_remove_bufferize`: inline `INDEX(STAGE)` when the compute is cheaper to
+//! recompute than to buffer, plus the two NOOP collapses that fall out of it.
 
 use std::sync::Arc;
 
@@ -16,6 +7,7 @@ use smallvec::smallvec;
 use svod_device::DeviceSpec;
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::{AxisId, AxisType, BufferizeOpts, Op, ReduceOp, UOp};
+use test_case::test_case;
 
 use crate::pattern::RewriteResult;
 use crate::rangeify::patterns::pm_remove_bufferize;
@@ -54,37 +46,24 @@ fn index_bufferize(compute: Arc<UOp>, buf_ranges: Vec<Arc<UOp>>, idx_ranges: Vec
 // Rule 1: INDEX(STAGE) — `remove_bufferize` cost heuristic
 // ============================================================================
 
-#[test]
-fn always_run_contiguous_is_kept() {
-    let x = UOp::native_const(1.0f32);
-    let contig = x.contiguous();
-    let r = range(8, 0);
-
-    let idx = index_bufferize(contig, vec![r.clone()], vec![r]);
-    let result = pm_remove_bufferize().rewrite(&idx, &mut ());
-
-    assert!(matches!(result, RewriteResult::NoMatch), "STAGE(CONTIGUOUS) must not be inlined");
+fn contiguous() -> Arc<UOp> {
+    UOp::native_const(1.0f32).contiguous()
 }
 
-#[test]
-fn always_run_copy_is_kept() {
-    let x = UOp::native_const(1.0f32);
-    let cp = x.copy_to_device(DeviceSpec::Cpu);
-    let r = range(8, 0);
-
-    let idx = index_bufferize(cp, vec![r.clone()], vec![r]);
-    let result = pm_remove_bufferize().rewrite(&idx, &mut ());
-
-    assert!(matches!(result, RewriteResult::NoMatch), "STAGE(COPY) must not be inlined");
+fn copy() -> Arc<UOp> {
+    UOp::native_const(1.0f32).copy_to_device(DeviceSpec::Cpu)
 }
 
-#[test]
-fn always_run_noop_is_kept() {
+/// An always-run source has effects (or a transfer-sized destination) that
+/// inlining would duplicate or resize.
+#[test_case(super::contiguous ; "contiguous")]
+#[test_case(super::copy ; "copy")]
+#[test_case(UOp::noop ; "noop")]
+fn always_run_sources_are_kept(build: fn() -> Arc<UOp>) {
     let r = range(8, 0);
-    let idx = index_bufferize(UOp::noop(), vec![r.clone()], vec![r]);
-    let result = pm_remove_bufferize().rewrite(&idx, &mut ());
+    let idx = index_bufferize(build(), vec![r.clone()], vec![r]);
 
-    assert!(matches!(result, RewriteResult::NoMatch), "STAGE(NOOP) must not be inlined");
+    assert!(matches!(pm_remove_bufferize().rewrite(&idx, &mut ()), RewriteResult::NoMatch));
 }
 
 #[test]
@@ -103,37 +82,19 @@ fn non_removable_bufferize_is_kept() {
     assert!(matches!(result, RewriteResult::NoMatch), "non-removable STAGE must not be inlined");
 }
 
-#[test]
-fn three_accessed_buffers_inlines() {
-    // At the threshold (3 distinct Param/Stage/MStack accesses) — inline.
+/// Inlining is worth it up to three distinct Param/Stage/MStack accesses; the
+/// cutoff is `> 3`.
+#[test_case(3, true ; "at the threshold")]
+#[test_case(4, false ; "over the threshold")]
+fn the_accessed_buffer_count_decides_inlining(params: usize, inlines: bool) {
     let r = range(8, 0);
-    let p1 = UOp::index().buffer(param(0, 8)).indices(vec![r.clone()]).call().expect("idx");
-    let p2 = UOp::index().buffer(param(1, 8)).indices(vec![r.clone()]).call().expect("idx");
-    let p3 = UOp::index().buffer(param(2, 8)).indices(vec![r.clone()]).call().expect("idx");
-    let compute = p1.try_add(&p2).expect("add").try_add(&p3).expect("add");
+    let read = |slot| UOp::index().buffer(param(slot, 8)).indices(vec![r.clone()]).call().expect("idx");
+    let compute = (1..params).fold(read(0), |acc, slot| acc.try_add(&read(slot)).expect("add"));
 
     let idx = index_bufferize(compute, vec![r.clone()], vec![r]);
     let result = pm_remove_bufferize().rewrite(&idx, &mut ());
 
-    assert!(
-        matches!(result, RewriteResult::Rewritten(_)),
-        "STAGE accessing 3 Params must be inlined (threshold is `> 3`)"
-    );
-}
-
-#[test]
-fn four_accessed_buffers_is_kept() {
-    let r = range(8, 0);
-    let p1 = UOp::index().buffer(param(0, 8)).indices(vec![r.clone()]).call().expect("idx");
-    let p2 = UOp::index().buffer(param(1, 8)).indices(vec![r.clone()]).call().expect("idx");
-    let p3 = UOp::index().buffer(param(2, 8)).indices(vec![r.clone()]).call().expect("idx");
-    let p4 = UOp::index().buffer(param(3, 8)).indices(vec![r.clone()]).call().expect("idx");
-    let compute = p1.try_add(&p2).expect("add").try_add(&p3).expect("add").try_add(&p4).expect("add");
-
-    let idx = index_bufferize(compute, vec![r.clone()], vec![r]);
-    let result = pm_remove_bufferize().rewrite(&idx, &mut ());
-
-    assert!(matches!(result, RewriteResult::NoMatch), "STAGE accessing 4 Params must be kept (threshold is `> 3`)");
+    assert_eq!(matches!(result, RewriteResult::Rewritten(_)), inlines);
 }
 
 #[test]
