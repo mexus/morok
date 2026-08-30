@@ -8,8 +8,11 @@
 //! - `SVOD_CPU_BACKEND` environment variable ("clang" or "llvm")
 //! - Explicit `create_cpu_device_with_backend()` call
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use svod_device::Result;
 use svod_device::device::{Compiler, Device, Program, ProgramSpec, Renderer, RuntimeFactory};
 use svod_device::registry::DeviceRegistry;
@@ -22,7 +25,7 @@ use crate::dispatch::KernelCif;
 use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA, ObjectCache, ObjectCacheKey};
 
 /// CPU backend selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CpuBackend {
     /// Clang C codegen backend (default).
     /// Generates C source, compiles with clang, loads via dlopen.
@@ -385,6 +388,34 @@ pub fn create_cpu_device_with_backend(registry: &DeviceRegistry, backend: CpuBac
         CpuBackend::Llvm => Arc::new(create_llvm_program),
     };
     Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
+}
+
+/// CPU devices memoized per backend, for the process-global allocator registry.
+///
+/// Building a CPU device probes the clang toolchain (`ClangToolchain::discover`
+/// plus `target_identity`), which costs ~20 ms. Callers that resolve a device
+/// per schedule item must not pay that per item.
+static CPU_DEVICES: Lazy<RwLock<HashMap<CpuBackend, Arc<Device>>>> = Lazy::new(Default::default);
+
+/// Get or create the shared CPU device for `backend`.
+///
+/// Repeated calls with the process-global allocator registry return the same
+/// `Arc`; distinct backends get distinct devices. Any other registry bypasses
+/// the cache, since a cached device holds the allocators it was built with.
+pub fn cpu_device_with_backend(registry: &DeviceRegistry, backend: CpuBackend) -> Result<Arc<Device>> {
+    if !std::ptr::eq(registry, svod_device::registry::registry()) {
+        return Ok(Arc::new(create_cpu_device_with_backend(registry, backend)?));
+    }
+    if let Some(device) = CPU_DEVICES.read().get(&backend) {
+        return Ok(Arc::clone(device));
+    }
+    let mut devices = CPU_DEVICES.write();
+    if let Some(device) = devices.get(&backend) {
+        return Ok(Arc::clone(device));
+    }
+    let device = Arc::new(create_cpu_device_with_backend(registry, backend)?);
+    devices.insert(backend, Arc::clone(&device));
+    Ok(device)
 }
 
 /// Construct CPU renderer/compiler components without creating an allocator or

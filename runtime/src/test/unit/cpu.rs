@@ -273,3 +273,24 @@ fn cpu_dispatch_passes_scalars_at_their_declared_width(value: i32) {
     unsafe { kernel.execute_with_vals(&buffers, &[value as i64]).expect("execute scalar-width fixture") };
     assert_eq!(out, value);
 }
+
+#[test]
+fn cpu_device_is_memoized_per_backend() {
+    use crate::devices::cpu::cpu_device_with_backend;
+    use std::sync::Arc;
+
+    let registry = svod_device::registry::registry();
+    let clang = cpu_device_with_backend(registry, CpuBackend::Clang).expect("clang device");
+    let clang_again = cpu_device_with_backend(registry, CpuBackend::Clang).expect("clang device");
+    assert!(Arc::ptr_eq(&clang, &clang_again), "same backend must reuse one device");
+
+    let llvm = cpu_device_with_backend(registry, CpuBackend::Llvm).expect("llvm device");
+    assert!(!Arc::ptr_eq(&clang, &llvm), "distinct backends must get distinct devices");
+    assert_ne!(clang.compiler.cache_key(), llvm.compiler.cache_key());
+
+    // A non-global allocator registry bypasses the cache: the cached device
+    // holds the allocators of the registry it was built with.
+    let local = DeviceRegistry::default();
+    let fresh = cpu_device_with_backend(&local, CpuBackend::Clang).expect("local clang device");
+    assert!(!Arc::ptr_eq(&clang, &fresh));
+}

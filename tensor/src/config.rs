@@ -36,9 +36,7 @@ struct CpuBackendResolver(CpuBackend);
 impl DeviceResolver for CpuBackendResolver {
     fn resolve(&self, spec: &DeviceSpec, registry: &DeviceRegistry) -> crate::Result<Arc<Device>> {
         match spec {
-            DeviceSpec::Cpu => {
-                Ok(Arc::new(svod_runtime::create_cpu_device_with_backend(registry, self.0).context(DeviceSnafu)?))
-            }
+            DeviceSpec::Cpu => svod_runtime::cpu_device_with_backend(registry, self.0).context(DeviceSnafu),
             _ => svod_runtime::DEVICE_FACTORIES.device(spec, registry).context(DeviceFactorySnafu),
         }
     }
@@ -364,3 +362,7 @@ macro_rules! codegen_tests {
         $crate::codegen_tests!($($rest)*);
     };
 }
+
+#[cfg(test)]
+#[path = "test/unit/config.rs"]
+mod tests;
