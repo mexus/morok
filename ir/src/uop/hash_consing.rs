@@ -118,7 +118,7 @@ enum OpData {
     // Special operations
     MSelectIdx(usize),
     SpecialName(String),
-    ParamData(ParamArg),
+    ParamData(Box<ParamArg>),
     SliceSize(usize),
     Stage(BufferizeOpts),
 
@@ -146,9 +146,9 @@ enum OpData {
     CustomCode(String),
     CustomFunctionKind(CustomFunctionKind),
     CallInfoData(CallInfo),
-    SourceData(String, Option<SourceStageIdentity>),
-    ProgramBinaryData(Vec<u8>, Option<BinaryStageIdentity>),
-    ProgramData(ProgramInfo, Option<SourceStageIdentity>, Option<BinaryStageIdentity>),
+    SourceData(Box<(String, Option<SourceStageIdentity>)>),
+    ProgramBinaryData(Box<(Vec<u8>, Option<BinaryStageIdentity>)>),
+    ProgramData(Box<(ProgramInfo, Option<SourceStageIdentity>, Option<BinaryStageIdentity>)>),
     SinkInfo(Option<crate::types::KernelInfo>),
 
     // Movement operations with extra data
@@ -164,6 +164,11 @@ enum OpData {
     // Tail variant preserves all pre-existing OpData hash discriminants.
     InsArg(InsArg),
 }
+
+// The hash-cons table stores one `UOpKey` per live UOp, and every `UOp::new`
+// probes it with a freshly built key, so `OpData`'s footprint is paid on the
+// hottest path in the compiler. Keep the rare, fat payloads behind a `Box`.
+const _: () = assert!(size_of::<OpData>() <= 128, "OpData grew: box the new payload");
 
 /// Child identities for in-process hash consing. Children are already
 /// hash-consed, while IDs distinguish equal-content nodes with different tags
@@ -190,7 +195,7 @@ impl UOpKey {
             Op::Special { name, .. } => OpData::SpecialName(name.clone()),
             Op::GetAddr { device, .. } => OpData::GetAddrDevice(device.clone()),
             Op::Copy { device, .. } => OpData::CopyDevice(device.clone()),
-            Op::Buffer { arg, .. } | Op::Param { arg, .. } => OpData::ParamData(arg.clone()),
+            Op::Buffer { arg, .. } | Op::Param { arg, .. } => OpData::ParamData(arg.clone().into()),
             Op::Slice { size, .. } => OpData::SliceSize(*size),
             Op::Stage { opts, .. } => OpData::Stage(opts.clone()),
             Op::Permute { axes, .. } => OpData::PermuteAxes(axes.clone()),
@@ -207,18 +212,23 @@ impl UOpKey {
             Op::CustomFunction { kind, .. } => OpData::CustomFunctionKind(kind.clone()),
             Op::Call { info, .. } | Op::Function { info, .. } => OpData::CallInfoData(info.clone()),
             Op::Sink { info, .. } => OpData::SinkInfo(info.clone()),
-            Op::Source { code, identity } => OpData::SourceData(code.clone(), identity.clone()),
-            Op::ProgramBinary { bytes, identity } => OpData::ProgramBinaryData(bytes.clone(), identity.clone()),
+            Op::Source { code, identity } => OpData::SourceData((code.clone(), identity.clone()).into()),
+            Op::ProgramBinary { bytes, identity } => {
+                OpData::ProgramBinaryData((bytes.clone(), identity.clone()).into())
+            }
             Op::Program { info, source, binary, .. } => OpData::ProgramData(
-                info.clone(),
-                source.as_ref().and_then(|stage| match stage.op() {
-                    Op::Source { identity, .. } => identity.clone(),
-                    _ => None,
-                }),
-                binary.as_ref().and_then(|stage| match stage.op() {
-                    Op::ProgramBinary { identity, .. } => identity.clone(),
-                    _ => None,
-                }),
+                (
+                    info.clone(),
+                    source.as_ref().and_then(|stage| match stage.op() {
+                        Op::Source { identity, .. } => identity.clone(),
+                        _ => None,
+                    }),
+                    binary.as_ref().and_then(|stage| match stage.op() {
+                        Op::ProgramBinary { identity, .. } => identity.clone(),
+                        _ => None,
+                    }),
+                )
+                    .into(),
             ),
             Op::Ins { arg, .. } => OpData::InsArg(arg.clone()),
             Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
