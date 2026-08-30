@@ -1,5 +1,5 @@
-//! Unit tests for the profiler data model, table rendering (GPU-free), and
-//! [`RunProfile::merge`] accumulation semantics.
+//! Unit tests for the profiler data model, table rendering (GPU-free), lane
+//! metrics, and [`RunProfile::merge`] accumulation semantics.
 
 use std::time::Duration;
 
@@ -23,38 +23,32 @@ fn pmc_counter_token_roundtrip() {
     assert_eq!(PmcCounter::from_token("BUSY"), Some(PmcCounter::SqBusyCycles), "case-insensitive alias");
 }
 
+/// `SVOD_PMC` parsing, and what each resulting selection enables. Counters are
+/// off unless asked for, and all-unknown tokens fall back to the default set
+/// rather than silently profiling nothing.
 #[test]
-fn pmc_selection_resolution() {
-    assert!(!PmcSelection::None.is_enabled());
-    assert!(PmcSelection::None.counters().is_empty());
-    assert!(PmcSelection::Default.is_enabled());
-    assert_eq!(PmcSelection::Default.counters().len(), 3);
-    let custom = PmcSelection::Custom(vec![PmcCounter::SqInstsValu]);
-    assert_eq!(custom.counters(), vec![PmcCounter::SqInstsValu]);
-}
+fn pmc_selection_is_parsed_and_resolved() {
+    assert_eq!(ProfileOptions::default().counters, PmcSelection::None);
+    assert_eq!(ProfileOptions::default().iters, 1);
+    assert!(ProfileOptions::default().static_analysis);
 
-#[test]
-fn parse_pmc_values() {
     assert_eq!(parse_pmc(""), PmcSelection::None);
     assert_eq!(parse_pmc("0"), PmcSelection::None);
-    assert_eq!(parse_pmc("1"), PmcSelection::Default);
-    assert_eq!(parse_pmc("valu,waves"), PmcSelection::Custom(vec![PmcCounter::SqInstsValu, PmcCounter::SqWaves]));
-    // All-unknown tokens fall back to the default set rather than an empty selection.
-    assert_eq!(parse_pmc("bogus"), PmcSelection::Default);
-}
+    assert!(!PmcSelection::None.is_enabled());
+    assert!(PmcSelection::None.counters().is_empty());
 
-#[test]
-fn profile_options_default() {
-    let o = ProfileOptions::default();
-    assert_eq!(o.iters, 1);
-    assert!(o.static_analysis);
-    assert_eq!(o.counters, PmcSelection::None);
+    assert_eq!(parse_pmc("1"), PmcSelection::Default);
+    assert_eq!(parse_pmc("bogus"), PmcSelection::Default, "all-unknown tokens fall back to the default set");
+    assert!(PmcSelection::Default.is_enabled());
+    assert_eq!(PmcSelection::Default.counters().len(), 3);
+
+    assert_eq!(parse_pmc("valu,waves"), PmcSelection::Custom(vec![PmcCounter::SqInstsValu, PmcCounter::SqWaves]));
+    assert_eq!(PmcSelection::Custom(vec![PmcCounter::SqInstsValu]).counters(), vec![PmcCounter::SqInstsValu]);
 }
 
 #[test]
 fn render_table_empty_and_host_only() {
-    // Empty report renders nothing.
-    assert_eq!(RunProfile::default().render_table(), "");
+    assert_eq!(RunProfile::default().render_table(), "", "an empty report renders nothing");
 
     // A host-only stage (no kernels) renders a single wall line, no metric table.
     let mut rp = RunProfile::default();
@@ -119,10 +113,11 @@ fn timing(operation: usize, millis: u64) -> OperationTiming {
     OperationTiming { operation, copy_leg: None, duration: Duration::from_millis(millis) }
 }
 
+/// Independent compute/copy forks at t=0, joined by a third op. The compute
+/// lane waits three ms after its first command for the longer copy lane, and
+/// the two lanes overlap for the five ms the compute op runs.
 #[test]
 fn host_fork_join_lane_metrics_measure_overlap_and_join_wait() {
-    // Independent compute/copy forks at t=0. The compute join waits three ms
-    // after its first command for the longer copy lane.
     let plan = semantic_plan(&[
         topology_op(0, QueueKind::Compute(0), &[], &[1]),
         topology_op(1, QueueKind::Copy(0), &[], &[2]),
@@ -141,6 +136,8 @@ fn host_fork_join_lane_metrics_measure_overlap_and_join_wait() {
     assert_eq!(compute.overlap, Duration::from_millis(5));
 }
 
+/// The same three ops chained by RAW hazards instead: nothing overlaps, and
+/// the makespan is the serial sum.
 #[test]
 fn alternating_copy_compute_metrics_preserve_serial_hazards() {
     let plan = semantic_plan(&[
