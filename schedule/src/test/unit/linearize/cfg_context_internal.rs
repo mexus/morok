@@ -1,61 +1,38 @@
 use super::*;
 use svod_dtype::DType;
 use svod_ir::types::ConstValue;
+use test_case::test_case;
 
-#[test]
-fn test_cfg_context_single_range() {
-    // Single RANGE should have no edges
-    let end_val = UOp::index_const(10);
-    let range = UOp::range(end_val, 0);
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let end = value.end(smallvec::smallvec![range]);
-    let sink = UOp::sink(vec![end]);
+fn loop_end(value: Arc<UOp>, ranges: &[Arc<UOp>]) -> Arc<UOp> {
+    value.end(ranges.iter().cloned().collect())
+}
 
-    let ctx = CFGContext::new(&sink);
+fn float(value: f32) -> Arc<UOp> {
+    UOp::const_(DType::Float32, ConstValue::Float(value as f64))
+}
+
+/// Ranges closed by the same END are not chained: predecessor edges only come from loops
+/// that actually follow one another.
+#[test_case(1; "one range")]
+#[test_case(2; "two sibling ranges")]
+fn ranges_closed_by_one_end_have_no_predecessor_edges(count: usize) {
+    let end = UOp::index_const(10);
+    let ranges: Vec<_> = (0..count).map(|axis| UOp::range(end.clone(), axis)).collect();
+    let ctx = CFGContext::new(&UOp::sink(vec![loop_end(float(1.0), &ranges)]));
+
     assert!(!ctx.has_edges());
 }
 
+/// The inner END depends on the outer range, so the loops nest rather than being siblings
+/// and the outer range keeps no predecessor.
 #[test]
-fn test_cfg_context_sibling_ranges() {
-    // Two sibling RANGEs should have one edge
-    let end_val = UOp::index_const(10);
-    let range1 = UOp::range(end_val.clone(), 0);
-    let range2 = UOp::range(end_val, 1);
+fn a_nested_range_is_not_a_sibling_of_its_parent() {
+    let end = UOp::index_const(10);
+    let outer_range = UOp::range(end.clone(), 1);
+    let inner_value = float(1.0).add(&outer_range.cast(DType::Float32));
+    let outer_end = loop_end(loop_end(inner_value, &[UOp::range(end, 0)]), std::slice::from_ref(&outer_range));
 
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let end = value.end(smallvec::smallvec![range1.clone(), range2.clone()]);
-    let sink = UOp::sink(vec![end]);
+    let ctx = CFGContext::new(&UOp::sink(vec![outer_end]));
 
-    let ctx = CFGContext::new(&sink);
-    // With 2 ranges, we should have 1 edge (range2 → range1)
-    assert!(ctx.edge_count() <= 1);
-}
-
-#[test]
-fn test_cfg_context_nested_ranges() {
-    // Nested RANGEs: inner loop runs inside outer loop.
-    // For inner_end to be nested inside outer_end, inner_end must depend on outer_range.
-    let end_val = UOp::index_const(10);
-
-    // Outer range first (so inner can depend on it)
-    let outer_range = UOp::range(end_val.clone(), 1);
-
-    // Inner range
-    let inner_range = UOp::range(end_val, 0);
-
-    // Inner value that depends on outer_range (so it runs inside outer loop)
-    // Use outer_range as part of the computation to create the dependency
-    let outer_idx = outer_range.cast(DType::Float32);
-    let inner_value = UOp::const_(DType::Float32, ConstValue::Float(1.0)).add(&outer_idx);
-    let inner_end = inner_value.end(smallvec::smallvec![inner_range.clone()]);
-
-    // Outer END
-    let outer_end = inner_end.end(smallvec::smallvec![outer_range.clone()]);
-
-    let sink = UOp::sink(vec![outer_end]);
-
-    let ctx = CFGContext::new(&sink);
-    // inner_end is nested inside outer_end (not siblings), so outer_range
-    // should have no predecessor edge
     assert!(ctx.get_predecessor(&outer_range).is_none());
 }

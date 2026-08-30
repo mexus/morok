@@ -1,91 +1,25 @@
 use super::*;
 
-#[test]
-fn test_magic_unsigned_div_3() {
-    // x / 3 for x in 0..=100
-    let result = magic_unsigned(100, 3);
-    assert!(result.is_some());
-    let (m, s) = result.unwrap();
+use test_case::test_case;
 
-    // Verify for some values
-    for x in 0..=100 {
-        let expected = x / 3;
-        let actual = ((x as i128 * m as i128) >> s) as i64;
-        assert_eq!(expected, actual, "Failed for x = {}", x);
+/// `magic_unsigned(max, d)` returns `(m, s)` with `(x * m) >> s == x / d` for every
+/// `x` in `0..=max`. The larger maxima are the ones a power-of-two factorization
+/// leaves behind (`x / 6` becomes `(x >> 1) / 3`, `x / 12` becomes `(x >> 2) / 3`).
+#[test_case(100, 3; "small max")]
+#[test_case(500, 3; "max left by factoring out 2")]
+#[test_case(1000, 7; "odd divisor")]
+#[test_case(10000, 10; "even divisor with a wide range")]
+fn magic_unsigned_reproduces_integer_division(max: i64, divisor: i64) {
+    let (m, s) = magic_unsigned(max, divisor).expect("a magic number exists");
+    for x in 0..=max {
+        assert_eq!(x / divisor, ((x as i128 * m as i128) >> s) as i64, "{x} / {divisor}");
     }
 }
 
 #[test]
-fn test_magic_unsigned_div_7() {
-    // x / 7 for x in 0..=1000
-    let result = magic_unsigned(1000, 7);
-    assert!(result.is_some());
-    let (m, s) = result.unwrap();
-
-    for x in 0..=1000 {
-        let expected = x / 7;
-        let actual = ((x as i128 * m as i128) >> s) as i64;
-        assert_eq!(expected, actual, "Failed for x = {}", x);
-    }
-}
-
-#[test]
-fn test_magic_unsigned_div_10() {
-    // x / 10 for x in 0..=10000
-    let result = magic_unsigned(10000, 10);
-    assert!(result.is_some());
-    let (m, s) = result.unwrap();
-
-    for x in (0..=10000).step_by(100) {
-        let expected = x / 10;
-        let actual = ((x as i128 * m as i128) >> s) as i64;
-        assert_eq!(expected, actual, "Failed for x = {}", x);
-    }
-}
-
-#[test]
-fn test_magic_unsigned_invalid() {
-    // Zero divisor
+fn magic_unsigned_rejects_non_positive_divisors() {
     assert!(magic_unsigned(100, 0).is_none());
-
-    // Negative divisor
     assert!(magic_unsigned(100, -5).is_none());
-}
-
-#[test]
-fn test_magic_unsigned_div_6_factorization() {
-    // x / 6 for x in 0..=1000
-    // Tests power-of-two factorization: 6 = 2 * 3
-    // Division by 6 should become: (x >> 1) / 3
-    let result = magic_unsigned(500, 3); // After shift, max is 500
-    assert!(result.is_some());
-    let (m, s) = result.unwrap();
-
-    for x in 0..=1000 {
-        let expected = x / 6;
-        // Simulate factorization: (x >> 1) then magic divide by 3
-        let shifted = x >> 1;
-        let actual = ((shifted as i128 * m as i128) >> s) as i64;
-        assert_eq!(expected, actual, "Failed for x = {}", x);
-    }
-}
-
-#[test]
-fn test_magic_unsigned_div_12_factorization() {
-    // x / 12 for x in 0..=1200
-    // Tests power-of-two factorization: 12 = 4 * 3
-    // Division by 12 should become: (x >> 2) / 3
-    let result = magic_unsigned(300, 3); // After shift by 2, max is 300
-    assert!(result.is_some());
-    let (m, s) = result.unwrap();
-
-    for x in 0..=1200 {
-        let expected = x / 12;
-        // Simulate factorization: (x >> 2) then magic divide by 3
-        let shifted = x >> 2;
-        let actual = ((shifted as i128 * m as i128) >> s) as i64;
-        assert_eq!(expected, actual, "Failed for x = {}", x);
-    }
 }
 
 #[test]
@@ -132,9 +66,9 @@ fn fast_division_replacements_are_exhaustive_for_eight_bit_ranges() {
     }
 }
 
-#[test_case::test_case(8, 64; "byte periods")]
-#[test_case::test_case(16, 16; "fixed period")]
-#[test_case::test_case(64, 4096; "wide periods")]
+#[test_case(8, 64; "byte periods")]
+#[test_case(16, 16; "fixed period")]
+#[test_case(64, 4096; "wide periods")]
 fn symbolic_divisor_factors_out_of_an_affine_numerator(period_min: i64, period_max: i64) {
     // (N*i + j) // N -> i and (N*i + j) % N -> j for a symbolic N, with j in one period.
     let n = UOp::var("n", svod_ir::DType::Index, period_min, period_max);
@@ -278,20 +212,20 @@ fn divmod_eval(expr: &Arc<UOp>, vars: &[Arc<UOp>], point: &[i64]) -> i64 {
     }
 }
 
-#[test_case::test_case("remove_nested_mod"; "remove_nested_mod: (a%12)%4 -> a%4")]
-#[test_case::test_case("remove_nested_mod_to_zero"; "remove_nested_mod: (a*4%12)%4 -> 0")]
-#[test_case::test_case("nested_div_six_over_three"; "nested_div: x%6//3 -> x//3%2")]
-#[test_case::test_case("nested_div_twelve_over_four"; "nested_div: x%12//4 -> x//4%3")]
-#[test_case::test_case("nested_div_into_mod"; "nested_div: idx*4%8//4 -> idx%2")]
-#[test_case::test_case("gcd_with_remainder_div"; "gcd_with_remainder: a*4//6 -> a*2//3")]
-#[test_case::test_case("gcd_with_remainder_div_offset"; "gcd_with_remainder: (a*4+2)//6 -> (a*2+1)//3")]
-#[test_case::test_case("gcd_with_remainder_mod_offset"; "gcd_with_remainder: (a*4+3)%6 -> (a*2+1)%3*2+1")]
-#[test_case::test_case("nest_by_factor_mod"; "nest_by_factor: (gidx0*4+lidx0)%8 -> lidx0+gidx0%2*4")]
-#[test_case::test_case("nest_by_factor_mod_odd"; "nest_by_factor: (a*3+b)%9 -> b+a%3*3")]
-#[test_case::test_case("nest_by_factor_mod_with_const"; "nest_by_factor: (a*4+b+2)%8 -> b+a%2*4+2")]
-#[test_case::test_case("divide_by_gcd_negative_coefficient"; "divide_by_gcd: (a*-4+4)%8 -> (a*-1+1)%2*4")]
-#[test_case::test_case("factor_remainder_negative_carry"; "factor_remainder: (a*-7+b)//5 floors the carry")]
-#[test_case::test_case("factor_remainder_partial_quotient"; "factor_remainder: (b*31+1)//18 -> (b*13+1)//18+b")]
+#[test_case("remove_nested_mod"; "remove_nested_mod: (a%12)%4 -> a%4")]
+#[test_case("remove_nested_mod_to_zero"; "remove_nested_mod: (a*4%12)%4 -> 0")]
+#[test_case("nested_div_six_over_three"; "nested_div: x%6//3 -> x//3%2")]
+#[test_case("nested_div_twelve_over_four"; "nested_div: x%12//4 -> x//4%3")]
+#[test_case("nested_div_into_mod"; "nested_div: idx*4%8//4 -> idx%2")]
+#[test_case("gcd_with_remainder_div"; "gcd_with_remainder: a*4//6 -> a*2//3")]
+#[test_case("gcd_with_remainder_div_offset"; "gcd_with_remainder: (a*4+2)//6 -> (a*2+1)//3")]
+#[test_case("gcd_with_remainder_mod_offset"; "gcd_with_remainder: (a*4+3)%6 -> (a*2+1)%3*2+1")]
+#[test_case("nest_by_factor_mod"; "nest_by_factor: (gidx0*4+lidx0)%8 -> lidx0+gidx0%2*4")]
+#[test_case("nest_by_factor_mod_odd"; "nest_by_factor: (a*3+b)%9 -> b+a%3*3")]
+#[test_case("nest_by_factor_mod_with_const"; "nest_by_factor: (a*4+b+2)%8 -> b+a%2*4+2")]
+#[test_case("divide_by_gcd_negative_coefficient"; "divide_by_gcd: (a*-4+4)%8 -> (a*-1+1)%2*4")]
+#[test_case("factor_remainder_negative_carry"; "factor_remainder: (a*-7+b)//5 floors the carry")]
+#[test_case("factor_remainder_partial_quotient"; "factor_remainder: (b*31+1)//18 -> (b*13+1)//18+b")]
 fn tinygrad_divmod_examples_fold_to_the_upstream_form(name: &str) {
     let DivmodCase { vars, expr, expected } = divmod_case(name);
     let folded = svod_ir::rewrite::graph_rewrite(crate::symbolic::symbolic(), expr.clone(), &mut ());

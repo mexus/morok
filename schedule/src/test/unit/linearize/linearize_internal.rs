@@ -4,6 +4,7 @@ use svod_dtype::{AddrSpace, DType, DeviceSpec};
 use svod_ir::types::{AxisId, AxisType, ConstValue, InsArg, RendererDevice, WmmaMetadata};
 
 use crate::linearize::line_rewrite_cleanups;
+use test_case::test_case;
 
 #[test]
 fn tinygrad_partial_range_comparison_rejects_path_prefixes() {
@@ -103,122 +104,45 @@ fn tinygrad_wmma_key_omits_svod_only_metadata() {
     );
 }
 
+/// Linearization is a topological order over the whole graph: each node is emitted
+/// once, after every source it depends on, with the root SINK last.
 #[test]
-fn test_linearize_single_const() {
-    let c = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let sink = UOp::sink(vec![c.clone()]);
+fn linearize_emits_each_node_after_its_sources() {
+    // A diamond over three constants (shared source), wrapped in a loop: covers
+    // constants, binary ops, RANGE/END and the terminating SINK.
+    let shared = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let left = shared.try_add(&UOp::const_(DType::Float32, ConstValue::Float(2.0))).unwrap();
+    let right = shared.try_add(&UOp::const_(DType::Float32, ConstValue::Float(3.0))).unwrap();
+    let sink = UOp::sink(vec![left.try_add(&right).unwrap().end(smallvec![UOp::range_const(10, 0)])]);
 
-    let result = linearize(sink.clone());
+    let order = linearize(sink.clone());
+    let at = |node: &Arc<UOp>| order.iter().position(|emitted| Arc::ptr_eq(emitted, node));
 
-    assert_eq!(result.len(), 2); // const + sink
-    // Const should come before sink
-    assert!(matches!(result[0].op(), Op::Const(_)));
-    assert!(matches!(result[1].op(), Op::Sink { .. }));
+    for node in sink.toposort() {
+        let position = at(&node).unwrap_or_else(|| panic!("{:?} was never emitted", node.op()));
+        for source in node.op().sources() {
+            let source_position = at(&source).unwrap_or_else(|| panic!("{:?} was never emitted", source.op()));
+            assert!(source_position < position, "{:?} emitted before its source {:?}", node.op(), source.op());
+        }
+    }
+    assert!(Arc::ptr_eq(order.last().expect("a non-empty linearization"), &sink));
+}
+
+/// Upstream dropped the CONST arm (52b989c6c "don't place consts early") and the
+/// DEFINE_VAR arm (4a4b6956d): a symbolic variable is placed as a PARAM.
+#[test_case(UOp::param(3, 1, DType::Float32, Some(DeviceSpec::Cpu)), (-20, Some(3)); "param carries its slot")]
+#[test_case(UOp::variable("n".to_string(), 0, 8, DType::Int32), (-20, Some(-1)); "define var is a param")]
+#[test_case(UOp::buffer(1, 1, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu)), (-18, None); "global buffer")]
+#[test_case(UOp::buffer(2, 1, DType::Float32, AddrSpace::Reg, None), (-18, None); "register buffer")]
+#[test_case(UOp::buffer(0, 1, DType::Float32, AddrSpace::Local, None), (-17, None); "local buffer")]
+#[test_case(UOp::const_(DType::Int32, ConstValue::Int(7)), (0, None); "const is not placed early")]
+#[test_case(UOp::range_const(10, 0), (5, None); "range is placed late")]
+fn tinygrad_placement_priorities(node: Arc<UOp>, expected: (i32, Option<i64>)) {
+    assert_eq!(priority(&node), expected);
 }
 
 #[test]
-fn test_linearize_simple_computation() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let sum = a.try_add(&b).unwrap();
-    let sink = UOp::sink(vec![sum]);
-
-    let result = linearize(sink);
-
-    // Should have: const, const, add, sink
-    assert_eq!(result.len(), 4);
-    // Constants should come first (priority -10)
-    assert!(matches!(result[0].op(), Op::Const(_)));
-    assert!(matches!(result[1].op(), Op::Const(_)));
-    // Then binary op
-    assert!(matches!(result[2].op(), Op::Binary(_, _, _)));
-    // Then sink
-    assert!(matches!(result[3].op(), Op::Sink { .. }));
-}
-
-#[test]
-fn test_linearize_with_range() {
-    // Create: for i in range(10): end(value)
-    let end_val = UOp::index_const(10);
-    let range = UOp::range(end_val, 0);
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let end = value.end(smallvec![range.clone()]);
-    let sink = UOp::sink(vec![end]);
-
-    let result = linearize(sink);
-
-    // Verify RANGE comes before END (RANGE priority 5, END priority -5)
-    // But RANGE should come after its sources
-    let range_pos = result.iter().position(|u| matches!(u.op(), Op::Range { .. }));
-    let end_pos = result.iter().position(|u| matches!(u.op(), Op::End { .. }));
-
-    assert!(range_pos.is_some());
-    assert!(end_pos.is_some());
-    // END depends on RANGE, so RANGE must come before END
-    assert!(range_pos.unwrap() < end_pos.unwrap());
-}
-
-#[test]
-fn test_linearize_preserves_dependencies() {
-    // Create a diamond dependency: a + b, where both depend on c
-    let c = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let c2 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let c3 = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-    let a = c.try_add(&c2).unwrap();
-    let b = c.try_add(&c3).unwrap();
-    let sum = a.try_add(&b).unwrap();
-    let sink = UOp::sink(vec![sum.clone()]);
-
-    let result = linearize(sink);
-
-    // c should appear before both a and b
-    let c_pos = result.iter().position(|u| std::sync::Arc::ptr_eq(u, &c));
-    let a_pos = result.iter().position(|u| std::sync::Arc::ptr_eq(u, &a));
-    let b_pos = result.iter().position(|u| std::sync::Arc::ptr_eq(u, &b));
-    let sum_pos = result.iter().position(|u| std::sync::Arc::ptr_eq(u, &sum));
-
-    assert!(c_pos.is_some());
-    assert!(a_pos.is_some());
-    assert!(b_pos.is_some());
-    assert!(sum_pos.is_some());
-
-    // Dependencies: c < a, c < b, a < sum, b < sum
-    assert!(c_pos.unwrap() < a_pos.unwrap());
-    assert!(c_pos.unwrap() < b_pos.unwrap());
-    assert!(a_pos.unwrap() < sum_pos.unwrap());
-    assert!(b_pos.unwrap() < sum_pos.unwrap());
-}
-
-#[test]
-fn test_priority_ordering() {
-    let param = UOp::param(0, 1, DType::Float32, None);
-    let range = UOp::range_const(10, 0);
-
-    assert!(priority(&param).0 < 0); // PARAM = -20
-    assert!(priority(&range).0 == 5); // RANGE = 5
-    assert_eq!(priority(&param).1, Some(0)); // PARAM extra = slot
-}
-
-#[test]
-fn test_pinned_param_and_buffer_priorities() {
-    let device_param = UOp::param(3, 1, DType::Float32, Some(DeviceSpec::Cpu));
-    let local = UOp::buffer(0, 1, DType::Float32, AddrSpace::Local, None);
-    let global = UOp::buffer(1, 1, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu));
-    let reg = UOp::buffer(2, 1, DType::Float32, AddrSpace::Reg, None);
-
-    assert_eq!(priority(&device_param), (-20, Some(3)));
-    assert_eq!(priority(&local), (-17, None));
-    assert_eq!(priority(&global), (-18, None));
-    assert_eq!(priority(&reg), (-18, None));
-
-    // The pin has no CONST arm (upstream 52b989c6c "don't place consts early")
-    // and no DEFINE_VAR arm (4a4b6956d): a symbolic variable is a PARAM.
-    assert_eq!(priority(&UOp::const_(DType::Int32, ConstValue::Int(7))), (0, None));
-    assert_eq!(priority(&UOp::variable("n".to_string(), 0, 8, DType::Int32)), (-20, Some(-1)));
-}
-
-#[test]
-fn test_tuplize_is_recursive_past_128_elements() {
+fn deep_precast_chain_linearizes_in_tuplize_order() {
     let mut low = UOp::const_(DType::Int32, ConstValue::Int(1));
     let mut high = UOp::const_(DType::Int32, ConstValue::Int(2));
     for _ in 0..140 {
@@ -234,7 +158,7 @@ fn test_tuplize_is_recursive_past_128_elements() {
 }
 
 #[test]
-fn test_equal_dependency_side_effects_use_full_arg_order() {
+fn equal_dependency_side_effects_use_full_arg_order() {
     let dependency = UOp::native_const(0i32);
     let later = UOp::new(Op::CustomI { deps: smallvec![dependency.clone()], code: "z".into() }, DType::Void);
     let earlier = UOp::new(Op::CustomI { deps: smallvec![dependency], code: "a".into() }, DType::Void);
@@ -244,7 +168,7 @@ fn test_equal_dependency_side_effects_use_full_arg_order() {
 }
 
 #[test]
-fn test_nested_axis_and_ins_arguments_participate_in_tuplize() {
+fn nested_axis_and_ins_arguments_participate_in_tuplize() {
     let end = UOp::index_const(4);
     let outer = UOp::range_axis(end.clone(), AxisId::RenumberedPath(smallvec![0, 1]), AxisType::Loop);
     let inner = UOp::range_axis(end, AxisId::RenumberedPath(smallvec![0, 2]), AxisType::Loop);
@@ -270,7 +194,7 @@ fn test_nested_axis_and_ins_arguments_participate_in_tuplize() {
 }
 
 #[test]
-fn test_linearize_cleanup_expands_gated_store() {
+fn linearize_cleanup_expands_a_gated_store_into_if_endif() {
     let buffer = UOp::param(0, 16, DType::Float32, None);
     let index = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
     let gate = UOp::native_const(true);
@@ -279,15 +203,15 @@ fn test_linearize_cleanup_expands_gated_store() {
     let result = line_rewrite_cleanups(vec![store]);
     assert_eq!(result.len(), 3);
     let Op::If { condition, body } = result[0].op() else { panic!("expected IF") };
-    assert!(Arc::ptr_eq(&condition, &gate));
+    assert!(Arc::ptr_eq(condition, &gate));
     assert_eq!(body.len(), 1);
     assert!(matches!(result[1].op(), Op::Store { gate: None, .. }));
     let Op::EndIf { if_op } = result[2].op() else { panic!("expected ENDIF") };
-    assert!(Arc::ptr_eq(&if_op, &result[0]));
+    assert!(Arc::ptr_eq(if_op, &result[0]));
 }
 
 #[test]
-fn test_tuplize_comparison_survives_a_forty_thousand_deep_chain() {
+fn tuplize_comparison_survives_a_forty_thousand_deep_chain() {
     // 2 MiB is a typical non-main thread stack. The recursive comparison
     // overflowed even the 8 MiB main stack somewhere past 20k levels.
     std::thread::Builder::new()

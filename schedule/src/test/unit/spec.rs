@@ -1,15 +1,15 @@
 //! Rule-level tests for Tinygrad's `spec_program` at pinned commit 8c8b43de.
 //!
-//! Program-only rules are tested directly, including ordering-sensitive rules.
 //! `spec_tensor` is used where useful to prove that a rejection comes from the
 //! program rule rather than an inherited `spec_shared` rule.
 
 use std::sync::Arc;
 
 use smallvec::smallvec;
-use svod_dtype::{AddrSpace, DType};
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
 use svod_ir::types::ConstValue;
 use svod_ir::{BinaryOp, ConstValueHash, Op, ParamArg, ReduceOp, UOp};
+use test_case::test_case;
 
 use crate::optimizer::apply_pre_optimization;
 use crate::spec::{
@@ -39,275 +39,135 @@ fn verify_program_err(root: &Arc<UOp>) -> String {
     type_verify(root, &spec_program()).expect_err("expected spec_program rejection").to_string()
 }
 
-fn kernel_param(slot: usize, dtype: DType) -> Arc<UOp> {
+fn structured_buffer(addrspace: AddrSpace, device: Option<DeviceSpec>) -> Arc<UOp> {
     UOp::new(
-        Op::Param {
-            shape: UOp::stack(smallvec![]),
-            arg: ParamArg::buffer(slot, dtype.clone(), AddrSpace::Global, None),
-        },
-        dtype,
+        Op::Buffer { shape: int_const(DType::Int32, 4), arg: ParamArg::buffer(3, DType::Float32, addrspace, device) },
+        DType::Float32,
     )
 }
 
-fn kernel_call(formals: Vec<Arc<UOp>>, args: Vec<Arc<UOp>>) -> Arc<UOp> {
-    UOp::sink(formals).call(args.into(), svod_ir::CallInfo::default())
+fn float_const(dtype: DType, value: f64) -> Arc<UOp> {
+    UOp::new(Op::Const(ConstValueHash(ConstValue::Float(value))), dtype)
 }
 
-#[test]
-fn spec_kernel_graph_accepts_valid_multi_output_call_graph() {
-    let formal = kernel_param(0, DType::Float32);
-    let input = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
-    let call = kernel_call(vec![formal], vec![input]);
-    let out0 = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32).after(smallvec![call.clone()]);
-    let out1 = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32).after(smallvec![call]);
-
-    verify_kernel_graph(&UOp::sink(vec![out0, out1])).expect("valid multi-output kernel graph");
+fn float_vconst(dtype: DType, values: [f64; 2]) -> Arc<UOp> {
+    UOp::new(
+        Op::VConst { values: values.into_iter().map(ConstValue::Float).collect() },
+        dtype.vec(2).expect("two-lane vector"),
+    )
 }
 
-#[test]
-fn spec_kernel_graph_rejects_call_body_and_argument_order() {
-    let bad_body = UOp::native_const(0i32).call(smallvec![], svod_ir::CallInfo::default());
-    let err = verify_kernel_graph(&UOp::sink(vec![bad_body])).expect_err("CONST is not an opaque kernel body");
-    assert!(err.to_string().contains("supported opaque body"), "unexpected error: {err}");
-
-    let float_formal = kernel_param(0, DType::Float32);
-    let int_formal = kernel_param(1, DType::Int32);
-    let float_actual = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
-    let int_actual = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Int32);
-    let reversed = kernel_call(vec![float_formal, int_formal], vec![int_actual, float_actual]);
-    let err = verify_kernel_graph(&UOp::sink(vec![reversed])).expect_err("CALL args are positional");
-    assert!(err.to_string().contains("positional arguments"), "unexpected error: {err}");
+fn special(dtype: DType, end: i64) -> Arc<UOp> {
+    UOp::new(Op::Special { end: int_const(dtype.clone(), end), name: "lidx0".to_string() }, dtype)
 }
 
-#[test]
-fn spec_kernel_graph_checks_mselect_index_and_mstack_layout() {
-    let cpu = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
-    let cuda = UOp::new_buffer(svod_dtype::DeviceSpec::Cuda { device_id: 0 }, 4, DType::Float32);
-    let stack = UOp::mstack(smallvec![cpu.clone(), cuda]);
-    verify_kernel_graph(&UOp::sink(vec![stack.mselect(1)])).expect("concrete-device MSTACK layout");
-
-    let err = verify_kernel_graph(&UOp::sink(vec![stack.mselect(2)])).expect_err("MSELECT index must be in range");
-    assert!(err.to_string().contains("in-range MSTACK"), "unexpected error: {err}");
-
-    let device_free = kernel_param(0, DType::Float32);
-    let malformed = UOp::mstack(smallvec![cpu, device_free]);
-    let err = verify_kernel_graph(&UOp::sink(vec![malformed])).expect_err("mixed device metadata must fail");
-    assert!(err.to_string().contains("MSTACK"), "unexpected error: {err}");
+fn shaped_stack(dtype: DType) -> Arc<UOp> {
+    UOp::stack((0..4).map(|value| UOp::const_(dtype.clone(), ConstValue::Float(value as f64))).collect())
 }
 
-#[test]
-fn spec_kernel_graph_checks_after_dependency_shape_and_context() {
-    let output = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
-    let malformed = output.after(smallvec![UOp::native_const(1i32)]);
-    let err = verify_kernel_graph(&UOp::sink(vec![malformed.clone()])).expect_err("AFTER dependency must be callable");
-    assert!(err.to_string().contains("CALL/AFTER dependencies"), "unexpected error: {err}");
-    match err {
-        SpecError::Verification { boundary, uop_id, source_path, .. } => {
-            assert_eq!(boundary, "kernel graph");
-            assert_eq!(uop_id, malformed.id);
-            assert_eq!(source_path, vec![0]);
-        }
-    }
+fn if_over(dedup_source: Arc<UOp>) -> Arc<UOp> {
+    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    UOp::new(Op::If { condition, body: smallvec![dedup_source] }, DType::Void)
 }
 
-#[test]
-fn spec_kernel_graph_accepts_copy_only_as_supported_opaque_call_body() {
-    let formal = kernel_param(0, DType::Float32);
-    let copy = formal.copy_to_device(svod_dtype::DeviceSpec::Cuda { device_id: 0 });
-    let input = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
-    let call = copy.call(smallvec![input], svod_ir::CallInfo::default());
-    verify_kernel_graph(&UOp::sink(vec![call])).expect("cross-device COPY call");
-
-    let direct = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32)
-        .copy_to_device(svod_dtype::DeviceSpec::Cuda { device_id: 0 });
-    let err = verify_kernel_graph(&UOp::sink(vec![direct])).expect_err("bare COPY must not survive in the outer graph");
-    assert!(err.to_string().contains("no matching rule"), "unexpected error: {err}");
+fn scalar_index() -> Arc<UOp> {
+    UOp::index().buffer(global_param(0)).indices(vec![int_const(DType::Int32, 0)]).call().unwrap()
 }
 
-#[test]
-fn spec_hcq_accepts_exact_getaddr_and_rejects_non_storage_source() {
-    let param = global_param(0);
-    let address = UOp::new(Op::GetAddr { src: param, device: svod_dtype::DeviceSpec::Cpu }, DType::UInt64);
-    assert!(type_verify(&UOp::sink(vec![address]), &spec_hcq()).is_ok());
-
-    let invalid =
-        UOp::new(Op::GetAddr { src: UOp::native_const(1u32), device: svod_dtype::DeviceSpec::Cpu }, DType::UInt64);
-    assert!(type_verify(&UOp::sink(vec![invalid]), &spec_hcq()).is_err());
-}
-
-#[test]
-fn spec_program_accepts_only_structured_local_and_reg_buffers() {
-    for addrspace in [AddrSpace::Local, AddrSpace::Reg] {
-        let buffer = UOp::new(
-            Op::Buffer { shape: int_const(DType::Int32, 4), arg: ParamArg::buffer(3, DType::Float32, addrspace, None) },
-            DType::Float32,
-        );
-        assert!(type_verify(&UOp::sink(vec![buffer]), &spec_program()).is_ok());
-    }
-
-    let global = UOp::new(
-        Op::Buffer {
-            shape: int_const(DType::Int32, 4),
-            arg: ParamArg::buffer(3, DType::Float32, AddrSpace::Global, Some(svod_dtype::DeviceSpec::Cpu)),
-        },
-        DType::Float32,
-    );
-    assert!(type_verify(&UOp::sink(vec![global]), &spec_program()).is_err());
-}
-
-#[test]
-fn spec_tensor_accepts_structured_global_buffer() {
-    let buffer = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
-    assert!(type_verify(&UOp::sink(vec![buffer]), &spec_tensor()).is_ok());
-}
-
-#[test]
-fn preoptimization_rejects_malformed_dtype_before_rewrites() {
-    let malformed = UOp::new(
-        Op::Binary(BinaryOp::Add, UOp::native_const(1i32), UOp::const_(DType::Float32, ConstValue::Float(1.0))),
+/// The `END(END(x, range), backedge)` shape that `split_ends` leaves behind.
+fn split_ends_backedge() -> Arc<UOp> {
+    let range = UOp::range_axis_dtype(
+        int_const(DType::Int32, 4),
+        svod_ir::AxisId::Renumbered(0),
+        svod_ir::types::AxisType::Loop,
         DType::Int32,
     );
-    let err =
-        apply_pre_optimization(UOp::sink(vec![malformed])).expect_err("mixed ALU dtype must fail at target boundary");
-    assert!(err.to_string().contains("binary operand/result dtype mismatch"), "unexpected error: {err}");
+    UOp::noop().end(smallvec![range]).end(smallvec![UOp::const_(DType::Bool, ConstValue::Bool(true))])
 }
 
-#[test]
-fn preoptimization_rejects_malformed_tensor_shape_and_source() {
-    let bad_shape = UOp::new(
-        Op::Buffer {
-            shape: int_const(DType::Int32, 4),
-            arg: ParamArg::buffer(0, DType::Float32, AddrSpace::Global, Some(svod_dtype::DeviceSpec::Cpu)),
-        },
-        DType::Float32,
-    );
-    assert!(apply_pre_optimization(UOp::sink(vec![bad_shape])).is_err(), "GLOBAL BUFFER shape must be weakint");
-
-    let bad_source = UOp::native_const(1i32).mselect(0);
-    let err = apply_pre_optimization(UOp::sink(vec![bad_source])).expect_err("MSELECT requires a target multi source");
-    assert!(err.to_string().contains("MSELECT requires"), "unexpected error: {err}");
+#[test_case(structured_buffer(AddrSpace::Local, None); "local buffer")]
+#[test_case(structured_buffer(AddrSpace::Reg, None); "reg buffer")]
+#[test_case(int_const(DType::Int32, 1); "concrete int const")]
+#[test_case(float_const(DType::Float32, 1.0); "concrete float const")]
+#[test_case(float_const(DType::Float32, f64::NAN); "canonical nan")]
+#[test_case(float_vconst(DType::Float32, [f64::NAN, 1.0]); "canonical nan lane in a vector")]
+#[test_case(special(DType::Int32, 8); "int32 special")]
+#[test_case(shaped_stack(DType::BFloat16); "devectorized shaped stack")]
+#[test_case(shaped_stack(DType::Float32).index_axes(vec![2]); "shaped index")]
+#[test_case(UOp::endif(if_over(scalar_index())); "if closed by endif")]
+#[test_case(split_ends_backedge(); "backedge end left by split_ends")]
+// spec.py:207-208 places the special SHRINK rule before the general movement rejection.
+#[test_case(UOp::new(
+    Op::Shrink { src: global_param(0), offsets: int_const(DType::Int32, 0), sizes: int_const(DType::Int32, 1) },
+    DType::Float32,
+); "special shrink wins over the movement rejection")]
+fn spec_program_accepts(node: Arc<UOp>) {
+    type_verify(&UOp::sink(vec![node]), &spec_program()).expect("spec_program should accept");
 }
 
-#[test]
-fn preoptimization_rejects_unsupported_movement_and_bad_multi_axis() {
-    let buffer = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
-    let legacy_reduce =
-        UOp::new(Op::ReduceAxis { src: buffer.clone(), reduce_op: ReduceOp::Add, axes: vec![0] }, DType::Float32);
-    let err = apply_pre_optimization(UOp::sink(vec![legacy_reduce])).expect_err("REDUCE_AXIS is not target tensor IR");
-    assert!(err.to_string().contains("no matching rule"), "unexpected error: {err}");
-
-    let bad_axis = UOp::multi(buffer, 1);
-    let err = apply_pre_optimization(UOp::sink(vec![bad_axis])).expect_err("MULTI axis must exist in its source shape");
-    assert!(err.to_string().contains("MULTI must"), "unexpected error: {err}");
+#[test_case(structured_buffer(AddrSpace::Global, Some(DeviceSpec::Cpu)), "structured REG/LOCAL allocation"; "global buffer")]
+#[test_case(UOp::native_const(1.0f32).reduce_with_num_axes(smallvec![], ReduceOp::Add, 1), "must be rangeified"; "tensor-form reduce")]
+#[test_case(UOp::const_(DType::Index, ConstValue::Int(1)), "legacy Index dtype must be lowered"; "legacy index dtype")]
+#[test_case(float_const(DType::Float32, 1.0 + 2f64.powi(-24)), "not canonical for its dtype"; "unrepresentable scalar")]
+#[test_case(float_vconst(DType::Float32, [1.0, 1.0 + 2f64.powi(-24)]), "not canonical for its dtype"; "unrepresentable lane")]
+#[test_case(float_const(DType::Float32, f64::from_bits(0x7ff8_0000_0000_0001)), "not canonical for its dtype"; "nan with a payload")]
+#[test_case(if_over(int_const(DType::Int32, 0)), "CAST/INDEX/SHRINK dedup source"; "if over a non-index dedup source")]
+#[test_case(UOp::new(Op::EndIf { if_op: int_const(DType::Int32, 0) }, DType::Void), "ENDIF must be void and close an IF"; "endif without an if")]
+#[test_case(special(DType::Int64, 8), "must be int32 after index lowering"; "int64 special")]
+#[test_case(UOp::new(Op::Multi { src: int_const(DType::Int32, 0), axis: 0 }, DType::Int32), "no matching rule"; "op outside the whitelist")]
+fn spec_program_rejects(node: Arc<UOp>, expected: &str) {
+    let err = verify_program_err(&UOp::sink(vec![node]));
+    assert!(err.contains(expected), "unexpected error: {err}");
 }
 
-#[test]
-fn spec_program_rejects_tensor_form_reduce() {
-    let tensor_reduce = UOp::native_const(1.0f32).reduce_with_num_axes(smallvec![], ReduceOp::Add, 1);
-    let err = type_verify(&UOp::sink(vec![tensor_reduce]), &spec_program())
-        .expect_err("tensor REDUCE must not reach codegen");
-    assert!(err.to_string().contains("must be rangeified"), "unexpected error: {err}");
-}
-
-#[test]
-fn preoptimization_accepts_valid_custom_kernel_forms() {
-    let buffer = global_param(0);
-    let index = UOp::index().buffer(buffer).indices(vec![int_const(DType::Int32, 0)]).call().unwrap();
-    let loaded = UOp::load().index(index.clone()).call();
-    let custom = UOp::custom(smallvec![loaded], "({0} + 1.0f)".to_string(), DType::Float32);
-    let kernel = UOp::sink(vec![index.store(custom)]);
-
-    assert!(apply_pre_optimization(kernel).is_ok(), "valid hand-authored custom kernel must cross the tensor boundary");
-}
-
-#[test]
-fn spec_shared_accepts_weakint_index_but_not_weakfloat_index() {
-    let buffer = global_param(0);
-    let weakint_index = UOp::new(
-        Op::Index { buffer: buffer.clone(), indices: smallvec![UOp::const_(DType::WeakInt, ConstValue::Int(0))] },
-        DType::Float32,
-    );
-    let weakfloat_index = UOp::new(
-        Op::Index { buffer, indices: smallvec![UOp::const_(DType::WeakFloat, ConstValue::Float(0.0))] },
-        DType::Float32,
-    );
-
-    assert!(type_verify(&UOp::sink(vec![weakint_index]), &spec_tensor()).is_ok());
-    assert!(type_verify(&UOp::sink(vec![weakfloat_index]), &spec_tensor()).is_err());
+/// Forms the tensor graph may still carry but a program may not.
+#[test_case(UOp::const_(DType::WeakInt, ConstValue::Int(1)), "weak dtype must be lowered"; "weakint")]
+#[test_case(UOp::const_(DType::WeakFloat, ConstValue::Float(1.0)), "weak dtype must be lowered"; "weakfloat")]
+#[test_case(UOp::new(
+    Op::Reshape { src: int_const(DType::Int32, 0), new_shape: int_const(DType::Int32, 1) },
+    DType::Int32,
+), "movement op must be lowered away"; "movement op")]
+#[test_case(UOp::invalid_marker(), "Invalid constant must be folded out"; "invalid marker")]
+fn spec_tensor_accepts_what_spec_program_rejects(node: Arc<UOp>, expected: &str) {
+    let sink = UOp::sink(vec![node]);
+    type_verify(&sink, &spec_tensor()).expect("legal in spec_shared/spec_tensor");
+    let err = verify_program_err(&sink);
+    assert!(err.contains(expected), "unexpected error: {err}");
 }
 
 fn raw_index(index: Arc<UOp>) -> Arc<UOp> {
     UOp::new(Op::Index { buffer: global_param(0), indices: smallvec![index] }, DType::Float32)
 }
 
-#[test]
-fn spec_shared_accepts_exact_invalid_index_values() {
-    let scalar = UOp::invalid_marker();
-    let vconst = UOp::vconst(vec![ConstValue::Invalid; 4], DType::Bool);
-    let vectorize = UOp::stack(smallvec![
-        UOp::invalid_marker(),
-        UOp::invalid_marker(),
-        UOp::invalid_marker(),
-        UOp::invalid_marker(),
-    ]);
+#[test_case(UOp::const_(DType::WeakInt, ConstValue::Int(0)); "weakint")]
+#[test_case(int_const(DType::Int32, 1); "int32")]
+#[test_case(UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1)], DType::Int32); "int32 vector")]
+#[test_case(UOp::invalid_marker(); "invalid marker")]
+#[test_case(UOp::vconst(vec![ConstValue::Invalid; 4], DType::Bool); "vector of invalid")]
+#[test_case(UOp::stack(smallvec![UOp::invalid_marker(); 4]); "stack of invalid markers")]
+fn spec_shared_accepts_index_value(index: Arc<UOp>) {
+    type_verify(&UOp::sink(vec![raw_index(index)]), &spec_tensor()).expect("legal INDEX address operand");
+}
 
-    for index in [scalar, vconst, vectorize] {
-        assert!(type_verify(&UOp::sink(vec![raw_index(index)]), &spec_tensor()).is_ok());
-    }
+#[test_case(UOp::const_(DType::WeakFloat, ConstValue::Float(0.0)); "weakfloat")]
+#[test_case(UOp::const_(DType::Bool, ConstValue::Bool(false)); "bool")]
+#[test_case(UOp::vconst(vec![ConstValue::Bool(false), ConstValue::Bool(true)], DType::Bool); "bool vector")]
+fn spec_shared_rejects_non_integer_index_value(index: Arc<UOp>) {
+    let err = type_verify(&UOp::sink(vec![raw_index(index)]), &spec_tensor())
+        .expect_err("non-integer INDEX address operand")
+        .to_string();
+    assert!(err.contains("non-integer value reached a memory INDEX operand"), "unexpected rejection: {err}");
 }
 
 #[test]
-fn spec_shared_rejects_bool_and_mixed_invalid_index_values() {
-    let ordinary_bool = UOp::const_(DType::Bool, ConstValue::Bool(false));
-    let ordinary_bool_vector = UOp::vconst(vec![ConstValue::Bool(false), ConstValue::Bool(true)], DType::Bool);
+fn spec_shared_rejects_index_vector_mixing_bool_and_int_lanes() {
     let mixed =
         UOp::new(Op::VConst { values: vec![ConstValue::Bool(false), ConstValue::Int(0)] }, DType::Bool.vec(2).unwrap());
-
-    for index in [ordinary_bool, ordinary_bool_vector] {
-        let err = type_verify(&UOp::sink(vec![raw_index(index)]), &spec_tensor())
-            .expect_err("ordinary Bool index must be rejected")
-            .to_string();
-        assert!(err.contains("non-integer value reached a memory INDEX operand"), "unexpected rejection: {err}");
-    }
-    assert!(
-        type_verify(&UOp::sink(vec![raw_index(mixed)]), &spec_tensor()).is_err(),
-        "mixed Bool/int vector must be rejected"
-    );
+    assert!(type_verify(&UOp::sink(vec![raw_index(mixed)]), &spec_tensor()).is_err());
 }
 
-#[test]
-fn spec_shared_preserves_integer_index_rules() {
-    let scalar = int_const(DType::Int32, 1);
-    let vector = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1)], DType::Int32);
-
-    for index in [scalar, vector] {
-        assert!(type_verify(&UOp::sink(vec![raw_index(index)]), &spec_tensor()).is_ok());
-    }
-}
-
-fn assert_weak_rejected_only_at_program_level(weak: Arc<UOp>, concrete: Arc<UOp>) {
-    let weak_sink = UOp::sink(vec![weak]);
-    assert!(type_verify(&weak_sink, &spec_tensor()).is_ok(), "weak dtype is legal in spec_shared/spec_tensor");
-    assert!(type_verify(&weak_sink, &spec_program()).is_err(), "weak dtype must be rejected by spec_program");
-    assert!(type_verify(&UOp::sink(vec![concrete]), &spec_program()).is_ok(), "concrete counterpart must pass");
-}
-
-#[test]
-fn spec_program_rejects_weakint_only_at_program_level() {
-    assert_weak_rejected_only_at_program_level(
-        UOp::const_(DType::WeakInt, ConstValue::Int(1)),
-        int_const(DType::Int32, 1),
-    );
-}
-
-#[test]
-fn spec_program_rejects_weakfloat_only_at_program_level() {
-    assert_weak_rejected_only_at_program_level(
-        UOp::const_(DType::WeakFloat, ConstValue::Float(1.0)),
-        UOp::const_(DType::Float32, ConstValue::Float(1.0)),
-    );
-}
-
+/// Pinned shift matrix: only a scalar `uint32` count may differ from the left
+/// operand's dtype.
 #[test]
 fn spec_shift_dtype_matrix_matches_pinned_uint32_exception() {
     let integer_dtypes = [
@@ -352,164 +212,137 @@ fn spec_shift_dtype_matrix_matches_pinned_uint32_exception() {
 }
 
 #[test]
-fn spec_program_explicitly_rejects_legacy_index_dtype() {
-    let sink = UOp::sink(vec![UOp::const_(DType::Index, ConstValue::Int(1))]);
-    let err = verify_program_err(&sink);
-    assert!(err.contains("legacy Index dtype must be lowered"), "unexpected error: {err}");
+fn spec_tensor_accepts_structured_global_buffer() {
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    assert!(type_verify(&UOp::sink(vec![buffer]), &spec_tensor()).is_ok());
 }
 
 #[test]
-fn post_index_lowering_invariant_reports_typed_context() {
+fn spec_hcq_accepts_exact_getaddr_and_rejects_non_storage_source() {
+    let address = UOp::new(Op::GetAddr { src: global_param(0), device: DeviceSpec::Cpu }, DType::UInt64);
+    assert!(type_verify(&UOp::sink(vec![address]), &spec_hcq()).is_ok());
+
+    let invalid = UOp::new(Op::GetAddr { src: UOp::native_const(1u32), device: DeviceSpec::Cpu }, DType::UInt64);
+    assert!(type_verify(&UOp::sink(vec![invalid]), &spec_hcq()).is_err());
+}
+
+fn kernel_param(slot: usize, dtype: DType) -> Arc<UOp> {
+    UOp::new(
+        Op::Param {
+            shape: UOp::stack(smallvec![]),
+            arg: ParamArg::buffer(slot, dtype.clone(), AddrSpace::Global, None),
+        },
+        dtype,
+    )
+}
+
+fn kernel_call(formals: Vec<Arc<UOp>>, args: Vec<Arc<UOp>>) -> Arc<UOp> {
+    UOp::sink(formals).call(args.into(), svod_ir::CallInfo::default())
+}
+
+fn cpu_buffer(dtype: DType) -> Arc<UOp> {
+    UOp::new_buffer(DeviceSpec::Cpu, 4, dtype)
+}
+
+fn device_mstack() -> Arc<UOp> {
+    let cuda = UOp::new_buffer(DeviceSpec::Cuda { device_id: 0 }, 4, DType::Float32);
+    UOp::mstack(smallvec![cpu_buffer(DType::Float32), cuda])
+}
+
+/// One CALL feeding two buffers through AFTER.
+fn multi_output_call_graph() -> Arc<UOp> {
+    let call = kernel_call(vec![kernel_param(0, DType::Float32)], vec![cpu_buffer(DType::Float32)]);
+    let out0 = cpu_buffer(DType::Float32).after(smallvec![call.clone()]);
+    let out1 = cpu_buffer(DType::Float32).after(smallvec![call]);
+    UOp::sink(vec![out0, out1])
+}
+
+/// A cross-device COPY is the one non-SINK body a CALL may wrap.
+fn cross_device_copy_call() -> Arc<UOp> {
+    let copy = kernel_param(0, DType::Float32).copy_to_device(DeviceSpec::Cuda { device_id: 0 });
+    UOp::sink(vec![copy.call(smallvec![cpu_buffer(DType::Float32)], svod_ir::CallInfo::default())])
+}
+
+#[test_case(multi_output_call_graph(); "one call feeding two outputs")]
+#[test_case(UOp::sink(vec![device_mstack().mselect(1)]); "concrete-device mstack layout")]
+#[test_case(cross_device_copy_call(); "cross-device copy call body")]
+fn spec_kernel_graph_accepts(sink: Arc<UOp>) {
+    verify_kernel_graph(&sink).expect("valid kernel graph");
+}
+
+#[test_case(
+    UOp::sink(vec![UOp::native_const(0i32).call(smallvec![], svod_ir::CallInfo::default())]),
+    "supported opaque body"; "const call body")]
+#[test_case(
+    UOp::sink(vec![kernel_call(
+        vec![kernel_param(0, DType::Float32), kernel_param(1, DType::Int32)],
+        vec![cpu_buffer(DType::Int32), cpu_buffer(DType::Float32)],
+    )]),
+    "positional arguments"; "call arguments swapped against their slots")]
+#[test_case(UOp::sink(vec![device_mstack().mselect(2)]), "in-range MSTACK"; "mselect out of range")]
+#[test_case(
+    UOp::sink(vec![UOp::mstack(smallvec![cpu_buffer(DType::Float32), kernel_param(0, DType::Float32)])]),
+    "MSTACK"; "mstack mixing device and device-free sources")]
+#[test_case(
+    UOp::sink(vec![cpu_buffer(DType::Float32).copy_to_device(DeviceSpec::Cuda { device_id: 0 })]),
+    "no matching rule"; "bare copy in the outer graph")]
+fn spec_kernel_graph_rejects(sink: Arc<UOp>, expected: &str) {
+    let err = verify_kernel_graph(&sink).expect_err("invalid kernel graph");
+    assert!(err.to_string().contains(expected), "unexpected error: {err}");
+}
+
+#[test]
+fn verification_errors_locate_the_offending_node() {
+    let malformed = cpu_buffer(DType::Float32).after(smallvec![UOp::native_const(1i32)]);
+    let SpecError::Verification { boundary, uop_id, source_path, reason, .. } =
+        verify_kernel_graph(&UOp::sink(vec![malformed.clone()])).expect_err("AFTER dependency must be callable");
+    assert_eq!(boundary, "kernel graph");
+    assert_eq!(uop_id, malformed.id);
+    assert_eq!(source_path, vec![0]);
+    assert!(reason.contains("CALL/AFTER dependencies"), "unexpected reason: {reason}");
+
     let stale = UOp::new(Op::Noop, DType::Index);
-    let err = verify_no_legacy_index_dtype(&UOp::sink(vec![stale.clone()]))
-        .expect_err("post-index-lowering boundary must reject Index");
-    match err {
-        SpecError::Verification { boundary, uop_id, source_path, reason, .. } => {
-            assert_eq!(boundary, "post-index-lowering");
-            assert_eq!(uop_id, stale.id);
-            assert_eq!(source_path, vec![0]);
-            assert_eq!(reason, "legacy Index dtype must be lowered before a program");
-        }
-    }
+    let SpecError::Verification { boundary, uop_id, source_path, reason, .. } =
+        verify_no_legacy_index_dtype(&UOp::sink(vec![stale.clone()])).expect_err("stale Index dtype");
+    assert_eq!(boundary, "post-index-lowering");
+    assert_eq!(uop_id, stale.id);
+    assert_eq!(source_path, vec![0]);
+    assert_eq!(reason, "legacy Index dtype must be lowered before a program");
 }
 
-#[test]
-fn spec_program_rejects_noncanonical_typed_constants() {
-    let midpoint = 1.0 + 2f64.powi(-24);
-    let scalar = UOp::new(Op::Const(ConstValueHash(ConstValue::Float(midpoint))), DType::Float32);
-    let vector = UOp::new(
-        Op::VConst { values: vec![ConstValue::Float(1.0), ConstValue::Float(midpoint)] },
-        DType::Float32.vec(2).unwrap(),
-    );
-
-    for constant in [scalar, vector] {
-        let err = verify_program_err(&UOp::sink(vec![constant]));
-        assert!(err.contains("typed constant value is not canonical for its dtype"), "unexpected error: {err}");
-    }
-}
-
-#[test]
-fn spec_program_accepts_canonical_typed_constants_and_nans() {
-    let scalar_nan = UOp::new(Op::Const(ConstValueHash(ConstValue::Float(f64::NAN))), DType::Float32);
-    let vector_nan = UOp::new(
-        Op::VConst { values: vec![ConstValue::Float(f64::NAN), ConstValue::Float(1.0)] },
-        DType::Float32.vec(2).unwrap(),
-    );
-
-    for constant in [UOp::const_(DType::Float32, ConstValue::Float(1.0)), scalar_nan, vector_nan] {
-        assert!(type_verify(&UOp::sink(vec![constant]), &spec_program()).is_ok());
-    }
-
-    let payload_nan =
-        UOp::new(Op::Const(ConstValueHash(ConstValue::Float(f64::from_bits(0x7ff8_0000_0000_0001)))), DType::Float32);
-    assert!(verify_program_err(&UOp::sink(vec![payload_nan])).contains("typed constant value is not canonical"));
-}
-
-#[test]
-fn spec_program_allows_special_shrink_before_movement_rejection() {
-    // Pinned spec.py:207-208 deliberately places this rule before the general
-    // movement-op rejection. The final source must be CONST.
-    let shrink = UOp::new(
-        Op::Shrink { src: global_param(0), offsets: int_const(DType::Int32, 0), sizes: int_const(DType::Int32, 1) },
-        DType::Float32,
-    );
-
-    assert!(
-        type_verify(&UOp::sink(vec![shrink]), &spec_program()).is_ok(),
-        "special SHRINK must win before movement rejection"
-    );
-}
-
-#[test]
-fn spec_program_rejects_other_movement_ops() {
-    let reshape =
-        UOp::new(Op::Reshape { src: int_const(DType::Int32, 0), new_shape: int_const(DType::Int32, 1) }, DType::Int32);
-    let sink = UOp::sink(vec![reshape]);
-
-    assert!(type_verify(&sink, &spec_tensor()).is_ok(), "movement is tensor-graph legal");
-    assert!(verify_program_err(&sink).contains("movement"), "movement must be rejected in a program");
-}
-
-#[test]
-fn spec_program_rejects_invalid_that_shared_spec_accepts() {
-    let sink = UOp::sink(vec![UOp::invalid_marker()]);
-
-    assert!(type_verify(&sink, &spec_tensor()).is_ok(), "Invalid is legal in spec_shared/spec_tensor");
-    assert!(verify_program_err(&sink).contains("Invalid"), "Invalid must be folded before a program");
-}
-
-#[test]
-fn spec_program_accepts_devectorized_shaped_stack() {
-    let lanes = (0..4).map(|value| UOp::const_(DType::BFloat16, ConstValue::Float(value as f64))).collect();
-    let vector = UOp::stack(lanes);
-
-    assert!(type_verify(&UOp::sink(vec![vector]), &spec_program()).is_ok());
-}
-
-#[test]
-fn spec_program_accepts_shaped_index() {
-    let lanes = (0..4).map(|value| UOp::const_(DType::Float32, ConstValue::Float(value as f64))).collect();
-    let vector = UOp::stack(lanes);
-    assert!(type_verify(&UOp::sink(vec![vector.index_axes(vec![2])]), &spec_program()).is_ok());
-}
-
-fn valid_if(condition: Arc<UOp>) -> Arc<UOp> {
-    let index = UOp::index().buffer(global_param(0)).indices(vec![int_const(DType::Int32, 0)]).call().unwrap();
-    UOp::new(Op::If { condition, body: smallvec![index] }, DType::Void)
-}
-
-#[test]
-fn spec_program_accepts_well_formed_if_and_endif() {
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    assert!(type_verify(&UOp::sink(vec![UOp::endif(valid_if(condition))]), &spec_program()).is_ok());
-}
-
-#[test]
-fn spec_program_rejects_if_with_non_index_dedup_source() {
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let bad_if = UOp::new(Op::If { condition, body: smallvec![int_const(DType::Int32, 0)] }, DType::Void);
-    assert!(
-        type_verify(&UOp::sink(vec![bad_if]), &spec_program()).is_err(),
-        "IF dedup source must be CAST/INDEX/SHRINK"
-    );
-}
-
-#[test]
-fn spec_program_rejects_endif_without_if() {
-    let bad_endif = UOp::new(Op::EndIf { if_op: int_const(DType::Int32, 0) }, DType::Void);
-    assert!(type_verify(&UOp::sink(vec![bad_endif]), &spec_program()).is_err(), "ENDIF must close an IF");
-}
-
-#[test]
-fn spec_program_requires_special_to_be_lowered_int32() {
-    let valid = UOp::new(Op::Special { end: int_const(DType::Int32, 8), name: "lidx0".to_string() }, DType::Int32);
-    assert!(type_verify(&UOp::sink(vec![valid]), &spec_program()).is_ok());
-
-    let wrong_width =
-        UOp::new(Op::Special { end: int_const(DType::Int64, 8), name: "lidx0".to_string() }, DType::Int64);
-    assert!(
-        type_verify(&UOp::sink(vec![wrong_width]), &spec_program()).is_err(),
-        "SPECIAL source and result must be int32 after index lowering"
-    );
-}
-
-#[test]
-fn spec_program_rejects_op_outside_whitelist() {
-    let multi = UOp::new(Op::Multi { src: int_const(DType::Int32, 0), axis: 0 }, DType::Int32);
-    let sink = UOp::sink(vec![multi]);
-    assert!(verify_program_err(&sink).contains("no matching rule"));
-}
-
-#[test]
-fn spec_program_accepts_the_backedge_end_left_by_split_ends() {
-    let range = UOp::range_axis_dtype(
-        int_const(DType::Int32, 4),
-        svod_ir::AxisId::Renumbered(0),
-        svod_ir::types::AxisType::Loop,
+#[test_case(
+    UOp::new(
+        Op::Binary(BinaryOp::Add, UOp::native_const(1i32), UOp::const_(DType::Float32, ConstValue::Float(1.0))),
         DType::Int32,
-    );
-    let backedge = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let ended = UOp::noop().end(smallvec![range]).end(smallvec![backedge]);
+    ),
+    "binary operand/result dtype mismatch"; "mixed alu dtype")]
+#[test_case(
+    structured_buffer(AddrSpace::Global, Some(DeviceSpec::Cpu)),
+    "tensor BUFFER must be structured GLOBAL storage"; "global buffer with a non-weakint shape")]
+#[test_case(UOp::native_const(1i32).mselect(0), "MSELECT requires"; "mselect of a non-multi source")]
+#[test_case(
+    UOp::new(
+        Op::ReduceAxis {
+            src: UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32),
+            reduce_op: ReduceOp::Add,
+            axes: vec![0],
+        },
+        DType::Float32,
+    ),
+    "no matching rule"; "legacy reduce_axis")]
+#[test_case(
+    UOp::multi(UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32), 1),
+    "MULTI must"; "multi axis outside its source shape")]
+fn preoptimization_rejects_at_the_tensor_boundary(node: Arc<UOp>, expected: &str) {
+    let err = apply_pre_optimization(UOp::sink(vec![node])).expect_err("malformed tensor graph");
+    assert!(err.to_string().contains(expected), "unexpected error: {err}");
+}
 
-    assert!(type_verify(&UOp::sink(vec![ended]), &spec_program()).is_ok());
+#[test]
+fn preoptimization_accepts_a_hand_authored_custom_kernel() {
+    let index = UOp::index().buffer(global_param(0)).indices(vec![int_const(DType::Int32, 0)]).call().unwrap();
+    let loaded = UOp::load().index(index.clone()).call();
+    let custom = UOp::custom(smallvec![loaded], "({0} + 1.0f)".to_string(), DType::Float32);
+
+    assert!(apply_pre_optimization(UOp::sink(vec![index.store(custom)])).is_ok());
 }

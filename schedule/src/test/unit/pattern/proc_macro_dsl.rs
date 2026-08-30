@@ -1,429 +1,75 @@
-//! Tests for the patterns! proc-macro DSL.
-//!
-//! These tests verify that the `patterns!` macro correctly generates
-//! `TypedPatternMatcher` instances for pattern-based UOp rewrites.
+//! Surface tests for the `patterns!` proc-macro DSL: every pattern form the macro
+//! accepts, and the `RewriteResult` it produces for a matching and a non-matching node.
 
 use std::sync::Arc;
 
 use crate::patterns;
+use crate::rewrite::graph_rewrite;
+use smallvec::smallvec;
 use svod_dtype::DType;
 use svod_ir::pattern::RewriteResult;
-use svod_ir::{BinaryOp, ConstValue, Op, UOp};
+use svod_ir::types::{AddrSpace, BufferizeOpts, ReduceOp};
+use svod_ir::{BinaryOp, ConstValue, Op, UOp, UnaryOp};
 
-#[test]
-fn test_getaddr_pattern() {
-    let matcher = patterns! {
-        GetAddr(src) ~> src
-    };
-    let buffer = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::UInt8);
-    let address = buffer.getaddr(None);
-    match matcher.rewrite(&address, &mut ()) {
-        RewriteResult::Rewritten(rewritten) => assert!(Arc::ptr_eq(&rewritten, &buffer)),
-        _ => panic!("expected GETADDR pattern to match"),
-    }
-}
-
-/// Helper to create a binary operation UOp
 fn binary(op: BinaryOp, lhs: Arc<UOp>, rhs: Arc<UOp>) -> Arc<UOp> {
     let dtype = lhs.dtype();
     UOp::new(Op::Binary(op, lhs, rhs), dtype)
 }
 
-#[test]
-fn test_simple_add_zero_pattern() {
-    let matcher = patterns! {
-        Add(x, Const(0)) ~> x
-    };
+fn stage_opts() -> BufferizeOpts {
+    BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true }
+}
 
-    // Create x + 0
-    let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-    let add = binary(BinaryOp::Add, x.clone(), zero);
+/// `INDEX(const, [offset])` — a well-formed address for the Load/Store tests.
+fn address(offset: i64) -> Arc<UOp> {
+    UOp::index().buffer(UOp::native_const(42.0f32)).indices(vec![UOp::index_const(offset)]).call().unwrap()
+}
 
-    let result = matcher.rewrite(&add, &mut ());
+fn bool_gate() -> Arc<UOp> {
+    UOp::const_(DType::Bool, ConstValue::Int(1))
+}
 
+#[track_caller]
+fn assert_rewrites_to(result: RewriteResult, expected: &Arc<UOp>) {
     match result {
-        RewriteResult::Rewritten(rewritten) => {
-            assert!(Arc::ptr_eq(&rewritten, &x), "Should rewrite to x");
-        }
-        _ => panic!("Expected rewrite to succeed"),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, expected), "rewrote to the wrong node"),
+        other => panic!("expected a rewrite, got {other:?}"),
     }
 }
 
-#[test]
-fn test_mul_one_pattern() {
-    let matcher = patterns! {
-        Mul(x, Const(1)) ~> x
-    };
-
-    // Create x * 1
-    let x = UOp::native_const(42i32);
-    let one = UOp::native_const(1i32);
-    let mul = binary(BinaryOp::Mul, x.clone(), one);
-
-    let result = matcher.rewrite(&mul, &mut ());
-
-    match result {
-        RewriteResult::Rewritten(rewritten) => {
-            assert!(Arc::ptr_eq(&rewritten, &x), "Should rewrite to x");
-        }
-        _ => panic!("Expected rewrite to succeed"),
-    }
+#[track_caller]
+fn assert_no_match(result: RewriteResult) {
+    assert!(matches!(result, RewriteResult::NoMatch), "expected NoMatch");
 }
 
 #[test]
-fn test_binding_pattern() {
+fn op_patterns_with_literal_constants() {
     let matcher = patterns! {
-        Mul(_, zero @ Const(0)) ~> zero
-    };
-
-    // Create x * 0
-    let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-    let mul = binary(BinaryOp::Mul, x, zero.clone());
-
-    let result = matcher.rewrite(&mul, &mut ());
-
-    match result {
-        RewriteResult::Rewritten(rewritten) => {
-            assert!(Arc::ptr_eq(&rewritten, &zero), "Should rewrite to zero");
-        }
-        _ => panic!("Expected rewrite to succeed"),
-    }
-}
-
-#[test]
-fn test_multiple_patterns() {
-    let matcher = patterns! {
+        GetAddr(src) ~> src,
         Add(x, Const(0)) ~> x,
         Mul(x, Const(1)) ~> x,
         Mul(_, zero @ Const(0)) ~> zero,
     };
 
-    // Test x + 0
-    let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-    let one = UOp::native_const(1i32);
-
-    let add_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
-    match matcher.rewrite(&add_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Add(x, 0) should rewrite to x"),
-    }
-
-    // Test x * 1
-    let mul_one = binary(BinaryOp::Mul, x.clone(), one);
-    match matcher.rewrite(&mul_one, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Mul(x, 1) should rewrite to x"),
-    }
-
-    // Test x * 0
-    let mul_zero = binary(BinaryOp::Mul, x, zero.clone());
-    match matcher.rewrite(&mul_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &zero)),
-        _ => panic!("Mul(x, 0) should rewrite to 0"),
-    }
-}
-
-#[test]
-fn test_no_match() {
-    let matcher = patterns! {
-        Add(x, Const(0)) ~> x
-    };
-
-    // Create x + 1 (should not match)
-    let x = UOp::native_const(42i32);
-    let one = UOp::native_const(1i32);
-    let add = binary(BinaryOp::Add, x, one);
-
-    let result = matcher.rewrite(&add, &mut ());
-    assert!(matches!(result, RewriteResult::NoMatch), "x + 1 should not match x + 0 pattern");
-}
-
-#[test]
-fn test_pattern_matcher_composition() {
-    let pm1 = patterns! {
-        Add(x, Const(0)) ~> x
-    };
-
-    let pm2 = patterns! {
-        Mul(x, Const(1)) ~> x
-    };
-
-    // Compose pattern matchers
-    let combined = pm1 + pm2;
+    let buffer = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::UInt8);
+    assert_rewrites_to(matcher.rewrite(&buffer.getaddr(None), &mut ()), &buffer);
 
     let x = UOp::native_const(42i32);
     let zero = UOp::native_const(0i32);
     let one = UOp::native_const(1i32);
-
-    // Test x + 0
-    let add_zero = binary(BinaryOp::Add, x.clone(), zero);
-    match combined.rewrite(&add_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Combined matcher should handle Add(x, 0)"),
-    }
-
-    // Test x * 1
-    let mul_one = binary(BinaryOp::Mul, x.clone(), one);
-    match combined.rewrite(&mul_one, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Combined matcher should handle Mul(x, 1)"),
-    }
-}
-
-#[test]
-fn test_complex_guard_with_block() {
-    // Test that complex guards work - guard checks if const is zero using a block expression
-    let matcher = patterns! {
-        Add(x, c) if {
-            // Complex guard logic: check if c is a zero constant
-            match c.op() {
-                Op::Const(cv) => matches!(cv.0, ConstValue::Int(0)) || matches!(cv.0, ConstValue::Float(f) if f == 0.0),
-                _ => false,
-            }
-        } ~> x
-    };
-
-    // Test x + 0 (int) - should match
-    let x = UOp::native_const(42i32);
-    let zero_int = UOp::native_const(0i32);
-    let add_zero_int = binary(BinaryOp::Add, x.clone(), zero_int);
-
-    match matcher.rewrite(&add_zero_int, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Add(x, 0) should match with complex guard"),
-    }
-
-    // Test x + 0.0 (float) - should match
-    let x_f32 = UOp::native_const(42.0f32);
-    let zero_float = UOp::native_const(0.0f32);
-    let add_zero_float = binary(BinaryOp::Add, x_f32.clone(), zero_float);
-
-    match matcher.rewrite(&add_zero_float, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_f32)),
-        _ => panic!("Add(x, 0.0) should match with complex guard"),
-    }
-
-    // Test x + 1 - should NOT match
-    let one = UOp::native_const(1i32);
-    let add_one = binary(BinaryOp::Add, x.clone(), one);
-
-    match matcher.rewrite(&add_one, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Add(x, 1) should NOT match zero guard"),
-    }
-}
-
-#[test]
-fn test_guard_with_pointer_equality() {
-    // Test guard using Arc::ptr_eq for self-folding patterns like x & x => x
-    let matcher = patterns! {
-        And(x, y) if Arc::ptr_eq(x, y) ~> x
-    };
-
-    let a = UOp::native_const(42i32);
-
-    // Test a & a - should match (same Rc pointer due to hash-consing)
-    let and_same = a.try_and_op(&a).unwrap();
-
-    match matcher.rewrite(&and_same, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a)),
-        _ => panic!("And(x, x) should rewrite to x"),
-    }
-
-    // Test a & b - should NOT match (different values = different pointers)
-    // Note: Svod uses hash-consing, so Const(42) and Const(42) will share the same Rc
-    // We need to use actually different values to test this
-    let b = UOp::native_const(99i32); // Different value = different Rc
-    let and_diff = a.try_and_op(&b).unwrap();
-
-    match matcher.rewrite(&and_diff, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("And(a, b) with different pointers should NOT match"),
-    }
-}
-
-#[test]
-fn test_auto_ptr_eq_duplicate_variable() {
-    // Test auto ptr_eq with duplicate variable names: And(x, x) ~> x
-    // This should automatically generate Arc::ptr_eq check without explicit guard
-    let matcher = patterns! {
-        And(x, x) ~> x
-    };
-
-    let a = UOp::native_const(42i32);
-
-    // Test a & a - should match (same Rc pointer)
-    let and_same = a.try_and_op(&a).unwrap();
-
-    match matcher.rewrite(&and_same, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a), "And(x, x) should rewrite to x"),
-        _ => panic!("And(x, x) should match"),
-    }
-
-    // Test a & b - should NOT match (different values = different pointers)
-    let b = UOp::native_const(99i32);
-    let and_diff = a.try_and_op(&b).unwrap();
-
-    match matcher.rewrite(&and_diff, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected - auto ptr_eq check fails
-        _ => panic!("And(a, b) with different pointers should NOT match"),
-    }
-}
-
-#[test]
-fn test_auto_ptr_eq_three_args() {
-    // Test auto ptr_eq with three duplicate variables: Where(x, x, x) ~> x
-    let matcher = patterns! {
-        Where(x, x, x) ~> x
-    };
-
-    // Use bool values since WHERE condition must be bool
-    // Create distinct bool constants for testing pointer equality
-    let a = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let b = UOp::const_(DType::Bool, ConstValue::Bool(false));
-
-    // Test Where(a, a, a) - should match
-    let where_same = UOp::try_where(a.clone(), a.clone(), a.clone()).unwrap();
-
-    match matcher.rewrite(&where_same, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a), "Where(x, x, x) should rewrite to x"),
-        _ => panic!("Where(x, x, x) should match"),
-    }
-
-    // Test Where(a, a, b) - should NOT match
-    let where_diff = UOp::try_where(a.clone(), a.clone(), b.clone()).unwrap();
-
-    match matcher.rewrite(&where_diff, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Where(a, a, b) should NOT match"),
-    }
-
-    // Test Where(a, b, a) - should NOT match (middle differs)
-    // This case catches the DuplicateTracker shadowing bug where only first==third is checked
-    let where_middle_diff = UOp::try_where(a.clone(), b.clone(), a.clone()).unwrap();
-
-    match matcher.rewrite(&where_middle_diff, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Where(a, b, a) should NOT match Where(x, x, x)"),
-    }
-
-    // Test Where(b, a, a) - should NOT match (first differs)
-    let where_first_diff = UOp::try_where(b.clone(), a.clone(), a.clone()).unwrap();
-
-    match matcher.rewrite(&where_first_diff, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Where(b, a, a) should NOT match Where(x, x, x)"),
-    }
-}
-
-#[test]
-fn test_special_constant_zero() {
-    // Test @zero special constant - matches both Int(0) and Float(0.0)
-    let matcher = patterns! {
-        Add(x, @zero) ~> x
-    };
-
-    // Test x + 0 (int)
-    let x_int = UOp::native_const(42i32);
-    let zero_int = UOp::native_const(0i32);
-    let add_zero_int = binary(BinaryOp::Add, x_int.clone(), zero_int);
-
-    match matcher.rewrite(&add_zero_int, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_int)),
-        _ => panic!("Add(x, @zero) should match int 0"),
-    }
-
-    // Test x + 0.0 (float)
-    let x_f32 = UOp::native_const(42.0f32);
-    let zero_float = UOp::native_const(0.0f32);
-    let add_zero_float = binary(BinaryOp::Add, x_f32.clone(), zero_float);
-
-    match matcher.rewrite(&add_zero_float, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_f32)),
-        _ => panic!("Add(x, @zero) should match float 0.0"),
-    }
-
-    // Test x + 1 - should NOT match @zero
-    let one = UOp::native_const(1i32);
-    let add_one = binary(BinaryOp::Add, x_int.clone(), one);
-
-    match matcher.rewrite(&add_one, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Add(x, 1) should NOT match @zero"),
-    }
-}
-
-#[test]
-fn test_special_constant_one() {
-    // Test @one special constant - matches both Int(1) and Float(1.0)
-    let matcher = patterns! {
-        Mul(x, @one) ~> x
-    };
-
-    // Test x * 1 (int)
-    let x_int = UOp::native_const(42i32);
-    let one_int = UOp::native_const(1i32);
-    let mul_one_int = binary(BinaryOp::Mul, x_int.clone(), one_int);
-
-    match matcher.rewrite(&mul_one_int, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_int)),
-        _ => panic!("Mul(x, @one) should match int 1"),
-    }
-
-    // Test x * 1.0 (float)
-    let x_f32 = UOp::native_const(42.0f32);
-    let one_float = UOp::native_const(1.0f32);
-    let mul_one_float = binary(BinaryOp::Mul, x_f32.clone(), one_float);
-
-    match matcher.rewrite(&mul_one_float, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_f32)),
-        _ => panic!("Mul(x, @one) should match float 1.0"),
-    }
-
-    // Test x * 2 - should NOT match @one
     let two = UOp::native_const(2i32);
-    let mul_two = binary(BinaryOp::Mul, x_int.clone(), two);
 
-    match matcher.rewrite(&mul_two, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Mul(x, 2) should NOT match @one"),
-    }
+    assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Add, x.clone(), zero.clone()), &mut ()), &x);
+    assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Mul, x.clone(), one.clone()), &mut ()), &x);
+    assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Mul, x.clone(), zero.clone()), &mut ()), &zero);
+    assert_no_match(matcher.rewrite(&binary(BinaryOp::Add, x.clone(), one), &mut ()));
+    assert_no_match(matcher.rewrite(&binary(BinaryOp::Mul, x, two), &mut ()));
 }
 
+/// `@zero`/`@one` match the int and the float spelling of the constant, in either operand
+/// position, both as an anonymous source and behind a `name @ ...` binding.
 #[test]
-fn test_special_constant_with_binding() {
-    // Test binding with @zero: zero @ @zero
-    let matcher = patterns! {
-        Mul(_, zero @ @zero) ~> zero
-    };
-
-    // Test x * 0 - should return the zero constant
-    let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-    let mul_zero = binary(BinaryOp::Mul, x, zero.clone());
-
-    match matcher.rewrite(&mul_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &zero)),
-        _ => panic!("Mul(_, zero @ @zero) should return zero"),
-    }
-
-    // Test with float 0.0
-    let x_f32 = UOp::native_const(42.0f32);
-    let zero_f32 = UOp::native_const(0.0f32);
-    let mul_zero_f32 = binary(BinaryOp::Mul, x_f32, zero_f32.clone());
-
-    match matcher.rewrite(&mul_zero_f32, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &zero_f32)),
-        _ => panic!("Mul(_, zero @ @zero) should return float zero"),
-    }
-}
-
-#[test]
-fn test_identity_patterns_with_special_constants() {
-    // Comprehensive identity pattern test using @zero and @one
+fn special_constant_patterns() {
     let matcher = patterns! {
         Add(x, @zero) ~> x,
         Add(@zero, x) ~> x,
@@ -433,780 +79,303 @@ fn test_identity_patterns_with_special_constants() {
         Mul(zero @ @zero, _) ~> zero,
     };
 
-    let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-    let one = UOp::native_const(1i32);
-
-    // x + 0 => x
-    let add_x_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
-    match matcher.rewrite(&add_x_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Add(x, @zero) failed"),
-    }
-
-    // 0 + x => x
-    let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
-    match matcher.rewrite(&add_zero_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Add(@zero, x) failed"),
-    }
-
-    // x * 1 => x
-    let mul_x_one = binary(BinaryOp::Mul, x.clone(), one.clone());
-    match matcher.rewrite(&mul_x_one, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Mul(x, @one) failed"),
-    }
-
-    // 1 * x => x
-    let mul_one_x = binary(BinaryOp::Mul, one.clone(), x.clone());
-    match matcher.rewrite(&mul_one_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Mul(@one, x) failed"),
-    }
-
-    // x * 0 => 0
-    let mul_x_zero = binary(BinaryOp::Mul, x.clone(), zero.clone());
-    match matcher.rewrite(&mul_x_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &zero)),
-        _ => panic!("Mul(_, @zero) failed"),
-    }
-
-    // 0 * x => 0
-    let mul_zero_x = binary(BinaryOp::Mul, zero.clone(), x.clone());
-    match matcher.rewrite(&mul_zero_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &zero)),
-        _ => panic!("Mul(@zero, _) failed"),
+    for (x, zero, one, two) in [
+        (UOp::native_const(42i32), UOp::native_const(0i32), UOp::native_const(1i32), UOp::native_const(2i32)),
+        (UOp::native_const(42.0f32), UOp::native_const(0.0f32), UOp::native_const(1.0f32), UOp::native_const(2.0f32)),
+    ] {
+        assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Add, x.clone(), zero.clone()), &mut ()), &x);
+        assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Add, zero.clone(), x.clone()), &mut ()), &x);
+        assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Mul, x.clone(), one.clone()), &mut ()), &x);
+        assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Mul, one, x.clone()), &mut ()), &x);
+        assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Mul, x.clone(), zero.clone()), &mut ()), &zero);
+        assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Mul, zero.clone(), x.clone()), &mut ()), &zero);
+        assert_no_match(matcher.rewrite(&binary(BinaryOp::Add, x.clone(), two.clone()), &mut ()));
+        assert_no_match(matcher.rewrite(&binary(BinaryOp::Mul, x, two), &mut ()));
     }
 }
 
-// NOTE: Tests for deprecated UPat API (test_or_casted_method, test_or_detach_method,
-// test_binary_commutative_pattern, test_permute_pattern_with_three_sources) were removed
-// during migration to TypedPatternMatcher infrastructure.
-
+/// Guards run after a structural match and veto it: a block guard inspecting the bound
+/// const, and an expression guard using `Arc::ptr_eq`.
 #[test]
-fn test_struct_field_extraction() {
-    // Test struct pattern with field extraction: Cast { src: x, dtype }
-    // The dtype field should be extracted and available in the guard/rewrite
-
-    // Create pattern that matches Cast where dtype matches a specific value
+fn guards_veto_a_structural_match() {
     let matcher = patterns! {
-        // Match Cast(x) where dtype is Float32, rewrite to x
-        Cast { src: x, dtype } if *dtype == DType::Float32 ~> x
-    };
-
-    // Create an Int32 constant
-    let x_int = UOp::native_const(42i32);
-
-    // Create Cast(x_int) to Float32
-    let cast_to_f32 = x_int.cast(DType::Float32);
-
-    // This should match (cast to Float32)
-    match matcher.rewrite(&cast_to_f32, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_int)),
-        _ => panic!("Cast {{ src: x, dtype }} with dtype == Float32 should match"),
-    }
-
-    // Create Cast(x_int) to Int64
-    let cast_to_i64 = x_int.cast(DType::Int64);
-
-    // This should NOT match (cast to Int64, not Float32)
-    match matcher.rewrite(&cast_to_i64, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Cast {{ src: x, dtype }} with dtype == Int64 should NOT match Float32 guard"),
-    }
-}
-
-#[test]
-fn test_struct_field_extraction_permute() {
-    // Test struct pattern with field extraction for Permute { src: x, axes }
-
-    let matcher = patterns! {
-        // Match Permute where axes has length 2
-        Permute { src: x, axes } if axes.len() == 2 ~> x
-    };
-
-    // Create a simple tensor
-    let x = UOp::native_const(1.0f32);
-
-    // Create Permute with 2 axes
-    let permute_2 = UOp::new(Op::Permute { src: x.clone(), axes: vec![1, 0] }, DType::Float32);
-
-    // This should match (2 axes)
-    match matcher.rewrite(&permute_2, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Permute with 2 axes should match"),
-    }
-
-    // Create Permute with 3 axes
-    let permute_3 = UOp::new(Op::Permute { src: x.clone(), axes: vec![2, 0, 1] }, DType::Float32);
-
-    // This should NOT match (3 axes, not 2)
-    match matcher.rewrite(&permute_3, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Permute with 3 axes should NOT match axes.len() == 2 guard"),
-    }
-}
-
-// ===== Nested Struct Pattern Tests =====
-
-#[test]
-fn test_nested_struct_pattern() {
-    // Test nested struct patterns: Cast { src: Cast { src: x, .. }, dtype }
-    // This matches a cast of a cast and extracts the innermost source
-    let matcher = patterns! {
-        Cast { src: Cast { src: x, .. }, dtype } if *dtype == DType::Float32 ~> x
-    };
-
-    // Create an Int32 constant
-    let x_int = UOp::native_const(42i32);
-
-    // Create inner cast: Cast(x_int) to Int64
-    let inner_cast = x_int.cast(DType::Int64);
-
-    // Create outer cast: Cast(inner_cast) to Float32
-    let outer_cast = inner_cast.cast(DType::Float32);
-
-    // This should match (outer cast to Float32)
-    match matcher.rewrite(&outer_cast, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &x_int), "Should extract innermost source");
-        }
-        _ => panic!("Nested Cast pattern should match"),
-    }
-
-    // Single cast should NOT match
-    let single_cast = x_int.cast(DType::Float32);
-    match matcher.rewrite(&single_cast, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected - not nested
-        _ => panic!("Single Cast should NOT match nested pattern"),
-    }
-}
-
-#[test]
-fn test_nested_struct_field_extraction() {
-    use svod_ir::types::{AddrSpace, BufferizeOpts};
-
-    // Test nested struct field extraction:
-    // Index { buffer: Stage { compute, ranges, .. }, indices }
-    // This should extract `ranges` from the inner Stage AND `indices` from the outer Index.
-    //
-    // Note: We use a simple comparison function for testing since ranges_equal is not available here
-    let matcher = patterns! {
-        Index { buffer: Stage { compute, ranges, .. }, indices }
-            if ranges.len() == indices.len() ~> compute
-    };
-
-    let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
-    let compute = UOp::native_const(42.0f32);
-    let range1 = UOp::range(UOp::index_const(10), 0);
-    let range2 = UOp::range(UOp::index_const(20), 1);
-
-    // Create: INDEX(STAGE(compute, [r1, r2]), [r1, r2])
-    let buf = UOp::stage(compute.clone(), vec![range1.clone(), range2.clone()], opts);
-    let idx = UOp::index().buffer(buf).indices(vec![range1.clone(), range2.clone()]).call().unwrap();
-
-    // Should match and return compute (ranges.len() == indices.len())
-    match matcher.rewrite(&idx, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &compute), "Should extract compute from nested pattern");
-        }
-        _ => panic!("Nested Index(Stage) pattern should match with extracted ranges"),
-    }
-}
-
-#[test]
-fn test_nested_struct_field_extraction_mismatch() {
-    use svod_ir::types::{AddrSpace, BufferizeOpts};
-
-    // Test that guard fails when ranges.len() != indices.len()
-    let matcher = patterns! {
-        Index { buffer: Stage { compute, ranges, .. }, indices }
-            if ranges.len() == indices.len() ~> compute
-    };
-
-    let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
-    let compute = UOp::native_const(42.0f32);
-    let range1 = UOp::range(UOp::index_const(10), 0);
-    let range2 = UOp::range(UOp::index_const(20), 1);
-
-    // Create: INDEX(STAGE(compute, [r1, r2]), [r1]) - different lengths
-    let buf = UOp::stage(compute.clone(), vec![range1.clone(), range2], opts);
-    let idx = UOp::index().buffer(buf).indices(vec![range1]).call().unwrap();
-
-    // Should NOT match because ranges.len() (2) != indices.len() (1)
-    match matcher.rewrite(&idx, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected - guard fails
-        _ => panic!("Should NOT match when ranges.len() != indices.len()"),
-    }
-}
-
-// ===== For-Loop Iteration Tests =====
-
-#[test]
-fn test_for_loop_unary_expansion() {
-    // Test that for-loop syntax generates patterns for multiple unary ops
-    #[allow(unused_variables)]
-    let matcher = patterns! {
-        for op in unary [Sqrt, Exp2] {
-            op(c) ~> {
-                // Just return the operand for testing
-                Arc::clone(c)
-            }
-        }
-    };
-
-    let x = UOp::native_const(42.0f32);
-
-    // Create Sqrt(x)
-    let sqrt_x = x.try_sqrt().unwrap();
-    match matcher.rewrite(&sqrt_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Sqrt pattern from for-loop should match"),
-    }
-
-    // Create Exp2(x)
-    let exp2_x = x.try_exp2().unwrap();
-    match matcher.rewrite(&exp2_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Exp2 pattern from for-loop should match"),
-    }
-
-    // Create Sin(x) - should NOT match (not in the loop)
-    let sin_x = x.try_sin().unwrap();
-    match matcher.rewrite(&sin_x, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Sin should NOT match (not in for-loop list)"),
-    }
-}
-
-#[test]
-fn test_for_loop_binary_expansion() {
-    // Test that for-loop syntax generates patterns for multiple binary ops
-    #[allow(unused_variables)]
-    let matcher = patterns! {
-        for op in binary [Add, Mul, Sub] {
-            op(x, @zero) ~> x
-        }
-    };
-
-    let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-
-    // Test Add(x, 0) => x
-    let add_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
-    match matcher.rewrite(&add_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Add(x, 0) from for-loop should match"),
-    }
-
-    // Test Mul(x, 0) => x
-    let mul_zero = binary(BinaryOp::Mul, x.clone(), zero.clone());
-    match matcher.rewrite(&mul_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Mul(x, 0) from for-loop should match"),
-    }
-
-    // Test Sub(x, 0) => x
-    let sub_zero = binary(BinaryOp::Sub, x.clone(), zero.clone());
-    match matcher.rewrite(&sub_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Sub(x, 0) from for-loop should match"),
-    }
-
-    // Test And(x, 0) - should NOT match (not in the loop)
-    let and_zero = x.try_and_op(&zero).unwrap();
-    match matcher.rewrite(&and_zero, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("And should NOT match (not in for-loop list)"),
-    }
-}
-
-#[test]
-fn test_for_loop_ternary_expansion() {
-    // Test that for-loop syntax generates patterns for ternary ops
-    #[allow(unused_variables)]
-    let matcher = patterns! {
-        for op in ternary [Where, MulAcc] {
-            op(a, b, c) ~> {
-                // For testing, just return the first argument
-                Arc::clone(a)
-            }
-        }
-    };
-
-    // WHERE condition must be bool, branches can be any type
-    let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let true_val = UOp::native_const(2.0f32);
-    let false_val = UOp::native_const(3.0f32);
-
-    // Test Where(cond, true_val, false_val) => cond
-    let where_abc = UOp::try_where(cond.clone(), true_val.clone(), false_val.clone()).unwrap();
-    match matcher.rewrite(&where_abc, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &cond)),
-        _ => panic!("Where pattern from for-loop should match"),
-    }
-
-    // MulAcc uses numeric types
-    let a = UOp::native_const(1.0f32);
-    let b = UOp::native_const(2.0f32);
-    let c = UOp::native_const(3.0f32);
-
-    // Test MulAcc(a, b, c) => a
-    let mulacc_abc = UOp::try_mulacc(a.clone(), b.clone(), c.clone()).unwrap();
-    match matcher.rewrite(&mulacc_abc, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a)),
-        _ => panic!("MulAcc pattern from for-loop should match"),
-    }
-}
-
-#[test]
-fn test_for_loop_with_op_var_access() {
-    use svod_ir::UnaryOp;
-
-    // Test that the operation variable `op` is accessible in the closure
-    let matcher = patterns! {
-        for op in unary [Sqrt, Exp2] {
-            op(x) ~> {
-                // Use the op variable to verify it's accessible
-                // Create a different unary op with the same operand
-                match op {
-                    UnaryOp::Sqrt => x.try_exp2().unwrap(),
-                    UnaryOp::Exp2 => x.try_sqrt().unwrap(),
-                    _ => Arc::clone(x),
+        And(x, y) if Arc::ptr_eq(x, y) ~> x,
+        Add(x, c) if {
+            match c.op() {
+                Op::Const(cv) => {
+                    matches!(cv.0, ConstValue::Int(0)) || matches!(cv.0, ConstValue::Float(f) if f == 0.0)
                 }
+                _ => false,
             }
-        }
+        } ~> x,
     };
 
-    let x = UOp::native_const(42.0f32);
+    let a = UOp::native_const(42i32);
+    let b = UOp::native_const(99i32);
+    assert_rewrites_to(matcher.rewrite(&a.try_and_op(&a).unwrap(), &mut ()), &a);
+    assert_no_match(matcher.rewrite(&a.try_and_op(&b).unwrap(), &mut ()));
 
-    // Sqrt(x) should rewrite to Exp2(x) (swapped)
-    let sqrt_x = x.try_sqrt().unwrap();
-    match matcher.rewrite(&sqrt_x, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(matches!(r.op(), Op::Unary(UnaryOp::Exp2, _)), "Sqrt should rewrite to Exp2");
-        }
-        _ => panic!("Sqrt pattern should match"),
-    }
+    let a_f32 = UOp::native_const(42.0f32);
+    assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Add, a.clone(), UOp::native_const(0i32)), &mut ()), &a);
+    assert_rewrites_to(
+        matcher.rewrite(&binary(BinaryOp::Add, a_f32.clone(), UOp::native_const(0.0f32)), &mut ()),
+        &a_f32,
+    );
+    assert_no_match(matcher.rewrite(&binary(BinaryOp::Add, a, UOp::native_const(1i32)), &mut ()));
+}
 
-    // Exp2(x) should rewrite to Sqrt(x) (swapped)
-    let exp2_x = x.try_exp2().unwrap();
-    match matcher.rewrite(&exp2_x, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(matches!(r.op(), Op::Unary(UnaryOp::Sqrt, _)), "Exp2 should rewrite to Sqrt");
-        }
-        _ => panic!("Exp2 pattern should match"),
+/// Repeating a binding name generates a `ptr_eq` check per extra occurrence. Each position
+/// must be checked independently — a `DuplicateTracker` that only compared first vs. last
+/// let `Where(a, b, a)` through.
+#[test]
+fn repeated_binding_requires_pointer_equality() {
+    let matcher = patterns! {
+        Where(x, x, x) ~> x
+    };
+
+    let a = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let b = UOp::const_(DType::Bool, ConstValue::Bool(false));
+
+    assert_rewrites_to(matcher.rewrite(&UOp::try_where(a.clone(), a.clone(), a.clone()).unwrap(), &mut ()), &a);
+    for (c, t, f) in
+        [(a.clone(), a.clone(), b.clone()), (a.clone(), b.clone(), a.clone()), (b.clone(), a.clone(), a.clone())]
+    {
+        assert_no_match(matcher.rewrite(&UOp::try_where(c, t, f).unwrap(), &mut ()));
     }
 }
 
+/// Struct patterns bind non-source fields (`dtype`, `axes`) for use in the guard.
 #[test]
-fn test_for_loop_mixed_with_regular_patterns() {
-    // Test mixing for-loops with regular patterns
+fn struct_patterns_bind_non_source_fields() {
+    let matcher = patterns! {
+        Cast { src: x, dtype } if *dtype == DType::Float32 ~> x,
+        Permute { src: x, axes } if axes.len() == 2 ~> x,
+    };
+
+    let x_int = UOp::native_const(42i32);
+    assert_rewrites_to(matcher.rewrite(&x_int.cast(DType::Float32), &mut ()), &x_int);
+    assert_no_match(matcher.rewrite(&x_int.cast(DType::Int64), &mut ()));
+
+    let x = UOp::native_const(1.0f32);
+    let permute = |axes: Vec<usize>| UOp::new(Op::Permute { src: x.clone(), axes }, DType::Float32);
+    assert_rewrites_to(matcher.rewrite(&permute(vec![1, 0]), &mut ()), &x);
+    assert_no_match(matcher.rewrite(&permute(vec![2, 0, 1]), &mut ()));
+}
+
+/// A struct pattern nested inside another binds fields from both levels.
+#[test]
+fn nested_struct_patterns() {
+    let matcher = patterns! {
+        Cast { src: Cast { src: x, .. }, dtype } if *dtype == DType::Float32 ~> x,
+        Index { buffer: Stage { compute, ranges, .. }, indices } if ranges.len() == indices.len() ~> compute,
+    };
+
+    let x_int = UOp::native_const(42i32);
+    assert_rewrites_to(matcher.rewrite(&x_int.cast(DType::Int64).cast(DType::Float32), &mut ()), &x_int);
+    assert_no_match(matcher.rewrite(&x_int.cast(DType::Float32), &mut ()));
+
+    let compute = UOp::native_const(42.0f32);
+    let r0 = UOp::range(UOp::index_const(10), 0);
+    let r1 = UOp::range(UOp::index_const(20), 1);
+    let stage = UOp::stage(compute.clone(), vec![r0.clone(), r1.clone()], stage_opts());
+    let indexed = |indices: Vec<Arc<UOp>>| UOp::index().buffer(stage.clone()).indices(indices).call().unwrap();
+    assert_rewrites_to(matcher.rewrite(&indexed(vec![r0.clone(), r1]), &mut ()), &compute);
+    assert_no_match(matcher.rewrite(&indexed(vec![r0]), &mut ()));
+}
+
+/// `for op in <arity> [...]` emits one rule per listed op, and coexists with the plain
+/// rules written before and after it.
+#[test]
+fn for_loop_expands_the_listed_ops() {
     #[allow(unused_variables)]
     let matcher = patterns! {
-        // Regular pattern first
         Add(x, @zero) ~> x,
-
-        // For-loop in the middle
         for op in unary [Sqrt, Exp2] {
-            op(x) ~> Arc::clone(x)
+            op(c) ~> Arc::clone(c)
         },
-
-        // Regular pattern after
+        for op in binary [Mul, Sub] {
+            op(x, @zero) ~> x
+        },
+        for op in ternary [Where, MulAcc] {
+            op(a, _b, _c) ~> Arc::clone(a)
+        },
         Mul(x, @one) ~> x,
     };
 
-    let x = UOp::native_const(42.0f32);
-    let zero = UOp::native_const(0.0f32);
-    let one = UOp::native_const(1.0f32);
-
-    // Test Add(x, 0) => x
-    let add_zero = binary(BinaryOp::Add, x.clone(), zero);
-    match matcher.rewrite(&add_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Add(x, 0) should match"),
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
+    for op in [BinaryOp::Add, BinaryOp::Mul, BinaryOp::Sub] {
+        assert_rewrites_to(matcher.rewrite(&binary(op, x.clone(), zero.clone()), &mut ()), &x);
     }
+    assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Mul, x.clone(), UOp::native_const(1i32)), &mut ()), &x);
+    assert_no_match(matcher.rewrite(&x.try_and_op(&zero).unwrap(), &mut ()));
 
-    // Test Sqrt(x) => x
-    let sqrt_x = x.try_sqrt().unwrap();
-    match matcher.rewrite(&sqrt_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Sqrt(x) from for-loop should match"),
-    }
+    let f = UOp::native_const(42.0f32);
+    assert_rewrites_to(matcher.rewrite(&f.try_sqrt().unwrap(), &mut ()), &f);
+    assert_rewrites_to(matcher.rewrite(&f.try_exp2().unwrap(), &mut ()), &f);
+    assert_no_match(matcher.rewrite(&f.try_sin().unwrap(), &mut ()));
 
-    // Test Mul(x, 1) => x
-    let mul_one = binary(BinaryOp::Mul, x.clone(), one);
-    match matcher.rewrite(&mul_one, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Mul(x, 1) should match"),
-    }
+    let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let where_op = UOp::try_where(cond.clone(), f.clone(), UOp::native_const(3.0f32)).unwrap();
+    assert_rewrites_to(matcher.rewrite(&where_op, &mut ()), &cond);
+    let mulacc = UOp::try_mulacc(f.clone(), UOp::native_const(2.0f32), UOp::native_const(3.0f32)).unwrap();
+    assert_rewrites_to(matcher.rewrite(&mulacc, &mut ()), &f);
 }
 
+/// `[*]` expands to every op of the arity, not just the commonly-used ones.
 #[test]
-fn test_for_loop_with_guard() {
-    // Test for-loop patterns with guards
+fn for_loop_wildcard_expands_every_op() {
     #[allow(unused_variables)]
     let matcher = patterns! {
-        for op in unary [Sqrt, Exp2] {
-            // Only match if operand is a constant
+        for op in unary [*] {
             op(c) if matches!(c.op(), Op::Const(_)) ~> Arc::clone(c)
-        }
+        },
+        for op in binary [*] {
+            op(x, @zero) ~> x
+        },
+        for op in ternary [*] {
+            op(a, _b, _c) ~> Arc::clone(a)
+        },
     };
 
-    let c = UOp::native_const(42.0f32);
-
-    // Sqrt(const) - should match
-    let sqrt_c = c.try_sqrt().unwrap();
-    match matcher.rewrite(&sqrt_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
-        _ => panic!("Sqrt(const) should match with guard"),
-    }
-
-    // Create a non-constant operand (binary)
-    let x = UOp::native_const(1.0f32);
-    let y = UOp::native_const(2.0f32);
-    let add_xy = binary(BinaryOp::Add, x, y);
-
-    // Sqrt(add) - should NOT match (operand is not a constant)
-    let sqrt_add = add_xy.try_sqrt().unwrap();
-    match matcher.rewrite(&sqrt_add, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Sqrt(non-const) should NOT match with const guard"),
-    }
-}
-
-#[test]
-fn test_for_loop_with_binding() {
-    // Test for-loop patterns with bindings
-    #[allow(unused_variables)]
-    let matcher = patterns! {
-        for op in unary [Sqrt, Exp2] {
-            op(inner @ @const) ~> inner
-        }
-    };
-
-    let c = UOp::native_const(42.0f32);
-
-    // Sqrt(const) - should match and return the inner constant
-    let sqrt_c = c.try_sqrt().unwrap();
-    match matcher.rewrite(&sqrt_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
-        _ => panic!("Sqrt(inner @ @const) should match and return inner"),
-    }
-
-    // Exp2(const) - should also match
-    let exp2_c = c.try_exp2().unwrap();
-    match matcher.rewrite(&exp2_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
-        _ => panic!("Exp2(inner @ @const) should match and return inner"),
-    }
-}
-
-// ===== ConstWithValue Extraction Tests =====
-
-#[test]
-fn test_const_with_value_extraction() {
-    // Test automatic ConstValue extraction with c@const(cv)
-    let matcher = patterns! {
-        // cv is ConstValue, c is &Arc<UOp>
-        Add(x, _c@const(cv)) if cv == ConstValue::Int(0) ~> x
-    };
+    let f = UOp::native_const(42.0f32);
+    // `.neg()` lowers to MUL(x, -1), so build the raw Unary(Neg) the wildcard should cover.
+    assert_rewrites_to(matcher.rewrite(&UOp::new(Op::Unary(UnaryOp::Neg, f.clone()), f.dtype()), &mut ()), &f);
+    assert_rewrites_to(matcher.rewrite(&f.try_sqrt().unwrap(), &mut ()), &f);
+    assert_rewrites_to(matcher.rewrite(&f.try_exp2().unwrap(), &mut ()), &f);
 
     let x = UOp::native_const(42i32);
     let zero = UOp::native_const(0i32);
-    let one = UOp::native_const(1i32);
-
-    // Test x + 0 - should match (cv == 0)
-    let add_zero = binary(BinaryOp::Add, x.clone(), zero);
-    match matcher.rewrite(&add_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Add(x, 0) should match with cv == 0"),
+    for op in [BinaryOp::Add, BinaryOp::Mul] {
+        assert_rewrites_to(matcher.rewrite(&binary(op, x.clone(), zero.clone()), &mut ()), &x);
     }
+    assert_rewrites_to(matcher.rewrite(&x.try_xor_op(&zero).unwrap(), &mut ()), &x);
 
-    // Test x + 1 - should NOT match (cv != 0)
-    let add_one = binary(BinaryOp::Add, x.clone(), one);
-    match matcher.rewrite(&add_one, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Add(x, 1) should NOT match cv == 0 guard"),
-    }
+    let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let where_op = UOp::try_where(cond.clone(), f.clone(), UOp::native_const(3.0f32)).unwrap();
+    assert_rewrites_to(matcher.rewrite(&where_op, &mut ()), &cond);
+    let mulacc = UOp::try_mulacc(f.clone(), UOp::native_const(2.0f32), UOp::native_const(3.0f32)).unwrap();
+    assert_rewrites_to(matcher.rewrite(&mulacc, &mut ()), &f);
 }
 
+/// The loop variable `op` is a real `UnaryOp` value inside the rewrite body.
 #[test]
-fn test_const_with_value_extraction_fallible() {
-    // Test ConstValue extraction with fallible pattern
+fn for_loop_body_can_read_the_op_variable() {
     let matcher = patterns! {
-        // Use cv in fallible expression with ?
-        Sqrt(_c@const(cv)) => cv.cast(&DType::Float32).map(|casted| UOp::const_(DType::Float32, casted))
-    };
-
-    let c = UOp::native_const(42.0f32);
-    let sqrt_c = c.try_sqrt().unwrap();
-
-    match matcher.rewrite(&sqrt_c, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            // Should create a Float32 constant with casted value
-            assert_eq!(r.dtype(), DType::Float32);
-        }
-        _ => panic!("Sqrt(c@const(cv)) should match and cast the value"),
-    }
-}
-
-// ===== Rest Pattern Tests =====
-
-#[test]
-fn test_rest_pattern_end() {
-    use smallvec::smallvec;
-
-    // Test End(_, ..) matching - verifies the `..` syntax works for variable-arity ops
-    let matcher = patterns! {
-        // Match any END op and return its computation
-        end_op @ End(_, ..) ~> {
-            if let Op::End { computation, .. } = end_op.op() {
-                Arc::clone(computation)
-            } else {
-                unreachable!()
+        for op in unary [Sqrt, Exp2] {
+            op(x) ~> match op {
+                UnaryOp::Sqrt => x.try_exp2().unwrap(),
+                _ => x.try_sqrt().unwrap(),
             }
         }
     };
 
-    let computation = UOp::native_const(42i32);
-    let range1 = UOp::range(UOp::index_const(10), 0);
-    let range2 = UOp::range(UOp::index_const(20), 1);
-
-    // END with 1 range - should match
-    let end1 = computation.end(smallvec![range1.clone()]);
-    match matcher.rewrite(&end1, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &computation), "Should rewrite to computation");
-        }
-        _ => panic!("End(_, ..) should match END with 1 range"),
-    }
-
-    // END with 2 ranges - should also match (that's the point of `..`)
-    let end2 = computation.end(smallvec![range1.clone(), range2.clone()]);
-    match matcher.rewrite(&end2, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &computation), "Should rewrite to computation");
-        }
-        _ => panic!("End(_, ..) should match END with 2 ranges"),
-    }
+    let x = UOp::native_const(42.0f32);
+    assert_rewrites_to(matcher.rewrite(&x.try_sqrt().unwrap(), &mut ()), &x.try_exp2().unwrap());
+    assert_rewrites_to(matcher.rewrite(&x.try_exp2().unwrap(), &mut ()), &x.try_sqrt().unwrap());
 }
 
+/// Guards and `name @ ...` bindings work inside a for-loop body.
 #[test]
-fn test_rest_pattern_reduce() {
-    use smallvec::smallvec;
-    use svod_ir::types::ReduceOp;
-
-    // Test Reduce(_, ..) matching - verifies the `..` syntax works for variable-arity ops
+fn for_loop_body_supports_guards_and_bindings() {
+    #[allow(unused_variables)]
     let matcher = patterns! {
-        // Match any REDUCE op and return a constant
-        reduce_op @ Reduce(_, ..) ~> UOp::const_(reduce_op.dtype(), ConstValue::Int(99))
+        for op in unary [Sqrt] {
+            op(c) if matches!(c.op(), Op::Const(_)) ~> Arc::clone(c)
+        },
+        for op in unary [Exp2] {
+            op(inner @ @const) ~> inner
+        },
+    };
+
+    let c = UOp::native_const(42.0f32);
+    let non_const = binary(BinaryOp::Add, UOp::native_const(1.0f32), UOp::native_const(2.0f32));
+
+    assert_rewrites_to(matcher.rewrite(&c.try_sqrt().unwrap(), &mut ()), &c);
+    assert_rewrites_to(matcher.rewrite(&c.try_exp2().unwrap(), &mut ()), &c);
+    assert_no_match(matcher.rewrite(&non_const.try_sqrt().unwrap(), &mut ()));
+    assert_no_match(matcher.rewrite(&non_const.try_exp2().unwrap(), &mut ()));
+}
+
+/// `name @ const(cv)` binds the `ConstValue` itself, for both the infallible (`~>`) and
+/// the fallible (`=>`) rewrite arm.
+#[test]
+fn const_value_is_extracted_from_the_binding() {
+    let matcher = patterns! {
+        Add(x, _c@const(cv)) if cv == ConstValue::Int(0) ~> x,
+        Sqrt(_c@const(cv)) => cv.cast(&DType::Float32).map(|casted| UOp::const_(DType::Float32, casted)),
+    };
+
+    let x = UOp::native_const(42i32);
+    assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Add, x.clone(), UOp::native_const(0i32)), &mut ()), &x);
+    assert_no_match(matcher.rewrite(&binary(BinaryOp::Add, x, UOp::native_const(1i32)), &mut ()));
+
+    let c = UOp::native_const(42.0f32);
+    assert_rewrites_to(matcher.rewrite(&c.try_sqrt().unwrap(), &mut ()), &c);
+}
+
+/// `..` in a tuple pattern makes the rule arity-independent for variable-arity ops.
+#[test]
+fn rest_pattern_matches_any_arity() {
+    let matcher = patterns! {
+        end_op @ End(_, ..) ~> {
+            let Op::End { computation, .. } = end_op.op() else { unreachable!() };
+            Arc::clone(computation)
+        },
+        reduce_op @ Reduce(_, ..) if matches!(reduce_op.op(), Op::Reduce { reduce_op: ReduceOp::Add, .. })
+            ~> UOp::const_(reduce_op.dtype(), ConstValue::Int(99)),
     };
 
     let src = UOp::native_const(42i32);
-    let range1 = UOp::range(UOp::index_const(10), 0);
-    let range2 = UOp::range(UOp::index_const(20), 1);
+    let r0 = UOp::range(UOp::index_const(10), 0);
+    let r1 = UOp::range(UOp::index_const(20), 1);
 
-    // REDUCE with 1 range - should match
-    let reduce1 = src.reduce(smallvec![range1.clone()], ReduceOp::Add);
-    match matcher.rewrite(&reduce1, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(matches!(r.op(), Op::Const(_)));
-        }
-        _ => panic!("Reduce(_, ..) should match REDUCE with 1 range"),
-    }
+    assert_rewrites_to(matcher.rewrite(&src.end(smallvec![r0.clone()]), &mut ()), &src);
+    assert_rewrites_to(matcher.rewrite(&src.end(smallvec![r0.clone(), r1.clone()]), &mut ()), &src);
 
-    // REDUCE with 2 ranges - should also match (that's the point of `..`)
-    let reduce2 = src.reduce(smallvec![range1.clone(), range2.clone()], ReduceOp::Add);
-    match matcher.rewrite(&reduce2, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(matches!(r.op(), Op::Const(_)));
-        }
-        _ => panic!("Reduce(_, ..) should match REDUCE with 2 ranges"),
-    }
+    let ninety_nine = UOp::const_(src.dtype(), ConstValue::Int(99));
+    assert_rewrites_to(matcher.rewrite(&src.reduce(smallvec![r0.clone()], ReduceOp::Add), &mut ()), &ninety_nine);
+    assert_rewrites_to(matcher.rewrite(&src.reduce(smallvec![r0.clone(), r1], ReduceOp::Add), &mut ()), &ninety_nine);
+    assert_no_match(matcher.rewrite(&src.reduce(smallvec![r0], ReduceOp::Mul), &mut ()));
 }
 
+/// `..` in a struct pattern matches a prefix of the sources (Tinygrad's `zip()` semantics)
+/// and ignores the remaining fields, whatever their number.
 #[test]
-fn test_rest_pattern_with_guard() {
-    use smallvec::smallvec;
-    use svod_ir::types::ReduceOp;
+fn struct_rest_pattern_ignores_the_remaining_fields() {
+    use svod_device::DeviceSpec;
 
-    // Test that guards work correctly with rest patterns
     let matcher = patterns! {
-        reduce_op @ Reduce(_, ..) if {
-            // Only match REDUCE with Add op
-            matches!(reduce_op.op(), Op::Reduce { reduce_op: ReduceOp::Add, .. })
-        } ~> UOp::const_(reduce_op.dtype(), ConstValue::Int(0))
+        Stage { compute: c, .. } ~> c,
+        Index { buffer: c, .. } if matches!(c.op(), Op::Const(_)) ~> c,
+        Copy { src: c, .. } if matches!(c.op(), Op::Const(_)) ~> c,
     };
 
-    let src = UOp::native_const(42i32);
-    let range = UOp::range(UOp::index_const(10), 0);
-
-    // REDUCE with Add - should match
-    let reduce_add = src.reduce(smallvec![range.clone()], ReduceOp::Add);
-    match matcher.rewrite(&reduce_add, &mut ()) {
-        RewriteResult::Rewritten(_) => {}
-        _ => panic!("Should match REDUCE Add"),
+    let c = UOp::native_const(42.0f32);
+    let ranges =
+        [UOp::range(UOp::index_const(10), 0), UOp::range(UOp::index_const(20), 1), UOp::range(UOp::index_const(30), 2)];
+    for n in 0..=ranges.len() {
+        let stage = UOp::stage(c.clone(), ranges[..n].to_vec(), stage_opts());
+        assert_rewrites_to(matcher.rewrite(&stage, &mut ()), &c);
     }
 
-    // REDUCE with Mul - should NOT match (guard fails)
-    let reduce_mul = src.reduce(smallvec![range.clone()], ReduceOp::Mul);
-    match matcher.rewrite(&reduce_mul, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Should NOT match REDUCE Mul"),
+    let indices = [UOp::index_const(0), UOp::index_const(1)];
+    for n in 1..=indices.len() {
+        let index = UOp::index().buffer(c.clone()).indices(indices[..n].to_vec()).call().unwrap();
+        assert_rewrites_to(matcher.rewrite(&index, &mut ()), &c);
     }
+
+    assert_rewrites_to(matcher.rewrite(&c.copy_to_device(DeviceSpec::Cuda { device_id: 0 }), &mut ()), &c);
 }
 
-// ===== Variable-Arity Prefix Matching Tests =====
-// These tests verify that SrcPattern::Tuple uses prefix matching (like Tinygrad's zip() semantics)
-// instead of exact-length matching. This allows patterns to match variable-arity ops.
-
+/// The four ways to write an `Option` field: `None`, `Some(g)`, `_`, and a bare name that
+/// binds the `Option` itself.
 #[test]
-fn test_bufferize_variable_ranges() {
-    use svod_ir::types::{AddrSpace, BufferizeOpts};
-
-    // Test Stage { compute: c, .. } with varying number of ranges
-    // This pattern should match Stage with 0, 1, 2, or more ranges
-    let matcher = patterns! {
-        Stage { compute: c, .. } if matches!(c.op(), Op::Const(_)) ~> c
-    };
-
-    let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
-    let const_val = UOp::native_const(42.0f32);
-    let range1 = UOp::range(UOp::index_const(10), 0);
-    let range2 = UOp::range(UOp::index_const(20), 1);
-
-    // Test with 0 ranges
-    let buf0 = UOp::stage(const_val.clone(), vec![], opts.clone());
-    match matcher.rewrite(&buf0, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 0 ranges");
-        }
-        _ => panic!("Stage {{ compute: c, .. }} should match with 0 ranges"),
-    }
-
-    // Test with 1 range
-    let buf1 = UOp::stage(const_val.clone(), vec![range1.clone()], opts.clone());
-    match matcher.rewrite(&buf1, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 1 range");
-        }
-        _ => panic!("Stage {{ compute: c, .. }} should match with 1 range"),
-    }
-
-    // Test with 2 ranges
-    let buf2 = UOp::stage(const_val.clone(), vec![range1, range2], opts);
-    match matcher.rewrite(&buf2, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 2 ranges");
-        }
-        _ => panic!("Stage {{ compute: c, .. }} should match with 2 ranges"),
-    }
-}
-
-#[test]
-fn test_index_variable_indices() {
-    // Test Index { buffer: c, .. } with varying number of indices
-    let matcher = patterns! {
-        Index { buffer: c, .. } if matches!(c.op(), Op::Const(_)) ~> c
-    };
-
-    let const_val = UOp::native_const(42.0f32);
-    let idx1 = UOp::index_const(0);
-    let idx2 = UOp::index_const(1);
-
-    // Test with 1 index (minimum for Index)
-    let index1 = UOp::index().buffer(const_val.clone()).indices(vec![idx1.clone()]).call().unwrap();
-    match matcher.rewrite(&index1, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 1 index");
-        }
-        _ => panic!("Index {{ buffer: c, .. }} should match with 1 index"),
-    }
-
-    // Test with 2 indices
-    let index2 = UOp::index().buffer(const_val.clone()).indices(vec![idx1.clone(), idx2.clone()]).call().unwrap();
-    match matcher.rewrite(&index2, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 2 indices");
-        }
-        _ => panic!("Index {{ buffer: c, .. }} should match with 2 indices"),
-    }
-}
-
-#[test]
-fn test_load_target_field_bindings() {
-    let matcher = patterns! {
-        Load { index, alt: _, gate: _ } ~> index
-    };
-
-    let buffer = UOp::native_const(42.0f32);
-    let idx = UOp::index_const(0);
-    let index = UOp::index().buffer(buffer).indices(vec![idx]).call().unwrap();
-    let load = UOp::load().index(index.clone()).call();
-    match matcher.rewrite(&load, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &index)),
-        _ => panic!("Load target fields should match"),
-    }
-}
-
-// ===== Option-field pattern tests (`gate: None`, `gate: Some(g)`, bare `gate`) =====
-
-/// Shared address for the Option-field tests: `INDEX(const, [offset])`.
-fn address(offset: i64) -> Arc<UOp> {
-    let buffer = UOp::native_const(42.0f32);
-    UOp::index().buffer(buffer).indices(vec![UOp::index_const(offset)]).call().unwrap()
-}
-
-fn bool_gate() -> Arc<UOp> {
-    UOp::const_(DType::Bool, ConstValue::Int(1))
-}
-
-#[test]
-fn test_option_none_pattern() {
-    let matcher = patterns! {
-        Load { index, alt: None, gate: None } ~> index
-    };
-
-    let idx = address(0);
-    let ungated = UOp::load().index(idx.clone()).call();
-    match matcher.rewrite(&ungated, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &idx), "should extract the ungated index"),
-        _ => panic!("Load with alt: None, gate: None should match"),
-    }
-
-    let gated = UOp::load().index(idx).alt(UOp::native_const(0.0f32)).gate(bool_gate()).call();
-    match matcher.rewrite(&gated, &mut ()) {
-        RewriteResult::NoMatch => {}
-        _ => panic!("gated Load must NOT match the None pattern"),
-    }
-}
-
-#[test]
-fn test_option_some_pattern() {
-    let matcher = patterns! {
-        Load { index: _, alt: _, gate: Some(g) } ~> g
-    };
-
-    let idx = address(0);
-    let gate = bool_gate();
-    let gated = UOp::load().index(idx.clone()).alt(UOp::native_const(0.0f32)).gate(gate.clone()).call();
-    match matcher.rewrite(&gated, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &gate), "should extract the gate"),
-        _ => panic!("Load with gate: Some(g) should match"),
-    }
-
-    match matcher.rewrite(&UOp::load().index(idx).call(), &mut ()) {
-        RewriteResult::NoMatch => {}
-        _ => panic!("ungated Load must NOT match the Some pattern"),
-    }
-}
-
-#[test]
-fn test_store_gate_bare_binding() {
-    // A bare `gate` field binds the `Option<Arc<UOp>>` itself, matching either way.
-    let matcher = patterns! {
+fn option_field_patterns() {
+    let none_only = patterns! { Load { index, alt: None, gate: None } ~> index };
+    let some_only = patterns! { Load { index: _, alt: _, gate: Some(g) } ~> g };
+    let either = patterns! { Load { index, alt: _, gate: _ } ~> index };
+    let bound = patterns! {
         Store { index, value: _, gate } => {
             match gate {
                 Some(g) => Some(g.clone()),
@@ -1216,22 +385,25 @@ fn test_store_gate_bare_binding() {
     };
 
     let idx = address(0);
-    let value = UOp::native_const(1.0f32);
-    match matcher.rewrite(&idx.store(value.clone()), &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &idx), "ungated store binds gate = None"),
-        _ => panic!("bare gate binding should match an ungated Store"),
-    }
-
     let gate = bool_gate();
-    match matcher.rewrite(&idx.store_gated(value, gate.clone()), &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &gate), "gated store binds gate = Some"),
-        _ => panic!("bare gate binding should match a gated Store"),
-    }
+    let ungated = UOp::load().index(idx.clone()).call();
+    let gated = UOp::load().index(idx.clone()).alt(UOp::native_const(0.0f32)).gate(gate.clone()).call();
+
+    assert_rewrites_to(none_only.rewrite(&ungated, &mut ()), &idx);
+    assert_no_match(none_only.rewrite(&gated, &mut ()));
+    assert_rewrites_to(some_only.rewrite(&gated, &mut ()), &gate);
+    assert_no_match(some_only.rewrite(&ungated, &mut ()));
+    assert_rewrites_to(either.rewrite(&ungated, &mut ()), &idx);
+    assert_rewrites_to(either.rewrite(&gated, &mut ()), &idx);
+
+    let value = UOp::native_const(1.0f32);
+    assert_rewrites_to(bound.rewrite(&idx.store(value.clone()), &mut ()), &idx);
+    assert_rewrites_to(bound.rewrite(&idx.store_gated(value, gate.clone()), &mut ()), &gate);
 }
 
+/// `gate: None` must hold at both levels of a nested pattern.
 #[test]
-fn test_nested_option_none_pattern() {
-    // Option fields nested at two levels: an ungated store of an ungated load.
+fn nested_option_field_patterns() {
     let matcher = patterns! {
         Store { index: _, value: Load { index: source, alt: None, gate: None }, gate: None } ~> source
     };
@@ -1239,279 +411,74 @@ fn test_nested_option_none_pattern() {
     let target = address(0);
     let source = address(1);
     let load = UOp::load().index(source.clone()).call();
-    match matcher.rewrite(&target.store(load.clone()), &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &source), "should reach the inner load address"),
-        _ => panic!("nested None pattern should match"),
-    }
+    let gated_load = UOp::load().index(source.clone()).alt(UOp::native_const(0.0f32)).gate(bool_gate()).call();
 
-    match matcher.rewrite(&target.store_gated(load, bool_gate()), &mut ()) {
-        RewriteResult::NoMatch => {}
-        _ => panic!("outer gate: Some must NOT match"),
-    }
-
-    let gated_load = UOp::load().index(source).alt(UOp::native_const(0.0f32)).gate(bool_gate()).call();
-    match matcher.rewrite(&target.store(gated_load), &mut ()) {
-        RewriteResult::NoMatch => {}
-        _ => panic!("inner gate: Some must NOT match"),
-    }
+    assert_rewrites_to(matcher.rewrite(&target.store(load.clone()), &mut ()), &source);
+    assert_no_match(matcher.rewrite(&target.store_gated(load, bool_gate()), &mut ()));
+    assert_no_match(matcher.rewrite(&target.store(gated_load), &mut ()));
 }
 
-// NOTE: test_prefix_matching_minimum_children was removed - it tested deprecated UPat API
-
+/// `|` alternatives: over whole patterns, over op names alone, and combined with `@zero`/`@one`.
 #[test]
-fn test_tuple_prefix_semantics_vs_exact() {
-    use svod_ir::types::{AddrSpace, BufferizeOpts};
-
-    // Verify that Tuple now uses prefix semantics (matches first N, ignores rest)
-    // rather than exact semantics (requires exactly N children)
-
-    // Pattern: Stage with compute only (via struct syntax)
-    let matcher = patterns! {
-        Stage { compute: c, .. } ~> c
-    };
-
-    let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
-    let const_val = UOp::native_const(42.0f32);
-    let range1 = UOp::range(UOp::index_const(10), 0);
-    let range2 = UOp::range(UOp::index_const(20), 1);
-    let range3 = UOp::range(UOp::index_const(30), 2);
-
-    // All of these should match because prefix matching ignores extra ranges
-    for (n, ranges) in [
-        (0, vec![]),
-        (1, vec![range1.clone()]),
-        (2, vec![range1.clone(), range2.clone()]),
-        (3, vec![range1, range2, range3]),
-    ] {
-        let buf = UOp::stage(const_val.clone(), ranges, opts.clone());
-        match matcher.rewrite(&buf, &mut ()) {
-            RewriteResult::Rewritten(r) => {
-                assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite with {} ranges", n);
-            }
-            _ => panic!("Stage {{ compute: c, .. }} should match with {} ranges (prefix semantics)", n),
-        }
-    }
-}
-
-// ===== Alternative Patterns (pipe operator |) Tests =====
-
-#[test]
-fn test_alternative_patterns_basic() {
-    // Test (Add | Mul) alternative matching
-    let matcher = patterns! {
-        (Add(x, _y) | Mul(x, _y)) ~> x
-    };
-
-    let a = UOp::native_const(5i32);
-    let b = UOp::native_const(3i32);
-
-    // Add should match
-    let add = binary(BinaryOp::Add, a.clone(), b.clone());
-    match matcher.rewrite(&add, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &a), "Add should rewrite to x");
-        }
-        _ => panic!("Add should match alternative pattern"),
-    }
-
-    // Mul should also match
-    let mul = binary(BinaryOp::Mul, a.clone(), b.clone());
-    match matcher.rewrite(&mul, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &a), "Mul should rewrite to x");
-        }
-        _ => panic!("Mul should match alternative pattern"),
-    }
-
-    // Sub should NOT match
-    let sub = binary(BinaryOp::Sub, a.clone(), b.clone());
-    match matcher.rewrite(&sub, &mut ()) {
-        RewriteResult::NoMatch => {}
-        _ => panic!("Sub should NOT match (Add | Mul) pattern"),
-    }
-}
-
-#[test]
-fn test_alternative_patterns_op_shorthand() {
-    // Test (Add | Mul)(args) shorthand syntax
-    let matcher = patterns! {
-        (Add | Mul)(x, @zero) ~> x
-    };
-
-    let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-
-    // Add(x, 0) should match
-    let add = binary(BinaryOp::Add, x.clone(), zero.clone());
-    match matcher.rewrite(&add, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &x), "Add(x, 0) should rewrite to x");
-        }
-        _ => panic!("Add(x, 0) should match"),
-    }
-
-    // Mul(x, 0) should also match
-    let mul = binary(BinaryOp::Mul, x.clone(), zero.clone());
-    match matcher.rewrite(&mul, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &x), "Mul(x, 0) should rewrite to x");
-        }
-        _ => panic!("Mul(x, 0) should match"),
-    }
-}
-
-#[test]
-fn test_alternative_patterns_grouped() {
-    // Test simpler alternative: both branches have same structure
-    let matcher = patterns! {
-        (Add(x, _y) | Mul(x, _y)) ~> x
-    };
-
-    let a = UOp::native_const(5i32);
-    let b = UOp::native_const(3i32);
-
-    // Add should match
-    let add = binary(BinaryOp::Add, a.clone(), b.clone());
-    match matcher.rewrite(&add, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &a), "Add(x, y) should rewrite to x");
-        }
-        _ => panic!("Add should match"),
-    }
-
-    // Mul should also match
-    let mul = binary(BinaryOp::Mul, a.clone(), b.clone());
-    match matcher.rewrite(&mul, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &a), "Mul(x, y) should rewrite to x");
-        }
-        _ => panic!("Mul should match"),
-    }
-}
-
-#[test]
-fn test_alternative_patterns_with_special_const() {
-    // Test alternative with special constants @zero and @one
-    let matcher = patterns! {
-        (Add(x, @zero) | Add(x, @one)) ~> x
-    };
+fn alternative_patterns() {
+    let whole = patterns! { (Add(x, _y) | Mul(x, _y)) ~> x };
+    let op_names = patterns! { (Add | Mul)(x, @zero) ~> x };
+    let special = patterns! { (Add(x, @zero) | Add(x, @one)) ~> x };
 
     let x = UOp::native_const(42i32);
     let zero = UOp::native_const(0i32);
     let one = UOp::native_const(1i32);
     let two = UOp::native_const(2i32);
 
-    // Add(x, 0) should match
-    let add0 = binary(BinaryOp::Add, x.clone(), zero);
-    match matcher.rewrite(&add0, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &x), "Add(x, @zero) should rewrite to x");
-        }
-        _ => panic!("Add(x, 0) should match @zero"),
+    for op in [BinaryOp::Add, BinaryOp::Mul] {
+        assert_rewrites_to(whole.rewrite(&binary(op, x.clone(), one.clone()), &mut ()), &x);
+        assert_rewrites_to(op_names.rewrite(&binary(op, x.clone(), zero.clone()), &mut ()), &x);
     }
+    assert_no_match(whole.rewrite(&binary(BinaryOp::Sub, x.clone(), one.clone()), &mut ()));
+    assert_no_match(op_names.rewrite(&binary(BinaryOp::Sub, x.clone(), zero.clone()), &mut ()));
 
-    // Add(x, 1) should also match
-    let add1 = binary(BinaryOp::Add, x.clone(), one);
-    match matcher.rewrite(&add1, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &x), "Add(x, @one) should rewrite to x");
-        }
-        _ => panic!("Add(x, 1) should match @one"),
-    }
-
-    // Add(x, 2) should NOT match
-    let add2 = binary(BinaryOp::Add, x.clone(), two);
-    match matcher.rewrite(&add2, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Add(x, 2) should NOT match (neither @zero nor @one)"),
-    }
+    assert_rewrites_to(special.rewrite(&binary(BinaryOp::Add, x.clone(), zero), &mut ()), &x);
+    assert_rewrites_to(special.rewrite(&binary(BinaryOp::Add, x.clone(), one), &mut ()), &x);
+    assert_no_match(special.rewrite(&binary(BinaryOp::Add, x, two), &mut ()));
 }
 
-// NOTE: test_upat_any_direct_api was removed - it tested deprecated UPat API
-
-// ===== Permutation Patterns (bracket syntax) Tests =====
-
+/// `Op[a, b]` tries both source orderings — including under `graph_rewrite`, which is where
+/// a permuted match first failed.
 #[test]
-fn test_permutation_pattern_basic() {
-    // Test Add[x, c] permutation matching (matches both Add(x, c) and Add(c, x))
+fn permutation_pattern_matches_both_orderings() {
     let matcher = patterns! {
-        Add[x, @const] ~> x
+        Add[x, @zero] ~> x
     };
 
-    let x = UOp::native_const(42i32);
-    let c = UOp::native_const(5i32);
-
-    // Add(x, c) should match with x bound to first arg
-    let add1 = binary(BinaryOp::Add, x.clone(), c.clone());
-    match matcher.rewrite(&add1, &mut ()) {
-        RewriteResult::Rewritten(_) => {}
-        _ => panic!("Add(x, c) should match permutation pattern"),
-    }
-
-    // Add(c, x) should also match (permutation tries both orderings)
-    let add2 = binary(BinaryOp::Add, c.clone(), x.clone());
-    match matcher.rewrite(&add2, &mut ()) {
-        RewriteResult::Rewritten(_) => {}
-        _ => panic!("Add(c, x) should match permutation pattern"),
-    }
-}
-
-#[test]
-fn test_permutation_pattern_commutative_const_folding() {
-    // Simulate commutative constant folding: Add[x, 0] ~> x
-    // This should match both Add(x, 0) and Add(0, x)
-    let matcher = patterns! {
-        Add[x, Const(0)] ~> x
-    };
-
-    let x = UOp::native_const(42i32);
+    let x = UOp::var("a", DType::Int32, 0, i64::MAX);
     let zero = UOp::native_const(0i32);
 
-    // Add(x, 0) should match
-    let add1 = binary(BinaryOp::Add, x.clone(), zero.clone());
-    match matcher.rewrite(&add1, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &x), "Add(x, 0) should rewrite to x");
-        }
-        _ => panic!("Add(x, 0) should match"),
-    }
+    assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Add, x.clone(), zero.clone()), &mut ()), &x);
+    assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Add, zero.clone(), x.clone()), &mut ()), &x);
 
-    // Add(0, x) should also match and rewrite to x
-    let add2 = binary(BinaryOp::Add, zero.clone(), x.clone());
-    match matcher.rewrite(&add2, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &x), "Add(0, x) should rewrite to x");
-        }
-        _ => panic!("Add(0, x) should match"),
-    }
+    let folded = graph_rewrite(&matcher, binary(BinaryOp::Add, zero, x.clone()), &mut ());
+    assert!(Arc::ptr_eq(&folded, &x));
 }
 
-// ===== Copy Operation Tests =====
-
+/// `=> |captures| expr` names the bindings the fallible rewrite body needs.
 #[test]
-fn test_copy_struct_pattern() {
-    use svod_device::DeviceSpec;
-
-    // Test Copy { src, device } struct pattern matching
+fn explicit_capture_list_in_a_fallible_rewrite() {
     let matcher = patterns! {
-        // Match Copy and return the source if it's a constant
-        Copy { src: c, .. } if matches!(c.op(), Op::Const(_)) ~> c
+        Index {
+            buffer: Index { buffer: real_buffer, indices: inner_indices },
+            indices: outer_indices
+        } if outer_indices.len() == 1 && inner_indices.len() == 1 => |real_buffer, inner_indices| {
+            UOp::index().buffer(real_buffer.clone()).indices(vec![inner_indices[0].clone()]).call().ok()
+        }
     };
 
-    let const_val = UOp::native_const(42.0f32);
-    let copy_op = const_val.copy_to_device(DeviceSpec::Cuda { device_id: 0 });
+    let real_buffer = UOp::native_const(42.0f32);
+    let inner = UOp::index().buffer(real_buffer).indices(vec![UOp::index_const(5)]).call().unwrap();
+    let outer = UOp::index().buffer(inner.clone()).indices(vec![UOp::index_const(10)]).call().unwrap();
 
-    match matcher.rewrite(&copy_op, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &const_val), "Copy {{ src: c, .. }} should rewrite to c");
-        }
-        _ => panic!("Copy {{ src: c, .. }} should match when src is constant"),
-    }
+    assert_rewrites_to(matcher.rewrite(&outer, &mut ()), &inner);
 }
 
-// NOTE: test_copy_f_copy_helper was removed - it tested deprecated UPat API
-
-/// Test context type for `@context` DSL feature.
 #[derive(Default)]
 struct TestContext {
     counter: u32,
@@ -1524,53 +491,29 @@ impl TestContext {
     }
 }
 
+/// `@context T` makes `ctx: &mut T` available to every rewrite body, both on a direct
+/// `rewrite` call and through `graph_rewrite`.
 #[test]
-fn test_context_declaration() {
-    // Test the @context declaration in patterns! DSL
-    // This allows patterns to access a mutable context passed at rewrite time.
-
-    // Create a PatternMatcher<TestContext> using @context
-    let matcher = patterns! {
+fn context_is_threaded_through_rewrite_bodies() {
+    let counting = patterns! {
         @context TestContext;
 
-        // Pattern that uses ctx to increment a counter
         x if matches!(x.op(), Op::Const(_)) => {
-            let count = ctx.increment();
-            if count > 0 {
-                Some(Arc::clone(x))
-            } else {
-                None
-            }
+            ctx.increment();
+            Some(Arc::clone(x))
         }
     };
 
-    // Create a constant
     let c = UOp::native_const(42i32);
-
-    // Create context
     let mut ctx = TestContext::default();
-    assert_eq!(ctx.counter, 0);
+    for expected in 1..=2 {
+        assert_rewrites_to(counting.rewrite(&c, &mut ctx), &c);
+        assert_eq!(ctx.counter, expected);
+    }
 
-    // First rewrite should increment counter
-    let result1 = matcher.rewrite(&c, &mut ctx);
-    assert!(matches!(result1, RewriteResult::Rewritten(_)));
-    assert_eq!(ctx.counter, 1);
-
-    // Second rewrite should increment again
-    let result2 = matcher.rewrite(&c, &mut ctx);
-    assert!(matches!(result2, RewriteResult::Rewritten(_)));
-    assert_eq!(ctx.counter, 2);
-}
-
-#[test]
-fn test_context_with_graph_rewrite() {
-    use crate::rewrite::graph_rewrite;
-
-    // Test @context with the full graph_rewrite pipeline
-    let matcher = patterns! {
+    let folder = patterns! {
         @context TestContext;
 
-        // Replace Add(x, @zero) with x, using context to track rewrites
         Add(x, @zero) => {
             ctx.increment();
             Some(Arc::clone(x))
@@ -1578,268 +521,45 @@ fn test_context_with_graph_rewrite() {
     };
 
     let x = UOp::native_const(5i32);
-    let zero = UOp::native_const(0i32);
-    let add = binary(BinaryOp::Add, x.clone(), zero);
-
+    let add = binary(BinaryOp::Add, x.clone(), UOp::native_const(0i32));
     let mut ctx = TestContext::default();
-    let result = graph_rewrite(&matcher, add, &mut ctx);
-
-    // Should have rewritten Add(5, 0) to 5
-    assert!(Arc::ptr_eq(&result, &x));
-    // Counter should have been incremented
+    assert!(Arc::ptr_eq(&graph_rewrite(&folder, add, &mut ctx), &x));
     assert_eq!(ctx.counter, 1);
 }
 
+/// `PatternMatcher<C> + PatternMatcher<C>` keeps both halves reachable and sharing one context.
 #[test]
-fn test_context_pattern_composition() {
-    // Test that PatternMatcher<C> + PatternMatcher<C> works for same context type
-    let matcher1 = patterns! {
+fn context_matchers_compose() {
+    let adds = patterns! {
         @context TestContext;
-        Add(x, @zero) => {
-            ctx.increment();
-            Some(Arc::clone(x))
-        }
+        Add(x, @zero) => { ctx.increment(); Some(Arc::clone(x)) }
     };
-
-    let matcher2 = patterns! {
+    let muls = patterns! {
         @context TestContext;
-        Mul(x, @one) => {
-            ctx.increment();
-            ctx.increment(); // Increment twice for mul
-            Some(Arc::clone(x))
-        }
+        Mul(x, @one) => { ctx.increment(); ctx.increment(); Some(Arc::clone(x)) }
     };
-
-    // Combine matchers - same context type, so this compiles
-    let combined = matcher1 + matcher2;
+    let combined = adds + muls;
 
     let x = UOp::native_const(5i32);
-    let zero = UOp::native_const(0i32);
-    let one = UOp::native_const(1i32);
-
-    let add_zero = binary(BinaryOp::Add, x.clone(), zero);
-    let mul_one = binary(BinaryOp::Mul, x.clone(), one);
-
     let mut ctx = TestContext::default();
 
-    // Test add pattern
-    let result1 = combined.rewrite(&add_zero, &mut ctx);
-    assert!(matches!(result1, RewriteResult::Rewritten(_)));
-    assert_eq!(ctx.counter, 1); // Add pattern increments once
+    let add = binary(BinaryOp::Add, x.clone(), UOp::native_const(0i32));
+    assert_rewrites_to(combined.rewrite(&add, &mut ctx), &x);
+    assert_eq!(ctx.counter, 1);
 
-    // Test mul pattern
-    let result2 = combined.rewrite(&mul_one, &mut ctx);
-    assert!(matches!(result2, RewriteResult::Rewritten(_)));
-    assert_eq!(ctx.counter, 3); // Mul pattern increments twice (1 + 2 = 3)
+    let mul = binary(BinaryOp::Mul, x.clone(), UOp::native_const(1i32));
+    assert_rewrites_to(combined.rewrite(&mul, &mut ctx), &x);
+    assert_eq!(ctx.counter, 3);
 }
 
+/// The crate's own DSL-authored symbolic matchers compose and fold through `graph_rewrite`.
 #[test]
-fn test_commutative_pattern_with_special_zero() {
-    // Test Add[x, @zero] commutative pattern - should match both orderings
-    let matcher = patterns! {
-        Add[x, @zero] ~> x
-    };
-
-    let x = UOp::var("a", svod_dtype::DType::Int32, 0, i64::MAX);
-    let zero = UOp::native_const(0i32);
-
-    // Add(x, 0) should match
-    let add_x_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
-    match matcher.rewrite(&add_x_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &x), "Add(x, 0) should rewrite to x");
-        }
-        _ => panic!("Add[x, @zero] should match Add(x, 0)"),
-    }
-
-    // Add(0, x) should also match (commutative)
-    let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
-    match matcher.rewrite(&add_zero_x, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &x), "Add(0, x) should rewrite to x");
-        }
-        _ => panic!("Add[x, @zero] should match Add(0, x) via commutativity"),
-    }
-}
-
-#[test]
-fn test_commutative_pattern_with_graph_rewrite() {
-    use crate::rewrite::graph_rewrite;
-
-    // Test Add[x, @zero] with graph_rewrite - like the failing property test
-    let matcher = patterns! {
-        Add[x, @zero] ~> x
-    };
-
-    let x = UOp::var("a", svod_dtype::DType::Int32, 0, i64::MAX);
-    let zero = UOp::native_const(0i32);
-
-    // Add(0, x) via graph_rewrite
-    let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
-    let result = graph_rewrite(&matcher, add_zero_x, &mut ());
-
-    assert!(Arc::ptr_eq(&result, &x), "graph_rewrite(Add(0, x)) should simplify to x");
-}
-
-#[test]
-fn test_symbolic_simple_add_zero() {
-    use crate::rewrite::graph_rewrite;
+fn symbolic_dsl_matchers_compose() {
     use crate::symbolic::patterns::{constant_folding_dsl_patterns, identity_and_zero_patterns};
 
-    // Test combining two matchers
     let matcher = constant_folding_dsl_patterns() + identity_and_zero_patterns();
+    let x = UOp::var("a", DType::Int32, 0, i64::MAX);
+    let add = binary(BinaryOp::Add, UOp::native_const(0i32), x.clone());
 
-    let x = UOp::var("a", svod_dtype::DType::Int32, 0, i64::MAX);
-    let zero = UOp::native_const(0i32);
-
-    // Add(0, x) via graph_rewrite with combined patterns
-    let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
-    let result = graph_rewrite(&matcher, add_zero_x, &mut ());
-
-    assert!(Arc::ptr_eq(&result, &x), "combined patterns + graph_rewrite(Add(0, x)) should simplify to x");
-}
-
-#[test]
-fn test_nested_index_target_fields() {
-    let matcher = patterns! {
-        Index {
-            buffer: Index { buffer: real_buffer, indices: inner_indices },
-            indices: outer_indices
-        } if outer_indices.len() == 1 && inner_indices.len() == 1 => |real_buffer, inner_indices| {
-            UOp::index().buffer(real_buffer.clone()).indices(vec![inner_indices[0].clone()]).call().ok()
-        }
-    };
-
-    let real_buffer = UOp::native_const(42.0f32);
-    let idx1 = UOp::index_const(5);
-    let idx2 = UOp::index_const(10);
-
-    // Create nested Index: INDEX(INDEX(real_buffer, [idx1]), [idx2])
-    let inner_idx = UOp::index().buffer(real_buffer.clone()).indices(vec![idx1.clone()]).call().unwrap();
-    let outer_idx = UOp::index().buffer(inner_idx.clone()).indices(vec![idx2.clone()]).call().unwrap();
-
-    // Should match and return INDEX(real_buffer, [idx1])
-    match matcher.rewrite(&outer_idx, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            // Result should be INDEX(real_buffer, [idx1])
-            if let Op::Index { buffer, indices } = r.op() {
-                assert!(Arc::ptr_eq(buffer, &real_buffer), "Buffer should be real_buffer");
-                assert_eq!(indices.len(), 1, "Should have 1 index");
-                assert!(Arc::ptr_eq(&indices[0], &idx1), "Index should be idx1 from inner");
-            } else {
-                panic!("Result should be Index op");
-            }
-        }
-        _ => panic!("Nested Index pattern should match"),
-    }
-}
-
-// ===== Wildcard For-Loop Tests ([*] syntax) =====
-
-#[test]
-fn test_for_loop_binary_wildcard() {
-    // Test that `binary [*]` expands to ALL binary ops
-    #[allow(unused_variables)]
-    let matcher = patterns! {
-        for op in binary [*] {
-            op(x, @zero) ~> x
-        }
-    };
-
-    let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-
-    // Test Add(x, 0) => x
-    let add_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
-    match matcher.rewrite(&add_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Add(x, 0) from binary [*] should match"),
-    }
-
-    // Test Mul(x, 0) => x
-    let mul_zero = binary(BinaryOp::Mul, x.clone(), zero.clone());
-    match matcher.rewrite(&mul_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Mul(x, 0) from binary [*] should match"),
-    }
-
-    // Test Xor(x, 0) => x (less common op, but should match with [*])
-    let xor_zero = x.try_xor_op(&zero).unwrap();
-    match matcher.rewrite(&xor_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Xor(x, 0) from binary [*] should match"),
-    }
-}
-
-#[test]
-fn test_for_loop_unary_wildcard() {
-    // Test that `unary [*]` expands to ALL unary ops
-    // Note: neg() produces MUL(x,-1) now, so use raw Unary(Neg) to test the DSL wildcard.
-    #[allow(unused_variables)]
-    let matcher = patterns! {
-        for op in unary [*] {
-            op(c) if matches!(c.op(), Op::Const(_)) ~> c
-        }
-    };
-
-    let c = UOp::native_const(42.0f32);
-
-    // Test Neg(const) — construct raw Unary(Neg) since .neg() produces MUL
-    let neg_c = UOp::new(Op::Unary(svod_ir::UnaryOp::Neg, c.clone()), c.dtype());
-    match matcher.rewrite(&neg_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
-        _ => panic!("Neg(const) from unary [*] should match"),
-    }
-
-    // Test Sqrt(const)
-    let sqrt_c = c.try_sqrt().unwrap();
-    match matcher.rewrite(&sqrt_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
-        _ => panic!("Sqrt(const) from unary [*] should match"),
-    }
-
-    // Test Exp2(const) - verifies [*] includes all ops
-    let exp2_c = c.try_exp2().unwrap();
-    match matcher.rewrite(&exp2_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
-        _ => panic!("Exp2(const) from unary [*] should match"),
-    }
-}
-
-#[test]
-fn test_for_loop_ternary_wildcard() {
-    // Test that `ternary [*]` expands to ALL ternary ops
-    #[allow(unused_variables)]
-    let matcher = patterns! {
-        for op in ternary [*] {
-            op(a, b, c) ~> {
-                // For testing, just return the first argument
-                Arc::clone(a)
-            }
-        }
-    };
-
-    // WHERE condition must be bool
-    let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let true_val = UOp::native_const(2.0f32);
-    let false_val = UOp::native_const(3.0f32);
-
-    // Test Where(cond, true_val, false_val) => cond
-    let where_abc = UOp::try_where(cond.clone(), true_val.clone(), false_val.clone()).unwrap();
-    match matcher.rewrite(&where_abc, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &cond)),
-        _ => panic!("Where from ternary [*] should match"),
-    }
-
-    // MulAcc uses numeric types
-    let a = UOp::native_const(1.0f32);
-    let b = UOp::native_const(2.0f32);
-    let c = UOp::native_const(3.0f32);
-
-    // Test MulAcc(a, b, c) => a
-    let mulacc_abc = UOp::try_mulacc(a.clone(), b.clone(), c.clone()).unwrap();
-    match matcher.rewrite(&mulacc_abc, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a)),
-        _ => panic!("MulAcc from ternary [*] should match"),
-    }
+    assert!(Arc::ptr_eq(&graph_rewrite(&matcher, add, &mut ()), &x));
 }

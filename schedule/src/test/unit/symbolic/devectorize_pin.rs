@@ -72,8 +72,7 @@ fn weak_folding_keeps_the_resnet_conv_devectorize_bounded() {
     }
     assert_eq!(scheduler.full_shape(), vec![16, 32, 7, 7, 512, 3, 3]);
 
-    let devectorized = through_devectorize(scheduler.get_optimized_ast(None), &renderer);
     // 6862 nodes before the weak arm of `fold_const_alu`, 4301 after (tinygrad: 2480).
-    eprintln!("PIN node_count={}", devectorized.node_count());
+    let devectorized = through_devectorize(scheduler.get_optimized_ast(None), &renderer);
     assert!(devectorized.node_count() < 5000, "devectorize blew up: {} nodes", devectorized.node_count());
 }
