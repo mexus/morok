@@ -1,5 +1,35 @@
 use super::*;
 use enumset::EnumSet;
+use std::sync::LazyLock;
+use strum::{EnumCount, VariantArray};
+
+/// Reflexive-transitive closure of [`ScalarDType::promotion_lattice`], indexed
+/// by discriminant.
+///
+/// `least_upper_dtype` intersects these sets on every ALU reconstruction --
+/// 138,702 calls for one resnet50 schedule -- and re-folding the lattice
+/// recursively per call revisits the tail shared by the four FP8 variants once
+/// per path. Computed once here by iterating the successor union to a fixed
+/// point, which terminates because the lattice is acyclic.
+static RECURSIVE_PARENTS: LazyLock<[EnumSet<ScalarDType>; ScalarDType::COUNT]> = LazyLock::new(|| {
+    let mut parents = [EnumSet::empty(); ScalarDType::COUNT];
+    for &dtype in ScalarDType::VARIANTS {
+        parents[dtype as usize] = EnumSet::only(dtype);
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &dtype in ScalarDType::VARIANTS {
+            let grown = dtype
+                .promotion_lattice()
+                .iter()
+                .fold(parents[dtype as usize], |set, &parent| set | parents[parent as usize]);
+            changed |= grown != parents[dtype as usize];
+            parents[dtype as usize] = grown;
+        }
+    }
+    parents
+});
 
 /// Commit a floating-point value to a concrete Tinygrad dtype grid.
 ///
@@ -250,10 +280,19 @@ impl ScalarDType {
         }
     }
 
+    /// Every dtype reachable from `self` through the promotion lattice, `self`
+    /// included. Table lookup: see [`RECURSIVE_PARENTS`].
     fn get_recursive_parents(self) -> EnumSet<Self> {
+        RECURSIVE_PARENTS[self as usize]
+    }
+
+    /// Recursive definition of [`Self::get_recursive_parents`], kept as the
+    /// oracle the table is checked against.
+    #[cfg(test)]
+    pub(crate) fn recursive_parents_oracle(self) -> EnumSet<Self> {
         self.promotion_lattice()
             .iter()
-            .fold(EnumSet::only(self), |dtypes, &parent| dtypes.union(parent.get_recursive_parents()))
+            .fold(EnumSet::only(self), |dtypes, &parent| dtypes.union(parent.recursive_parents_oracle()))
     }
 
     /// Check if casting from `from` to `to` is safe (preserves value).
@@ -432,3 +471,7 @@ impl DType {
         DEFAULT_FLOAT
     }
 }
+
+#[cfg(test)]
+#[path = "test/unit/cast.rs"]
+mod tests;
