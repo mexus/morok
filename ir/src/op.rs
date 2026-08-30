@@ -618,3 +618,65 @@ impl Op {
         }
     }
 }
+
+/// Number of `u64` words needed to hold one bit per [`pattern_derived::OpKey`].
+const OP_MASK_WORDS: usize = pattern_derived::OP_KEY_COUNT.div_ceil(64);
+
+/// Set of operation kinds, one bit per [`pattern_derived::OpKey`].
+///
+/// Backs the pattern matcher's early reject: every UOp caches the mask of its direct
+/// children's op kinds ([`UOp::src_ops`]), and every compiled pattern entry carries the
+/// mask of op kinds its fixed-position sources demand. An entry whose mask is not a
+/// subset of the node's mask cannot match, so its closure is never called.
+///
+/// Tinygrad equivalent: `UPat.early_reject` / `UOp._src_ops` (uop/ops.py:1352, 1480).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct OpMask([u64; OP_MASK_WORDS]);
+
+impl OpMask {
+    /// Mask with no op kinds set — never rejects.
+    pub const EMPTY: Self = Self([0; OP_MASK_WORDS]);
+
+    /// Mask holding exactly `key`.
+    #[inline]
+    pub const fn of_key(key: &pattern_derived::OpKey) -> Self {
+        let index = key.index();
+        let mut words = [0; OP_MASK_WORDS];
+        words[index / 64] = 1 << (index % 64);
+        Self(words)
+    }
+
+    /// Mask holding exactly the kind of `op`.
+    #[inline]
+    pub fn of_op(op: &Op) -> Self {
+        Self::of_key(&pattern_derived::OpKey::from_op(op))
+    }
+
+    /// Union of two masks.
+    #[inline]
+    pub fn union(self, other: Self) -> Self {
+        let mut words = self.0;
+        for (word, other) in words.iter_mut().zip(other.0) {
+            *word |= other;
+        }
+        Self(words)
+    }
+
+    /// Whether every kind in `self` is also in `other` (Tinygrad: `issubset`).
+    #[inline]
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.0.iter().zip(other.0).all(|(mine, theirs)| mine & !theirs == 0)
+    }
+
+    /// Whether no kind is set.
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.0.iter().all(|word| *word == 0)
+    }
+}
+
+impl FromIterator<pattern_derived::OpKey> for OpMask {
+    fn from_iter<I: IntoIterator<Item = pattern_derived::OpKey>>(keys: I) -> Self {
+        keys.into_iter().fold(Self::EMPTY, |mask, key| mask.union(Self::of_key(&key)))
+    }
+}

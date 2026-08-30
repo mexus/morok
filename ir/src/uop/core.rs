@@ -169,6 +169,13 @@ pub struct UOp {
     /// O(1) per node since children are already created with their content_hash set.
     /// Used for schedule-level caching where UOp IDs are not stable across runs.
     pub content_hash: u64,
+    /// Set of op kinds among this node's direct children, computed at creation time.
+    ///
+    /// Drives the pattern matcher's early reject: a compiled pattern whose fixed-position
+    /// sources demand an op kind absent here cannot match, so its closure is skipped.
+    /// Tinygrad equivalent: `UOp._src_ops` (uop/ops.py:1480), memoised there instead.
+    #[debug(skip)]
+    pub(crate) src_ops: crate::op::OpMask,
     /// Tag for tracking tensor identity through the rangeify pipeline.
     ///
     /// Tags are sequences of integer indices that track which original tensor
@@ -210,6 +217,11 @@ impl UOp {
     /// Get the operation.
     pub fn op(&self) -> &Op {
         &self.op
+    }
+
+    /// Set of op kinds among the direct children (Tinygrad: `UOp._src_ops`).
+    pub fn src_ops(&self) -> crate::op::OpMask {
+        self.src_ops
     }
 
     /// Get the data type.
@@ -1439,6 +1451,7 @@ impl Clone for UOp {
             op: self.op.clone(),
             dtype: self.dtype.clone(),
             content_hash: self.content_hash,
+            src_ops: self.src_ops,
             tag: self.tag.clone(),
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),

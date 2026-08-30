@@ -3,7 +3,7 @@
 use super::analyze::{AnalyzedVariant, VariantGroups, VariantKind, analyze_variants, group_by_kind};
 use super::parse::parse_input;
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{DeriveInput, Ident, Result};
 
 /// Generate all code from the derive input.
@@ -84,6 +84,28 @@ fn generate_op_key(variants: &[AnalyzedVariant], _groups: &VariantGroups, enum_n
         })
         .collect();
 
+    // Dense index per OpKey, used as the bit position in `OpMask`. Ungrouped variants take
+    // one slot each; a grouped variant reserves one slot per sub-enum variant so that
+    // `Binary(Add)` and `Binary(Mul)` reject independently.
+    let mut index_arms: Vec<TokenStream> = Vec::new();
+    let mut next = 0usize;
+    for v in variants.iter().filter(|v| v.kind != VariantKind::Grouped) {
+        let name = &v.name;
+        let index = next;
+        next += 1;
+        index_arms.push(quote! { OpKey::#name => #index });
+    }
+    let mut base_defs: Vec<TokenStream> = Vec::new();
+    let mut count = quote! { #next };
+    for v in variants.iter().filter(|v| v.kind == VariantKind::Grouped) {
+        let name = &v.name;
+        let ty = v.filter_enum_type.as_ref().expect("grouped variant has a filter enum");
+        let base = format_ident!("OP_KEY_BASE_{}", name.to_string().to_uppercase());
+        base_defs.push(quote! { const #base: usize = #count; });
+        index_arms.push(quote! { OpKey::#name(sub) => #base + *sub as usize });
+        count = quote! { #base + <#ty as ::strum::VariantArray>::VARIANTS.len() };
+    }
+
     quote! {
         /// Operation key for pattern indexing.
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -91,11 +113,24 @@ fn generate_op_key(variants: &[AnalyzedVariant], _groups: &VariantGroups, enum_n
             #(#key_variants),*
         }
 
+        #(#base_defs)*
+
+        /// Number of distinct `OpKey` values — the bit width of `OpMask`.
+        pub const OP_KEY_COUNT: usize = #count;
+
         impl OpKey {
             /// Extract the operation key from an Op.
             pub fn from_op(op: &#enum_name) -> Self {
                 match op {
                     #(#from_op_arms),*
+                }
+            }
+
+            /// Dense bit position of this key within an `OpMask`.
+            #[inline]
+            pub const fn index(&self) -> usize {
+                match self {
+                    #(#index_arms),*
                 }
             }
         }
