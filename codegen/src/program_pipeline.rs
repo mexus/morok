@@ -30,6 +30,11 @@ fn unpack_program(program: &Arc<UOp>) -> Result<ProgramParts> {
     Ok((sink.clone(), info.clone(), linear.clone(), source.clone(), binary.clone()))
 }
 
+/// Structural check on the PROGRAM stage tuple. Deliberately does *not* run
+/// `type_verify` on the sink: `program_from_sink_impl` already verifies it once
+/// against `spec_program`, and this runs at every stage transition
+/// (do_linearize / do_render / do_compile / ...), so verifying here re-walked
+/// the whole kernel five extra times.
 fn validate_program_shape(program: &Arc<UOp>) -> Result<()> {
     let (sink, info, linear, source, binary) = unpack_program(program)?;
 
@@ -76,7 +81,6 @@ fn validate_program_shape(program: &Arc<UOp>) -> Result<()> {
         )));
     }
 
-    verify_final_sink(&sink)?;
     validate_program_info(&sink, &info, None)?;
 
     Ok(())
@@ -493,8 +497,12 @@ pub fn get_program(
     let mut program = match input.op() {
         Op::Program { .. } => {
             validate_program_shape(input)?;
-            let (_, info, _, _, _) = unpack_program(input)?;
-            validate_program_info(&unpack_program(input)?.0, &info, Some(renderer.device()))?;
+            let (sink, info, _, _, _) = unpack_program(input)?;
+            // The only `spec_program` check on an externally supplied PROGRAM:
+            // one that already carries a LINEAR stage skips `do_linearize`, so
+            // its SINK would otherwise never be verified here.
+            verify_final_sink(&sink)?;
+            validate_program_info(&sink, &info, Some(renderer.device()))?;
             input.clone()
         }
         other => return Err(invalid_program_state(format!("expected PROGRAM input, got {other:?}"))),

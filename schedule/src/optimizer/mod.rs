@@ -535,7 +535,7 @@ fn apply_post_optimization_configured_with_capture(
     let gates_moved =
         graph_rewrite(crate::devectorize::pm_scalarize_register_stack_index_preserve_deps(), gates_moved, &mut ());
     let gates_moved = crate::devectorize::merge_register_read_ends(gates_moved);
-    assert!(
+    debug_assert!(
         !gates_moved.toposort().iter().any(crate::devectorize::is_register_stack_index),
         "direct register-stack lane selection must preserve all ordering dependencies",
     );
@@ -587,6 +587,10 @@ fn apply_post_optimization_configured_with_capture(
 }
 
 fn assert_target_renderer_boundary(root: &Arc<UOp>) {
+    // Debug-only invariant sweep: a full toposort plus a shape query per node.
+    if !cfg!(debug_assertions) {
+        return;
+    }
     for node in root.toposort() {
         match node.op() {
             Op::Index { buffer, indices } if indices.len() > 1 => {
