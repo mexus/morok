@@ -91,11 +91,9 @@ jobs:
           # L0: no internal deps
           publish_crate svod-dtype &
           publish_crate svod-macros &
-          publish_crate svod-arch &
           wait
           wait_for_crate svod-dtype "$VERSION"
           wait_for_crate svod-macros "$VERSION"
-          wait_for_crate svod-arch "$VERSION"
 
           # L1
           publish_crate svod-ir
@@ -117,9 +115,12 @@ jobs:
           publish_crate svod-runtime
           wait_for_crate svod-runtime "$VERSION"
 
-          # L6
-          publish_crate svod-tensor
+          # L6: svod-tensor + svod-arch (arch depends on svod-runtime)
+          publish_crate svod-tensor &
+          publish_crate svod-arch &
+          wait
           wait_for_crate svod-tensor "$VERSION"
+          wait_for_crate svod-arch "$VERSION"
 
           # L7: svod-tk + svod-onnx (no inter-dep); svod-tk must precede svod-model
           publish_crate svod-tk &
