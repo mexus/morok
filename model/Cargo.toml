@@ -5,6 +5,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Ready-to-run model implementations (ASR, embeddings, vision) for the Svod ML compiler"
 
 [dependencies]
 base64 = "0.22"
