@@ -57,7 +57,9 @@ fn test_benchmark_early_stop() {
 #[test]
 fn test_benchmark_early_stop_passes_under_cutoff() {
     let kernel = MockKernel { name: "fast".into(), sleep_micros: 50 };
-    let cutoff = Duration::from_millis(1);
+    // Wide margin: a 50us sleep can take >1ms wall on a loaded CI runner, and
+    // this test only claims that early-stop does NOT trigger under the cutoff.
+    let cutoff = Duration::from_millis(100);
     let config = BenchmarkConfig { early_stop: Some(cutoff * 3), ..BenchmarkConfig::default() };
 
     let result = unsafe { benchmark_kernel(&kernel, &[], &[], None, None, &config) }.unwrap();
